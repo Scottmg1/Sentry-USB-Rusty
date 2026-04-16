@@ -329,8 +329,16 @@ async fn configure_dwc2_overlay(env: &SetupEnv, progress: &(dyn Fn(&str) + Send 
 }
 
 /// Check if root needs shrinking (when Pi Imager auto-expanded it).
+///
+/// Shrinking an ext4 root filesystem requires an initramfs premount script
+/// that runs BEFORE the root is mounted. The flow is:
+///
+/// 1. First run: detect need → install initramfs hooks → reboot
+/// 2. During boot: initramfs premount script does e2fsck + resize2fs on
+///    the unmounted root → writes /root/RESIZE_RESULT marker
+/// 3. Next setup run: read RESIZE_RESULT → shrink partition table → reboot
+/// 4. Final setup run: partitions exist, skip this phase entirely
 async fn check_root_shrink(env: &SetupEnv, progress: &(dyn Fn(&str) + Send + Sync)) -> Result<bool> {
-    // Only needed on first setup when no partitions exist yet
     if crate::partition::partitions_exist().await {
         return Ok(false);
     }
@@ -340,6 +348,94 @@ async fn check_root_shrink(env: &SetupEnv, progress: &(dyn Fn(&str) + Send + Syn
         None => return Ok(false),
     };
 
+    let root_dev = sentryusb_shell::run(
+        "bash", &["-c", "lsblk -dpno name \"$(findmnt -D -no SOURCE --target /)\""],
+    ).await.unwrap_or_default().trim().to_string();
+
+    let root_part_num = sentryusb_shell::run(
+        "bash", &["-c", &format!("echo '{}' | grep -o '[0-9]*$'", root_dev)],
+    ).await.unwrap_or_default().trim().to_string();
+
+    // --- Phase 2: Check if a previous initramfs resize left a result ---
+    let resize_result_file = "/root/RESIZE_RESULT";
+    let resize_marker = "/root/RESIZE_ATTEMPTED";
+
+    if Path::new(resize_result_file).exists() {
+        let result = std::fs::read_to_string(resize_result_file).unwrap_or_default();
+        let result = result.trim();
+        let _ = std::fs::remove_file(resize_result_file);
+
+        if result == "success" {
+            progress("Root filesystem resize completed successfully during boot.");
+            let _ = std::fs::remove_file(resize_marker);
+
+            // Shrink the partition table to match the smaller filesystem
+            progress("Shrinking root partition table entry to match filesystem...");
+            let sector_size = sentryusb_shell::run(
+                "bash", &["-c", &format!(
+                    "cat /sys/block/$(lsblk -no pkname '{}')/queue/hw_sector_size", root_dev
+                )],
+            ).await.unwrap_or_else(|_| "512".to_string()).trim().parse::<u64>().unwrap_or(512);
+
+            let tune2fs_out = sentryusb_shell::run(
+                "bash", &["-c", &format!(
+                    "tune2fs -l '{}' | grep 'Block count:\\|Block size:' | awk '{{print $2}}' FS=: | tr -d ' '",
+                    root_dev
+                )],
+            ).await.unwrap_or_default();
+            let parts: Vec<&str> = tune2fs_out.trim().lines().collect();
+            if parts.len() == 2 {
+                let block_count: u64 = parts[0].trim().parse().unwrap_or(0);
+                let block_size: u64 = parts[1].trim().parse().unwrap_or(4096);
+                let fs_sectors = block_count * block_size / sector_size;
+
+                let start_sector = sentryusb_shell::run(
+                    "bash", &["-c", &format!("partx --show -g -o START '{}'", root_dev)],
+                ).await.unwrap_or_default().trim().to_string();
+
+                progress(&format!("Resizing partition to {} sectors", fs_sectors));
+                let _ = sentryusb_shell::run_with_timeout(
+                    Duration::from_secs(30),
+                    "bash", &["-c", &format!(
+                        "echo '{},{}' | sfdisk --force --no-reread '{}' -N {}",
+                        start_sector, fs_sectors, boot_disk, root_part_num
+                    )],
+                ).await;
+            }
+
+            // Clean up initramfs entries from config.txt
+            if Path::new("/sentryusb/config.txt").exists() {
+                let config = std::fs::read_to_string("/sentryusb/config.txt").unwrap_or_default();
+                if config.contains("SENTRYUSB-REMOVE") {
+                    let cleaned: String = config.lines()
+                        .filter(|l| !l.contains("SENTRYUSB-REMOVE"))
+                        .collect::<Vec<_>>().join("\n");
+                    let _ = std::fs::write("/sentryusb/config.txt", cleaned + "\n");
+                    let initrd = format!("initrd.img-{}", std::env::consts::ARCH);
+                    let _ = std::fs::remove_file(format!("/boot/{}", initrd));
+                } else {
+                    let _ = sentryusb_shell::run("update-initramfs", &["-u"]).await;
+                }
+            }
+
+            progress("Root partition shrink complete, rebooting...");
+            reboot().await;
+            return Ok(true);
+
+        } else if result.starts_with("fail:") {
+            let _ = std::fs::remove_file(resize_marker);
+            progress(&format!(
+                "FATAL: Root filesystem resize failed: {}. Try reflashing with Balena Etcher instead of Raspberry Pi Imager.",
+                result
+            ));
+            bail!("Root resize failed: {}", result);
+        } else {
+            progress(&format!("WARNING: Unrecognized resize result: {}", result));
+            let _ = std::fs::remove_file(resize_marker);
+        }
+    }
+
+    // --- Phase 1: Check if root partition needs shrinking ---
     let output = sentryusb_shell::run(
         "bash", &["-c", &format!(
             "sfdisk -F '{}' 2>/dev/null | grep -o '[0-9]* bytes' | head -1 | awk '{{print $1}}'",
@@ -347,38 +443,175 @@ async fn check_root_shrink(env: &SetupEnv, progress: &(dyn Fn(&str) + Send + Syn
         )],
     ).await.unwrap_or_default();
     let unpart_bytes: u64 = output.trim().parse().unwrap_or(0);
-    let min_space: u64 = 8 * 1024 * 1024 * 1024; // 8 GiB
+    let min_space: u64 = 8 * 1024 * 1024 * 1024;
 
     if unpart_bytes >= min_space {
         progress(&format!("Sufficient unpartitioned space: {} GB", unpart_bytes / 1024 / 1024 / 1024));
         return Ok(false);
     }
 
+    // Check if we already tried and failed (prevent infinite loop)
+    if Path::new(resize_marker).exists() {
+        progress("FATAL: Previous root shrink attempt failed. Delete /root/RESIZE_ATTEMPTED and try again, or reflash with Balena Etcher.");
+        bail!("Previous root shrink attempt failed. Reflash with Balena Etcher instead of Raspberry Pi Imager.");
+    }
+
     progress(&format!(
-        "Insufficient unpartitioned space ({} MB). Root partition may need shrinking.",
+        "Insufficient unpartitioned space ({} MB). Root partition needs shrinking.",
         unpart_bytes / 1024 / 1024
     ));
     progress("This usually happens when Raspberry Pi Imager is used to flash the image.");
-    progress("Initiating root filesystem shrink via initramfs...");
 
-    // Calculate shrink target
+    // Verify root is the last partition (required to free space at the end)
+    let last_part = sentryusb_shell::run(
+        "bash", &["-c", &format!(
+            "sfdisk -q -l '{}' | tail +2 | sort -n -k 2 | tail -1 | awk '{{print $1}}'",
+            boot_disk
+        )],
+    ).await.unwrap_or_default().trim().to_string();
+    if root_dev != last_part {
+        progress("FATAL: Root is not the last partition. Cannot shrink. Reflash with Balena Etcher.");
+        bail!("Root is not the last partition, cannot shrink");
+    }
+
+    // Calculate shrink target: current usage + 2G headroom, minimum 6G
     let used_output = sentryusb_shell::run(
         "bash", &["-c", "df --output=used -k / | tail -1 | tr -d ' '"],
     ).await?;
     let used_kb: u64 = used_output.trim().parse().unwrap_or(0);
     let target_gb = ((used_kb / 1024 / 1024) + 2).max(6);
 
-    let _ = std::fs::write("/root/RESIZE_ATTEMPTED", "");
+    progress(&format!("Shrinking root filesystem to {}GB to free space for setup...", target_gb));
 
-    // This will reboot the system
+    let _ = std::fs::write(resize_marker, "");
+
+    // Ensure initramfs is available
+    let kernel_ver = sentryusb_shell::run("uname", &["-r"]).await?.trim().to_string();
+    let initrd_name = format!("initrd.img-{}", kernel_ver);
+    let boot_part = std::fs::read_link("/sentryusb")
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_else(|_| "/boot".to_string());
+
+    let initrd_on_boot = format!("{}/{}", boot_part, initrd_name);
+    let initrd_in_boot = format!("/boot/{}", initrd_name);
+
+    if !Path::new(&initrd_on_boot).exists() && !Path::new(&initrd_in_boot).exists() {
+        if Path::new("/sentryusb/config.txt").exists() {
+            progress("Temporarily enabling initramfs for root resize...");
+            let _ = sentryusb_shell::run_with_timeout(
+                Duration::from_secs(120),
+                "update-initramfs", &["-c", "-k", &kernel_ver],
+            ).await;
+            let mut f = std::fs::OpenOptions::new().append(true).open("/sentryusb/config.txt")?;
+            use std::io::Write;
+            writeln!(f, "initramfs {} followkernel # SENTRYUSB-REMOVE", initrd_name)?;
+        } else {
+            let _ = std::fs::remove_file(resize_marker);
+            progress("FATAL: Cannot shrink root automatically. Reflash with Balena Etcher.");
+            bail!("Cannot shrink root: no initramfs and no config.txt");
+        }
+    }
+
+    // Copy initramfs to boot partition if needed
+    if boot_part != "/boot" && Path::new(&initrd_in_boot).exists() {
+        let _ = std::fs::copy(&initrd_in_boot, &initrd_on_boot);
+    }
+
+    // Install the initramfs resize hooks and premount script
+    progress("Installing initramfs resize hooks...");
+    install_initramfs_resize_scripts(target_gb, &kernel_ver).await?;
+
+    progress("Rebooting into initramfs to shrink root filesystem...");
+    reboot().await;
+    Ok(true)
+}
+
+/// Install initramfs hooks and premount script for offline root resize.
+async fn install_initramfs_resize_scripts(target_gb: u64, kernel_ver: &str) -> Result<()> {
+    // Hook: copy e2fsck, resize2fs, mount, umount into initrd
+    let hook = r#"#!/bin/sh
+PREREQ=""
+prereqs() { echo "$PREREQ"; }
+case "$1" in prereqs) prereqs; exit 0;; esac
+. /usr/share/initramfs-tools/hook-functions
+copy_exec $(readlink -f /sbin/findfs) /sbin/findfs-full
+copy_exec /sbin/e2fsck /sbin
+copy_exec /sbin/resize2fs /sbin
+copy_exec /bin/mount /bin
+copy_exec /bin/umount /bin
+"#;
+    std::fs::create_dir_all("/etc/initramfs-tools/hooks")?;
+    std::fs::write("/etc/initramfs-tools/hooks/resize2fs", hook)?;
+    let _ = sentryusb_shell::run("chmod", &["+x", "/etc/initramfs-tools/hooks/resize2fs"]).await;
+
+    // Premount script: runs before root is mounted, does e2fsck + resize2fs
+    let premount = format!(r#"#!/bin/sh
+PREREQ=""
+ROOT_SIZE="{target_gb}G"
+prereqs() {{ echo "$PREREQ"; }}
+case "$1" in prereqs) prereqs; exit 0;; esac
+echo
+echo "root=${{ROOT}}  "
+while [ ! -d /dev/disk/by-partuuid ]; do
+  echo "waiting for /dev/disk/by-partuuid"
+  sleep 1
+done
+ROOT_DEVICE="$(/sbin/findfs-full "$ROOT")"
+echo "root device name is ${{ROOT_DEVICE}}  "
+if [ -x /sbin/vgchange ]; then
+    /sbin/vgchange -a y || echo "vgchange: $?  "
+fi
+write_resize_marker() {{
+  mkdir -p /tmp/rootmnt
+  if mount "$ROOT_DEVICE" /tmp/rootmnt 2>/dev/null; then
+    echo "$1" > /tmp/rootmnt/root/RESIZE_RESULT
+    umount /tmp/rootmnt 2>/dev/null || true
+  fi
+  rmdir /tmp/rootmnt 2>/dev/null || true
+}}
+if /sbin/e2fsck -y -v -f "$ROOT_DEVICE"; then
+  if /sbin/resize2fs -f -d 8 "$ROOT_DEVICE" "$ROOT_SIZE"; then
+    echo "resize2fs completed successfully"
+    write_resize_marker "success"
+  else
+    RC=$?
+    echo "resize2fs failed with exit code $RC"
+    write_resize_marker "fail:resize2fs:$RC"
+  fi
+else
+  RC=$?
+  echo "e2fsck $ROOT_DEVICE failed with exit code $RC"
+  write_resize_marker "fail:e2fsck:$RC"
+fi
+"#);
+    std::fs::create_dir_all("/etc/initramfs-tools/scripts/init-premount")?;
+    std::fs::write("/etc/initramfs-tools/scripts/init-premount/resize", premount)?;
+    let _ = sentryusb_shell::run("chmod", &["+x", "/etc/initramfs-tools/scripts/init-premount/resize"]).await;
+
+    // Regenerate initramfs
     sentryusb_shell::run_with_timeout(
-        Duration::from_secs(300),
-        "bash", &["-c", &format!(
-            "resize2fs /dev/$(findmnt -n -o SOURCE /) {}G && reboot", target_gb
-        )],
+        Duration::from_secs(120),
+        "update-initramfs", &["-v", "-u", "-k", kernel_ver],
     ).await?;
 
-    Ok(true)
+    // Copy updated initramfs to boot partition if needed
+    let initrd_name = format!("initrd.img-{}", kernel_ver);
+    let boot_part = std::fs::read_link("/sentryusb")
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_else(|_| "/boot".to_string());
+    if boot_part != "/boot" {
+        let src = format!("/boot/{}", initrd_name);
+        let dst = format!("{}/{}", boot_part, initrd_name);
+        if Path::new(&src).exists() {
+            let _ = std::fs::copy(&src, &dst);
+        }
+    }
+
+    // Clean up the hook and premount script (they're already baked into initrd)
+    let _ = std::fs::remove_file("/etc/initramfs-tools/hooks/resize2fs");
+    let _ = std::fs::remove_file("/etc/initramfs-tools/scripts/init-premount/resize");
+
+    Ok(())
 }
 
 /// Fix cmdline.txt modules-load to include dwc2 and g_ether.

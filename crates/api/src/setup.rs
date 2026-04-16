@@ -111,8 +111,6 @@ fn spawn_setup(hub: sentryusb_ws::Hub) {
     }
 
     tokio::spawn(async move {
-        let _ = std::fs::remove_file("/root/RESIZE_ATTEMPTED");
-
         hub.broadcast("setup_status", &serde_json::json!({"status": "running"}));
         info!("[setup] Starting native Rust setup");
 
