@@ -11,12 +11,27 @@ SERVICE_NAME="sentryusb"
 echo "=== SentryUSB Rust Installer ==="
 echo ""
 
-# Check we're on ARM64 Linux
+# Detect architecture
 ARCH=$(uname -m)
-if [ "$ARCH" != "aarch64" ]; then
-    echo "ERROR: This installer is for ARM64 (aarch64) only. Detected: $ARCH"
-    exit 1
-fi
+case "$ARCH" in
+    aarch64)
+        BINARY_NAME="sentryusb-linux-arm64"
+        echo "Detected: ARM64 (Pi 3/4/5/Zero2W 64-bit)"
+        ;;
+    armv7l)
+        BINARY_NAME="sentryusb-linux-armv7"
+        echo "Detected: ARMv7 (Pi 2/3/Zero2W 32-bit)"
+        ;;
+    armv6l)
+        BINARY_NAME="sentryusb-linux-armv6"
+        echo "Detected: ARMv6 (Pi Zero W/1)"
+        ;;
+    *)
+        echo "ERROR: Unsupported architecture: $ARCH"
+        echo "Supported: aarch64, armv7l, armv6l"
+        exit 1
+        ;;
+esac
 
 if [ "$(id -u)" -ne 0 ]; then
     echo "ERROR: Run as root (sudo)"

@@ -11,21 +11,39 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  build-arm64:
-    name: Build ARM64 (Pi 3/4/5/Zero2W)
+  build:
+    name: Build ${{ matrix.name }}
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - name: ARM64 (Pi 3/4/5/Zero2W 64-bit)
+            target: aarch64-unknown-linux-gnu
+            linker: aarch64-linux-gnu-gcc
+            gcc: gcc-aarch64-linux-gnu
+            artifact: sentryusb-linux-arm64
+          - name: ARMv7 (Pi 2/3/Zero2W 32-bit)
+            target: armv7-unknown-linux-gnueabihf
+            linker: arm-linux-gnueabihf-gcc
+            gcc: gcc-arm-linux-gnueabihf
+            artifact: sentryusb-linux-armv7
+          - name: ARMv6 (Pi Zero W/1)
+            target: arm-unknown-linux-gnueabihf
+            linker: arm-linux-gnueabihf-gcc
+            gcc: gcc-arm-linux-gnueabihf
+            artifact: sentryusb-linux-armv6
     steps:
       - uses: actions/checkout@v4
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: aarch64-unknown-linux-gnu
+          targets: ${{ matrix.target }}
 
       - name: Install cross-compilation tools
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq gcc-aarch64-linux-gnu
+          sudo apt-get install -y -qq ${{ matrix.gcc }}
 
       - name: Cache cargo registry
         uses: actions/cache@v4
@@ -34,11 +52,10 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-arm64-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-${{ matrix.target }}-${{ hashFiles('**/Cargo.lock') }}
 
-      - name: Build frontend
+      - name: Ensure frontend exists
         run: |
-          # Copy frontend from Sentry-USB if available, otherwise use placeholder
           if [ -d "crates/sentryusb/static/assets" ]; then
             echo "Frontend already present"
           else
@@ -48,22 +65,23 @@ jobs:
           fi
 
       - name: Build release binary
-        run: |
-          cargo build --release --target aarch64-unknown-linux-gnu
+        run: cargo build --release --target ${{ matrix.target }}
         env:
-          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: ${{ matrix.linker }}
+          CARGO_TARGET_ARMV7_UNKNOWN_LINUX_GNUEABIHF_LINKER: ${{ matrix.linker }}
+          CARGO_TARGET_ARM_UNKNOWN_LINUX_GNUEABIHF_LINKER: ${{ matrix.linker }}
 
       - name: Package binary
         run: |
           mkdir -p release
-          cp target/aarch64-unknown-linux-gnu/release/sentryusb release/sentryusb-linux-arm64
+          cp target/${{ matrix.target }}/release/sentryusb release/${{ matrix.artifact }}
           ls -lh release/
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: sentryusb-linux-arm64
-          path: release/sentryusb-linux-arm64
+          name: ${{ matrix.artifact }}
+          path: release/${{ matrix.artifact }}
 
   test:
     name: Test
@@ -80,7 +98,7 @@ jobs:
 
   release:
     name: Create Release
-    needs: [build-arm64, test]
+    needs: [build, test]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     permissions:
@@ -88,11 +106,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Download ARM64 binary
+      - name: Download all binaries
         uses: actions/download-artifact@v4
         with:
-          name: sentryusb-linux-arm64
           path: release/
+          merge-multiple: true
+
+      - name: List release files
+        run: ls -lh release/
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
