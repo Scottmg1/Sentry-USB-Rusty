@@ -1,0 +1,28 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/sentryusb",
+    "crates/config",
+    "crates/shell",
+    "crates/ws",
+    "crates/drives",
+    "crates/api",
+    "crates/notify",
+    "crates/usb_gadget",
+]
+
+[workspace.dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "process", "time", "signal", "sync", "io-util", "net"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+chrono = { version = "0.4", features = ["serde"] }
+
+[profile.release]
+opt-level = "s"
+lto = "thin"
+strip = true
+codegen-units = 1

@@ -1,0 +1,19 @@
+[package]
+name = "sentryusb-notify"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+reqwest = { version = "0.12", features = ["json"] }
+async-trait = "0.1"
+
+chrono = { workspace = true }
+
+sentryusb-config = { path = "../config", package = "sentryusb-config" }
+sentryusb-shell = { path = "../shell", package = "sentryusb-shell" }

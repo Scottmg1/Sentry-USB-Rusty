@@ -1,0 +1,19 @@
+[package]
+name = "sentryusb-drives"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+chrono = { workspace = true }
+rusqlite = { version = "0.32", features = ["bundled"] }
+bincode = "1"
+memmap2 = "0.9"
+byteorder = "1"
+
+sentryusb-ws = { path = "../ws", package = "sentryusb-ws" }

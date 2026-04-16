@@ -1,0 +1,15 @@
+[package]
+name = "sentryusb-gadget"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+tokio = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+sentryusb-shell = { path = "../shell", package = "sentryusb-shell" }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
