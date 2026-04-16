@@ -10,7 +10,7 @@ use serde::Deserialize;
 use tokio::sync::{Mutex, Notify};
 use crate::router::AppState;
 
-/// Keep-awake state.
+#[allow(dead_code)]
 #[derive(Clone, Copy, PartialEq)]
 enum KaState {
     Idle,
@@ -18,6 +18,7 @@ enum KaState {
     Active,
 }
 
+#[allow(dead_code)]
 impl KaState {
     fn as_str(&self) -> &str {
         match self {
@@ -28,6 +29,7 @@ impl KaState {
     }
 }
 
+#[allow(dead_code)]
 struct KaInner {
     state: KaState,
     mode: String,
@@ -36,7 +38,7 @@ struct KaInner {
     stop_notify: Arc<Notify>,
 }
 
-/// Shared keep-awake manager.
+#[allow(dead_code)]
 pub struct KeepAwakeManager {
     inner: Mutex<KaInner>,
 }
