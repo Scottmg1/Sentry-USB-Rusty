@@ -233,7 +233,6 @@ pub async fn send_to_all(
         results.push(("mobile_push".to_string(), r));
     }
 
-    // SNS requires AWS signing — still uses subprocess for now
     if config.sns_enabled {
         let r = sns::send(&config.sns_topic_arn, title, message).await;
         log_result("SNS", &r);

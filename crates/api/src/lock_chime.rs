@@ -133,6 +133,20 @@ fn is_gadget_active() -> bool {
     Path::new(GADGET_CONFIG_DIR).exists()
 }
 
+async fn gadget_disable() -> Result<(), String> {
+    tokio::task::spawn_blocking(sentryusb_gadget::disable)
+        .await
+        .map_err(|e| format!("join: {}", e))?
+        .map_err(|e| e.to_string())
+}
+
+async fn gadget_enable() -> Result<(), String> {
+    tokio::task::spawn_blocking(sentryusb_gadget::enable)
+        .await
+        .map_err(|e| format!("join: {}", e))?
+        .map_err(|e| e.to_string())
+}
+
 fn is_mount_point_active(mount_point: &str) -> bool {
     let Ok(data) = std::fs::read_to_string("/proc/mounts") else {
         return false;
@@ -196,14 +210,8 @@ async fn sync_lock_chime_to_cam_disk() -> Result<(), String> {
     let gadget_was_active = is_gadget_active();
 
     if gadget_was_active {
-        if let Err(e) = sentryusb_shell::run_with_timeout(
-            Duration::from_secs(10),
-            "bash",
-            &["/root/bin/disable_gadget.sh"],
-        )
-        .await
-        {
-            info!("lockchime: disable_gadget.sh failed: {}", e);
+        if let Err(e) = gadget_disable().await {
+            info!("lockchime: gadget disable failed: {}", e);
         }
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
@@ -211,14 +219,8 @@ async fn sync_lock_chime_to_cam_disk() -> Result<(), String> {
     let copy_err = copy_lock_chime_to_cam_mount().await;
 
     if gadget_was_active {
-        if let Err(e) = sentryusb_shell::run_with_timeout(
-            Duration::from_secs(10),
-            "bash",
-            &["/root/bin/enable_gadget.sh"],
-        )
-        .await
-        {
-            info!("lockchime: enable_gadget.sh failed: {}", e);
+        if let Err(e) = gadget_enable().await {
+            info!("lockchime: gadget enable failed: {}", e);
             return Err(format!("re-enable gadget: {}", e));
         }
         info!("lockchime: USB gadget re-enabled -- Tesla will read the new lock sound");
@@ -237,14 +239,8 @@ async fn clear_lock_chime_from_cam_disk() -> Result<(), String> {
     let gadget_was_active = is_gadget_active();
 
     if gadget_was_active {
-        if let Err(e) = sentryusb_shell::run_with_timeout(
-            Duration::from_secs(10),
-            "bash",
-            &["/root/bin/disable_gadget.sh"],
-        )
-        .await
-        {
-            info!("lockchime: disable_gadget.sh failed: {}", e);
+        if let Err(e) = gadget_disable().await {
+            info!("lockchime: gadget disable failed: {}", e);
         }
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
@@ -253,12 +249,7 @@ async fn clear_lock_chime_from_cam_disk() -> Result<(), String> {
         sentryusb_shell::run_with_timeout(Duration::from_secs(10), "mount", &[CAM_MOUNT_POINT]).await
     {
         if gadget_was_active {
-            let _ = sentryusb_shell::run_with_timeout(
-                Duration::from_secs(10),
-                "bash",
-                &["/root/bin/enable_gadget.sh"],
-            )
-            .await;
+            let _ = gadget_enable().await;
         }
         return Err(format!("mount cam disk: {}", e));
     }
@@ -274,13 +265,7 @@ async fn clear_lock_chime_from_cam_disk() -> Result<(), String> {
     }
 
     if gadget_was_active {
-        if let Err(e) = sentryusb_shell::run_with_timeout(
-            Duration::from_secs(10),
-            "bash",
-            &["/root/bin/enable_gadget.sh"],
-        )
-        .await
-        {
+        if let Err(e) = gadget_enable().await {
             return Err(format!("re-enable gadget: {}", e));
         }
     }

@@ -16,18 +16,25 @@ pub async fn reboot(State(_s): State<AppState>) -> (StatusCode, Json<serde_json:
 
 /// POST /api/system/toggle-drives
 pub async fn toggle_drives(State(_s): State<AppState>, _body: String) -> (StatusCode, Json<serde_json::Value>) {
-    let gadget_active = std::path::Path::new("/sys/kernel/config/usb_gadget/sentryusb").exists();
-    if gadget_active {
-        let _ = sentryusb_shell::run("bash", &["/root/bin/disable_gadget.sh"]).await;
+    if sentryusb_gadget::is_active() {
+        let _ = tokio::task::spawn_blocking(sentryusb_gadget::disable).await;
     } else {
-        let _ = sentryusb_shell::run("bash", &["/root/bin/enable_gadget.sh"]).await;
+        let _ = tokio::task::spawn_blocking(sentryusb_gadget::enable).await;
     }
     crate::json_ok()
 }
 
 /// POST /api/system/trigger-sync
 pub async fn trigger_sync(State(_s): State<AppState>) -> (StatusCode, Json<serde_json::Value>) {
-    tokio::spawn(async { let _ = sentryusb_shell::run("bash", &["/root/bin/force_sync.sh"]).await; });
+    tokio::spawn(async {
+        let canary = std::path::Path::new("/tmp/archive_is_unreachable");
+        if std::fs::File::create(canary).is_err() {
+            return;
+        }
+        while canary.exists() {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        }
+    });
     crate::json_ok()
 }
 

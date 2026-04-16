@@ -67,8 +67,24 @@ pub async fn remove_paired_device(
 
 /// POST /api/notifications/test
 pub async fn send_test_notification(State(_s): State<AppState>) -> (StatusCode, Json<serde_json::Value>) {
-    match sentryusb_shell::run("bash", &["/root/bin/send-push-message", "SentryUSB", "Test notification from SentryUSB"]).await {
-        Ok(_) => crate::json_ok(),
-        Err(e) => crate::json_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    let config = sentryusb_notify::NotifyConfig::from_config();
+    let results = sentryusb_notify::send_to_all(&config, "SentryUSB", "Test notification from SentryUSB").await;
+
+    let attempted = results.len();
+    let failures: Vec<String> = results
+        .into_iter()
+        .filter_map(|(name, r)| r.err().map(|e| format!("{}: {}", name, e)))
+        .collect();
+
+    if attempted == 0 {
+        return crate::json_error(StatusCode::BAD_REQUEST, "No notification providers are enabled");
     }
+    if !failures.is_empty() && failures.len() == attempted {
+        return crate::json_error(StatusCode::INTERNAL_SERVER_ERROR, &failures.join("; "));
+    }
+    (StatusCode::OK, Json(serde_json::json!({
+        "status": "ok",
+        "attempted": attempted,
+        "failed": failures,
+    })))
 }

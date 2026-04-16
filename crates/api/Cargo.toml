@@ -33,3 +33,4 @@ sentryusb-ws = { path = "../ws", package = "sentryusb-ws" }
 sentryusb-drives = { path = "../drives", package = "sentryusb-drives" }
 sentryusb-notify = { path = "../notify", package = "sentryusb-notify" }
 sentryusb-setup = { path = "../setup", package = "sentryusb-setup" }
+sentryusb-gadget = { path = "../usb_gadget", package = "sentryusb-gadget" }

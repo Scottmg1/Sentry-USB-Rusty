@@ -94,7 +94,7 @@ pub async fn save_setup_config(
     Json(body): Json<std::collections::HashMap<String, String>>,
 ) -> (StatusCode, Json<serde_json::Value>) {
     // Remount filesystem read-write (root fs may be read-only)
-    let _ = sentryusb_shell::run("bash", &["-c", "/root/bin/remountfs_rw"]).await;
+    let _ = sentryusb_shell::run("mount", &["/", "-o", "remount,rw"]).await;
 
     let config_path = sentryusb_config::find_config_path();
     match sentryusb_config::write_file(config_path, &body) {
