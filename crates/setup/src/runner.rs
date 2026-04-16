@@ -216,9 +216,9 @@ async fn reboot() {
     let _ = sentryusb_shell::run("reboot", &[]).await;
 }
 
-/// Set WiFi regulatory domain to US if not set.
+/// Set WiFi regulatory domain to US if not set. Persists via /etc/default/crda
+/// and cfg80211 module param so it survives reboots without needing one.
 async fn configure_wifi_regulatory(_env: &SetupEnv, progress: &(dyn Fn(&str) + Send + Sync)) -> Result<bool> {
-    // Check if NetworkManager is managing WiFi
     if sentryusb_shell::run("systemctl", &["-q", "is-enabled", "NetworkManager.service"]).await.is_ok() {
         let output = sentryusb_shell::run(
             "bash", &["-c", "iw reg get 2>/dev/null | grep -oP '(?<=country )\\w+' | head -1"],
@@ -227,9 +227,14 @@ async fn configure_wifi_regulatory(_env: &SetupEnv, progress: &(dyn Fn(&str) + S
         if reg.is_empty() || reg == "00" {
             progress("Setting WiFi regulatory domain to US");
             let _ = sentryusb_shell::run("iw", &["reg", "set", "US"]).await;
-            return Ok(true);
+            // Persist so it survives reboots (no reboot needed)
+            let _ = std::fs::write("/etc/default/crda", "REGDOMAIN=US\n");
+            let _ = sentryusb_shell::run(
+                "bash", &["-c", "mkdir -p /etc/modprobe.d && echo 'options cfg80211 ieee80211_regdom=US' > /etc/modprobe.d/cfg80211.conf"],
+            ).await;
         }
     }
+    // Never requires a reboot
     Ok(false)
 }
 

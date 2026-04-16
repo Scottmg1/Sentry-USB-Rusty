@@ -1,10 +1,22 @@
 //! Setup wizard configuration API.
+//!
+//! The setup process supports mid-setup reboots (e.g. for dwc2 overlay or
+//! root partition shrink). The boot-loop works like this:
+//!
+//! 1. User clicks "Run Setup" in the web wizard → `POST /api/setup/run`
+//! 2. `run_full_setup` creates `SENTRYUSB_SETUP_STARTED`, runs phases.
+//! 3. If a phase requires a reboot, setup exits early (marker still present).
+//! 4. Pi reboots → systemd starts the web server → `auto_resume_setup()`
+//!    sees STARTED without FINISHED → re-spawns `run_full_setup`.
+//! 5. `run_full_setup` skips already-completed phases and continues.
+//! 6. When all phases finish, STARTED is removed and FINISHED is created.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use axum::Json;
 use axum::extract::State;
 use axum::http::StatusCode;
+use tracing::info;
 
 use crate::router::AppState;
 
@@ -28,6 +40,14 @@ fn is_setup_finished() -> bool {
 
 fn is_setup_started() -> bool {
     SETUP_STARTED_PATHS.iter().any(|p| std::path::Path::new(p).exists())
+}
+
+/// Call at server startup to resume an interrupted setup after reboot.
+pub fn auto_resume_setup(hub: sentryusb_ws::Hub) {
+    if is_setup_started() && !is_setup_finished() {
+        info!("[setup] Detected interrupted setup (STARTED marker present, no FINISHED). Auto-resuming...");
+        spawn_setup(hub);
+    }
 }
 
 /// GET /api/setup/status
@@ -83,18 +103,18 @@ pub async fn save_setup_config(
     }
 }
 
-/// POST /api/setup/run
-pub async fn run_setup(State(s): State<AppState>) -> (StatusCode, Json<serde_json::Value>) {
+/// Shared logic: spawn the setup task in the background.
+fn spawn_setup(hub: sentryusb_ws::Hub) {
     if SETUP_RUNNING.swap(true, Ordering::SeqCst) {
-        return crate::json_error(StatusCode::CONFLICT, "Setup is already running");
+        info!("[setup] Setup already running, skipping duplicate spawn");
+        return;
     }
 
-    let hub = s.hub.clone();
     tokio::spawn(async move {
         let _ = std::fs::remove_file("/root/RESIZE_ATTEMPTED");
 
         hub.broadcast("setup_status", &serde_json::json!({"status": "running"}));
-        tracing::info!("[setup] Starting native Rust setup");
+        info!("[setup] Starting native Rust setup");
 
         let hub_clone = hub.clone();
         let progress = sentryusb_setup::runner::make_progress(move |msg: &str| {
@@ -115,6 +135,15 @@ pub async fn run_setup(State(s): State<AppState>) -> (StatusCode, Json<serde_jso
             }
         }
     });
+}
+
+/// POST /api/setup/run
+pub async fn run_setup(State(s): State<AppState>) -> (StatusCode, Json<serde_json::Value>) {
+    if SETUP_RUNNING.load(Ordering::SeqCst) {
+        return crate::json_error(StatusCode::CONFLICT, "Setup is already running");
+    }
+
+    spawn_setup(s.hub.clone());
 
     (StatusCode::OK, Json(serde_json::json!({"status": "started"})))
 }

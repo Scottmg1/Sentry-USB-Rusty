@@ -95,6 +95,9 @@ async fn main() {
         drives: drive_state,
     };
 
+    // Resume setup if it was interrupted by a reboot (e.g. dwc2 overlay, root shrink)
+    sentryusb_api::setup::auto_resume_setup(hub.clone());
+
     // Build the API router
     let mut app = sentryusb_api::build_router(app_state.clone());
 
