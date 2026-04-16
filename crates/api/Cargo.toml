@@ -17,7 +17,7 @@ tower = "0.5"
 tower-http = { version = "0.6", features = ["fs"] }
 ring = "0.17"
 rand = "0.9"
-reqwest = { version = "0.12", features = ["json", "multipart", "stream"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "multipart", "stream", "rustls-tls"] }
 portable-pty = "0.8"
 zip = { version = "2", default-features = false, features = ["deflate"] }
 hex = "0.4"
