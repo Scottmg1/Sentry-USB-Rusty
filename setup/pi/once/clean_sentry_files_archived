@@ -1,0 +1,38 @@
+#!/bin/bash -eu
+
+# remove files from sentry_files_archived that were declared
+# as archived, even though they weren't.
+
+if [ "$(getconf LONG_BIT)" = "64" ] || [ "$(. /etc/os-release && echo "${VERSION_ID:-}")" != "12" ]
+then
+  exit
+fi
+
+declare -r list=/mutable/sentry_files_archived
+declare -r newlist="${list}.new"
+
+if [ ! -s "$list" ]
+then
+  exit
+fi
+
+log "Fixing previously-archived list"
+
+declare -ri numentries=$(wc -l < "$list")
+declare -i current=0
+
+cat "$list"  | {
+  touch "$newlist"
+  while read -r path
+  do
+    let current=current+1
+    echo -en "$((100*current/numentries))%\r"
+    if [ ! -e "/mutable/TeslaCam/$path" -a -r "/mutable/TeslaCam/$path" ]
+    then
+      echo -e "\nmissed $path\n"
+    else
+      echo "$path" >> "$newlist"
+    fi
+  done
+  mv "$newlist" "$list"
+}

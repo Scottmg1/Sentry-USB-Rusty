@@ -1,0 +1,83 @@
+#!/bin/bash -eu
+
+PREVWRITTEN=-1
+
+STATE=UNDETERMINED
+
+COUNT=0
+
+BURSTSIZE=0
+
+log "waiting up to 90 seconds for idle interval"
+for _ in {1..90}
+do
+  sleep 1
+  PROC=$(pgrep -x file-storage || true)
+  if [ -z "$PROC" ]
+  then
+    log "mass storage process not active, OK to write"
+    exit 0
+  fi
+  WRITTEN=$(grep ^write_bytes "/proc/$PROC/io" | awk '{print $2}')
+  if (( PREVWRITTEN == -1 ))
+  then
+    # we don't have a previous measurement yet
+    PREVWRITTEN=$WRITTEN
+    continue
+  fi
+  DELTA=$((WRITTEN-PREVWRITTEN))
+  PREVWRITTEN=$WRITTEN
+
+  case $STATE in
+    UNDETERMINED)
+      if (( DELTA > 500000 ))
+      then
+        log "write in progress"
+        STATE=WRITING
+        BURSTSIZE=$DELTA
+      else
+        #log "waiting for first write"
+        true
+      fi
+      ;;
+    WRITING)
+      if (( DELTA < 500000 ))
+      then
+        # transition to the "not writing" state
+        log "no longer writing, wrote $BURSTSIZE"
+        BURSTSIZE=0
+        STATE=IDLE
+        COUNT=0
+      else
+        #log "still writing"
+        BURSTSIZE=$((BURSTSIZE+DELTA))
+      fi
+      ;;
+
+    IDLE)
+      # not writing
+      if (( DELTA > 500000 ))
+      then
+        # apparently we're still/again writing
+        log "going back to writing state"
+        BURSTSIZE=$DELTA
+        STATE=WRITING
+        COUNT=0
+      else
+        COUNT=$((COUNT+1))
+        if (( COUNT > 5 ))
+        then
+          log "no writes seen in the last 5 seconds"
+          exit 0
+        else
+          #log "still not writing"
+          true
+        fi
+      fi
+      ;;
+  esac
+done
+
+log "couldn't determine idle interval"
+exit 1
+

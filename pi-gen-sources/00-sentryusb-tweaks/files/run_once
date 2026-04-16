@@ -1,0 +1,8 @@
+#!/bin/bash -eu
+
+# This script is executed once at the very beginning of setup.
+# After it is run, this script will be renamed to 'ran_once'
+# and setup will continue.
+# If you make modifications to this script that include rebooting
+# the device, you should ensure the script is not run again on
+# the next boot, for example by renaming or deleting it.

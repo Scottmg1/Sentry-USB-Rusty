@@ -1,0 +1,91 @@
+#!/bin/bash -eu
+
+if [[ ( -z "${TEMPERATURE_WARNING:+x}" ) && ( -z "${TEMPERATURE_CAUTION:+x}" ) && ( -z "${TEMPERATURE_INTERVAL:+x}" ) && ( -z "${TEMPERATURE_POSTARCHIVE:+x}" ) ]]
+then
+  log "Temperature Monitor: Not enabled."
+  exit 0
+elif [[ ! ( -e /sys/class/thermal/thermal_zone0/temp ) ]] 
+then
+  log "Temperature Monitor: Not supported by this device."
+  exit 0
+fi
+
+function readable() { 
+  local temp1=$(($1 / 1000))
+  local temp2=$(($1 % 1000))
+  echo "${temp1}.${temp2}°C"
+}
+
+counter=0
+set_warning=0
+set_caution=0
+timestamp=$(date +"%Y-%m-%d %H:%M:%S")
+raw_temp=$(cat /sys/class/thermal/thermal_zone0/temp)
+peak_time=$timestamp
+peak_temp=$raw_temp
+message=""
+
+while true
+do
+  if [[ "$raw_temp" -gt "$peak_temp" ]]
+  then
+    peak_temp=$raw_temp
+    peak_time=$timestamp
+  fi
+
+  # Log Warning threshold exceeded
+  if [[ ! ( -z "${TEMPERATURE_WARNING:+x}" ) ]]
+  then
+    if [[ "$raw_temp" -lt $((TEMPERATURE_WARNING - 5000)) ]] # Clear Warning flag if below threshold - 5 degrees (hysteresis)
+    then
+      set_warning=0
+    fi
+    if [[ ("$raw_temp" -gt "$TEMPERATURE_WARNING") && ("$set_warning" -eq 0) ]]
+    then
+      set_warning=1
+      message="Temperature Monitor: WARNING threshold exceeded ($(readable "$TEMPERATURE_WARNING"))!!!"
+      /root/bin/send-push-message "$NOTIFICATION_TITLE:" "$message" "" temperature || log "Temperature Monitor: Failed to send push message; likely no internet connection presently."
+    fi
+  fi
+
+  # Log Caution threshold exceeded
+  if [[ ! ( -z "${TEMPERATURE_CAUTION:+x}" ) ]]
+  then
+    if [[ "$raw_temp" -lt $((TEMPERATURE_CAUTION - 5000)) ]] # Clear Caution flag if below threshold - 5 degrees (hysteresis)
+    then
+      set_caution=0
+    fi
+    if [[ ("$raw_temp" -gt "$TEMPERATURE_CAUTION") && ("$set_caution" -eq 0) ]]
+    then
+      set_caution=1
+      message="Temperature Monitor: CAUTION threshold exceeded ($(readable "$TEMPERATURE_CAUTION"))!!!"
+      /root/bin/send-push-message "$NOTIFICATION_TITLE:" "$message" "" temperature || log "Temperature Monitor: Failed to send push message; likely no internet connection presently."
+    fi
+  fi
+
+  # Log temperature at fixed interval
+  if [[ ! ( -z "${TEMPERATURE_INTERVAL:+x}" ) ]]
+  then
+    counter_mod=$((counter % (TEMPERATURE_INTERVAL * 60)))
+    if [ "$counter_mod" -eq 0 ]
+    then
+      log "Temperature Monitor: $(readable "$raw_temp") (max=$(readable "$peak_temp") $peak_time)"
+    fi
+  fi
+
+  # Log right after Archive_Clips
+  if [[ -e /tmp/flag_post_archive ]]
+  then
+    rm /tmp/flag_post_archive # Clear flag
+    if [[ "${TEMPERATURE_POSTARCHIVE:-false}" = "true" ]]
+    then
+      message="Temperature Monitor: $(readable "$raw_temp") (max=$(readable "$peak_temp") $peak_time)"
+      /root/bin/send-push-message "$NOTIFICATION_TITLE:" "$message" "" temperature || log "Temperature Monitor: Failed to send push message."
+    fi
+  fi
+
+  sleep 60
+  ((counter+=60))
+  timestamp=$(date +"%Y-%m-%d %H:%M:%S")
+  raw_temp=$(cat /sys/class/thermal/thermal_zone0/temp)
+done

@@ -1,0 +1,277 @@
+#!/bin/bash
+# Post-archive hook: process newly archived dashcam clips for GPS/drive data.
+# Called by archiveloop after archive_clips completes, before awake_stop.
+# Only runs if DRIVE_MAP_ENABLED is set to true in the config.
+
+source /root/bin/envsetup.sh 2>/dev/null || true
+
+if [ "${DRIVE_MAP_ENABLED:-false}" != "true" ]; then
+  exit 0
+fi
+
+LOG_FILE="${LOG_FILE:-/mutable/archiveloop.log}"
+
+function log() {
+  echo "$(date): [drive-map] $*" >> "$LOG_FILE"
+}
+
+# Find the SentryUSB API port
+SENTRYUSB_PORT="${SENTRYUSB_PORT:-80}"
+API_URL="http://127.0.0.1:${SENTRYUSB_PORT}"
+
+# Wait for the SentryUSB API to become reachable (it may still be starting
+# after a reboot, or briefly unavailable during an update).
+API_READY=false
+for i in 1 2 3 4 5 6; do
+  if curl -sf "${API_URL}/api/drives/status" > /dev/null 2>&1; then
+    API_READY=true
+    break
+  fi
+  log "SentryUSB API not reachable (attempt $i/6), retrying in 5s..."
+  sleep 5
+done
+
+if [ "$API_READY" != "true" ]; then
+  log "SentryUSB API not reachable after 30s, skipping drive processing"
+  exit 0
+fi
+
+# Clear archive status so the processing API doesn't think archiving is
+# still in progress.  archive_clips is finished by the time this script
+# runs, but the status file may not have been cleaned up yet.
+rm -f /tmp/archive_status.json /tmp/archive_status.json.tmp
+
+# Process a single clips directory: trigger API, wait for completion
+function process_clips_dir() {
+  local clips_dir="$1"
+  log "Starting drive processing on $clips_dir"
+
+  # Retry up to 6 times (60s) if the server is busy (409 = already running or archiving)
+  local max_retries=6
+  local retry_wait=10
+  local attempt=0
+  local HTTP_CODE RESPONSE
+
+  while [ $attempt -lt $max_retries ]; do
+    HTTP_CODE=$(curl -s -o /tmp/drive_process_response.json -w "%{http_code}" \
+      -X POST "${API_URL}/api/drives/process?post_archive=1" \
+      -H "Content-Type: application/json" \
+      -d "{\"clips_dir\": \"${clips_dir}\", \"throttle_ms\": 20}" 2>/dev/null)
+    RESPONSE=$(cat /tmp/drive_process_response.json 2>/dev/null)
+
+    if [ "$HTTP_CODE" = "200" ] || [ "$HTTP_CODE" = "202" ]; then
+      break
+    elif [ "$HTTP_CODE" = "409" ]; then
+      attempt=$((attempt + 1))
+      log "Processing busy (409), retrying in ${retry_wait}s (attempt $attempt/$max_retries): $RESPONSE"
+      sleep $retry_wait
+    else
+      log "Failed to trigger processing for $clips_dir (HTTP $HTTP_CODE): $RESPONSE"
+      return 1
+    fi
+  done
+
+  if [ $attempt -ge $max_retries ]; then
+    log "Failed to trigger processing for $clips_dir: still busy after ${max_retries} retries"
+    return 1
+  fi
+
+  log "Processing triggered: $RESPONSE"
+
+  local total_estimate
+  total_estimate=$(echo "$RESPONSE" | grep -o '"total":[0-9]*' | cut -d: -f2 || echo "0")
+
+  local timeout=1800
+  local elapsed=0
+  local poll_interval=10
+  local last_progress_log=0
+
+  while [ $elapsed -lt $timeout ]; do
+    sleep $poll_interval
+    elapsed=$((elapsed + poll_interval))
+
+    STATUS=$(curl -sf "${API_URL}/api/drives/status" 2>/dev/null)
+    if [ $? -ne 0 ]; then
+      log "Failed to check status, continuing to wait..."
+      continue
+    fi
+
+    RUNNING=$(echo "$STATUS" | grep -o '"running":true' || true)
+    if [ -z "$RUNNING" ]; then
+      ROUTES=$(echo "$STATUS" | grep -o '"routes_count":[0-9]*' | cut -d: -f2)
+      PROCESSED=$(echo "$STATUS" | grep -o '"processed_count":[0-9]*' | cut -d: -f2)
+      log "Processing complete for $clips_dir. Routes: ${ROUTES:-0}, Files processed: ${PROCESSED:-0}"
+      return 0
+    fi
+
+    # Log progress every 15 seconds
+    if [ $((elapsed - last_progress_log)) -ge 15 ]; then
+      PROCESSED=$(echo "$STATUS" | grep -o '"processed_count":[0-9]*' | cut -d: -f2)
+      ROUTES=$(echo "$STATUS" | grep -o '"routes_count":[0-9]*' | cut -d: -f2)
+      log "Still processing $clips_dir... (${elapsed}s elapsed, ${PROCESSED:-?} files processed, ${ROUTES:-?} routes)"
+      last_progress_log=$elapsed
+    fi
+  done
+
+  log "Processing timed out for $clips_dir after ${timeout}s"
+  return 1
+}
+
+# Process RecentClips from local snapshot storage (not NFS archive, not live cam)
+CLIPS_DIR="/mutable/TeslaCam/RecentClips"
+if [ ! -d "$CLIPS_DIR" ]; then
+  log "RecentClips directory not found at $CLIPS_DIR, skipping"
+  exit 0
+fi
+
+# Capture drive count before processing so we can detect new data
+BEFORE_STATS=$(curl -sf "${API_URL}/api/drives/stats" 2>/dev/null)
+DRIVES_BEFORE=$(echo "$BEFORE_STATS" | grep -o '"drives_count":[0-9]*' | cut -d: -f2)
+DRIVES_BEFORE=${DRIVES_BEFORE:-0}
+
+process_clips_dir "$CLIPS_DIR"
+PROCESSED=$?
+
+log "Drive processing complete. $PROCESSED directories processed."
+
+# Check if archive is still reachable before syncing drive data.
+# If the user drove away during processing, skip the sync — it will
+# be retried on the next archive cycle.
+ARCHIVE_REACHABLE=true
+if [ -x /root/bin/archive-is-reachable.sh ]; then
+  ARCHIVE_SERVER="${ARCHIVE_SERVER:-}"
+  # Derive ARCHIVE_SERVER from archive type if not set
+  if [ -z "$ARCHIVE_SERVER" ]; then
+    if [ -n "${RSYNC_SERVER:-}" ]; then
+      ARCHIVE_SERVER="$RSYNC_SERVER"
+    elif [ -n "${RCLONE_DRIVE:-}" ]; then
+      ARCHIVE_SERVER="8.8.8.8"
+    fi
+  fi
+  if [ -n "$ARCHIVE_SERVER" ]; then
+    if ! /root/bin/archive-is-reachable.sh "$ARCHIVE_SERVER" 2>/dev/null; then
+      ARCHIVE_REACHABLE=false
+      log "Archive unreachable after drive processing, skipping drive-data.json sync (user likely drove away)"
+    fi
+  fi
+fi
+
+# Sync drive-data.json to the rsync archive server.
+# For CIFS/NFS archive types, the Go server's SyncToArchive() handles this
+# while /mnt/archive is still mounted.  For rsync archive there is no local
+# mount, so SyncToArchive() silently skips — we handle it here instead.
+if [ "$ARCHIVE_REACHABLE" = "true" ] && [ -n "${RSYNC_SERVER:-}" ] && [ -n "${RSYNC_USER:-}" ] && [ -f /mutable/drive-data.json ]; then
+  log "Syncing drive-data.json to rsync archive..."
+  if rsync -avh --no-perms --omit-dir-times --timeout=60 \
+      /mutable/drive-data.json \
+      "$RSYNC_USER@$RSYNC_SERVER:${RSYNC_PATH}/drive-data.json" > /dev/null 2>&1; then
+    log "Synced drive-data.json to archive ($(wc -c < /mutable/drive-data.json) bytes)."
+  else
+    log "Warning: failed to sync drive-data.json to rsync archive."
+  fi
+fi
+
+# For rclone archive (no local mount; rclone pushes directly to cloud storage).
+if [ "$ARCHIVE_REACHABLE" = "true" ] && [ -n "${RCLONE_DRIVE:-}" ] && [ -f /mutable/drive-data.json ]; then
+  log "Syncing drive-data.json to rclone archive..."
+  if rclone --config /root/.config/rclone/rclone.conf copy \
+      /mutable/drive-data.json "$RCLONE_DRIVE:${RCLONE_PATH}/drive-data.json" > /dev/null 2>&1; then
+    log "Synced drive-data.json to rclone archive ($(wc -c < /mutable/drive-data.json) bytes)."
+  else
+    log "Warning: failed to sync drive-data.json to rclone archive."
+  fi
+fi
+
+# Backup config after successful archive
+if [ "$ARCHIVE_REACHABLE" = "true" ]; then
+  log "Creating config backup..."
+  BACKUP_RESULT=$(curl -sf -X POST "${API_URL}/api/system/backup" 2>/dev/null)
+  if [ $? -eq 0 ]; then
+    log "Config backup created successfully."
+  else
+    log "Warning: config backup failed."
+  fi
+fi
+
+# Send notification only if new drives were added
+if [ -x /root/bin/send-push-message ]; then
+  STATS=$(curl -sf "${API_URL}/api/drives/stats" 2>/dev/null)
+  if [ $? -eq 0 ]; then
+    DRIVES_AFTER=$(echo "$STATS" | grep -o '"drives_count":[0-9]*' | cut -d: -f2)
+    DRIVES_AFTER=${DRIVES_AFTER:-0}
+    if [ "$DRIVES_AFTER" -gt "$DRIVES_BEFORE" ]; then
+      NEW_DRIVES=$((DRIVES_AFTER - DRIVES_BEFORE))
+
+      # Check user unit preference (mi or km) from setup config (DRIVE_MAP_UNIT)
+      UNIT_PREF=$(curl -sf "${API_URL}/api/setup/config" 2>/dev/null | grep -o '"DRIVE_MAP_UNIT":{[^}]*}' | grep -o '"value":"[^"]*"' | cut -d'"' -f4)
+
+      # Calculate NEW distance by subtracting before from after
+      if [ "$UNIT_PREF" = "km" ]; then
+        DIST_AFTER=$(echo "$STATS" | grep -o '"total_distance_km":[0-9.]*' | cut -d: -f2)
+        DIST_BEFORE=$(echo "$BEFORE_STATS" | grep -o '"total_distance_km":[0-9.]*' | cut -d: -f2)
+        DIST_LABEL="km"
+      else
+        DIST_AFTER=$(echo "$STATS" | grep -o '"total_distance_mi":[0-9.]*' | cut -d: -f2)
+        DIST_BEFORE=$(echo "$BEFORE_STATS" | grep -o '"total_distance_mi":[0-9.]*' | cut -d: -f2)
+        DIST_LABEL="miles"
+      fi
+      DIST_BEFORE=${DIST_BEFORE:-0}
+      DIST_AFTER=${DIST_AFTER:-0}
+      # Calculate new distance (using awk for float subtraction)
+      NEW_DIST=$(awk "BEGIN { printf \"%.2f\", ${DIST_AFTER} - ${DIST_BEFORE} }")
+
+      if [ "$NEW_DRIVES" -eq 1 ]; then
+        DRIVE_WORD="drive"
+      else
+        DRIVE_WORD="drives"
+      fi
+
+      /root/bin/send-push-message "${NOTIFICATION_TITLE:-SentryUSB}:" \
+        "${NEW_DRIVES} new ${DRIVE_WORD} mapped (${NEW_DIST} ${DIST_LABEL})." \
+        info drives || log "Failed to send notification"
+    else
+      log "No new drives found, skipping drive stats notification."
+    fi
+  fi
+fi
+
+# Check for updates automatically (if not disabled)
+AUTO_UPDATE_CHECK=$(curl -sf "${API_URL}/api/config/preference?key=auto_update_check" 2>/dev/null | grep -o '"value":"[^"]*"' | cut -d'"' -f4)
+if [ "$AUTO_UPDATE_CHECK" != "disabled" ]; then
+  log "Checking for SentryUSB updates..."
+  UPDATE_RESULT=$(curl -sf -X POST "${API_URL}/api/system/check-update" 2>/dev/null)
+  if [ $? -eq 0 ]; then
+    # Determine which version to notify about (stable or prerelease)
+    NOTIFY_VER=""
+    UPDATE_AVAILABLE=$(echo "$UPDATE_RESULT" | grep -o '"update_available":true')
+    if [ -n "$UPDATE_AVAILABLE" ]; then
+      NOTIFY_VER=$(echo "$UPDATE_RESULT" | grep -o '"latest_version":"[^"]*"' | cut -d'"' -f4)
+    fi
+    # If user is on prerelease channel, also check for prerelease updates
+    UPDATE_CHANNEL=$(curl -sf "${API_URL}/api/config/preference?key=update_channel" 2>/dev/null | grep -o '"value":"[^"]*"' | cut -d'"' -f4)
+    if [ "$UPDATE_CHANNEL" = "prerelease" ] && [ -z "$NOTIFY_VER" ]; then
+      PRE_AVAILABLE=$(echo "$UPDATE_RESULT" | grep -o '"prerelease":{[^}]*"available":true')
+      if [ -n "$PRE_AVAILABLE" ]; then
+        NOTIFY_VER=$(echo "$UPDATE_RESULT" | grep -o '"prerelease":{[^}]*"version":"[^"]*"' | grep -o '"version":"[^"]*"' | cut -d'"' -f4)
+      fi
+    fi
+
+    if [ -n "$NOTIFY_VER" ]; then
+      # Only send notification once per version (check marker file)
+      NOTIFIED_FILE="/tmp/sentryusb-update-notified-${NOTIFY_VER}"
+      if [ ! -f "$NOTIFIED_FILE" ] && [ -x /root/bin/send-push-message ]; then
+        /root/bin/send-push-message "${NOTIFICATION_TITLE:-SentryUSB}:" \
+          "Update available: ${NOTIFY_VER}. Open Settings to install." \
+          info update || log "Failed to send update notification"
+        touch "$NOTIFIED_FILE"
+      fi
+      log "Update available: ${NOTIFY_VER}"
+    else
+      log "SentryUSB is up to date."
+    fi
+  else
+    log "Could not check for updates (no internet?)."
+  fi
+fi
+
+exit 0

@@ -1,0 +1,36 @@
+#!/bin/dash
+
+diskimage="/backingfiles/snapshots/$1/snap.bin"
+mountpoint="/backingfiles/snapshots/$1/mnt"
+optfile="${diskimage}.opts"
+
+case $1 in
+  snap-*)
+    ;;
+  *)
+    exit 1
+    ;;
+esac
+
+if [ ! -r "$diskimage" ]
+then
+  /root/bin/release_snapshot.sh "$1"
+  exit 1
+fi
+
+if [ ! -L "$mountpoint" ] && [ -d "$mountpoint" ]
+then
+  rmdir "$mountpoint"
+  ln -s "/tmp/snapshots/$1" "$mountpoint"
+fi
+
+if [ ! -f "$optfile" ]
+then
+  rm -rf "$optfile"
+  /root/bin/mountoptsforimage "${diskimage}" | {
+    read -r fstype opts
+    echo "-fstype=${fstype},ro,${opts} :${diskimage}" > "$optfile"
+  }
+fi
+
+cat "$optfile"

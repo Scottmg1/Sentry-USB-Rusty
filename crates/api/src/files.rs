@@ -268,10 +268,84 @@ pub async fn delete_file(State(_s): State<AppState>, Query(params): Query<Delete
 }
 
 /// POST /api/files/upload
-pub async fn upload_file(State(_s): State<AppState>, _body: axum::body::Bytes) -> (StatusCode, Json<serde_json::Value>) {
-    // TODO: Implement multipart file upload (requires multipart feature)
-    // For now return a helpful error
-    crate::json_error(StatusCode::NOT_IMPLEMENTED, "File upload requires multipart support (not yet implemented)")
+///
+/// Multipart form: `file` (required, the file payload) and `path` (required,
+/// destination directory). Filename is taken from the upload part's
+/// Content-Disposition `filename=`.
+pub async fn upload_file(
+    State(_s): State<AppState>,
+    mut multipart: axum::extract::Multipart,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let mut dest_dir: Option<String> = None;
+    let mut file_data: Option<(String, Vec<u8>)> = None;
+
+    while let Ok(Some(field)) = multipart.next_field().await {
+        let name = field.name().unwrap_or("").to_string();
+        match name.as_str() {
+            "path" => {
+                if let Ok(v) = field.text().await {
+                    dest_dir = Some(v);
+                }
+            }
+            "file" => {
+                let filename = field
+                    .file_name()
+                    .unwrap_or("upload.bin")
+                    .to_string();
+                match field.bytes().await {
+                    Ok(bytes) => file_data = Some((filename, bytes.to_vec())),
+                    Err(e) => {
+                        return crate::json_error(
+                            StatusCode::BAD_REQUEST,
+                            &format!("Failed to read upload: {}", e),
+                        );
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let (filename, bytes) = match file_data {
+        Some(f) => f,
+        None => return crate::json_error(StatusCode::BAD_REQUEST, "Missing file in upload"),
+    };
+    let dest_dir = match dest_dir {
+        Some(d) if !d.is_empty() => d,
+        _ => return crate::json_error(StatusCode::BAD_REQUEST, "Missing path parameter"),
+    };
+
+    let dest_path = format!("{}/{}", dest_dir.trim_end_matches('/'), filename);
+    let (clean, allowed) = is_path_allowed(&dest_path);
+    if !allowed {
+        return crate::json_error(StatusCode::FORBIDDEN, "Access denied");
+    }
+
+    if let Some(parent) = clean.parent() {
+        if let Err(e) = std::fs::create_dir_all(parent) {
+            return crate::json_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("Failed to create directory: {}", e),
+            );
+        }
+    }
+
+    let size = bytes.len();
+    if let Err(e) = std::fs::write(&clean, &bytes) {
+        return crate::json_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("Failed to write file: {}", e),
+        );
+    }
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "name": filename,
+            "path": dest_path,
+            "size": size.to_string(),
+        })),
+    )
 }
 
 /// GET /api/files/download

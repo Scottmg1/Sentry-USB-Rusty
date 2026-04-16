@@ -1,0 +1,17 @@
+[package]
+name = "cttseraser"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "cttseraser"
+path = "src/main.rs"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+fuser = { version = "0.15", default-features = false, features = ["abi-7-26"] }
+libc = "0.2"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }

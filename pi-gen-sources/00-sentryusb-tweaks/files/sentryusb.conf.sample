@@ -1,0 +1,508 @@
+#####################################################################
+# SAMPLE CONFIGURATION FILE FOR SENTRYUSB Pi Setup
+#
+# Example config file for SentryUSB setup. Lines with "#" are comments/ignored.
+# Remove the "#" before "export" to activate a line. Be sure to rename this file
+# to "sentryusb.conf" and place it in the "boot" folder of your SD card.
+# More info: https://github.com/Scottmg1/Sentry-USB
+#
+######################################################################
+
+# Wifi setup information.
+# You do not need to set these variables if networking is already configured
+# and you ran the "install.sh" script.
+# Note that some devices, like Raspberry Pi Zero W, only support 2.4 GHz wifi.
+#export SSID='your_ssid'
+#export WIFIPASS='your_pass'
+
+# Variables for CIFS (Windows/Mac file sharing) archiving.
+# If you want to use rsync, rclone, or NFS, delete or comment out this section
+# and uncomment the rsync or rclone section below.
+export ARCHIVE_SYSTEM=cifs
+export ARCHIVE_SERVER=your_archive_name_or_ip
+export SHARE_NAME='your_archive_share/optional_path_on_share'
+export SHARE_USER=username
+export SHARE_PASSWORD='password'
+# the cifs options below usually don't need to be specified
+# export SHARE_DOMAIN=domain
+# export CIFS_VERSION="3.0"
+# export CIFS_SEC="ntlm"
+
+# Variables for rsync archiving
+# For instructions setting up SSH Public Key authentication, view:
+# https://github.com/Scottmg1/Sentry-USB/blob/main-dev/doc/SetupRSync.md#step-1-authentication
+#export ARCHIVE_SYSTEM=rsync
+#export RSYNC_USER=username
+#export RSYNC_SERVER=hostname_or_ip
+#export RSYNC_PATH=path_on_server
+
+# Variables for rclone archiving
+# If you are using rclone to archive to a local (non-cloud) server,
+# you may want to set the ARCHIVE_SERVER variable to the name or
+# ip of you local server instead.
+#export ARCHIVE_SYSTEM=rclone
+#export ARCHIVE_SERVER=8.8.8.8
+#export RCLONE_DRIVE="remotename"
+#export RCLONE_PATH="remotepathname"
+# The following is optional
+#export RCLONE_FLAGS=()
+
+# Variables for NFS archiving
+# Note: SHARE_NAME must be the exact export path on the NAS (e.g. /volume1/TeslaCam)
+#export ARCHIVE_SYSTEM=nfs
+#export ARCHIVE_SERVER=hostname_or_ip
+#export SHARE_NAME='/volume1/TeslaCam'
+
+# The DATA_DRIVE option (formerly USB_DRIVE) is used to specify that you want
+# to store recordings on a different drive than the boot drive. If you don't
+# plan on using an sd card at all (i.e. you are both booting from and storing
+# recordings on the USB drive), or are ONLY using an sd card (i.e. boot from
+# and store recordings on sd card), do NOT uncommment this line.
+# This should be set to the device name of the drive, e.g. /dev/sda for a drive
+# connected to a USB port, or /dev/nvme0n1 for an onboard NVME drive.
+# NOTE: the specified drive will be wiped and repartitioned.
+# export DATA_DRIVE=/dev/sda
+
+# The car normally keeps an hour worth of RecentClips, however there have been
+# reports of that amount varying by country.
+# In order to keep a continuous record of RecentClips the snapshot interval
+# should be set about 2 minutes shorter than the amount of RecentClips history
+# the car keeps. The following adjusts the capture interval for cases where the
+# car only keeps 10 minutes of history. Please follow your local regulations
+# when uncommenting and/or adjusting this setting.
+# export SNAPSHOT_INTERVAL=480 # this number is in seconds
+
+# Uncomment this to archive RecentClips in addition to SavedClips, SentryClips
+# and track mode clips.
+#export ARCHIVE_RECENTCLIPS=true
+
+# SavedClips, SentryClips and track mode clips are archived by default, but
+# you can turn that off by uncommenting the settings below
+#export ARCHIVE_SAVEDCLIPS=false
+#export ARCHIVE_SENTRYCLIPS=false
+#export ARCHIVE_TRACKMODECLIPS=false
+
+# Notes on sd card and image sizes:
+#   * A 128 GB or larger sd card (or USB drive, when using Pi4) is recommended.
+#     The minimum supported size is 64 GB.
+#   * The setup script will keep a fixed 6 GB of space in reserve regardless of
+#     sd card size.
+#   * CAM_SIZE should generally be somewhat small, 40G is recommended, unless you
+#     plan on accumulating a lot of footage between archive operations, in which
+#     case you should increase the value (an hour of recordings, or 6 Sentry
+#     events, is about 7-10 GB of data, depending on the model year of the car).
+#   * MUSIC_SIZE should be large enough to hold your music library, obviously.
+#   * If no music size is specified, no music drive will be created.
+#   * If no lightshow size is specified, no lightshow drive will be created.
+#   * If no boombox size is specified, no boombox drive will be created.
+export CAM_SIZE=40G
+#export MUSIC_SIZE=4G
+#export LIGHTSHOW_SIZE=1G
+#export BOOMBOX_SIZE=100M
+
+# If you want to automatically copy music from a CIFS share every time
+# the Pi connects to wifi, set the following variable. The share is
+# assumed to exist on the same server as the archive share. It can
+# be the same share as the share used for backing up recordings, but
+# the folder needs to be different.
+# export MUSIC_SHARE_NAME=your_music_share/music_folder
+
+# Uncomment to use ExFAT filesystem instead of FAT32.
+# ExFAT is the filesystem used by Tesla when the drive is formatted in the car.
+# Using ExFAT is not recommended for the SentryUSB prebuilt image, as it is
+# based on an older kernel that has no TRIM support for ExFAT.
+# export USE_EXFAT=true
+
+# Uncomment to enable a Samba/CIFS server that makes the recordings available
+# as a network share.
+# This is obsolete/deprecated, as you can now access recordings via SentryUSB's
+# web interface.
+#export SAMBA_ENABLED=true
+# uncomment to enable guest access to the Samba server
+#export SAMBA_GUEST=true
+
+# Uncomment to enable SentryUSB to act as a wifi access point with the given
+# SSID, so you can access it while on the road. This should work on Raspberry Pi
+# but may not work on other devices.
+#export AP_SSID='SentryUSB'
+# Change this! The setup script will not accept the default 'password'
+# Also note that the wifi password must be at least 8 characters.
+#export AP_PASS='password'
+# IP address is optional. The AP will give its clients IP addresses in the
+# x.x.x.10-254 range so make sure you don't put the AP's IP address in
+# that range.
+#export AP_IP='192.168.66.1'
+
+# Uncomment if you'd like to password protect the SentryUSB web interface
+# WARNING: Anyone on the $SSID (and $AP_SSID if configured) wifi network can
+# freely interact with the SentryUSB web interface if it isn't secured!
+# export WEB_USERNAME='pi'
+# export WEB_PASSWORD='raspberry'
+
+# Uncomment this if you are using Raspberry Pi OS and want to set the time
+# zone to something other than the default 'BST' timezone.
+# If you are using Armbian then Armbian likely already set the correct time
+# zone when you first set up Armbian, and uncommenting this isn't necessary.
+# Can be an actual time zone, or "auto" to attempt automatic timezone detection
+# export TIME_ZONE="America/Los_Angeles"
+
+# By default there is a 20 second delay between connecting to wifi and
+# starting the archiving of recorded clips. Uncomment this to change
+# the duration of that delay
+# export ARCHIVE_DELAY=20
+
+# Uncomment if you want to override the default hostname of "sentryusb"
+# export SENTRYUSB_HOSTNAME=sentryusb-Model3
+
+# Push notifications consist of a title and a message.
+# By default SENTRYUSB_HOSTNAME is used as the title, but you can
+# set a custom title by setting the following variable.
+# export NOTIFICATION_TITLE="SentryUSB Notification"
+
+# Uncomment if setting up Signal_cli notifications
+# export SIGNAL_ENABLED=true
+# export SIGNAL_URL=http://<url>:8080
+# export SIGNAL_FROM_NUM=country_code_and_number_configured_with_signal
+# export SIGNAL_TO_NUM=country_code_and_number_configured_with_signal
+
+# Uncomment if setting up Pushover push notifications
+# export PUSHOVER_ENABLED=true
+# export PUSHOVER_USER_KEY=user_key
+# export PUSHOVER_APP_KEY=app_key
+
+# Uncomment if setting up Gotify push notifications
+# export GOTIFY_ENABLED=true
+# export GOTIFY_DOMAIN=https://gotify.domain.com
+# export GOTIFY_APP_TOKEN=put_your_token_here
+# export GOTIFY_PRIORITY=5
+
+# Uncomment if setting up IFTTT push notifications
+# export IFTTT_ENABLED=true
+# export IFTTT_EVENT_NAME=put_your_event_name_here
+# export IFTTT_KEY=put_your_key_here
+
+# Uncomment if setting up Discord push notifications
+# export DISCORD_ENABLED=true
+# export DISCORD_WEBHOOK_URL=put_your_webhook_url_here
+
+# Uncomment if setting up AWS SNS notifications
+# export SNS_ENABLED=true
+# export AWS_REGION=us-east-1
+# export AWS_ACCESS_KEY_ID=put_your_accesskeyid_here
+# export AWS_SECRET_ACCESS_KEY=put_your_secretkey_here
+# export AWS_SNS_TOPIC_ARN=put_your_sns_topicarn_here
+
+# Uncomment if setting up Telegram notifications
+# export TELEGRAM_ENABLED=true
+# export TELEGRAM_CHAT_ID=123456789
+# export TELEGRAM_BOT_TOKEN=bot123456789:abcdefghijklmnopqrstuvqxyz987654321
+# export TELEGRAM_SILENT_NOTIFY=false
+
+# Uncomment if setting up Webhook notifications
+# export WEBHOOK_ENABLED=true
+# export WEBHOOK_URL=http://domain/path
+
+# Uncomment if setting up Slack notifications
+# export SLACK_ENABLED=true
+# export SLACK_WEBHOOK_URL=http://domain/path
+
+# Uncomment if setting up Matrix notifications
+# export MATRIX_ENABLED=true
+# export MATRIX_SERVER_URL=https://matrix.org
+# export MATRIX_USERNAME=put_your_matrix_username_here
+# export MATRIX_PASSWORD='put_your_matrix_password_here'
+# export MATRIX_ROOM='put_the_matrix_target_room_id_here'
+
+# Uncomment if setting up ntfy notifications
+# export NTFY_ENABLED=true
+# export NTFY_URL=https://ntfy.example.com/yourtopic
+# export NTFY_TOKEN=your_token_if_needed
+# export NTFY_PRIORITY=3
+
+# Mobile App push notifications (auto-configured via pairing)
+# Credentials (device_id, secret) are stored in /root/.sentryusb/notification-credentials.json
+# and loaded automatically by envsetup.sh — do not add them here.
+# export MOBILE_PUSH_ENABLED=true
+
+# Uncomment if setting up shell notifications.
+# export NOTIFICATION_COMMAND_ENABLED=true
+# export NOTIFICATION_COMMAND_START="ssh root@remote-server 'command args'"
+# export NOTIFICATION_COMMAND_FINISH="ssh root@remote-server 'command args'"
+
+# Tesla_dashcam / Trigger file support.
+# Uncomment any TRIGGER_FILE_xxxxx below to create trigger file(s) in the
+# archive directory for the listed clip type after all clips have been
+# transferred for that type.
+# e.g: export TRIGGER_FILE_SAVED=ARCHIVE_UPLOADED would create a file in
+# $ARCHIVE_BASE/SavedClips/ARCHIVE_UPLOADED.
+# Uncomment TRIGGER_FILE_ANY to create a trigger file in $ARCHIVE_BASE. This will
+# make tesla_dashcam process both SavedClips and SentryClips when either changes.
+# This is useful if using https://github.com/ehendrix23/tesla_dashcam to further
+# process clips.
+# e.g: tesla_dashcom --monitor --monitor_trigger $ARCHIVE_BASE/SavedClips/ARCHIVE_UPLOADED $ARCHIVE_BASE/SavedClips
+#
+# You may modify the value to your desired trigger filename. Remember to alter
+# your tesla_dashcam trigger filename to match.
+#.
+# export TRIGGER_FILE_SAVED=ARCHIVE_UPLOADED
+# export TRIGGER_FILE_SENTRY=ARCHIVE_UPLOADED
+# export TRIGGER_FILE_RECENT=ARCHIVE_UPLOADED
+# export TRIGGER_FILE_ANY=ARCHIVE_UPLOADED
+
+################################################################################
+# !!!!!!!!!!!!!!!!!!!!!! IMPORTANT KEEP CAR AWAKE CHANGES !!!!!!!!!!!!!!!!!!!!!!
+#
+# Recent car firmware has deactivated the power ports when the vehicle enters a
+# sleep state. This restriction can hinder the completion of the archiving
+# process by Sentry-USB. Tesla subsequently introduced the "Keep Accessory Power
+# On" feature, but is not applicable to the data port utilized by Dashcam and
+# Sentry-USB.
+#
+# In order to keep the car awake, several methods have been implemented:
+# TeslaFi, Tessie, Bluetooth Low Energy (BLE), and Webhooks. Please note that the previous
+# implementation using the (unofficial) Tesla API was removed. Tesla had
+# superseded it with their official Fleet API (a paid service for developers).
+#
+# Recent car firmware has deactivated the power ports when the vehicle enters a
+# sleep state. This restriction can hinder the completion of the archiving
+# process by Sentry-USB. Tesla subsequently introduced the “Keep Accessory Power
+# On” feature, but is not applicable to the data port utilized by Dashcam and
+# Sentry-USB.
+#
+# In order to keep the car awake, several methods have been implemented:
+# TeslaFi, Tessie, Bluetooth Low Energy (BLE), and Webhooks. Please note that the previous
+# implementation using the (unofficial) Tesla API was removed. Tesla had
+# superseded it with their official Fleet API (a paid service for developers).
+#
+# In order to keep the car awake, several methods have been implemented:
+# TeslaFi, Tessie, Bluetooth Low Energy (BLE), and Webhooks. Please note that the previous
+# implementation using the (unofficial) Tesla API was removed. Tesla had
+# superseded it with their official Fleet API (a paid service for developers).
+# Consequently, TeslaFi and Tessie now enforce request rate limits. As a result,
+# the entire Keep Car Awake framework has been refactored to use considerably
+# fewer requests and now leverages Sentry Mode exclusively for TeslaFi and
+# Tessie. BLE's direct connection does not have such limit, therefore uses
+# a different approach to keep the car awake without involving Sentry Mode.
+#
+# There are pros and cons to consider in selecting which method works best for
+# you. 
+#
+# BLE Pros/Cons:
+#   ++ Direct connection to the car; unlimited.
+#   - Added complexity to configure initially
+#   - Some security vulnerability
+#   * See Hardware wiki for more BLE hardware & software support notes:
+#     https://github.com/Scottmg1/Sentry-USB/wiki/Hardware
+#
+# TeslaFi/Tessie Pros/Cons:
+#   + Straightforward to configure initially
+#   + Remote monitoring and management
+#   - Tessie: If not using Sentry Mode, need to maintain a consistent
+#     wifi/interenet connection to keep car alive.
+#   - Some security vulnerability
+#   - Requires paid 3rd-party service from TeslaFi or Tessie
+#
+# Webhook Pros/Cons:
+#   + Does not require SentryUSB to store credentials that can directly
+#     control your vehicle
+#   - Requires another service like home assistant be setup to receive
+#     webhooks and carry out the required actions to keep the vehicle awake
+#
+# DISCLAIMER:
+#   All 3 methods have some level of security implications. For BLE,
+#   key pair is stored on the device. For TeslaFi/Tessie, the API access token
+#   (not the main login) is in the config file. Having said that, the offender
+#   would require physical access to the device and the technical knowledge to
+#   compromise your vehicle. User discretion advised.
+#
+#   Good Security Practices:
+#     * Change your SentryUSB user passwords (pi and root)
+#     * Set user/password for the SentryUSB AP (if enabled)
+#     * Enable Tesla's pin-to-drive
+#     * If your SentryUSB has been compromised, immediately change your
+#       Tesla.com password, which will invalidate all 3rd-party app access.
+#       Followed by ...
+#         Tesla BLE: Login to your Tesla account and remove the BLE key pair.
+#         TeslaFi: Login to your TeslaFi account and revoke API token.
+#         Tessie: Login to your Tessie account and revoke API token.
+#         Server/WiFi: Change your login credentials.
+#
+# Other ways to keep the data port powered through sleep is to manually turning
+# on Sentry Mode or Camp Mode from the Tesla App. However, neither are great
+# solutions as they keep the car awake indefinitely, thus unnecessarily
+# consuming the car’s high-voltage battery. For that reason, it’s a good idea
+# to set up notification mechanisms (see preceding sections) so you know when to
+# manually turn Off Sentry/Camp Mode from the Tesla App.
+#
+# Another alternative is using a power bank or UPS hat to keep SentryUSB powered
+# independent of the power state of the car's USB ports. See the SentryUSB wiki
+# for more info.
+#
+# - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+#  !!! IMPORTANT: Only ONE control API should be used at a time.
+#                 Do not include parameters for both TeslaFi and Tessie, or
+#                 combine BLE with either services.
+# .   .   .   .   .   .   .   .   .   .   .   .   .   .   .   .   .   .   .   .
+#
+# Determine your Keep Car Awake preference (choose 1 case). Please consider the
+# compatibility notes. If applicable, also make a 1-time change (set and
+# forget) to your in-car menu: Safety -> Sentry Mode.
+#
+#  Case 1: [Compatible with TeslaFi, Tessie, BLE, or Webhook]
+#
+#          You want Sentry Mode turned On everywhere, except when parked safely
+#          at home. Upon arriving home, Sentry Mode will already be ON
+#          to power SentryUSB through archiving. Once archiving completes, a
+#          command will be sent to turn OFF Sentry Mode, thus allowing the car
+#          to go back to sleep. Whenever you start a new drive, car will default
+#          Sentry Mode to ON by default, per your in-car setting.
+#
+#     >>>> IMPORTANT: Verify your in-car Sentry Mode is set to ON, and
+#                     'Exclude Home' is UNCHECKED.
+#
+#  Case 2: [Compatible with TeslaFi, Tessie, BLE, or Webhook]
+#
+#          You DON'T want Sentry Mode turned on anywhere, unless archiving.
+#          Mode of operation: Upon arriving home, SentryUSB will send a command
+#          to turn ON Sentry Mode. Once archiving completes, a command will be
+#          sent to turn OFF Sentry Mode, thus allow the car to go back to sleep.
+#          Sentry Mode will remain OFF from this point forward until the next
+#          archiving activity.
+#
+#     >>>> IMPORTANT: Verify your in-car Sentry Mode is set to OFF.
+#
+#  Case 3: [Compatible with Tessie, BLE, or Webhook]
+#
+#          Sentry Mode is not used by SentryUSB. Instead a periodic command is
+#          sent to the car to keep it awake.
+#
+# Provide your use case here:
+#export SENTRY_CASE=1
+#
+# .   .   .   .   .   .   .   .   .   .   .   .   .   .   .   .   .   .   .   .
+#
+# For TeslaFi, provide your API token here:
+#export TESLAFI_API_TOKEN='YOUR_TESLAFI_API_TOKEN_GOES_HERE'
+#
+#   How to generate TeslaFi API Tokens:
+#     1. Log into your TeslaFi account.
+#     2. Navigate to Settings -> Tesla API -> API Token (tab).
+#
+#   Enable TeslaFi API Command:
+#     1. Navigate to Settings -> Tesla API -> Commands (tab).
+#     2. Verify 'Sentry Mode' command is checked (enabled).
+#     3. For added security, recommend disabling 'Unlock' command.
+# .   .   .   .   .   .   .   .   .   .   .   .   .   .   .   .   .   .   .   .
+#
+# For Tessie, provide your API token and vehicle VIN here:
+#export TESSIE_API_TOKEN='YOUR_TESSIE_API_TOKEN_GOES_HERE'
+#export TESSIE_VIN=5YJ3E1EA4JF000001
+#
+#   How to generate Tessie API Tokens
+#     1. Log into your Tessie account.
+#     2. Navigate to Settings -> Developer API -> Generate access token.
+# .   .   .   .   .   .   .   .   .   .   .   .   .   .   .   .   .   .   .   .
+#
+# For BLE, provide your vehicle VIN here:
+#export TESLA_BLE_VIN=5YJ3E1EA4JF000001
+#
+#   Pairing SentryUSB as a BLE device:
+#   
+#    1.  Ensure the SentryUSB device is inside the vehicle and powered.
+#
+#    2a. From the SentryUSB Web UI: Settings > Pair BLE with Car
+#    2b. Alternatively, if Web UI was not enabled, from the SSH command line:
+#        sudo /root/bin/tesla-control -ble -vin <your VIN> add-key-request /root/.ble/key_public.pem owner cloud_key
+#
+#    3.  Shortly after initiating pairing, a request is shown for an authorized
+#        key card. Please tap a key card on the center console promptly and
+#        confirm on the in-car screen.
+#
+#    4.  If done successfully, you'll see an "Unknown Key" (can be renamed)
+#        entry under the in-car Locks screen.
+#
+#        Note: This does not prevent the car from locking, nor does it allow
+#        someone to readily unlock or drive the car. An authroized key (card,
+#        phone, fob) is still required.
+# .   .   .   .   .   .   .   .   .   .   .   .   .   .   .   .   .   .   .   .
+#
+# For webhook, provide the URL of the webhook that will receive awake messages:
+#export KEEP_AWAKE_WEBHOOK_URL=http://domain/path
+#
+#   A webhook message with a JSON body will be sent. The shape of the JSON will be { "awake_command": "<command>" }
+#   Commands that will be sent to this webook:
+#     1. start: Sent when SENTRY_CASE=2 and the archive process starts
+#     2. stop: Sent when SENTRY_CASE=1 or 2 and the archive process stops
+#     3. nudge: Sent when SENTRY_CASE=3 and the archive process is ongoing
+################################################################################
+
+# Temperature Monitor
+#   Understanding your device’s thermal profile is crucial for maintaining
+#   performance and reliability. As a point of reference, Raspberry Pi
+#   Foundation states that its operating temperature range is 0°C to 85°C, and
+#   the system will begin to throttle the processor when it reaches 80°C to
+#   prevent damage. Anecdotally, other sub-components may become unstable at
+#   lower thresholds (e.g., Wi-Fi). As a general best practice, keep the
+#   temperature below 70°C. Start monitoring closely when it regularly reaches
+#   above 60°C. Differences between manufacturer, model, and revisions should
+#   also be considered.
+#
+#   Uncommenting any of the following parameters will activate SentryUSB's
+#   temperature monitoring, which checks temperature once a minute and retains
+#   the maximum value until the device is reset or powered-off.
+#
+#   The following parameters determine when log entries and push messages, if
+#   configured, are triggered. The fixed-interval case will only log entries,
+#   but not send push message, to avoid over-saturating 
+#
+#   Triggers:
+#   
+#   Two (2) temperature threshold triggers for: WARNING and CAUTION.
+#   The triggers will only fire once to cut down on spam. Only when the
+#   temperatures settles 5 deg°C below the set thresholds, are they allowed to
+#   re-trigger again. Caution is generally considered less severe than Warning,
+#   but you have the freedom to set or unset them as you please. Set values
+#   must be integers and expressed in milli-°C (e.g., 68.0°C = 68000)
+#export TEMPERATURE_WARNING=68000
+#export TEMPERATURE_CAUTION=55000
+#
+#   Fixed-interval trigger logs (no push messages) the instantaneous and maximum
+#   values. The maximum value is held through the recording period and reset at
+#   the conclusion of the archiving/music sync process. This trigger may be useful
+#   to better understand the thermal activity throughout the day.
+#   The set value must be an integer and expressed in minutes (minimum = 1).  
+#export TEMPERATURE_INTERVAL=60
+#
+#   At the end of each archiving/music sync process, the device typically runs
+#   hotter, making it an ideal time to capture temperature.
+export TEMPERATURE_POSTARCHIVE=true
+
+# Uncomment if you want to increase the size of the root
+# filesystem so there's extra space for installing additional
+# software. This only works if the backing store partition hasn't
+# been created yet, i.e. during early setup, and requires an extra
+# reboot. Sizes can be specified as for example "500M" or "2G"
+# export INCREASE_ROOT_SIZE=500M
+
+# Uncomment if you want to have SentryUSB automatically install some
+# additional packages during setup. This only works if there is enough
+# free space available on the root partition to install the requested packages.
+# Requested packages should be space delineated
+# export INSTALL_USER_REQUESTED_PACKAGES="iftop mosh sysstat"
+
+# Uncomment if you want to use different vm/cpu parameters.
+# Leave commented to use SentryUSB's defaults, or set to 'default'
+# to use the system defaults.
+# See https://www.kernel.org/doc/Documentation/sysctl/vm.txt
+# and https://www.kernel.org/doc/Documentation/cpu-freq/governors.txt
+# for details.
+#export DIRTY_BACKGROUND_BYTES=65536
+#export DIRTY_RATIO=80
+#export CPU_GOVERNOR=conservative
+
+# Uncomment and change if you want setup scripts to be pulled
+# from a different repo than github.com/Scottmg1/Sentry-USB
+# export REPO=Scottmg1
+
+# Uncomment and change if you want a different branch than main-dev
+# export BRANCH=main-dev

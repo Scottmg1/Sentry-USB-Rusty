@@ -1,0 +1,27 @@
+[Unit]
+Description=SentryUSB BLE Peripheral
+Documentation=https://github.com/Scottmg1/Sentry-USB
+After=bluetooth.target bluetooth.service dbus.service
+Requires=bluetooth.target dbus.service
+BindsTo=bluetooth.service
+ConditionPathExists=/usr/bin/python3
+
+[Service]
+Type=simple
+# Clean up stale keep-awake lock if present — if systemd is starting us,
+# no keep-awake session should be holding the radio.
+ExecStartPre=-/bin/rm -f /tmp/ble_keep_awake_active
+ExecStartPre=/usr/sbin/rfkill unblock bluetooth
+ExecStartPre=-/usr/bin/hciconfig hci0 up
+ExecStartPre=/bin/bash -c 'for i in $(seq 1 30); do busctl status org.bluez >/dev/null 2>&1 && break; echo "Waiting for org.bluez... ($i/30)"; sleep 1; done'
+ExecStart=/usr/bin/python3 /root/bin/sentryusb-ble.py
+Restart=always
+RestartSec=5
+RuntimeMaxSec=86400
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=sentryusb-ble
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target

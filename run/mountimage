@@ -1,0 +1,10 @@
+#!/bin/bash -eu
+
+source="$1"
+mountpoint="$2"
+shift 3
+opts="$*"
+
+read -r fstype moreopts <<<"$(/root/bin/mountoptsforimage "$source")"
+
+mount -t "$fstype" -o "$opts,$moreopts" "$source" "$mountpoint"

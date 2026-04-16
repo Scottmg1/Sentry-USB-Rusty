@@ -1,0 +1,14 @@
+IMG_NAME=sentryusb-armhf
+PI_GEN_RELEASE=sentryusb-prebuilt-32bit
+LOCALE_DEFAULT=en_US.UTF-8
+TARGET_HOSTNAME=sentryusb
+KEYBOARD_KEYMAP=us
+KEYBOARD_LAYOUT="English (US)"
+TIMEZONE_DEFAULT="America/Los_Angeles"
+FIRST_USER_NAME=sentryusb
+FIRST_USER_PASS=raspberry
+DISABLE_FIRST_BOOT_USER_RENAME=1
+WPA_COUNTRY=US
+ENABLE_SSH=1
+STAGE_LIST="stage0 stage1 stage2 stage_sentryusb"
+RELEASE=trixie

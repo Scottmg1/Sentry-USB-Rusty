@@ -1,0 +1,15 @@
+#!/bin/bash
+
+echo "Making root partition writeable"
+mount / -o remount,rw
+
+# Remount the boot/firmware partition writable.
+# /sentryusb (or legacy /teslausb) is a symlink to /boot/firmware or /boot.
+for _mp in /sentryusb /teslausb; do
+  if findmnt "$_mp" > /dev/null 2>&1; then
+    echo "Making boot/firmware partition writeable ($_mp)"
+    mount "$_mp" -o remount,rw
+    break
+  fi
+done
+echo "Done. Make any changes needed, and reboot the Pi when ready."

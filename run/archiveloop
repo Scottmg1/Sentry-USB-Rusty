@@ -1,0 +1,1316 @@
+#!/bin/bash -eu
+
+if [ "${BASH_SOURCE[0]}" != "$0" ]
+then
+  echo "${BASH_SOURCE[0]} must be executed, not sourced"
+  return 1 # shouldn't use exit when sourced
+fi
+
+# Unload the module that was loaded by cmdline.txt
+modprobe -r g_ether
+
+export LOG_FILE=/mutable/archiveloop.log
+
+# If /mutable is full, try to recover by truncating the log file
+# so archiveloop can start instead of crash-looping.
+if ! echo "test" >> "$LOG_FILE" 2>/dev/null; then
+  : > "$LOG_FILE" 2>/dev/null || true
+fi
+
+function log () {
+  echo "$( date ):" "$@" >> "$LOG_FILE" 2>/dev/null || true
+  if [[ "$(stat --format="%s" "$LOG_FILE" 2>/dev/null)" -gt 1000000 ]] 2>/dev/null
+  then
+    local log_file2="${LOG_FILE}.2"
+    tail -n 5000 "$LOG_FILE" > "${log_file2}" 2>/dev/null
+    mv "$log_file2" "$LOG_FILE" 2>/dev/null || true
+    log "(log truncated)"
+  fi
+}
+
+function log_errors_on_exit {
+  log "archiveloop exited with code $1. Recent errors follow"
+  journalctl -n 15 -u teslausb >> "$LOG_FILE" 2>/dev/null || true
+  log "end of errors."
+  exit "$1"
+}
+
+if [ "${FLOCKED:-}" != "$0" ]
+then
+  if FLOCKED="$0" flock -en -E 99 "$0" "$0" "$@" || case "$?" in
+  99) echo already running
+      exit 99
+      ;;
+  *)  log_errors_on_exit $?
+      ;;
+  esac
+  then
+    # success
+    log_errors_on_exit 0
+  fi
+fi
+
+export CAM_MOUNT=/mnt/cam
+export MUSIC_MOUNT=/mnt/music
+export WRAPS_MOUNT=/mnt/wraps
+
+# read the setup variables and define other environment variables and functions
+source /root/bin/envsetup.sh
+
+# Reason passed to awake_start so nudge log lines show what is keeping the car awake.
+export KEEP_AWAKE_REASON=Archive
+# Single global PID file shared with web UI keep-awake. awake_start kills
+# any existing nudge loop before starting a new one, so only one BLE
+# nudge process runs at a time (prevents hci0 contention).
+export KEEP_AWAKE_PID_FILE=/tmp/keep_awake_nudge_pid
+
+# led triggers may have been built as modules, so try
+# to load them
+if ! grep -q timer "$STATUSLED/trigger"
+then
+  modprobe ledtrig-timer || log "timer LED trigger unavailable"
+fi
+if ! grep -q heartbeat "$STATUSLED/trigger"
+then
+  modprobe ledtrig-heartbeat || log "heartbeat LED trigger unavailable" 
+fi
+
+if [ -z "${ARCHIVE_SERVER+x}" ]
+then
+  case "${ARCHIVE_SYSTEM:-none}" in
+    rsync)
+      export ARCHIVE_SERVER="$RSYNC_SERVER"
+      ;;
+    rclone)
+      export ARCHIVE_SERVER="8.8.8.8"
+      ;;
+    none)
+      export ARCHIVE_SERVER=localhost
+      ;;
+    *)
+      log "ARCHIVE_SERVER not set"
+      exit 1
+      ;;
+  esac
+elif [ "${ARCHIVE_SYSTEM:-none}" = "cifs" ] || [ "${ARCHIVE_SYSTEM:-none}" = "nfs" ]
+then
+  # For CIFS and NFS
+  [[ -n "${SHARE_NAME:-}" && -f /backingfiles/cam_disk.bin ]] && export ARCHIVE_MOUNT=/mnt/archive
+  [[ -n "${MUSIC_SHARE_NAME:-}" && -f /backingfiles/music_disk.bin ]] && export MUSIC_ARCHIVE_MOUNT=/mnt/musicarchive
+fi
+
+function timestamp () {
+  local prefix=${1:-}
+  while IFS= read -r line
+  do
+    echo "$(date): $prefix$line"
+  done
+}
+
+function fix_errors_in_image () {
+  local image="$1"
+  log "Running fsck on $image..."
+  if ! loopback=$(losetup_find_show -P "$image"); then
+    log "ERROR: losetup failed for $image"
+    return 1
+  fi
+  # Use -p repair arg. It works with vfat and exfat.
+  /sbin/fsck "${loopback}p1" -- -p |& timestamp '| ' >> "$LOG_FILE" || echo ""
+  if ! losetup -d "$loopback"; then
+    log "WARNING: failed to detach loopback $loopback for $image"
+  fi
+  log "Finished fsck on $image."
+}
+
+function archive_is_reachable () {
+  local reachable=true
+
+  /root/bin/archive-is-reachable.sh "$ARCHIVE_SERVER" || reachable=false
+
+  if [ "$reachable" = false ]
+  then
+    false
+    return
+  fi
+  true
+}
+
+function sync_user_media_to_cam () {
+  if ! has_cam_disk
+  then
+    return
+  fi
+  log "Syncing user media to cam drive..."
+
+  # Sync Wraps to its own dedicated disk if available, otherwise to cam
+  if [ -e /backingfiles/wraps_disk.bin ] && [ -d "/mutable/Wraps" ] && [ -n "$(ls -A /mutable/Wraps 2>/dev/null)" ]
+  then
+    if ensure_mountpoint_is_mounted "$WRAPS_MOUNT"
+    then
+      mkdir -p "$WRAPS_MOUNT/Wraps"
+      rsync -a --delete "/mutable/Wraps/" "$WRAPS_MOUNT/Wraps/" >> "$LOG_FILE" 2>&1 \
+        || log "Failed to sync Wraps to wraps drive"
+      unmount_mount_point "$WRAPS_MOUNT"
+      log "Synced Wraps to dedicated wraps drive."
+    else
+      log "Could not mount wraps drive, falling back to cam drive for Wraps."
+      # Fall through to cam-based sync below
+      if ensure_mountpoint_is_mounted "$CAM_MOUNT"
+      then
+        mkdir -p "$CAM_MOUNT/Wraps"
+        rsync -a --delete "/mutable/Wraps/" "$CAM_MOUNT/Wraps/" >> "$LOG_FILE" 2>&1 \
+          || log "Failed to sync Wraps to cam drive"
+        unmount_mount_point "$CAM_MOUNT"
+      fi
+    fi
+  fi
+
+  # Sync LicensePlate (and Wraps if no dedicated wraps disk) to cam drive
+  if ensure_mountpoint_is_mounted "$CAM_MOUNT"
+  then
+    if [ ! -e /backingfiles/wraps_disk.bin ]
+    then
+      # No dedicated wraps disk — sync Wraps to cam drive (legacy behavior)
+      if [ -d "/mutable/Wraps" ] && [ -n "$(ls -A /mutable/Wraps 2>/dev/null)" ]
+      then
+        mkdir -p "$CAM_MOUNT/Wraps"
+        rsync -a --delete "/mutable/Wraps/" "$CAM_MOUNT/Wraps/" >> "$LOG_FILE" 2>&1 \
+          || log "Failed to sync Wraps to cam drive"
+      fi
+    fi
+    if [ -d "/mutable/LicensePlate" ] && [ -n "$(ls -A /mutable/LicensePlate 2>/dev/null)" ]
+    then
+      mkdir -p "$CAM_MOUNT/LicensePlate"
+      rsync -a --delete "/mutable/LicensePlate/" "$CAM_MOUNT/LicensePlate/" >> "$LOG_FILE" 2>&1 \
+        || log "Failed to sync LicensePlate to cam drive"
+    fi
+    # Sync LockChime.wav to the root of the cam drive so Tesla reads it via USB
+    if [ -f "/mutable/LockChime.wav" ]
+    then
+      cp -f "/mutable/LockChime.wav" "$CAM_MOUNT/LockChime.wav" >> "$LOG_FILE" 2>&1 \
+        || log "Failed to sync LockChime.wav to cam drive"
+    else
+      # No active lock chime — remove from cam drive if present
+      rm -f "$CAM_MOUNT/LockChime.wav" 2>/dev/null || true
+    fi
+    unmount_mount_point "$CAM_MOUNT"
+    log "Done syncing user media."
+  else
+    log "Could not mount cam drive to sync user media."
+  fi
+}
+
+function sync_disk_media_to_host () {
+  log "Reverse-syncing disk media to host paths..."
+
+  # Reverse-sync Wraps: files uploaded via USB (directly to the wraps disk
+  # image) need to appear in /mutable/Wraps so the web UI can see them.
+  if [ -e /backingfiles/wraps_disk.bin ]
+  then
+    if ensure_mountpoint_is_mounted "$WRAPS_MOUNT"
+    then
+      if [ -d "$WRAPS_MOUNT/Wraps" ] && [ -n "$(ls -A "$WRAPS_MOUNT/Wraps" 2>/dev/null)" ]
+      then
+        mkdir -p /mutable/Wraps
+        rsync -a --ignore-existing "$WRAPS_MOUNT/Wraps/" "/mutable/Wraps/" >> "$LOG_FILE" 2>&1 \
+          || log "Failed to reverse-sync Wraps from wraps drive"
+        log "Reverse-synced Wraps from wraps drive to /mutable/Wraps."
+      fi
+      unmount_mount_point "$WRAPS_MOUNT"
+    fi
+  fi
+
+  # Reverse-sync LicensePlate (and Wraps when no dedicated wraps disk)
+  # from the cam drive.
+  if [ -e /backingfiles/cam_disk.bin ]
+  then
+    if ensure_mountpoint_is_mounted "$CAM_MOUNT"
+    then
+      if [ ! -e /backingfiles/wraps_disk.bin ] && [ -d "$CAM_MOUNT/Wraps" ] && [ -n "$(ls -A "$CAM_MOUNT/Wraps" 2>/dev/null)" ]
+      then
+        mkdir -p /mutable/Wraps
+        rsync -a --ignore-existing "$CAM_MOUNT/Wraps/" "/mutable/Wraps/" >> "$LOG_FILE" 2>&1 \
+          || log "Failed to reverse-sync Wraps from cam drive"
+        log "Reverse-synced Wraps from cam drive to /mutable/Wraps."
+      fi
+      if [ -d "$CAM_MOUNT/LicensePlate" ] && [ -n "$(ls -A "$CAM_MOUNT/LicensePlate" 2>/dev/null)" ]
+      then
+        mkdir -p /mutable/LicensePlate
+        rsync -a --ignore-existing "$CAM_MOUNT/LicensePlate/" "/mutable/LicensePlate/" >> "$LOG_FILE" 2>&1 \
+          || log "Failed to reverse-sync LicensePlate from cam drive"
+        log "Reverse-synced LicensePlate from cam drive."
+      fi
+      unmount_mount_point "$CAM_MOUNT"
+    fi
+  fi
+
+  # Clear stale autofs mount-option cache files for media disks.
+  # These are regenerated on next access. Stale files can cause mount
+  # failures after disk images are recreated (wizard re-run / disk wipe).
+  for img in music_disk.bin lightshow_disk.bin boombox_disk.bin
+  do
+    rm -f "/backingfiles/${img}.opts"
+  done
+
+  log "Done reverse-syncing disk media to host paths."
+}
+
+function connect_usb_drives_to_host() {
+  clear_archive_status
+  log "Connecting usb to host..."
+  # Always ensure the USB gadget is fully torn down before touching the cam
+  # disk image.  If clean_cam_mount was skipped (e.g. archive became
+  # unreachable while the car drove away), the gadget is still active and
+  # mounting cam_disk.bin for the sync below would give the Pi and the car
+  # simultaneous access to the same block device, corrupting the filesystem
+  # and causing the Tesla to stop writing dashcam footage.
+  if /root/bin/disable_gadget.sh 2>/dev/null; then
+    log "Disabled stale USB gadget before sync"
+    fix_errors_in_images
+  fi
+  sync_disk_media_to_host
+  # Randomize lock chime BEFORE sync_user_media_to_cam so the fresh random pick
+  # at /mutable/LockChime.wav gets copied into the cam disk during the sync step.
+  local port="${SENTRYUSB_PORT:-80}"
+  curl -sf -X POST "http://127.0.0.1:${port}/api/lockchime/randomize-on-connect" > /dev/null 2>&1 || true
+  sync_user_media_to_cam
+  # Pre-trigger autofs mounts for media directories while disk images
+  # are free (before the gadget takes over). This ensures the web UI
+  # can display Music/LightShow/Boombox files immediately after boot.
+  for d in Music LightShow Boombox
+  do
+    ls "/var/www/html/fs/$d" > /dev/null 2>&1 || true
+  done
+  if ! /root/bin/enable_gadget.sh; then
+    log "ERROR: enable_gadget.sh failed (exit $?)"
+  fi
+  log "Connected usb to host."
+  sleep 5
+}
+
+function away_mode_active () {
+  local flag="/mutable/sentryusb_away_mode.json"
+  [ -f "$flag" ] || return 1
+  # The Go server updates remaining_sec in the flag file every 30s,
+  # so this works reliably regardless of whether the Pi has an RTC.
+  local remaining
+  remaining=$(grep -o '"remaining_sec":[0-9]*' "$flag" | cut -d: -f2)
+  [ -n "$remaining" ] && [ "$remaining" -gt 0 ] 2>/dev/null
+}
+
+function wifi_cycle () {
+  # This fix is only needed when ap0 exists.  ap0 shares the same physical
+  # radio as wlan0 and locks it to the AP channel, preventing wlan0 from
+  # scanning other channels to find the home network.  Without ap0,
+  # NetworkManager handles reconnection on its own.
+  if ! iw dev ap0 info &>/dev/null; then
+    return
+  fi
+
+  log "Tearing down ap0 to free radio for wlan0 reconnect..."
+  nmcli con down SENTRYUSB_AP 2>/dev/null || true
+  iw dev ap0 del 2>/dev/null || true
+  sleep 2
+
+  # Disconnect and reconnect wlan0
+  nmcli device disconnect wlan0 2>/dev/null || true
+  sleep 2
+  nmcli device connect wlan0 2>/dev/null || true
+
+  # Wait up to 30 seconds for wlan0 to connect
+  local i
+  for i in $(seq 1 30); do
+    local state
+    state=$(nmcli -t -f DEVICE,STATE device status 2>/dev/null | grep "^wlan0:" | cut -d: -f2) || true
+    if [ "${state:-}" = "connected" ]; then
+      log "wlan0 reconnected after ${i}s"
+      break
+    fi
+    sleep 1
+  done
+
+  # Recreate ap0
+  if ! iw dev ap0 info &>/dev/null; then
+    iw dev wlan0 interface add ap0 type __ap 2>/dev/null || true
+  fi
+  iw wlan0 set power_save off 2>/dev/null || true
+  iw ap0 set power_save off 2>/dev/null || true
+  nmcli con up SENTRYUSB_AP 2>/dev/null || true
+}
+
+function wait_for_archive_to_be_reachable () {
+  log "Waiting for archive to be reachable..."
+  local scan_counter=0
+  while true
+  do
+    if archive_is_reachable
+    then
+      log "Archive is reachable."
+      break
+    fi
+    if [ -e /tmp/archive_is_reachable ]
+    then
+      log "Simulating archive is reachable"
+      rm /tmp/archive_is_reachable
+      break
+    fi
+    # WiFi recovery while waiting for home network.
+    # When Away Mode is active the AP has exclusive radio access — skip
+    # all scanning and wifi_cycle so the AP stays up uninterrupted.
+    scan_counter=$((scan_counter + 1))
+    if ! away_mode_active; then
+      # Normal mode: AP is off, scan freely
+      if (( scan_counter % 30 == 0 )); then
+        nmcli device wifi rescan 2>/dev/null || true
+      fi
+      # wifi_cycle only needed if ap0 somehow still exists
+      if (( scan_counter % 300 == 0 )) && iw dev ap0 info &>/dev/null; then
+        log "Archive still unreachable after ${scan_counter}s, cycling WiFi..."
+        wifi_cycle
+      fi
+    else
+      # Away Mode: skip all scanning, AP has exclusive radio access
+      if (( scan_counter % 300 == 0 )); then
+        log "Away Mode active, skipping WiFi scan/cycle"
+      fi
+    fi
+    sleep 1
+  done
+}
+
+function retry () {
+  local attempts=0
+  while true
+  do
+    if "$@"
+    then
+      true
+      return
+    fi
+    if [ "$attempts" -ge 10 ]
+    then
+      log "Attempts exhausted."
+      false
+      return
+    fi
+    log "Sleeping before retry ..."
+    /bin/sleep 1
+    attempts=$((attempts + 1))
+    log "Retrying ($attempts) '$*' ..."
+  done
+  false
+  return
+}
+
+function ensure_mountpoint_is_mounted () {
+  local mount_point="$1"
+
+  if findmnt --mountpoint "$mount_point" > /dev/null
+  then
+    log "$mount_point is already mounted."
+  else
+    if timeout 10 mount "$mount_point" >> "$LOG_FILE" 2>&1
+    then
+      log "Mounted $mount_point."
+    else
+      log "Failed to mount $mount_point."
+      return 1
+    fi
+  fi
+}
+
+function ensure_mountpoint_is_mounted_with_retry () {
+  retry ensure_mountpoint_is_mounted "$1"
+}
+
+function ensure_cam_file_is_mounted () {
+  log "Ensuring cam file is mounted..."
+  disconnect_usb_drives_from_host
+  ensure_mountpoint_is_mounted_with_retry "$CAM_MOUNT"
+  log "Ensured cam file is mounted."
+}
+
+function ensure_music_file_is_mounted () {
+  log "Ensuring music backing file is mounted..."
+  disconnect_usb_drives_from_host
+  ensure_mountpoint_is_mounted_with_retry "$MUSIC_MOUNT"
+  log "Ensured music drive is mounted."
+}
+
+function unmount_mount_point () {
+  local mount_point="$1"
+  log "Unmounting $mount_point..."
+  if umount "$mount_point" >> "$LOG_FILE" 2>&1
+  then
+    log "Unmounted $mount_point."
+  else
+    log "Failed to unmount $mount_point, trying lazy unmount."
+    if umount -l "$mount_point" >> "$LOG_FILE" 2>&1
+    then
+      log "lazily unmounted $mount_point"
+    else
+      log "lazy unmount failed"
+    fi
+  fi
+}
+
+function unmount_cam_file () {
+  unmount_mount_point "$CAM_MOUNT"
+}
+
+function unmount_music_file () {
+  unmount_mount_point "$MUSIC_MOUNT"
+}
+
+function wait_for_archive_to_be_unreachable () {
+  log "Waiting for archive to be unreachable..."
+  while true
+    do
+      if ! retry archive_is_reachable
+      then
+        log "Archive is unreachable."
+        break
+      fi
+      if [ -e /tmp/archive_is_unreachable ]
+      then
+        log "Simulating archive being unreachable."
+        rm /tmp/archive_is_unreachable
+        break
+      fi
+      sleep 1
+  done
+}
+
+function check_if_usb_gadget_is_mounted () {
+  LUNFILE=/sys/kernel/config/usb_gadget/sentryusb/configs/c.1/mass_storage.0/lun.0/file
+  if [ -n "$(cat /sys/kernel/config/usb_gadget/sentryusb/UDC)" ] &&
+     [ -e "$LUNFILE" ] &&
+     [ -n "$(cat $LUNFILE)" ]
+  then
+    return
+  fi
+
+  log "USB Gadget not mounted. Fixing files and remounting..."
+  disconnect_usb_drives_from_host
+  connect_usb_drives_to_host
+}
+
+function trim_free_space() {
+  local mount_point="$1"
+
+  # Make sure the partition is mounted.
+  if found=$(findmnt -n --mountpoint "$mount_point")
+  then
+    loop=$(echo "$found" | awk '{print $2}')
+    image=$(losetup -l -n --output=BACK-FILE "$loop")
+    log "Trimming free space in $mount_point, which has $(filefrag "$image" | awk '{print $2}') extents"
+    if fstrim "$mount_point" >> "$LOG_FILE" 2>&1
+    then
+      log "Trim complete, image now has $(filefrag "$image" | awk '{print $2}') extents"
+    else
+      log "Trimming free space in $mount_point failed."
+    fi
+  else
+    log "Could not trim free space in $mount_point. Not Mounted."
+  fi
+}
+
+function fix_errors_in_images () {
+  for i in cam music boombox lightshow wraps
+  do
+    img="/backingfiles/${i}_disk.bin"
+    if [ -e "$img" ]
+    then
+      fix_errors_in_image "$img"
+    fi
+  done
+}
+
+function disconnect_usb_drives_from_host () {
+  log "Disconnecting usb from host..."
+  if /root/bin/disable_gadget.sh
+  then
+    fix_errors_in_images
+  else
+    log "ERROR: disable_gadget.sh failed (exit $?), skipping fsck"
+  fi
+  log "Disconnected usb from host."
+}
+
+function convert_seconds_to_nice_time () {
+  local -r h=$(($1/3600))
+  local -r m=$((($1%3600)/60))
+  local -r s=$(($1%60))
+
+  if [ $h -gt 0 ]
+  then
+    printf "%dh%dm%ds" $h $m $s
+  elif [ $m -gt 0 ]
+  then
+    printf "%dm%ds" $m $s
+  else
+    printf "%ds" $s
+  fi
+}
+
+function filterfile {
+  if [ -x /root/bin/archive-filter ]
+  then
+    /root/bin/archive-filter "$1"
+  fi
+}
+
+function sortfile {
+  touch "$1"
+  sort "$1" > /tmp/sort_tmp.$$
+  mv /tmp/sort_tmp.$$ "$1"
+}
+
+function prunefile {
+  sortfile "$1"
+  sortfile "$2"
+  comm -2 -3 "$1" "$2" > /tmp/prune_tmp.$$
+  mv /tmp/prune_tmp.$$ "$1"
+}
+
+function intersect {
+  sortfile "$1"
+  sortfile "$2"
+  comm -1 -2 "$1" "$2" > /tmp/prune_tmp.$$
+  mv /tmp/prune_tmp.$$ "$1"
+}
+
+function write_archive_status () {
+  echo "$1" > /tmp/archive_status.json.tmp
+  mv /tmp/archive_status.json.tmp /tmp/archive_status.json
+}
+
+function clear_archive_status () {
+  rm -f /tmp/archive_status.json /tmp/archive_status.json.tmp
+}
+
+function archive_progress_monitor () {
+  local total="$1"
+  local listfile="$2"
+  local overlay="$3"
+  local push_counter=0
+  local start_time
+  start_time=$(date +%s)
+
+  while true; do
+    sleep 5
+    local done=0
+    while IFS= read -r line; do
+      [ -L "$overlay/$line" ] || done=$((done + 1))
+    done < "$listfile"
+    write_archive_status "{\"phase\":\"archiving\",\"current\":$done,\"total\":$total}"
+
+    # Send APNs Live Activity update every ~30s (6 × 5s)
+    push_counter=$((push_counter + 1))
+    if [ $((push_counter % 6)) -eq 0 ]; then
+      local eta=0
+      local elapsed=$(( $(date +%s) - start_time ))
+      if [ $done -gt 0 ] && [ $elapsed -gt 5 ]; then
+        eta=$(( (total - done) * elapsed / done ))
+      fi
+      /root/bin/send-live-activity update archiving "$done" "$total" "$eta" || true
+    fi
+  done
+}
+
+function clean_cam_mount {
+
+  local mode="${1:-}"
+
+  if [ "$mode" = "freespace" ]
+  then
+    if [ -e /tmp/last_clean_time ]
+    then
+      read -r -d . last < /tmp/last_clean_time
+      read -r -d . now < /proc/uptime
+      if (( (now - last) < 300 ))
+      then
+        log "skipping cleaning cam mount"
+        return
+      fi
+    fi
+    cat /proc/uptime > /tmp/last_clean_time
+  fi
+
+  log "cleaning cam mount"
+  ensure_cam_file_is_mounted
+
+  # Delete the files that fsck "recovered". These are generally files
+  # that were deleted previously by the car or teslausb
+  find "${CAM_MOUNT}" \( \( -type f -name FSCK\*.REC \) -o \( -type f -name "*~[0-9].MP4" \) \) -print0 | xargs -0 rm -rf
+
+  # Delete short recordings
+  (cd "${CAM_MOUNT}"; find . -type f -name \*.mp4 -size -100000c -printf '%P\n' ) | xargs rm -rf
+
+  if [ "$mode" = "freespace" ]
+  then
+    # Remove files, oldest first, until there is at least 20GB of free space
+ 
+    (cd "${CAM_MOUNT}"; find . -type f -a \( -path './TeslaCam/*' -o -path './TeslaTrackMode/*' \) -printf '%P\0') > /tmp/rmcandidates.txt
+    if [ -s /tmp/rmcandidates.txt ]
+    then
+      (cd "${CAM_MOUNT}"; xargs -a /tmp/rmcandidates.txt -0 ls -cr1) > /tmp/rmcandidatesbytime.txt
+    else
+      true > /tmp/rmcandidatesbytime.txt
+    fi
+ 
+    local freespace
+    while read -r line
+    do
+      freespace=$(eval "$(stat --file-system --format="echo \$((%f*%S))" "${CAM_MOUNT}/.")")
+      if ((freespace > 20000000000))
+      then
+        break;
+      fi
+      rm "${CAM_MOUNT}/$line"
+    done < /tmp/rmcandidatesbytime.txt
+    # Clean up temp files from RAM-backed /tmp
+    rm -f /tmp/rmcandidates.txt /tmp/rmcandidatesbytime.txt
+  fi
+
+  # delete directories that are now empty
+  find "$CAM_MOUNT/TeslaCam/RecentClips" "$CAM_MOUNT/TeslaCam/SavedClips" \
+    "$CAM_MOUNT/TeslaCam/SentryClips" "$CAM_MOUNT/TeslaTrackMode" -mindepth 1 -type d -empty -delete || true
+
+  # Trim the camera archive to reduce the number of blocks in the snapshot.
+  trim_free_space "$CAM_MOUNT"
+
+  unmount_cam_file
+
+  log "done cleaning cam mount"
+}
+
+# Directory structure car uses:
+# TeslaCam/
+#   RecentClips/
+#      videos.mp4
+#   SavedClips/
+#     datetime/
+#       videos.mp4
+#       event.json
+#       thumb.png
+#   SentryClips/
+#     datetime/
+#       videos.mp4
+#       event.json
+#       thumb.png
+# TeslaTrackMode/
+#   lapvideo.mp4
+#   laptelemetry.csv
+function archive_teslacam_clips () {
+  log "Checking saved folder count..."
+
+  local -r overlaylower=/mutable/TeslaCam
+  local -r overlayupper=/tmp/cam/upper
+  local -r overlaywork=/tmp/cam/work
+  local -r overlaymerged=/tmp/cam/merged
+
+  rm -rf "$overlayupper" "$overlaywork" "$overlaymerged"
+  mkdir -p "$overlayupper" "$overlaywork" "$overlaymerged"
+
+  if ! mount -t overlay overlay -o "lowerdir=$overlaylower,upperdir=$overlayupper,workdir=$overlaywork" "$overlaymerged"; then
+    log "ERROR: failed to mount overlay (lower=$overlaylower upper=$overlayupper merged=$overlaymerged)"
+    return 1
+  fi
+
+  # Build list of the files to be archived.
+  local -r sentrylist=/tmp/sentry_files
+  local -r sentrylist_archived=/tmp/sentry_files_archived
+  local -r sentrylist_previously_archived=/mutable/sentry_files_archived
+  local -r ignorelist=/tmp/ignore_files
+
+  # Find files by name only. Don't follow the symlinks yet, since that
+  # would cause all snapshots to be mounted.
+  local -a savedclipsopt
+  local -a sentryclipsopt
+  local -a trackmodeclipsopt
+  local -a recentclipsopt
+  if [ "${ARCHIVE_SAVEDCLIPS:-true}" = "true" ]
+  then
+    savedclipsopt=("-path" "./SavedClips/*")
+  else
+    savedclipsopt=("-false")
+  fi
+  if [ "${ARCHIVE_SENTRYCLIPS:-true}" = "true" ]
+  then
+    sentryclipsopt=("-o" "-path" "./SentryClips/*")
+  fi
+  if [ "${ARCHIVE_TRACKMODECLIPS:-true}" = "true" ]
+  then
+    trackmodeclipsopt=("-o" "-path" "./TeslaTrackMode/*")
+  fi
+  if [ "${ARCHIVE_RECENTCLIPS:-false}" = "true" ]
+  then
+    recentclipsopt=("-o" "-path" "./RecentClips/*")
+  fi
+  (cd "$overlaylower"; find . \( \( "${savedclipsopt[@]}" "${sentryclipsopt[@]}" "${trackmodeclipsopt[@]}" "${recentclipsopt[@]}" \) -type l \) \
+        -a -fprintf "$sentrylist" '%P\n')
+
+  # Copy lists of previously-archived files from /mutable
+  if [ -r "${sentrylist_previously_archived}" ]
+  then
+    cp "${sentrylist_previously_archived}" "${sentrylist_archived}"
+  fi
+
+  # Remove files that no longer exist in snapshots from the
+  # "previously archived" list, so the list doesn't keep growing.
+  intersect "${sentrylist_archived}" "${sentrylist}"
+
+  # Remove previously-archived files from the archive candidate list
+  prunefile "${sentrylist}" "${sentrylist_archived}"
+
+  # ${sentrylist} is now a list of files that haven't been archived yet.
+  # Remove short recordings from this list. This requires following the
+  # links and looking at the files themselves.
+  if [ -s "${sentrylist}" ]
+  then
+    (cd "$overlaymerged"; xargs -a "${sentrylist}" echo "find -L" | while read -r line
+        do
+          eval "$line \( -name \*.mp4 -a -size -100000c -printf '%p\n' \)"
+        done) > ${ignorelist}
+  else
+    true > "${ignorelist}"
+  fi
+
+  # remove the short files from the list of files to be archived
+  prunefile "${sentrylist}" "${ignorelist}"
+
+  # apply custom removals/additions
+  filterfile "${sentrylist}"
+
+  local -r sentry_count=$(grep -c -v TeslaTrackMode "$sentrylist")
+  local -r trackmode_count=$(grep -c TeslaTrackMode "$sentrylist")
+  local -r ignore_count=$(wc -l < "$ignorelist")
+  local -r total_count=$((sentry_count + trackmode_count))
+
+  # extract some noteworthy info from the file list
+  local -r saved_event_count=$(grep 'SavedClips/' < "$sentrylist" | sed 's/[^\/]\+$//' | sort -u  | wc -l)
+  local -r sentry_event_count=$(grep 'SentryClips/' < "$sentrylist" | sed 's/[^\/]\+$//' | sort -u  | wc -l)
+
+  local -r event_count=$((saved_event_count + sentry_event_count))
+
+  log "There are $event_count event folder(s) with $sentry_count file(s) and $trackmode_count track mode file(s) to move." \
+      " $ignore_count short recording(s) will be skipped."
+
+  local archive_success=true
+  if [[ "$total_count" -gt 0 ]]
+  then
+    log "Starting recording archiving"
+    local -r start_ts=$(date --utc --date "now" +%s)
+
+    local message="Archiving "
+    if [[ $sentry_count -gt 0 && $trackmode_count -gt 0 ]]
+    then
+      message+="$trackmode_count track mode file(s) and $sentry_count file(s) including $event_count event folder(s)"
+    elif [[ $sentry_count -gt 0 && $event_count -gt 0 ]]
+    then
+      message+="$sentry_count file(s) including $event_count event folder(s)"
+    elif [[ $sentry_count -gt 0 ]]
+    then
+      message+="$sentry_count file(s)"
+    else
+      message+="$trackmode_count track mode file(s)"
+    fi
+    message+=" starting at $(date)"
+    ARCHIVE_TOTAL_COUNT=$total_count /root/bin/send-push-message "$NOTIFICATION_TITLE:" "$message" start archive_start || log "failed to send mobile app notification"
+    /root/bin/send-live-activity start "$total_count" || true
+
+    # setup trigger files
+    local -r triggerdir=/tmp/triggers
+    local -r triggerlist=/tmp/triggers.txt
+    rm -rf "${triggerdir}"
+    mkdir -p "${triggerdir}/SentryClips"
+    mkdir -p "${triggerdir}/SavedClips"
+    mkdir -p "${triggerdir}/RecentClips"
+    true > "${triggerlist}"
+    if [ -n "${TRIGGER_FILE_SAVED+x}" ]
+    then
+      touch "${triggerdir}/SavedClips/${TRIGGER_FILE_SAVED}"
+      echo "SavedClips/${TRIGGER_FILE_SAVED}" >> "${triggerlist}"
+    fi
+    if [ -n "${TRIGGER_FILE_SENTRY+x}" ]
+    then
+      touch "${triggerdir}/SentryClips/${TRIGGER_FILE_SENTRY}"
+      echo "SentryClips/${TRIGGER_FILE_SENTRY}" >> "${triggerlist}"
+    fi
+    if [ -n "${TRIGGER_FILE_RECENT+x}" ]
+    then
+      touch "${triggerdir}/RecentClips/${TRIGGER_FILE_RECENT}"
+      echo "RecentClips/${TRIGGER_FILE_RECENT}" >> "${triggerlist}"
+    fi
+    if [ -n "${TRIGGER_FILE_ANY+x}" ]
+    then
+      touch "${triggerdir}/${TRIGGER_FILE_ANY}"
+      echo "${TRIGGER_FILE_ANY}" >> "${triggerlist}"
+    fi
+
+    write_archive_status "{\"phase\":\"archiving\",\"current\":0,\"total\":$total_count}"
+    archive_progress_monitor "$total_count" "${sentrylist}" "$overlaymerged" &
+    local progress_pid=$!
+
+    if /root/bin/archive-clips.sh "$overlaymerged" "${sentrylist}" "${triggerdir}" "${triggerlist}"
+    then
+      message="Archiving completed successfully. "
+    else
+      local arc_exit=$?
+      message="Error during archiving. "
+      archive_success=false
+      log "ERROR: archive-clips.sh failed with exit code $arc_exit"
+      if [ -e /tmp/rsynclog ]; then
+        log "--- rsync output ---"
+        tail -20 /tmp/rsynclog >> "$LOG_FILE"
+        log "--- end rsync output ---"
+      fi
+      if [ -e /tmp/archive-rsync-cmd.log ]; then
+        log "--- rsync cmd log (last 10 lines) ---"
+        tail -10 /tmp/archive-rsync-cmd.log >> "$LOG_FILE"
+        log "--- end rsync cmd log ---"
+      fi
+    fi
+
+    kill "$progress_pid" 2>/dev/null || true
+    wait "$progress_pid" 2>/dev/null || true
+
+    local -i sentry_archived=0
+    local -i trackmode_archived=0
+
+    while read -r line
+    do
+      if [[ ! -L "$overlaymerged/$line" ]]
+      then
+        case $line in
+          TeslaTrackMode*)
+            trackmode_archived=$((trackmode_archived + 1))
+            ;;
+          *)
+            sentry_archived=$((sentry_archived + 1))
+            ;;
+        esac
+        echo "$line" >> "${sentrylist_archived}"
+      fi
+    done < ${sentrylist}
+
+    # copy the list of archived files back to /mutable if it has changed
+    if ! diff -q -N "${sentrylist_archived}" "${sentrylist_previously_archived}" > /dev/null
+    then
+        cp "${sentrylist_archived}" "${sentrylist_previously_archived}.new"
+        mv "${sentrylist_previously_archived}.new" "${sentrylist_previously_archived}"
+    fi
+
+    message+="Archived "
+    if [[ $sentry_count -gt 0 && $trackmode_count -gt 0 ]]
+    then
+      message+="${trackmode_archived} trackmode files and ${sentry_archived} other files"
+    elif [[ $sentry_count -gt 0 ]]
+    then
+      message+="${sentry_archived} files"
+    else
+      message+="${trackmode_archived} trackmode files"
+    fi
+    local -r end_ts=$(date --utc --date "now" +%s)
+    local -r delta=$((end_ts - start_ts))
+    message+=" in $(convert_seconds_to_nice_time $delta)"
+    /root/bin/send-push-message "$NOTIFICATION_TITLE:" "${message}" finish archive_complete
+    /root/bin/send-live-activity end complete || true
+
+    # Check RTC battery health (Pi 5 only) — warn on every archive if dead/missing
+    if [ "${RTC_BATTERY_ENABLED:-false}" = "true" ] && isPi5; then
+      rtc_year=$(cut -d- -f1 < /sys/class/rtc/rtc0/date 2>/dev/null)
+      if [ -n "$rtc_year" ] && [ "$rtc_year" -lt 2024 ]; then
+        /root/bin/send-push-message "$NOTIFICATION_TITLE:" \
+          "RTC battery appears dead or missing. Replace the battery on the Pi 5's J5 header to maintain accurate time." \
+          warning rtc_battery || true
+      fi
+    fi
+
+    if [ -e /tmp/archive-error.log ]
+    then
+      cat /tmp/archive-error.log >> ${LOG_FILE}
+      rm /tmp/archive-error.log
+    fi
+  fi
+
+  # overlayfs behavior is undefined if the lower is changed while the overlay is active, so umount first
+  umount "$overlaymerged"
+
+  if archive_is_reachable
+  then
+    if [ "$archive_success" = "true" ]
+    then
+      clean_cam_mount freespace
+    else
+      log "Skipping cleaning step after archive error"
+    fi
+  else
+    log "Archive not reachable, assuming user drove away, skipping cleaning step"
+  fi
+}
+
+function copy_music_files () {
+  log "Starting music sync..."
+
+  ensure_music_file_is_mounted
+
+  /root/bin/copy-music.sh
+
+  # Trim the empty space from the music archive.
+  trim_free_space "$MUSIC_MOUNT"
+
+  unmount_music_file
+}
+
+function has_cam_disk () {
+  [ -f /backingfiles/cam_disk.bin ]
+}
+
+function archive_clips () {
+  log "Archiving..."
+
+  if ! /root/bin/connect-archive.sh
+  then
+    log "ERROR: connect-archive.sh failed (exit $?), skipping archive step."
+    log "  ARCHIVE_SYSTEM=${ARCHIVE_SYSTEM:-unset} ARCHIVE_SERVER=${ARCHIVE_SERVER:-unset}"
+    if [ "${ARCHIVE_SYSTEM:-}" = "cifs" ]; then
+      log "  ARCHIVE_MOUNT=${ARCHIVE_MOUNT:-unset} SHARE_NAME=${SHARE_NAME:-unset}"
+    fi
+    return
+  fi
+
+  if ! has_cam_disk
+  then
+    log "Skipping archiving (no cam disk)"
+  elif archive_teslacam_clips
+  then
+    log "Finished archiving."
+  else
+    log "Archiving failed."
+  fi
+
+  if { timeout 5 [ -d "${MUSIC_ARCHIVE_MOUNT:-}" -a -d "$MUSIC_MOUNT" ]; } || \
+     { [ "${ARCHIVE_SYSTEM:-none}" = "rsync" ] && [ -n "${MUSIC_SHARE_NAME:-}" ] && [ -f /backingfiles/music_disk.bin ]; }
+  then
+    log "Copying music..."
+    if copy_music_files
+    then
+      log "Finished copying music."
+    else
+      log "ERROR: copy_music_files failed (exit $?)"
+    fi
+  else
+    log "Music archive not configured or unreachable (MUSIC_ARCHIVE_MOUNT=${MUSIC_ARCHIVE_MOUNT:-unset})"
+  fi
+
+  touch /tmp/flag_post_archive  #Set post-archive flag for optional temperature logging
+  clear_archive_status
+  # Reconnect cam drive before post-archive processing.
+  # Processing reads local snapshots, not the cam disk — the car can resume
+  # recording immediately instead of waiting for processing to finish.
+  connect_usb_drives_to_host
+  /root/bin/post-archive-process.sh || log "ERROR: post-archive-process.sh failed (exit $?)"
+  /root/bin/send-live-activity end complete || true
+  if ! archive_is_reachable; then
+    log "Archive became unreachable during drive processing, user likely drove away"
+  fi
+  /root/bin/disconnect-archive.sh 2>> "$LOG_FILE" || true
+}
+
+function slowblink () {
+  echo timer > "$STATUSLED/trigger" || return 0
+  echo 900 > "$STATUSLED/delay_off"
+  echo 100 > "$STATUSLED/delay_on"
+}
+
+function fastblink () {
+  echo timer > "$STATUSLED/trigger" || return 0
+  echo 150 > "$STATUSLED/delay_off"
+  echo 50 > "$STATUSLED/delay_on"
+}
+
+
+function doubleblink () {
+  echo heartbeat > "$STATUSLED/trigger" || return 0
+  echo 0 > "$STATUSLED/invert"
+}
+
+# Write system time → RTC via /dev/rtc0 ioctl (Pi 5 only)
+function rtc_sync_systohc () {
+  [ -e /dev/rtc0 ] || return 1
+  python3 -c "
+import fcntl, struct, time
+t = time.gmtime()
+data = struct.pack('9i', t.tm_sec, t.tm_min, t.tm_hour, t.tm_mday, t.tm_mon-1, t.tm_year-1900, t.tm_wday, t.tm_yday, -1)
+with open('/dev/rtc0', 'wb') as f:
+    fcntl.ioctl(f.fileno(), 0x4024700a, data)
+" 2>/dev/null
+}
+
+function set_time () {
+  log "Trying to set time..."
+  local -r uptime_start=$(awk '{print $1}' /proc/uptime)
+  local -r clocktime_start=$(date +%s.%N)
+  for _ in {1..5}
+  do
+    if ntpdig -S time.google.com || sntp -S 129.6.15.28
+    # Fall back to NIST time server if DNS resolution fails (DNS over TLS & Cert is invalid because of wrong time)
+    then
+      local -r uptime_end=$(awk '{print $1}' /proc/uptime)
+      local -r clocktime_end=$(date +%s.%N)
+      log "$(awk "BEGIN {printf \"Time adjusted by %f seconds after %f seconds\", $clocktime_end-$clocktime_start, $uptime_end-$uptime_start}")"
+      return
+    fi
+    log "sntp failed, retrying..."
+    sleep 2
+  done
+  log "Failed to set time"
+}
+
+function timesyncloop {
+  echo -n timesyncloop > /proc/self/comm
+  while true
+  do
+    if ping -c 1 -W 3 time.google.com &>/dev/null || ping -c 1 -W 3 129.6.15.28 &>/dev/null; then
+      set_time
+      # Sync NTP-corrected time to RTC battery (Pi never shuts down gracefully)
+      if [ "${RTC_BATTERY_ENABLED:-false}" = "true" ] && isPi5; then
+        rtc_sync_systohc || true
+      fi
+    fi
+    sleep "${TIME_SYNC_INTERVAL:-3600}"
+  done
+}
+
+function snapshotloop {
+  echo -n snapshotloop > /proc/self/comm
+  while true
+  do
+    sleep "${SNAPSHOT_INTERVAL:-3480}"
+    /root/bin/waitforidle || true
+    /root/bin/make_snapshot.sh
+    # Incrementally process new clips after each snapshot.
+    # The processor skips already-processed files, so this is lightweight.
+    # Runs in a subshell so the snapshot loop isn't blocked.
+    if [ "${DRIVE_MAP_WHILE_AWAY:-false}" = "true" ]; then
+      (
+        SENTRYUSB_PORT="${SENTRYUSB_PORT:-80}"
+        API_URL="http://127.0.0.1:${SENTRYUSB_PORT}"
+        if curl -sf "${API_URL}/api/drives/status" > /dev/null 2>&1; then
+          curl -sf -X POST "${API_URL}/api/drives/process?post_archive=1" \
+            -H "Content-Type: application/json" \
+            -d '{"clips_dir": "/mutable/TeslaCam/RecentClips", "throttle_ms": 30}' \
+            > /dev/null 2>&1 || true
+        fi
+      ) &
+    fi
+  done
+}
+
+function freespacemanager {
+  echo -n freespacemanager > /proc/self/comm
+  # 10G
+  local reserve=10737418240
+  local threepctoftotalspace
+  threepctoftotalspace=$(eval "$(stat --file-system --format="echo \$((%b*%S/33))" /backingfiles/cam_disk.bin)")
+  reserve=$((reserve+threepctoftotalspace))
+
+  while true
+  do
+    local freespace
+    freespace=$(eval "$(stat --file-system --format="echo \$((%f*%S))" /backingfiles/cam_disk.bin)")
+    if [ "$freespace" -lt "$reserve" ]
+    then
+      /root/bin/manage_free_space.sh "$reserve" || sleep 30
+    fi
+    sleep 30
+  done
+}
+
+function logrotator {
+  echo -n logrotator > /proc/self/comm
+  while true
+  do
+    if [ -s /var/log/nginx/access.log ]
+    then
+      mv -f /var/log/nginx/access.log /var/log/nginx/access.log.prev || true
+    fi
+    if [ -s /var/log/nginx/error.log ]
+    then
+      mv -f /var/log/nginx/error.log /var/log/nginx/error.log.prev || true
+    fi
+    if [ -e /var/run/nginx.pid ]
+    then
+      kill -USR1 "$(cat /var/run/nginx.pid)"
+    fi
+    sleep 1800
+  done
+}
+
+function wifichecker {
+  echo -n wifichecker > /proc/self/comm
+  dmesg -w | {
+    while TMOUT=1 read -r line
+    do
+      true
+    done
+    wifi=working
+    while read -r line
+    do
+      case $line in
+        *"failed to enable fw supplicant")
+          if [ "$wifi" = "working" ]
+          then
+            wifi="notworking"
+          else
+            log "restarting wifi because of: $line"
+            modprobe -r brcmfmac cfg80211 brcmutil || true
+            modprobe brcmfmac || true
+            while TMOUT=1 read -r line
+            do
+              true
+            done
+            wifi="working"
+          fi
+          ;;
+        *)
+          wifi=working
+          ;;
+      esac
+    done
+  }
+}
+
+function set_sys_param() {
+  local -r parampath="$1"
+  local -r var="$2"
+  local -r defaultval="$3"
+
+  local -r val=${!var:-$defaultval}
+  if [[ ${val} = "default" ]]
+  then
+    log "not setting $parampath"
+  else
+    echo "$val" > "$parampath" || true
+  fi
+}
+
+export -f ensure_mountpoint_is_mounted
+export -f retry
+export -f ensure_mountpoint_is_mounted_with_retry
+export -f log
+
+echo "==============================================" >> "$LOG_FILE"
+log "Starting archiveloop at $(awk '{print $1}' /proc/uptime) seconds uptime..."
+
+set_sys_param /proc/sys/vm/dirty_background_bytes DIRTY_BACKGROUND_BYTES 65536
+set_sys_param /proc/sys/vm/dirty_ratio DIRTY_RATIO 80
+set_sys_param /sys/devices/system/cpu/cpufreq/policy0/scaling_governor CPU_GOVERNOR conservative
+
+/root/bin/temperature_monitor &
+
+if has_cam_disk
+then
+  snapshotloop &
+  freespacemanager &
+fi
+logrotator &
+wifichecker &
+timesyncloop &
+
+fix_errors_in_images
+
+if has_cam_disk
+then
+  # always remove files that fsck recoverd
+  clean_cam_mount boot
+
+  # don't need another fsck because fix_errors_in_images already did that
+  /root/bin/make_snapshot.sh nofsck
+fi
+
+connect_usb_drives_to_host
+
+if archive_is_reachable
+then
+  fastblink
+
+  set_time
+
+  # Seed RTC with NTP-corrected time on first boot
+  if [ "${RTC_BATTERY_ENABLED:-false}" = "true" ] && isPi5; then
+    rtc_sync_systohc || true
+  fi
+
+  # A large clock step can cause NetworkManager to drop the WiFi
+  # connection (it thinks the DHCP lease expired). Re-verify and recover.
+  if ! archive_is_reachable; then
+    log "Network lost after time adjustment, waiting for recovery..."
+    wait_for_archive_to_be_reachable
+  fi
+
+  /root/bin/awake_start || true
+
+  archive_clips
+
+  /root/bin/awake_stop || true
+
+  doubleblink
+
+  connect_usb_drives_to_host
+
+  if archive_is_reachable; then
+    wait_for_archive_to_be_unreachable
+  fi
+fi
+
+while true
+do
+  slowblink
+
+  wait_for_archive_to_be_reachable
+
+  fastblink
+
+  set_time
+
+  # Sync NTP-corrected time to RTC battery
+  if [ "${RTC_BATTERY_ENABLED:-false}" = "true" ] && isPi5; then
+    rtc_sync_systohc || true
+  fi
+
+  # A large clock step can cause NetworkManager to drop the WiFi
+  # connection (it thinks the DHCP lease expired). Re-verify and recover.
+  if ! archive_is_reachable; then
+    log "Network lost after time adjustment, waiting for recovery..."
+    wait_for_archive_to_be_reachable
+  fi
+
+  /root/bin/awake_start || true
+
+  sleep "${ARCHIVE_DELAY:-20}"
+
+  # take a snapshot before archive_clips starts deleting files
+  if has_cam_disk
+  then
+    if ! /root/bin/make_snapshot.sh; then
+      log "ERROR: make_snapshot.sh failed (exit $?)"
+    fi
+  fi
+
+  archive_clips
+
+  /root/bin/awake_stop || true
+
+  doubleblink
+
+  connect_usb_drives_to_host
+
+  if archive_is_reachable; then
+    wait_for_archive_to_be_unreachable
+  fi
+
+  check_if_usb_gadget_is_mounted
+done

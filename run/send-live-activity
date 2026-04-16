@@ -1,0 +1,81 @@
+#!/bin/bash -eu
+# Send Live Activity start/update/end to paired iOS devices via the notification backend.
+# Uses both push-to-start (native) and silent push (fallback) for reliability.
+# Usage:
+#   send-live-activity start [total_files]
+#   send-live-activity update <phase> <current> <total> [eta_seconds]
+#   send-live-activity end [phase]
+
+source /root/bin/envsetup.sh 2>/dev/null || true
+
+if [ "${MOBILE_PUSH_ENABLED:-false}" != "true" ] || [ -z "${MOBILE_PUSH_DEVICE_ID:-}" ]; then
+  exit 0
+fi
+
+BACKEND_URL="https://notifications.sentry-six.com"
+ACTION="${1:-}"
+DEVICE_NAME="${NOTIFICATION_TITLE:-SentryUSB}"
+
+case "$ACTION" in
+  start)
+    TOTAL="${2:-0}"
+    # Push-to-start (native Live Activity start)
+    curl -sf --connect-timeout 10 --max-time 30 -X POST \
+      -H "Content-Type: application/json" \
+      -H "X-Device-Secret: $MOBILE_PUSH_SECRET" \
+      -d "{
+        \"device_id\": \"${MOBILE_PUSH_DEVICE_ID}\",
+        \"attributes_type\": \"ArchiveActivityAttributes\",
+        \"attributes\": {\"deviceName\": \"${DEVICE_NAME}\"},
+        \"content_state\": {\"phase\": \"archiving\", \"current\": 0, \"total\": ${TOTAL}, \"isArchiving\": true, \"etaSeconds\": 0}
+      }" \
+      "${BACKEND_URL}/start-activity" > /dev/null 2>&1 || true
+    # Silent push fallback (wakes app to start activity)
+    curl -sf --connect-timeout 10 --max-time 30 -X POST \
+      -H "Content-Type: application/json" \
+      -H "X-Device-Secret: $MOBILE_PUSH_SECRET" \
+      -d "{
+        \"device_id\": \"${MOBILE_PUSH_DEVICE_ID}\",
+        \"silent\": true,
+        \"live_activity\": {\"action\": \"start\", \"phase\": \"archiving\", \"current\": 0, \"total\": ${TOTAL}, \"device_name\": \"${DEVICE_NAME}\"}
+      }" \
+      "${BACKEND_URL}/send" > /dev/null 2>&1 || true
+    ;;
+  update)
+    PHASE="${2:-processing}"
+    CURRENT="${3:-0}"
+    TOTAL="${4:-0}"
+    ETA="${5:-0}"
+    curl -sf --connect-timeout 10 --max-time 30 -X POST \
+      -H "Content-Type: application/json" \
+      -H "X-Device-Secret: $MOBILE_PUSH_SECRET" \
+      -d "{
+        \"device_id\": \"${MOBILE_PUSH_DEVICE_ID}\",
+        \"content_state\": {\"phase\": \"${PHASE}\", \"current\": ${CURRENT}, \"total\": ${TOTAL}, \"isArchiving\": true, \"etaSeconds\": ${ETA}},
+        \"event\": \"update\"
+      }" \
+      "${BACKEND_URL}/send-activity-update" > /dev/null 2>&1 || true
+    ;;
+  end)
+    PHASE="${2:-complete}"
+    curl -sf --connect-timeout 10 --max-time 30 -X POST \
+      -H "Content-Type: application/json" \
+      -H "X-Device-Secret: $MOBILE_PUSH_SECRET" \
+      -d "{
+        \"device_id\": \"${MOBILE_PUSH_DEVICE_ID}\",
+        \"content_state\": {\"phase\": \"${PHASE}\", \"current\": 0, \"total\": 0, \"isArchiving\": false, \"etaSeconds\": 0},
+        \"event\": \"end\"
+      }" \
+      "${BACKEND_URL}/send-activity-update" > /dev/null 2>&1 || true
+    # Silent push fallback to end activity
+    curl -sf --connect-timeout 10 --max-time 30 -X POST \
+      -H "Content-Type: application/json" \
+      -H "X-Device-Secret: $MOBILE_PUSH_SECRET" \
+      -d "{
+        \"device_id\": \"${MOBILE_PUSH_DEVICE_ID}\",
+        \"silent\": true,
+        \"live_activity\": {\"action\": \"end\", \"phase\": \"${PHASE}\"}
+      }" \
+      "${BACKEND_URL}/send" > /dev/null 2>&1 || true
+    ;;
+esac

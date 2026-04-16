@@ -1,0 +1,261 @@
+#!/bin/bash -e
+#
+# rc.local
+#
+# This script is executed at the end of each multiuser runlevel.
+# Make sure that the script will "exit 0" on success or any other
+# value on error.
+#
+# In order to enable or disable this script just change the execution
+# bits.
+#
+# By default this script does nothing.
+
+# Print the IP address
+_IP=$(hostname -I) || true
+if [ "$_IP" ]
+then
+  printf "My IP address is %s\n" "$_IP"
+fi
+
+if [ ! -L /sentryusb ]
+then
+  rm -rf /sentryusb
+  if [ -d /boot/firmware ] && findmnt --fstab /boot/firmware &> /dev/null
+  then
+    ln -s /boot/firmware /sentryusb
+  else
+    ln -s /boot /sentryusb
+  fi
+fi
+
+if [ -f /sentryusb/run_once ]
+then
+  cp /sentryusb/run_once /tmp/
+  chmod +x /tmp/run_once
+  /tmp/run_once || echo "run_once failed"
+  mv /sentryusb/run_once /sentryusb/ran_once || true
+fi
+
+SETUP_LOGFILE=/sentryusb/sentryusb-setup.log
+
+function write_all_leds {
+  for led in /sys/class/leds/*
+  do
+    echo "$1" > "$led/$2" || true
+  done &> /dev/null
+}
+
+function error_strobe() {
+  modprobe ledtrig_timer || true
+  write_all_leds timer trigger
+  while true
+  do
+    write_all_leds 1 delay_on
+    write_all_leds 100 delay_off
+    sleep 1
+    write_all_leds 0 delay_on
+    sleep 1
+  done
+}
+
+function setup_progress () {
+  echo "$( date ) : $1" >> "$SETUP_LOGFILE" || echo "can't write to $SETUP_LOGFILE"
+  echo "$1"
+}
+
+function get_script () {
+  local local_path="$1"
+  local name="$2"
+  local remote_path="${3:-}"
+
+  IFS=". " read -r start_time _ < /proc/uptime
+
+  while ! curl -o "$local_path/$name" https://raw.githubusercontent.com/"$REPO"/"$REPO_NAME"/"$BRANCH"/"$remote_path"/"$name"
+  do
+    setup_progress "get_script failed, retrying"
+    sntp -S time.google.com 2>/dev/null || ntpdig -S time.google.com 2>/dev/null || true
+    sleep 3
+    IFS=". " read -r now _ < /proc/uptime
+    if [ $((now - start_time)) -gt 60 ]
+    then
+      setup_progress "failed to get script after 60 seconds, exiting"
+      return 1
+    fi
+  done
+  chmod +x "$local_path/$name"
+}
+
+function nm_connect_wifi () {
+  IFS=". " read -r start_time _ < /proc/uptime
+
+  while ! nmcli device wifi connect "$SSID" password "$WIFIPASS" hidden yes
+  do
+    IFS=". " read -r now _ < /proc/uptime
+    if [ $((now - start_time)) -gt 60 ]
+    then
+      setup_progress "failed to connect to wifi after 60 seconds, exiting"
+      return 1
+    fi
+    setup_progress "failed to connect to wifi, retrying"
+    sleep 5
+  done
+}
+
+function enable_wifi () {
+  setup_progress "Detecting whether to configure wifi"
+  if [[ -n "$SSID" ]] && [[ -n "$WIFIPASS" ]]
+  then
+    if [ ! -e /sentryusb/WIFI_ENABLED ]
+    then
+      if [ -x /root/bin/remountfs_rw ]
+      then
+        /root/bin/remountfs_rw
+      fi
+      if systemctl -q is-enabled NetworkManager.service
+      then
+        setup_progress "Connecting to wifi using Network Manager"
+        if ! nm_connect_wifi
+        then
+          setup_progress "Failed to connect to wifi"
+          error_strobe &
+          exit 0
+        fi
+      else
+        setup_progress "Configuring wpa_supplicant"
+        cp /sentryusb/wpa_supplicant.conf.sample /sentryusb/wpa_supplicant.conf
+        sed -i -e "s/TEMPSSID/${SSID}/g" /sentryusb/wpa_supplicant.conf
+        sed -i -e "s/TEMPPASS/${WIFIPASS}/g" /sentryusb/wpa_supplicant.conf
+        cp /sentryusb/wpa_supplicant.conf /etc/wpa_supplicant/wpa_supplicant.conf
+      fi
+
+      # set the host name now if possible, so it's effective immediately after the reboot
+      local old_host_name
+      old_host_name=$(cat /etc/hostname)
+      if [[ -n "$SENTRYUSB_HOSTNAME" ]] && [[ "$SENTRYUSB_HOSTNAME" != "$old_host_name" ]]
+      then
+        local new_host_name="$SENTRYUSB_HOSTNAME"
+        echo "$new_host_name" > /etc/hostname
+        if grep -q "^127\.0\.1\.1" /etc/hosts; then
+          sed -i -e "s/^127\.0\.1\.1.*/127.0.1.1\t$new_host_name/" /etc/hosts
+        else
+          echo "127.0.1.1	$new_host_name" >> /etc/hosts
+        fi
+      fi
+
+      dpkg-reconfigure -f noninteractive openssh-server
+      rfkill unblock wifi &> /dev/null || true
+      for i in /var/lib/systemd/rfkill/*:wlan ; do
+        echo 0 > "$i"
+      done
+      systemctl enable ssh
+
+      touch /sentryusb/WIFI_ENABLED
+      setup_progress "Rebooting..."
+      exec reboot
+    fi
+  else
+    setup_progress "skipping wifi setup because variables not specified"
+  fi
+}
+
+function safesource {
+  cat <<EOF > /tmp/checksetupconf
+#!/bin/bash -eu
+source '$1' &> /tmp/checksetupconf.out
+EOF
+  chmod +x /tmp/checksetupconf
+  if ! /tmp/checksetupconf
+  then
+    setup_progress "Error in $1:"
+    setup_progress "$(cat /tmp/checksetupconf.out)"
+    error_strobe &
+    exit 1
+  fi
+  # shellcheck disable=SC1090
+  source "$1"
+}
+
+if [ -e "/sentryusb/sentryusb.conf" ]
+then
+  if [ -e /root/bin/remountfs_rw ]
+  then
+    /root/bin/remountfs_rw
+  fi
+  mv /sentryusb/sentryusb.conf /root/
+  dos2unix /root/sentryusb.conf
+  # A config on the boot partition means the user wants headless setup.
+  # Create the started marker so the boot-loop below will proceed.
+  touch "/sentryusb/SENTRYUSB_SETUP_STARTED"
+fi
+if [ -e "/root/sentryusb.conf" ]
+then
+  safesource /root/sentryusb.conf
+elif [ -e "/sentryusb/sentryusb.conf.sample" ]
+then
+  setup_progress "no config file found, but sample file is present."
+else
+  setup_progress "no config file found."
+fi
+
+# check if we previously marked wifi as enabled
+enable_wifi
+# Good to start setup at this point
+
+# This begins the Headless Setup loop
+# Only continue setup if it was explicitly started (via the web wizard or manually)
+# and hasn't finished yet. Without the STARTED check, a fresh install would auto-run
+# setup on boot before the user had a chance to configure via the wizard.
+if [ -e "/sentryusb/SENTRYUSB_SETUP_STARTED" ] && [ ! -e "/sentryusb/SENTRYUSB_SETUP_FINISHED" ]
+then
+  if [ -e /root/bin/remountfs_rw ]
+  then
+    /root/bin/remountfs_rw
+  fi
+
+  if [ -e "/root/sentryusb.conf" ]
+  then
+    source "/root/sentryusb.conf"
+  else
+    # No conf file found, can't complete setup
+    setup_progress "Setup appears not to have completed, but you didn't provide a sentryusb.conf."
+  fi
+
+  # Make the bin dir if needed to grab the setup script into it and persist
+  if [ ! -d "/root/bin" ]
+  then
+    mkdir "/root/bin"
+  fi
+
+  if [ ! -e "/root/bin/setup-sentryusb" ]
+  then
+    REPO=${REPO:-Scottmg1}
+    REPO_NAME=${REPO_NAME:-Sentry-USB}
+    BRANCH=${BRANCH:-main-dev}
+    # Script doesn't exist, grab it.
+    setup_progress "Grabbing main setup file."
+    if ! get_script /root/bin setup-sentryusb setup/pi
+    then
+      setup_progress "Failed to retrieve setup script. Check network settings."
+      error_strobe &
+      exit 0
+    fi
+  fi
+
+  setup_progress "Starting setup."
+
+  # Start setup. This should take us all the way through to reboot
+  if ! /root/bin/setup-sentryusb
+  then
+    error_strobe &
+    exit 0
+  fi
+
+  # reboot for good measure, also restarts the rc.local script
+  exec reboot
+fi
+
+# we're done. If setup completed successfully, sentryusb will have been
+# started as a systemd service at this point
+
+exit 0

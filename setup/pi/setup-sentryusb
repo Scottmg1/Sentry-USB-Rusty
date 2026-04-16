@@ -1,0 +1,1817 @@
+#!/bin/bash -eu
+
+if [[ $EUID -ne 0 ]]
+then
+  echo "STOP: Run sudo -i."
+  exit 1
+fi
+
+if [ "$(. /etc/os-release && echo "${VERSION_ID:-}")" = "9" ]
+then
+  echo "STOP: Stretch-based install is no longer supported. Please flash the latest prebuilt."
+  exit 1
+fi
+
+if [ "${FLOCKED:-}" != "$0" ]
+then
+  if FLOCKED="$0" flock -en -E 99 "$0" "$0" "$@" || case "$?" in
+  99) echo already running
+      exit 99
+      ;;
+  *)  exit $?
+      ;;
+  esac
+  then
+    # success
+    exit 0
+  fi
+fi
+
+function setup_progress () {
+  local setup_logfile=/sentryusb/sentryusb-setup.log
+  if [ -w $setup_logfile ]
+  then
+    echo "$( date ) : $*" >> "$setup_logfile"
+  fi
+  echo "$@"
+}
+
+function curlwrapper () {
+  setup_progress "curl $*" > /dev/null
+  local attempts=0
+  while ! curl -s -S --stderr /tmp/curl.err --fail "$@"
+  do
+    attempts=$((attempts + 1))
+    if [ "$attempts" -ge 20 ]
+    then
+      setup_progress "giving up after 20 tries"
+      if [ -e /tmp/curl.err ]
+      then
+        setup_progress "$(cat /tmp/curl.err)"
+      else
+        setup_progress '(no reason given)'
+      fi
+      exit 1
+    fi
+    setup_progress "'curl $*' failed, retrying" > /dev/null
+    sntp -S time.google.com || ntpdig -S time.google.com || true
+    sleep 3
+  done
+}
+
+function copy_script () {
+  local remote_path="$1"
+  local name="${1/*\/}"
+  local local_path="$2"
+
+  if [ -z ${SOURCE_DIR:+x} ]
+  then
+    if declare -F download_sources &> /dev/null
+    then
+      download_sources
+    else
+      export SOURCE_DIR=/tmp/sourcedir
+      umount "$SOURCE_DIR" &> /dev/null || true
+      rm -rf "$SOURCE_DIR"
+      mkdir -p "$SOURCE_DIR"
+      mount -t tmpfs none "$SOURCE_DIR"
+      (
+        cd "$SOURCE_DIR"
+        curlwrapper -L "https://github.com/${REPO}/${REPO_NAME}/archive/${BRANCH}.tar.gz" | tar zxf - --strip-components=1
+      )
+    fi
+  fi
+
+  cp "${SOURCE_DIR}/$remote_path" "$local_path/$name"
+  chmod +x "$local_path/$name"
+  setup_progress "Downloaded $local_path/$name ..."
+}
+
+function safesource {
+  cat <<EOF > /tmp/checksetupconf
+#!/bin/bash -eu
+source '$1' &> /tmp/checksetupconf.out
+EOF
+  chmod +x /tmp/checksetupconf
+  if ! /tmp/checksetupconf
+  then
+    setup_progress "Error in $1:"
+    setup_progress "$(cat /tmp/checksetupconf.out)"
+    exit 1
+  fi
+  # shellcheck disable=SC1090
+  source "$1"
+}
+
+THISDIR=$(dirname "$(readlink -f "$0")")
+if [ ! -e "$THISDIR/envsetup.sh" ]
+then
+  # source the conf file directly to get REPO, BRANCH or download_sources
+  # in case they're set
+  safesource /root/sentryusb.conf
+  REPO=${REPO:-Scottmg1}
+  REPO_NAME=${REPO_NAME:-Sentry-USB}
+  BRANCH=${BRANCH:-main-dev}
+  copy_script setup/pi/envsetup.sh "$THISDIR"
+fi
+# SC can't follow non-constant source
+# shellcheck disable=SC1090
+source "$THISDIR/envsetup.sh"
+
+function dehumanize () {
+  echo $(($(echo "$1" | sed 's/GB/G/;s/MB/M/;s/KB/K/;s/G/*1024M/;s/M/*1024K/;s/K/*1024/')))
+}
+
+REBOOT=false
+
+# Ensure a WiFi regulatory country code is set. Use US as the default
+# to avoid using the disallowed channels in the US.
+if systemctl -q is-enabled NetworkManager.service 2>/dev/null
+then
+  # Bookworm+ uses NetworkManager — set regulatory domain via iw
+  CURRENT_REG=$(iw reg get 2>/dev/null | grep -oP '(?<=country )\w+' | head -1)
+  if [ -z "$CURRENT_REG" ] || [ "$CURRENT_REG" = "00" ]
+  then
+    setup_progress "setting WiFi regulatory domain to US via iw"
+    iw reg set US
+    REBOOT=true
+  fi
+else
+  # Legacy (pre-Bookworm): set country in wpa_supplicant.conf
+  WPA=/etc/wpa_supplicant/wpa_supplicant.conf
+  if [ -e "$WPA" ] && ! grep -q "country=" $WPA && grep -q "network=" $WPA
+  then
+    setup_progress "adding country code to wpa_supplicant.conf"
+    echo "country=US" >> $WPA
+    REBOOT=true
+  fi
+fi
+
+BOOT_DISK=$(lsblk -dpno pkname "$(findmnt -D -no SOURCE --target /sentryusb)")
+declare -rx BOOT_DISK
+BOOT_PARTITION_DEVICE=$(lsblk -dpno name "$(findmnt -D -no SOURCE --target /sentryusb)")
+readonly BOOT_PARTITION_DEVICE
+readonly BOOT_DEVICE_PARTITION_PREFIX=${BOOT_PARTITION_DEVICE%?}
+export BOOT_DEVICE_PARTITION_PREFIX
+ROOT_PARTITION_DEVICE=$(lsblk -dpno name "$(findmnt -D -no SOURCE --target /)")
+declare -rx ROOT_PARTITION_DEVICE
+ROOT_PART_NUM=$(echo "$ROOT_PARTITION_DEVICE" | grep -o '[0-9]*$')
+readonly ROOT_PART_NUM
+
+# --- Root partition shrink recovery ---
+# If the image was flashed with a tool that auto-expanded the root partition
+# (e.g. Raspberry Pi Imager), there may be no free space left for backingfiles
+# and mutable partitions. Detect this and shrink root via initramfs.
+RESIZE_RESULT_FILE="/root/RESIZE_RESULT"
+RESIZE_MARKER="/root/RESIZE_ATTEMPTED"
+
+# Phase 2: Check if a previous initramfs resize left a result marker
+if [ -f "$RESIZE_RESULT_FILE" ]
+then
+  result_content=$(cat "$RESIZE_RESULT_FILE")
+  rm -f "$RESIZE_RESULT_FILE"
+  case "$result_content" in
+    success)
+      setup_progress "Root filesystem resize completed successfully during boot."
+      rm -f "$RESIZE_MARKER"
+      # Now shrink the partition table to match the smaller filesystem
+      devsectorsize=$(cat "/sys/block/$(lsblk -no pkname "${ROOT_PARTITION_DEVICE}")/queue/hw_sector_size")
+      read -r fsblockcount fsblocksize < <(tune2fs -l "${ROOT_PARTITION_DEVICE}" | grep "Block count:\|Block size:" | awk '{print $2}' FS=: | tr -d ' ' | tr '\n' ' ' | (cat; echo))
+      fsnumsectors=$((fsblockcount * fsblocksize / devsectorsize))
+      rootpartstartsector=$(partx --show -g -o START "${ROOT_PARTITION_DEVICE}")
+      setup_progress "Shrinking root partition to match filesystem: ${fsnumsectors} sectors"
+      echo "${rootpartstartsector},${fsnumsectors}" | sfdisk --force --no-reread "${BOOT_DISK}" -N "${ROOT_PART_NUM}"
+      # Clean up initramfs config.txt entries
+      if [ -e /sentryusb/config.txt ] && grep -q SENTRYUSB-REMOVE /sentryusb/config.txt
+      then
+        sed -i '/SENTRYUSB-REMOVE/d' /sentryusb/config.txt
+        rm -f "/boot/initrd.img-$(uname -r)"
+      else
+        update-initramfs -u 2>/dev/null || true
+      fi
+      setup_progress "Root partition shrink complete, rebooting..."
+      reboot
+      exit 0
+      ;;
+    fail:e2fsck:*)
+      exit_code="${result_content##*:}"
+      rm -f "$RESIZE_MARKER"
+      setup_progress "STOP: Root filesystem check (e2fsck) failed with exit code $exit_code. The filesystem may need manual repair: e2fsck -f $ROOT_PARTITION_DEVICE"
+      exit 1
+      ;;
+    fail:resize2fs:*)
+      exit_code="${result_content##*:}"
+      rm -f "$RESIZE_MARKER"
+      setup_progress "STOP: Root filesystem resize failed with exit code $exit_code. Try reflashing with Balena Etcher instead of Raspberry Pi Imager."
+      exit 1
+      ;;
+    *)
+      setup_progress "WARNING: Unrecognized resize result: $result_content"
+      rm -f "$RESIZE_MARKER"
+      ;;
+  esac
+fi
+
+# Phase 1: Check if root partition needs shrinking
+# Only if no backingfiles/mutable partitions exist yet (first setup run)
+if [ ! -e /dev/disk/by-label/backingfiles ] && [ ! -e /dev/disk/by-label/mutable ]
+then
+  unpart_bytes=$(sfdisk -F "$BOOT_DISK" 2>/dev/null | grep -o '[0-9]* bytes' | head -1 | awk '{print $1}')
+  unpart_bytes=${unpart_bytes:-0}
+  min_space=$(( (1<<30) * 8 ))  # 8 GiB minimum
+
+  if [ "$unpart_bytes" -lt "$min_space" ]
+  then
+    # Root partition was auto-expanded — need to shrink it
+    # Verify root is the last partition so shrinking it frees space at the end
+    lastpart=$(sfdisk -q -l "$BOOT_DISK" | tail +2 | sort -n -k 2 | tail -1 | awk '{print $1}')
+    if [ "$ROOT_PARTITION_DEVICE" != "$lastpart" ]
+    then
+      setup_progress "STOP: Insufficient unpartitioned space ($(( unpart_bytes / 1024 / 1024 ))MB), and root is not the last partition. Reflash with Balena Etcher."
+      exit 1
+    fi
+
+    # Check if we already attempted and it failed
+    if [ -f "$RESIZE_MARKER" ]
+    then
+      setup_progress "STOP: Previous root shrink attempt failed. Delete $RESIZE_MARKER and try again, or reflash with Balena Etcher."
+      exit 1
+    fi
+
+    # Calculate shrink target: current usage + 2G headroom, minimum 6G
+    used_kb=$(df --output=used -k / | tail -1 | tr -d ' ')
+    target_gb=$(( (used_kb / 1024 / 1024) + 2 ))
+    if [ "$target_gb" -lt 6 ]; then target_gb=6; fi
+
+    setup_progress "Root partition auto-expanded to fill disk (only $(( unpart_bytes / 1024 / 1024 ))MB free)."
+    setup_progress "This usually happens when Raspberry Pi Imager is used to flash the image."
+    setup_progress "Shrinking root filesystem from $(( $(blockdev --getsize64 "$ROOT_PARTITION_DEVICE") / 1024 / 1024 / 1024 ))GB to ${target_gb}GB to free space for setup..."
+
+    touch "$RESIZE_MARKER"
+
+    # Ensure initramfs is available for the resize
+    INITRD_NAME="initrd.img-$(uname -r)"
+    BOOT_PART="$(readlink -f /sentryusb)"
+    if [ ! -e "${BOOT_PART}/${INITRD_NAME}" ] && [ ! -e "/boot/${INITRD_NAME}" ]
+    then
+      if [ -f /etc/os-release ] && grep -q Raspbian /etc/os-release && [ -e /sentryusb/config.txt ]
+      then
+        setup_progress "Temporarily enabling initramfs for root resize"
+        update-initramfs -c -k "$(uname -r)"
+        echo "initramfs ${INITRD_NAME} followkernel # SENTRYUSB-REMOVE" >> /sentryusb/config.txt
+      else
+        rm -f "$RESIZE_MARKER"
+        setup_progress "STOP: Cannot shrink root on this OS automatically. Reflash with Balena Etcher."
+        exit 1
+      fi
+    fi
+    # Copy initramfs to boot partition if needed
+    if [ "/boot" != "${BOOT_PART}" ] && [ -e "/boot/${INITRD_NAME}" ]
+    then
+      cp "/boot/${INITRD_NAME}" "${BOOT_PART}/${INITRD_NAME}"
+    fi
+
+    # Download and run the initramfs resize tool
+    copy_script tools/debian-resizefs.sh /tmp
+    bash /tmp/debian-resizefs.sh "${target_gb}G"
+    # debian-resizefs.sh reboots at the end
+    exit 0
+  fi
+fi
+# --- End root partition shrink recovery ---
+
+INCREASE_ROOT_SIZE=$(($(dehumanize "$INCREASE_ROOT_SIZE") / 512))
+
+if [ "$INCREASE_ROOT_SIZE" != "0" ] && [ ! -e "${BOOT_DEVICE_PARTITION_PREFIX}$((ROOT_PART_NUM+1))" ]
+then
+  if [ ! -e /root/SENTRYUSB_ROOT_PARTITION_INCREASED ]
+  then
+    touch /root/SENTRYUSB_ROOT_PARTITION_INCREASED
+    ROOTSTART=$(partx --show -g -o START "${ROOT_PARTITION_DEVICE}")
+    ROOTSIZE=$(partx --show -g -o SECTORS "${ROOT_PARTITION_DEVICE}")
+    ROOTSIZE=$((ROOTSIZE + INCREASE_ROOT_SIZE))
+    if echo "$ROOTSTART,$ROOTSIZE" | sfdisk --force --no-reread "${BOOT_DISK}" -N "${ROOT_PART_NUM}"
+    then
+      setup_progress "increased root partition size"
+      REBOOT=true
+    else
+      setup_progress "WARNING: failed to increase root partition size. The root partition may already be at maximum size."
+      setup_progress "Continuing setup without resizing root partition."
+    fi
+  else
+    setup_progress "increasing root filesystem size to match partition size"
+    resize2fs "${ROOT_PARTITION_DEVICE}"
+  fi
+fi
+
+if [ "$REBOOT" = "true" ]
+then
+  if [ -t 0 ] && [ "${NO_REBOOT_PROMPT:-}" != "1" ]
+  then
+    setup_progress "please reboot for changes to take effect"
+    exit
+  else
+    setup_progress "rebooting for changes to take effect"
+    reboot
+    exit
+  fi
+fi
+
+function headless_setup_mark_setup_success () {
+  rm -f /sentryusb/SENTRYUSB_SETUP_FAILED
+  rm -f /sentryusb/SENTRYUSB_SETUP_STARTED
+  touch /sentryusb/SENTRYUSB_SETUP_FINISHED
+}
+
+function flash () {
+  local ON=0
+  local OFF=1
+  if isPi4 || isPi5
+  then
+    ON=1
+    OFF=0
+  fi
+  echo none > "$STATUSLED/trigger"
+  echo $OFF > "$STATUSLED/brightness"
+  sleep 1
+  for ((i=1; i<=$1; i++))
+  do
+    echo $ON > "$STATUSLED/brightness"
+    sleep .2
+    echo $OFF > "$STATUSLED/brightness"
+    sleep .8
+  done
+}
+
+function headless_setup_progress_flash () {
+  if [ ! -t 0 ]
+  then
+    flash "$1"
+  fi
+}
+
+function verify_configuration () {
+  copy_script setup/pi/verify-configuration.sh /tmp
+
+  /tmp/verify-configuration.sh
+}
+
+function get_common_scripts () {
+  setup_progress "Downloading common runtime scripts."
+  copy_script run/remountfs_rw /root/bin
+  copy_script run/make_snapshot.sh /root/bin
+  copy_script run/release_snapshot.sh /root/bin
+  copy_script run/manage_free_space.sh /root/bin
+  copy_script run/force_sync.sh /root/bin
+  copy_script run/mountoptsforimage /root/bin
+  copy_script run/mountimage /root/bin
+  copy_script run/enable_gadget.sh /root/bin
+  copy_script run/disable_gadget.sh /root/bin
+  copy_script server/ble/sentryusb-ble.py /root/bin
+  ln -sf /root/bin/mountimage /sbin/mount.sentryusb
+}
+
+function install_ble_daemon () {
+  setup_progress "Installing SentryUSB BLE peripheral daemon..."
+
+  # Install required Python packages and BlueZ if not already present
+  for pkg in python3-dbus python3-gi bluez; do
+    if ! dpkg-query -W --showformat='${db:Status-Status}\n' "$pkg" 2>/dev/null | grep -q '^installed$'; then
+      setup_progress "Installing $pkg..."
+      DEBIAN_FRONTEND=noninteractive apt-get -y --force-yes install "$pkg" 2>/dev/null || \
+        setup_progress "WARNING: Failed to install $pkg"
+    fi
+  done
+
+  chmod +x /root/bin/sentryusb-ble.py 2>/dev/null || true
+
+  # Install D-Bus policy file so BlueZ can call GATT methods on our daemon.
+  # Required on Pi 5 / Bookworm where D-Bus policies are stricter.
+  copy_script server/ble/com.sentryusb.ble.conf /etc/dbus-1/system.d || true
+  if [ -f /etc/dbus-1/system.d/com.sentryusb.ble.conf ]; then
+    setup_progress "D-Bus policy installed for BLE daemon"
+  fi
+
+  # BlueZ 5.69+ on Raspberry Pi requires --experimental for reliable LE peripheral
+  # advertisement registration. Without it, RegisterAdvertisement returns
+  # org.bluez.Error.Failed on many Pi hardware/firmware combinations.
+  # Detect actual bluetoothd binary path before writing override.
+  BTDAEMON=$(systemctl cat bluetooth.service 2>/dev/null | grep '^ExecStart=' | head -1 | sed 's/ExecStart=//' | awk '{print $1}')
+  BTDAEMON=${BTDAEMON:-$(command -v bluetoothd || find /usr/lib/bluetooth /usr/sbin -maxdepth 1 -name bluetoothd -print -quit 2>/dev/null)}
+  if [ -n "$BTDAEMON" ] && [ -x "$BTDAEMON" ]; then
+    mkdir -p /etc/systemd/system/bluetooth.service.d
+    cat > /etc/systemd/system/bluetooth.service.d/sentryusb-experimental.conf << EOF
+[Service]
+ExecStart=
+ExecStart=$BTDAEMON --experimental
+EOF
+    systemctl daemon-reload
+    systemctl restart bluetooth 2>/dev/null || true
+    sleep 2
+    setup_progress "bluetoothd experimental mode enabled ($BTDAEMON)"
+  else
+    setup_progress "WARNING: Could not find bluetoothd binary, skipping --experimental override"
+  fi
+
+  # Install the systemd service file
+  copy_script server/ble/sentryusb-ble.service /etc/systemd/system || true
+
+  if [ -f /etc/systemd/system/sentryusb-ble.service ]; then
+    systemctl daemon-reload
+    systemctl enable sentryusb-ble 2>/dev/null || true
+    systemctl restart sentryusb-ble 2>/dev/null || true
+    setup_progress "BLE peripheral daemon installed and started."
+  else
+    setup_progress "WARNING: sentryusb-ble.service not found, BLE daemon not started."
+  fi
+}
+
+function update_sentryusb_binary () {
+  setup_progress "Updating SentryUSB binary..."
+  local BINARY_INSTALL_DIR="/opt/sentryusb"
+  local BINARY_NAME="sentryusb"
+  local BINARY_SUFFIX
+
+  case "$(uname -m)" in
+    aarch64) BINARY_SUFFIX="linux-arm64" ;;
+    armv7l) BINARY_SUFFIX="linux-armv7" ;;
+    armv6l) BINARY_SUFFIX="linux-armv6" ;;
+    x86_64) BINARY_SUFFIX="linux-amd64" ;;
+    *)
+      setup_progress "WARNING: Unsupported architecture $(uname -m), skipping binary update"
+      return
+      ;;
+  esac
+
+  local DOWNLOAD_URL="https://github.com/${REPO}/${REPO_NAME}/releases/latest/download/${BINARY_NAME}-${BINARY_SUFFIX}"
+  local TMP_BINARY="/tmp/sentryusb-new"
+
+  if curlwrapper -fsSL "$DOWNLOAD_URL" -o "$TMP_BINARY" 2>/dev/null; then
+    chmod +x "$TMP_BINARY"
+    mkdir -p "$BINARY_INSTALL_DIR"
+    mv "$TMP_BINARY" "$BINARY_INSTALL_DIR/$BINARY_NAME"
+    local RELEASE_TAG
+    RELEASE_TAG=$(curlwrapper -fsSL --max-time 10 \
+      "https://api.github.com/repos/${REPO}/${REPO_NAME}/releases/latest" 2>/dev/null \
+      | grep '"tag_name"' | head -1 \
+      | sed 's/.*"tag_name": *"\([^"]*\)".*/\1/' || true)
+    if [ -n "${RELEASE_TAG:-}" ]; then
+      echo "$RELEASE_TAG" > "$BINARY_INSTALL_DIR/version"
+      setup_progress "Binary updated to $RELEASE_TAG"
+    else
+      setup_progress "Binary updated (version unknown)"
+    fi
+    # Do NOT restart the service here — the new binary will be used after
+    # the final reboot at the end of setup.  Restarting mid-setup kills
+    # the Go web server that is monitoring setup progress, causing the
+    # wizard UI to appear permanently stuck.
+  else
+    setup_progress "WARNING: Could not download binary from $DOWNLOAD_URL — keeping existing binary"
+  fi
+}
+
+function update_sentryusb_service () {
+  setup_progress "Updating sentryusb systemd service definition..."
+  cat > /etc/systemd/system/sentryusb.service << 'EOF'
+[Unit]
+Description=SentryUSB Web Server
+After=network-online.target
+Wants=network-online.target
+Conflicts=nginx.service
+
+[Service]
+Type=simple
+ExecStartPre=-/bin/systemctl stop nginx
+ExecStartPre=-/bin/systemctl disable nginx
+ExecStart=/opt/sentryusb/sentryusb -port 80
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  systemctl daemon-reload
+  systemctl enable sentryusb 2>/dev/null || true
+  setup_progress "sentryusb.service updated."
+}
+
+function install_avahi_service () {
+  setup_progress "Installing Avahi mDNS service for iOS app discovery..."
+  if ! command -v avahi-daemon &>/dev/null; then
+    DEBIAN_FRONTEND=noninteractive apt-get -y --force-yes install avahi-daemon 2>/dev/null || \
+      setup_progress "WARNING: Failed to install avahi-daemon"
+  fi
+  mkdir -p /etc/avahi/services
+  copy_script setup/pi/avahi-sentryusb.service /tmp
+  mv /tmp/avahi-sentryusb.service /etc/avahi/services/sentryusb.service
+  systemctl enable avahi-daemon 2>/dev/null || true
+  systemctl restart avahi-daemon 2>/dev/null || true
+  setup_progress "Avahi mDNS service installed — iOS app can now discover this Pi."
+}
+
+# If only the dwc2 module is loaded at boot then the Pi will present
+# itself as a non-responsive USB device until a gadget is created.
+# When connected to a Windows host, this will show as a device with
+# vendor ID 0 (which is invalid), and Windows might pop up an error
+# message saying "USB device not recognized", while a connected Linux
+# host will log messages like "device descriptor read/64, error -110"
+# to the kernel log, and 'lsusb' might hang for over a minute or until
+# a gadget is created.
+# To work around this, make sure the g_ether module is loaded along
+# with dwc2. The archiveloop script will then unload the g_ether
+# module (the attached host will see no device at all at this point)
+# before creating the mass storage gadget.
+function fix_cmdline_txt_modules_load () {
+  if [ ! -f "$CMDLINE_PATH" ]
+  then
+    setup_progress "cmdline.txt does not exist, skipping"
+    return 1
+  fi
+  # Extract the modules-load portion of the command line.
+  # Note that this not handle spaces in the argument.
+  local curparam
+  curparam=$(grep -P -o " modules.load=[^\s\$]*" "$CMDLINE_PATH" || true)
+  if [[ "$curparam" == "" ]]
+  then
+    curparam="\$"
+  elif [[ "$curparam" == *"dwc2"* ]] && [[ "$curparam" == *"g_ether"* ]]
+  then
+    setup_progress "cmdline.txt is up to date"
+    return 1
+  fi
+
+  # replace the current parameter
+  setup_progress "Updated cmdline.txt from:"
+  setup_progress "$(cat "$CMDLINE_PATH")"
+  sed -i "s/${curparam}/ modules-load=dwc2,g_ether/" "$CMDLINE_PATH"
+  setup_progress "to:"
+  setup_progress "$(cat "$CMDLINE_PATH")"
+  # return 0 to signal that cmdline.txt was changed and a reboot is needed
+  return 0
+}
+
+# Disable UAS for USB drives known to have issues with the UAS driver on
+# Raspberry Pi.  When UAS fails the kernel offlines the drive, making
+# /backingfiles and /mutable unavailable.  The quirk forces the drive to
+# use the simpler usb-storage driver instead.
+#
+# Each entry is  vendor:product  (hex, from lsusb / dmesg).
+# The ':u' suffix tells usb-storage to ignore UAS for that device.
+KNOWN_UAS_QUIRK_DEVICES=(
+  "04e8:4001"   # Samsung PSSD T7 / T7 Shield / T7 Touch
+  "04e8:4011"   # Samsung PSSD T5 EVO
+  "04e8:61f5"   # Samsung PSSD T5 / T3
+  "174c:55aa"   # ASMedia ASM1051E (common in USB-SATA enclosures)
+  "152d:0578"   # JMicron JMS578 (common in USB-SATA enclosures)
+)
+
+function fix_uas_quirks() {
+  if [ ! -f "$CMDLINE_PATH" ]; then
+    setup_progress "cmdline.txt does not exist, skipping UAS quirks"
+    return
+  fi
+
+  # Build the quirks string from all known devices not already present
+  local existing_quirks
+  existing_quirks=$(grep -P -o 'usb-storage\.quirks=[^\s]*' "$CMDLINE_PATH" || true)
+
+  local new_entries=()
+  for dev in "${KNOWN_UAS_QUIRK_DEVICES[@]}"; do
+    # skip comment-only entries
+    dev="${dev%%#*}"
+    dev="${dev// /}"
+    [ -z "$dev" ] && continue
+
+    if [[ "$existing_quirks" == *"$dev"* ]]; then
+      continue
+    fi
+    new_entries+=("${dev}:u")
+  done
+
+  if [ ${#new_entries[@]} -eq 0 ]; then
+    setup_progress "UAS quirks already up to date"
+    return
+  fi
+
+  local joined
+  joined=$(IFS=,; echo "${new_entries[*]}")
+
+  if [ -z "$existing_quirks" ]; then
+    # No quirks param yet — append one
+    sed -i "s|\$| usb-storage.quirks=${joined}|" "$CMDLINE_PATH"
+  else
+    # Append to existing quirks value (comma-separated)
+    sed -i "s|${existing_quirks}|${existing_quirks},${joined}|" "$CMDLINE_PATH"
+  fi
+
+  setup_progress "Added UAS quirks: ${joined}"
+  setup_progress "cmdline.txt is now: $(cat "$CMDLINE_PATH")"
+}
+
+BACKINGFILES_MOUNTPOINT=/backingfiles
+MUTABLE_MOUNTPOINT=/mutable
+
+function update_backingfiles_fstab_entry () {
+  local filename="$1"
+  local mountpoint="$2"
+  sed -i "\@^$filename .*@d" /etc/fstab
+  if [ -e "$filename" ]
+  then
+    mkdir -p "$mountpoint"
+    echo "$filename $mountpoint sentryusb noauto 0 0" >> /etc/fstab
+    setup_progress "updated /etc/fstab for $mountpoint"
+  fi
+}
+
+function mount_with_retry () {
+  for i in {1..5}
+  do
+    if mount "$@"
+    then
+      return
+    fi
+    setup_progress "'mount $*' failed, retrying"
+    sleep 1
+  done
+  return 1
+}
+
+function create_usb_drive_backing_files () {
+  if [ ! -e "$BACKINGFILES_MOUNTPOINT" ]
+  then
+    mkdir "$BACKINGFILES_MOUNTPOINT"
+  fi
+
+  if [ ! -e "$MUTABLE_MOUNTPOINT" ]
+  then
+    mkdir "$MUTABLE_MOUNTPOINT"
+  fi
+
+  copy_script setup/pi/create-backingfiles-partition.sh /tmp
+  /tmp/create-backingfiles-partition.sh "$BACKINGFILES_MOUNTPOINT" "$MUTABLE_MOUNTPOINT"
+
+  if ! findmnt --mountpoint $BACKINGFILES_MOUNTPOINT > /dev/null
+  then
+    setup_progress "Mounting the partition for the backing files..."
+    # Detach stale loop devices from previous backing file images that
+    # might block the mount (common when migrating from TeslaUSB).
+    for loop in $(losetup -a 2>/dev/null | grep "$BACKINGFILES_MOUNTPOINT/" | cut -d: -f1); do
+      umount "$loop" 2>/dev/null || true
+      losetup -d "$loop" 2>/dev/null || true
+    done
+    # Clear the XFS log to prevent slow journal replay on dirty filesystems.
+    # On large drives (1TB+) previously used by TeslaUSB, replaying a dirty
+    # journal can take 10+ minutes and appear to hang.
+    bf_dev=$(findfs LABEL=backingfiles 2>/dev/null || true)
+    if [ -n "$bf_dev" ]; then
+      timeout 60 xfs_repair -L "$bf_dev" 2>/dev/null || true
+    fi
+    mount $BACKINGFILES_MOUNTPOINT
+    setup_progress "Mounted the partition for the backing files."
+  fi
+
+  if ! findmnt --mountpoint $MUTABLE_MOUNTPOINT > /dev/null
+  then
+    setup_progress "Mounting the mutable partition..."
+    mount $MUTABLE_MOUNTPOINT
+    setup_progress "Mounted the mutable partition."
+  fi
+
+  # Only clean up snapshots and TeslaCam symlinks when the cam disk image
+  # doesn't exist yet (fresh install).  For re-runs where the image is
+  # recreated due to a size change, create-backingfiles.sh handles cleanup
+  # so that data is preserved when nothing actually changed.
+  if [ ! -e "$BACKINGFILES_MOUNTPOINT/cam_disk.bin" ]
+  then
+    if [ -d "$MUTABLE_MOUNTPOINT/TeslaCam" ]
+    then
+      setup_progress "Cleaning old TeslaCam symlinks..."
+      rm -rf "$MUTABLE_MOUNTPOINT/TeslaCam/RecentClips" "$MUTABLE_MOUNTPOINT/TeslaCam/SavedClips" "$MUTABLE_MOUNTPOINT/TeslaCam/SentryClips" "$MUTABLE_MOUNTPOINT/TeslaCam/TeslaTrackMode"
+      rm -f "$MUTABLE_MOUNTPOINT/sentry_files_archived"
+    fi
+    if [ -d "$BACKINGFILES_MOUNTPOINT/snapshots" ]
+    then
+      setup_progress "Cleaning old snapshots..."
+      rm -rf "$BACKINGFILES_MOUNTPOINT/snapshots"
+    fi
+  fi
+
+  setup_progress "Creating backing disk files."
+  copy_script tools/resize-image.sh /root/bin
+  copy_script setup/pi/create-backingfiles.sh /tmp
+  /tmp/create-backingfiles.sh "$CAM_SIZE" "$MUSIC_SIZE" "$LIGHTSHOW_SIZE" "$BOOMBOX_SIZE" "$BACKINGFILES_MOUNTPOINT" "$USE_EXFAT" 50M
+
+  update_backingfiles_fstab_entry $BACKINGFILES_MOUNTPOINT/cam_disk.bin /mnt/cam
+  update_backingfiles_fstab_entry $BACKINGFILES_MOUNTPOINT/music_disk.bin /mnt/music
+  update_backingfiles_fstab_entry $BACKINGFILES_MOUNTPOINT/lightshow_disk.bin /mnt/lightshow
+  update_backingfiles_fstab_entry $BACKINGFILES_MOUNTPOINT/boombox_disk.bin /mnt/boombox
+  update_backingfiles_fstab_entry $BACKINGFILES_MOUNTPOINT/wraps_disk.bin /mnt/wraps
+
+  # mount cam image and make sure the right directories exist
+  umount /mnt/cam > /dev/null || true
+  local ret=0
+  /root/bin/disable_gadget.sh || ret=$?
+  if (( (ret == 0) || (ret == 2) ))
+  then
+    if [ -e /backingfiles/cam_disk.bin ] && mount_with_retry /mnt/cam
+    then
+      mkdir -p /mnt/cam/TeslaCam
+      mkdir -p /mnt/cam/TeslaTrackMode
+      touch /mnt/cam/.metadata_never_index
+
+      local -r sentrylist_previously_archived=/mutable/sentry_files_archived
+
+      # For upgrades from before snapshot-archiving, assume everything from the
+      # snapshots -except the files still on the disk image- was already archived,
+      # to avoid re-archiving things that were manually deleted from the archive
+      # server.
+      if [ ! -e "$sentrylist_previously_archived" ] && [ -d "$MUTABLE_MOUNTPOINT/TeslaCam" ]
+      then
+        find "$MUTABLE_MOUNTPOINT/TeslaCam" -type l -printf '%P\n' | sort > /tmp/allfiles.txt
+        find /mnt/cam/TeslaCam /mnt/cam/ -type f -printf '%P\n' | sort > /tmp/stilloncard.txt
+        comm -2 -3 /tmp/allfiles.txt /tmp/stilloncard.txt > "$sentrylist_previously_archived"
+        rm -f /tmp/allfiles.txt /tmp/stilloncard.txt
+      fi
+
+      umount -l /mnt/cam || setup_progress "failed to unmount /mnt/cam"
+    fi
+
+    if [ -e /backingfiles/music_disk.bin ] && mount_with_retry /mnt/music
+    then
+      touch /mnt/music/.metadata_never_index
+      umount -l /mnt/music || setup_progress "failed to unmount /mnt/music"
+    fi
+
+    if [ -e /backingfiles/lightshow_disk.bin ] && mount_with_retry /mnt/lightshow
+    then
+      mkdir -p /mnt/lightshow/LightShow
+      touch /mnt/lightshow/.metadata_never_index
+      umount -l /mnt/lightshow || setup_progress "failed to unmount /mnt/lightshow"
+    fi
+
+    if [ -e /backingfiles/boombox_disk.bin ] && mount_with_retry /mnt/boombox
+    then
+      mkdir -p /mnt/boombox/Boombox
+      touch /mnt/boombox/.metadata_never_index
+      umount -l /mnt/boombox || setup_progress "failed to unmount /mnt/boombox"
+    fi
+
+    if [ -e /backingfiles/wraps_disk.bin ] && mount_with_retry /mnt/wraps
+    then
+      mkdir -p /mnt/wraps/Wraps
+      touch /mnt/wraps/.metadata_never_index
+      umount -l /mnt/wraps || setup_progress "failed to unmount /mnt/wraps"
+    fi
+
+  else
+    setup_progress "STOP: Couldn't check image"
+    exit 1
+  fi
+}
+
+function configure_hostname () {
+  local new_host_name="$SENTRYUSB_HOSTNAME"
+  local old_host_name
+  old_host_name=$(hostname)
+
+  # Set the specified hostname if it differs from the current name
+  if [ "$new_host_name" != "$old_host_name" ]
+  then
+    setup_progress "Configuring the hostname..."
+
+    # Set the kernel hostname first so /etc/hosts and the kernel agree
+    echo "$new_host_name" > /etc/hostname
+    while ! hostnamectl set-hostname "$new_host_name"
+    do
+      if [ ! -e /lib/systemd/system/dbus.service ]
+      then
+        break
+      fi
+      setup_progress "hostnamectl failed, retrying"
+      sleep 1
+    done
+
+    # Ensure /etc/hosts has a correct 127.0.1.1 entry for the new hostname.
+    # A global sed replace is fragile — instead, explicitly manage the line.
+    if grep -q "^127\.0\.1\.1" /etc/hosts; then
+      sed -i -e "s/^127\.0\.1\.1.*/127.0.1.1\t$new_host_name/" /etc/hosts
+    else
+      echo "127.0.1.1	$new_host_name" >> /etc/hosts
+    fi
+
+    # Restart avahi so it picks up the new hostname for .local mDNS
+    systemctl restart avahi-daemon || true
+    setup_progress "Configured hostname: $(hostname)"
+  fi
+}
+
+function make_root_fs_readonly () {
+  copy_script setup/pi/make-root-fs-readonly.sh /tmp
+  /tmp/make-root-fs-readonly.sh
+}
+
+function update_package_index () {
+  setup_progress "Updating package index files..."
+  # the package index might be in a bad state if setup was previously
+  # interrupted, so fix it up first
+  dpkg --configure -a || true
+  if [ "$(. /etc/os-release && echo "${VERSION_ID:-}")" = "10" ] && grep -q 'raspbian\.raspberrypi\.org' /etc/apt/sources.list
+  then
+    echo "Updating apt sources for legacy Buster (consider using a more recent image)"
+    sed -i 's|raspbian.raspberrypi.org|legacy.raspbian.org|g' /etc/apt/sources.list
+  fi
+
+  while ! (apt-get update || apt-get update --allow-releaseinfo-change)
+  do
+    setup_progress "Failed, retrying"
+    sleep 2
+  done
+}
+
+function upgrade_packages () {
+  if [ "$UPGRADE_PACKAGES" = true ]
+  then
+    setup_progress "Upgrading installed packages..."
+    # clean the cache to free up space, since especially
+    # a kernel update requires quite a bit of temporary
+    # extra space
+    apt-get clean
+    apt-get --assume-yes upgrade
+  else
+    setup_progress "Skipping package upgrade."
+  fi
+  # no real need to keep the cache around after setup
+  apt-get clean
+  fstrim / || true
+}
+
+function set_timezone () {
+  if [ -n "${TIME_ZONE:+x}" ]
+  then
+    if [ -f "/usr/share/zoneinfo/$TIME_ZONE" ]
+    then
+      ln -sf "/usr/share/zoneinfo/$TIME_ZONE" /etc/localtime
+    elif [ "$TIME_ZONE" = "auto" ]
+    then
+      if curlwrapper -o /root/bin/tzupdate.py https://raw.githubusercontent.com/marcone/tzupdate/develop/tzupdate.py
+      then
+        chmod +x /root/bin/tzupdate.py
+        if ! tzout=$(/root/bin/tzupdate.py 2>&1)
+        then
+          setup_progress "auto timezone failed: $tzout"
+        else
+          setup_progress "$tzout"
+        fi
+      fi
+    else
+      setup_progress "invalid timezone: $TIME_ZONE"
+    fi
+  fi
+}
+
+# There's probably a better way of doing this.
+# If not, there should be.
+function get_usb_state {
+  local current
+  local last;
+  current=$(cat /sys/class/udc/*/state)
+  echo -n "Gadget state: $current"
+  if [ "$current" = "configured" ]
+  then
+    echo
+    return
+  fi
+  last=$(dmesg | grep 'g_mass_storage\|dwc2' | tail -1)
+  if [ -z "$last" ]
+  then
+    echo ". No UMS/dwc2 messages in dmesg"
+    return
+  fi
+  local usbstatetime
+  usbstatetime=$(echo "$last" | tr -d '[]' | awk '{print $1}')
+  now=$(awk '{print $1}' /proc/uptime)
+  awk "BEGIN {printf \". %.1f seconds ago: \", $now-$usbstatetime}"
+  case $last in
+    # this message is now a debug log and doesn't show in normal builds
+    *"Linux File-Backed Storage")
+      echo "connected to host and host mounted drive(s)"
+      ;;
+    *"new device"*)
+      ;&
+    *"new address"*)
+      echo "connected to host"
+      ;;
+    *"bound driver"*)
+      echo "mass storage ready, but not connected to host (check cable)"
+      ;;
+    *)
+      echo "unknown":
+  esac
+}
+
+function cmd_install {
+  /root/bin/remountfs_rw
+  copy_script "$1" /root/bin
+  setup_progress "$1 installed in /root/bin/"
+  exit
+}
+
+function cmd_selfupdate {
+  echo "The 'selfupdate' command is no longer supported. Run '$0 upgrade' instead."
+  exit 0
+}
+
+function cmd_upgrade {
+  if [ ! -e /sentryusb/SENTRYUSB_SETUP_FINISHED ]
+  then
+    echo "STOP: previous setup didn't finish, can't upgrade unfinished install"
+    exit 1
+  fi
+  copy_script setup/pi/setup-sentryusb /tmp &> /dev/null
+  copy_script setup/pi/envsetup.sh /tmp &> /dev/null
+  exec bash -c "/tmp/setup-sentryusb upgrade_prepare && NO_REBOOT_PROMPT=1 /tmp/setup-sentryusb && /tmp/setup-sentryusb upgrade_finish"
+}
+
+function cmd_upgrade_prepare {
+  setup_progress "preparing for full upgrade"
+  (
+    systemctl stop sentryusb-archive || true
+    killall archiveloop || true
+    service smbd stop || true
+    service autofs stop || true
+    umount /backingfiles/snapshots/snap*/mnt || true
+    umount /mnt/cam /mnt/music || true
+    umount /mnt/lightshow || true
+    umount /mnt/boombox || true
+    umount /mnt/archive /mnt/musicarchive || true
+    /root/bin/disable_gadget.sh || true
+    /root/bin/remountfs_rw
+    # a previous bookworm install may have the makers in /boot, so move
+    # them to /sentryusb (/boot/firmware)
+    if [ ! /boot -ef /sentryusb ]
+    then
+      for i in WIFI_ENABLED SENTRYUSB_SETUP_STARTED SENTRYUSB_SETUP_FINISHED
+      do
+        if [ -e "/boot/$i" ]
+        then
+          mv "/boot/$i" /sentryusb
+        fi
+      done
+    fi
+  ) &> /dev/null
+}
+
+function cmd_upgrade_finish {
+  mv /tmp/setup-sentryusb /root/bin/setup-sentryusb
+  mv /tmp/envsetup.sh /root/bin/envsetup.sh
+  setup_progress "upgrade finished"
+  for i in {5..1}
+  do
+    echo -e -n "rebooting in $i seconds to apply changes, press ctrl-c to abort\r"
+    sleep 1
+  done
+  echo -e '\nRebooting'
+  reboot
+}
+
+# Install or update just the BLE peripheral daemon and its dependencies.
+# Much faster than a full upgrade — use this to add BLE support to an
+# existing install without re-running the entire setup.
+#
+# Usage: setup-sentryusb install_ble
+function cmd_install_ble {
+  if [ ! -e /sentryusb/SENTRYUSB_SETUP_FINISHED ]
+  then
+    echo "STOP: run this only on a completed install. Run full setup first."
+    exit 1
+  fi
+
+  setup_progress "Installing/updating SentryUSB BLE peripheral daemon..."
+
+  /root/bin/remountfs_rw
+
+  # Install Python dependencies and ensure BlueZ is present
+  for pkg in python3-dbus python3-gi bluez avahi-daemon; do
+    if ! dpkg-query -W --showformat='${db:Status-Status}\n' "$pkg" 2>/dev/null | grep -q '^installed$'; then
+      setup_progress "Installing $pkg..."
+      DEBIAN_FRONTEND=noninteractive apt-get -y --force-yes install "$pkg" || \
+        setup_progress "WARNING: failed to install $pkg"
+    fi
+  done
+
+  # Download latest BLE daemon and service file
+  mkdir -p /root/bin
+  copy_script server/ble/sentryusb-ble.py /root/bin || true
+  chmod +x /root/bin/sentryusb-ble.py
+  copy_script server/ble/sentryusb-ble.service /etc/systemd/system || true
+
+  # Install D-Bus policy file for BLE daemon (required on Pi 5 / Bookworm)
+  copy_script server/ble/com.sentryusb.ble.conf /etc/dbus-1/system.d || true
+  if [ -f /etc/dbus-1/system.d/com.sentryusb.ble.conf ]; then
+    setup_progress "D-Bus policy installed for BLE daemon"
+  fi
+
+  # Set up bluetoothd --experimental override with the correct detected path.
+  # --experimental enables LEAdvertisingManager1 on older BlueZ versions.
+  BTDAEMON=$(systemctl cat bluetooth.service 2>/dev/null | grep '^ExecStart=' | head -1 | sed 's/ExecStart=//' | awk '{print $1}')
+  BTDAEMON=${BTDAEMON:-$(command -v bluetoothd 2>/dev/null)}
+  if [ -n "$BTDAEMON" ] && [ -x "$BTDAEMON" ]; then
+    mkdir -p /etc/systemd/system/bluetooth.service.d
+    cat > /etc/systemd/system/bluetooth.service.d/sentryusb-experimental.conf << EOF
+[Service]
+ExecStart=
+ExecStart=$BTDAEMON --experimental
+EOF
+    setup_progress "bluetoothd experimental mode enabled ($BTDAEMON)"
+  else
+    setup_progress "WARNING: could not detect bluetoothd path, skipping --experimental override"
+  fi
+
+  # Install Avahi mDNS advertisement so the iOS app can discover the Pi over WiFi
+  mkdir -p /etc/avahi/services
+  copy_script setup/pi/avahi-sentryusb.service /tmp || true
+  [ -f /tmp/avahi-sentryusb.service ] && mv /tmp/avahi-sentryusb.service /etc/avahi/services/sentryusb.service
+
+  systemctl daemon-reload
+  systemctl enable avahi-daemon 2>/dev/null || true
+  systemctl restart avahi-daemon 2>/dev/null || true
+  systemctl restart bluetooth 2>/dev/null || true
+  sleep 3
+  systemctl enable sentryusb-ble 2>/dev/null || true
+  systemctl restart sentryusb-ble 2>/dev/null || true
+
+  setup_progress "BLE daemon installed and started."
+  setup_progress "Check status with:  journalctl -u sentryusb-ble -n 20 --no-pager"
+}
+
+# Fix WiFi/networking on installs that used the old read-only setup (symlinks to
+# /mutable). Run after remounting root rw. Safe to run multiple times.
+function cmd_fix_networking {
+  if [ ! -e /sentryusb/SENTRYUSB_SETUP_FINISHED ]; then
+    setup_progress "STOP: run this only on a completed install. Run full setup first."
+    exit 1
+  fi
+  setup_progress "Remounting root read-write..."
+  /root/bin/remountfs_rw
+  copy_script setup/pi/fix-readonly-networking.sh /tmp
+  /tmp/fix-readonly-networking.sh
+  setup_progress "Networking fix applied. Reboot for WiFi/AP to work correctly."
+}
+
+function checkmounted() {
+  if ! findmnt "$1" &> /dev/null
+  then
+    echo "ERROR: $1 is not mounted"
+  fi
+}
+
+function checkfsrw() {
+  local -r opts=$(findmnt -n -o options "$1")
+  local -r rw=${opts:0:2}
+  if [[ "$rw" != "$2" ]]
+  then
+    echo "$1 is $rw, should be $2"
+  fi
+}
+
+function boot_is_not_on_root {
+  [ "$(stat -c "%d" /)" -ne "$(stat -L -c "%d" /sentryusb)" ]
+}
+
+function diagnose {
+  local hardware
+  local os
+
+  hardware=$( tr -d '\000' < /sys/firmware/devicetree/base/model )
+  os=$(. /etc/os-release && echo "$PRETTY_NAME")
+  {
+    echo -e "====== summary ======"
+    echo -e "hardware: ${hardware}"
+    echo -e "OS: ${os}"
+    if [ "${ARCHIVE_SYSTEM:-unset}" = "unset" ]
+    then
+      echo "ERROR: no archive method specified!"
+    elif [ "${ARCHIVE_SYSTEM:-none}" = "cifs" ]
+    then
+      if grep -q '/mnt/archive' /etc/fstab
+      then
+        echo "CIFS archiving selected"
+      else
+        echo "ERROR: CIFS archiving selected, but archive not defined in fstab"
+      fi
+    elif [ "${ARCHIVE_SYSTEM:-none}" = "nfs" ]
+    then
+      if grep -q '/mnt/archive' /etc/fstab
+      then
+        echo "NFS archiving selected"
+      else
+        echo "ERROR: NFS archiving selected, but archive not defined in fstab"
+      fi
+    elif [ "${ARCHIVE_SYSTEM:-none}" = "rclone" ]
+    then
+      if [ ! -e "/root/.config/rclone/rclone.conf" ]
+      then
+        echo "ERROR: rclone archiving selected, but rclone config does not exist"
+      elif [ ! -L "/root/.config/rclone" ]
+      then
+        echo "ERROR: rclone archiving selected, but rclone config is in /root"
+      else
+        echo "rclone archiving selected"
+      fi
+    else
+      echo "archive method: ${ARCHIVE_SYSTEM:-unset}"
+    fi
+
+    if [[ "$DATA_DRIVE" != "" ]] && (isPi4 || isPi5)
+    then
+      echo "DATA_DRIVE=$DATA_DRIVE: consider booting from USB instead."
+    fi
+
+    if ! blkid -L backingfiles > /dev/null
+    then
+      echo "ERROR: backingfiles partition does not exist"
+    fi
+    if [ ! -d /backingfiles ]
+    then
+      echo "backingfiles directory does not exist"
+    fi
+    if ! grep -q '/backingfiles' /etc/fstab
+    then
+      echo "ERROR: backingfiles not in fstab"
+    fi
+
+    if [ ! -f /backingfiles/cam_disk.bin ]
+    then
+      echo "ERROR: cam disk image does not exist"
+    fi
+    if ! grep -q '/backingfiles/cam_disk.bin' /etc/fstab
+    then
+      echo "ERROR: cam disk image not in fstab"
+    fi
+    for i in 0 1 2 3 4 5 6
+    do
+      LUN="/sys/kernel/config/usb_gadget/sentryusb/functions/mass_storage.0/lun.${i}/file"
+      if [ -e "$LUN" ]
+      then
+        echo "lun${i} connected, from file $(cat "$LUN")"
+      fi
+    done
+    if ! blkid -L mutable > /dev/null
+    then
+      echo "ERROR: mutable partition does not exist"
+    fi
+    if [ ! -d /mutable ]
+    then
+      echo "ERROR: mutable directory does not exist"
+    fi
+    if ! grep -q '/mutable' /etc/fstab
+    then
+      echo "ERROR: mutable not in fstab"
+    fi
+
+    if [ -n "${SNAPSHOT_INTERVAL:+x}" ]
+    then
+      echo "Snapshot interval: $SNAPSHOT_INTERVAL"
+    fi
+
+    numsnapshots=$( mount | grep -c snapshot )
+    echo "$numsnapshots snapshots mounted"
+
+    if [ ! -e /sentryusb/SENTRYUSB_SETUP_FINISHED ]
+    then
+      echo 'ERROR: setup did not finish'
+    fi
+
+    get_usb_state
+
+    local -r archiveloopcount=$(pgrep -f archiveloop | wc -l)
+    if ((archiveloopcount <= 2))
+    then
+      echo "archiveloop is not running"
+      journalctl -u sentryusb-archive | tail -30
+    fi
+
+    local -r inodes=$(df --output=ipcent /mutable/ | sed 1d | sed 's/[^0-9]//g')
+    if [[ "$inodes" -gt 80 ]]
+    then
+      echo "WARNING: /mutable is low on inodes: ${inodes}% used"
+    fi
+
+    if [[ "$BRANCH" != "main-dev" || "$REPO" != "Scottmg1" ]]
+    then
+      echo "WARNING: using $REPO/$BRANCH"
+    fi
+
+    if [ -x /root/bin/archive-filter ]
+    then
+      echo "Custom archive filter is in use"
+    fi
+
+    read -r offset <<<"$(sfdisk -l -q -o START /backingfiles/cam_disk.bin | tail -1)"
+    fstype=$(blkid --probe -o value -s TYPE --offset $((offset*512)) /backingfiles/cam_disk.bin)
+    if [ "$fstype" = "exfat" ]
+    then
+      echo "CAM drive is formatted as ExFAT. Recommend using FAT32 instead."
+    fi
+    checkfsrw / ro
+    if boot_is_not_on_root
+    then
+      checkfsrw /sentryusb ro
+    fi
+    checkfsrw /backingfiles rw
+    checkfsrw /mutable rw
+    checkmounted /var/www/html/TeslaCam
+    checkmounted /var/www/html/fs
+
+    echo -e "====== disk / images ======"
+    parted -s "${BOOT_DISK}" print || true
+    if [ -n "${DATA_DRIVE:+x}" ]
+    then
+      parted -s "$DATA_DRIVE" print || true
+    fi
+    if [ -f /backingfiles/cam_disk.bin ]
+    then
+      echo "cam disk image has $(filefrag /backingfiles/cam_disk.bin | awk '{print $2}') extents"
+      parted -s /backingfiles/cam_disk.bin print || true
+    else
+      echo "no cam disk image found"
+    fi
+    if [ -f /backingfiles/music_disk.bin ]
+    then
+      echo "music disk image has $(filefrag /backingfiles/music_disk.bin | awk '{print $2}') extents"
+      parted -s /backingfiles/music_disk.bin print || true
+    else
+      echo "no music disk image found"
+    fi
+    if [ -f /backingfiles/lightshow_disk.bin ]
+    then
+      echo "lightshow disk image has $(filefrag /backingfiles/lightshow_disk.bin | awk '{print $2}') extents"
+      parted -s /backingfiles/lightshow_disk.bin print || true
+    else
+      echo "no lightshow disk image found"
+    fi
+    if [ -f /backingfiles/boombox_disk.bin ]
+    then
+      echo "boombox disk image has $(filefrag /backingfiles/boombox_disk.bin | awk '{print $2}') extents"
+      parted -s /backingfiles/boombox_disk.bin print || true
+    else
+      echo "no boombox disk image found"
+    fi
+    df -h /sentryusb/ / /backingfiles/ /mutable/
+    echo -e "====== network ======"
+    ifconfig
+    iwconfig wlan0 | grep Link
+
+    echo -e "====== access point ======"
+    if iw dev ap0 info &> /dev/null
+    then
+      echo "ap0 interface exists"
+      iw dev ap0 info || true
+      ip addr show ap0 2>/dev/null || true
+    else
+      echo "ap0 interface does not exist"
+    fi
+    if nmcli con show SENTRYUSB_AP &> /dev/null
+    then
+      echo "SENTRYUSB_AP connection exists"
+      nmcli con show SENTRYUSB_AP 2>/dev/null | head -20 || true
+    else
+      echo "SENTRYUSB_AP connection not found in NetworkManager"
+    fi
+    if systemctl is-active hostapd &> /dev/null
+    then
+      echo "hostapd is running"
+    elif systemctl is-enabled hostapd &> /dev/null
+    then
+      echo "hostapd is enabled but not running"
+      journalctl -u hostapd --no-pager -n 10 2>/dev/null || true
+    else
+      echo "hostapd is not enabled (using NetworkManager AP mode or AP not configured)"
+    fi
+    if systemctl is-active dnsmasq &> /dev/null
+    then
+      echo "dnsmasq is running"
+    fi
+
+    echo -e "====== bluetooth / BLE ======"
+    if command -v hciconfig &> /dev/null
+    then
+      hciconfig -a 2>/dev/null || echo "hciconfig failed"
+    else
+      echo "hciconfig not installed"
+    fi
+    if command -v bluetoothctl &> /dev/null
+    then
+      bluetoothctl show 2>/dev/null || echo "bluetoothctl show failed"
+    fi
+    if dpkg-query -W --showformat='${db:Status-Status}\n' "bluez" 2>/dev/null | grep -q '^installed$'
+    then
+      echo "bluez is installed"
+    else
+      echo "bluez is NOT installed"
+    fi
+    if systemctl is-active bluetooth &> /dev/null
+    then
+      echo "bluetooth service is running"
+    else
+      echo "bluetooth service is NOT running"
+      journalctl -u bluetooth --no-pager -n 10 2>/dev/null || true
+    fi
+    if [ -f /root/.ble/key_public.pem ]
+    then
+      echo "BLE public key exists: /root/.ble/key_public.pem"
+    else
+      echo "BLE public key does NOT exist"
+    fi
+    if [ -f /root/.ble/key_private.pem ]
+    then
+      echo "BLE private key exists: /root/.ble/key_private.pem"
+    else
+      echo "BLE private key does NOT exist"
+    fi
+    if [ -x /root/bin/tesla-control ]
+    then
+      echo "tesla-control binary exists"
+    else
+      echo "tesla-control binary does NOT exist"
+    fi
+    if [ -x /root/bin/tesla-keygen ]
+    then
+      echo "tesla-keygen binary exists"
+    else
+      echo "tesla-keygen binary does NOT exist"
+    fi
+    if [ -n "${TESLA_BLE_VIN:+x}" ]
+    then
+      echo "TESLA_BLE_VIN is set: ${TESLA_BLE_VIN}"
+      if [ -x /root/bin/tesla-control ] && [ -f /root/.ble/key_private.pem ]
+      then
+        if /root/bin/tesla-control -ble -vin "${TESLA_BLE_VIN^^}" body-controller-state 2>/dev/null
+        then
+          echo "Car is reachable via BLE"
+          if /root/bin/tesla-control -ble -vin "${TESLA_BLE_VIN^^}" session-info /root/.ble/key_private.pem infotainment 2>/dev/null
+          then
+            echo "BLE key is PAIRED with the car"
+          else
+            echo "BLE key is NOT paired with the car (or session-info failed)"
+          fi
+        else
+          echo "Car is NOT reachable via BLE (out of range or BLE issue)"
+        fi
+      fi
+    else
+      echo "TESLA_BLE_VIN is not set (BLE not configured)"
+    fi
+
+    echo -e "====== fstab ======"
+    if [ -e /etc/fstab ]
+    then
+      cat /etc/fstab
+    else
+      echo "no fstab found"
+    fi
+
+    echo -e "====== mounts ======"
+    mount
+
+    echo -e "====== initial setup boot log ======"
+    mkdir /tmp/root$$
+    mount --bind / /tmp/root$$
+    if [ -e /tmp/root$$/var/log/boot.log ]
+    then
+      cat /tmp/root$$/var/log/boot.log
+    else
+      echo "no boot log found"
+    fi
+    umount /tmp/root$$
+    rmdir /tmp/root$$
+
+    echo -e "====== rc.local log ======"
+    journalctl -u rc-local
+
+    echo -e "====== setup log ======"
+    if [ -e /sentryusb/sentryusb-setup.log ]
+    then
+      cat /sentryusb/sentryusb-setup.log
+    else
+      echo "no setup log found"
+    fi
+
+    echo -e "====== archiveloop log ======"
+    if [ -e /mutable/archiveloop.log ]
+    then
+      cat /mutable/archiveloop.log
+    else
+      echo "no archiveloop log found"
+    fi
+
+    echo -e "====== system log ======"
+    if [ -x /bin/logread ]
+    then
+      /bin/logread
+    else
+      echo "logread not installed"
+    fi
+
+    echo -e "====== dmesg ======"
+    dmesg -T
+    echo -e "====== process list and uptime ======"
+    ps -eaf
+    echo "$(hostname) has been $(uptime -p). System time is $(date)"
+    echo -e "====== end of diagnostics ======"
+  }
+}
+
+function cmd_diagnose {
+  { diagnose || true; } |&
+    # clean up the output a bit
+    tr '\r' '\n' |
+    sed '/^ *$/d' |
+    grep -a -v '^Reading package lists' |
+    grep -a -v '^(Reading database' |
+    grep -a -v "^Adding 'diversion of" |
+    grep -a -v "^Removing 'diversion of" |
+    sed -E 's/\o033\[0;32m//' |
+    sed -E 's/\o033\[0m//'
+}
+
+export -f setup_progress
+
+INSTALL_DIR=${INSTALL_DIR:-/root/bin}
+if [ "$INSTALL_DIR" != "/root/bin" ]
+then
+  setup_progress "WARNING: 'INSTALL_DIR' setup variable no longer supported"
+fi
+
+BRANCHNAME="$BRANCH"
+
+if [ -n "${1:+x}" ]
+then
+  command=cmd_$1
+  if typeset -f "$command" > /dev/null
+  then
+    shift
+    $command "$@"
+    exit 0
+  else
+    setup_progress "unknown command: $1"
+    exit 1
+  fi
+fi
+
+# Turn on all leds in case they're still flashing
+# from pre-setup.
+for led in /sys/class/leds/*
+do
+  if [ -e "$led/trigger" ]
+  then
+    echo none > "$led/trigger" || true
+    echo 1 > "$led/brightness" || true
+  fi
+done
+
+# Update config.txt if needed
+# Pi 3 needs dr_mode=peripheral to ensure the DWC2 controller operates in
+# gadget/peripheral mode rather than defaulting to host mode.
+# Pi 4 and Pi 5 need the overlay under their model-specific [piN] section
+# because modern Raspberry Pi OS (Bookworm) uses conditional sections in
+# config.txt — a globally placed dtoverlay can be ignored.
+if [ -f "$PICONFIG_PATH" ]
+then
+  if isPi3
+  then
+    if ! grep -q 'dtoverlay=dwc2,dr_mode=peripheral' "$PICONFIG_PATH"
+    then
+      sed -i '/^dtoverlay=dwc2$/d' "$PICONFIG_PATH"
+      echo -e "dtoverlay=dwc2,dr_mode=peripheral\n" >> "$PICONFIG_PATH"
+      setup_progress "rebooting to apply dwc2 overlay change (peripheral mode for Pi 3)"
+      reboot
+      exit 0
+    fi
+  elif isPi4
+  then
+    # Ensure [pi4] section exists with dtoverlay=dwc2.
+    # Remove any stale global dtoverlay=dwc2 (left over from base image)
+    # since Pi 4 needs it under the [pi4] conditional section.
+    pi4_needs_reboot=false
+    if grep -q '^\[pi4\]' "$PICONFIG_PATH"
+    then
+      # Section exists — check if dtoverlay=dwc2 is present within it
+      if ! sed -n '/^\[pi4\]/,/^\[/p' "$PICONFIG_PATH" | grep -q 'dtoverlay=dwc2'
+      then
+        sed -i '/^\[pi4\]/a dtoverlay=dwc2' "$PICONFIG_PATH"
+        pi4_needs_reboot=true
+      fi
+    else
+      # No [pi4] section — create one
+      if grep -q '^\[cm4\]' "$PICONFIG_PATH"
+      then
+        sed -i '/^\[cm4\]/i [pi4]\ndtoverlay=dwc2\n' "$PICONFIG_PATH"
+      else
+        printf '\n[pi4]\ndtoverlay=dwc2\n' >> "$PICONFIG_PATH"
+      fi
+      pi4_needs_reboot=true
+    fi
+    # Clean up global dtoverlay=dwc2 that is outside any section
+    sed -i '/^\[/,$!{/^dtoverlay=dwc2$/d}' "$PICONFIG_PATH"
+    if [ "$pi4_needs_reboot" = true ]
+    then
+      setup_progress "rebooting to apply dwc2 overlay change (Pi4 gadget mode)"
+      reboot
+      exit 0
+    fi
+  elif isPi5
+  then
+    # Ensure [pi5] section exists with dtoverlay=dwc2.
+    # Remove any stale global dtoverlay=dwc2 (left over from base image)
+    # since Pi 5 needs it under the [pi5] conditional section.
+    pi5_needs_reboot=false
+    if grep -q '^\[pi5\]' "$PICONFIG_PATH"
+    then
+      # Section exists — check if dtoverlay=dwc2 is present within it
+      if ! sed -n '/^\[pi5\]/,/^\[/p' "$PICONFIG_PATH" | grep -q 'dtoverlay=dwc2'
+      then
+        sed -i '/^\[pi5\]/a dtoverlay=dwc2' "$PICONFIG_PATH"
+        pi5_needs_reboot=true
+      fi
+    else
+      # No [pi5] section — create one
+      if grep -q '^\[cm5\]' "$PICONFIG_PATH"
+      then
+        sed -i '/^\[cm5\]/i [pi5]\ndtoverlay=dwc2\n' "$PICONFIG_PATH"
+      else
+        printf '\n[pi5]\ndtoverlay=dwc2\n' >> "$PICONFIG_PATH"
+      fi
+      pi5_needs_reboot=true
+    fi
+    # Clean up global dtoverlay=dwc2 that is outside any section
+    sed -i '/^\[/,$!{/^dtoverlay=dwc2$/d}' "$PICONFIG_PATH"
+    if [ "$pi5_needs_reboot" = true ]
+    then
+      setup_progress "rebooting to apply dwc2 overlay change (Pi5 gadget mode)"
+      reboot
+      exit 0
+    fi
+  elif isPi2
+  then
+    # Ensure [pi02] section exists with dtoverlay=dwc2.
+    # The stock Bookworm config.txt has dtoverlay=dwc2 inside [cm5], so a
+    # bare grep would wrongly conclude the overlay is already enabled — but
+    # the [cm5] section does not apply to Pi Zero 2 W.
+    pi02_needs_reboot=false
+    if grep -q '^\[pi02\]' "$PICONFIG_PATH"
+    then
+      # Section exists — check if dtoverlay=dwc2 is present within it
+      if ! sed -n '/^\[pi02\]/,/^\[/p' "$PICONFIG_PATH" | grep -q 'dtoverlay=dwc2'
+      then
+        sed -i '/^\[pi02\]/a dtoverlay=dwc2' "$PICONFIG_PATH"
+        pi02_needs_reboot=true
+      fi
+    else
+      # No [pi02] section — create one before [all] if possible
+      if grep -q '^\[all\]' "$PICONFIG_PATH"
+      then
+        sed -i '/^\[all\]/i [pi02]\ndtoverlay=dwc2\n' "$PICONFIG_PATH"
+      else
+        printf '\n[pi02]\ndtoverlay=dwc2\n' >> "$PICONFIG_PATH"
+      fi
+      pi02_needs_reboot=true
+    fi
+    # Clean up global dtoverlay=dwc2 that is outside any section
+    sed -i '/^\[/,$!{/^dtoverlay=dwc2$/d}' "$PICONFIG_PATH"
+    if [ "$pi02_needs_reboot" = true ]
+    then
+      setup_progress "rebooting to apply dwc2 overlay change (Pi Zero 2 W gadget mode)"
+      reboot
+      exit 0
+    fi
+  else
+    # Fallback for other boards (Pi Zero W, etc.)
+    # Check that dtoverlay=dwc2 is present in the [all] section or globally
+    # (before any [section] header), not just anywhere in the file — the
+    # stock Bookworm config.txt has dtoverlay=dwc2 inside [cm5] which does
+    # not apply to other boards.
+    has_global_dwc2=false
+    if sed -n '1,/^\[/p' "$PICONFIG_PATH" | grep -q 'dtoverlay=dwc2'
+    then
+      has_global_dwc2=true
+    elif sed -n '/^\[all\]/,/^\[/p' "$PICONFIG_PATH" | grep -q 'dtoverlay=dwc2'
+    then
+      has_global_dwc2=true
+    fi
+    if [ "$has_global_dwc2" = false ]
+    then
+      if grep -q '^\[all\]' "$PICONFIG_PATH"
+      then
+        sed -i '/^\[all\]/a dtoverlay=dwc2' "$PICONFIG_PATH"
+      else
+        echo -e "dtoverlay=dwc2\n" >> "$PICONFIG_PATH"
+      fi
+      setup_progress "rebooting to apply dwc2 overlay change"
+      reboot
+      exit 0
+    fi
+  fi
+fi
+
+configure_hostname
+
+tmpdir=/tmp/$$
+mkdir -p "$tmpdir"
+copy_script setup/pi/setup-sentryusb "$tmpdir"  &> /dev/null
+if cmp -s "$tmpdir/setup-sentryusb" "$0"
+then
+  setup_progress "$0 is up to date"
+else
+  setup_progress "WARNING: $BRANCHNAME contains a different version of $0. It is recommended to run '$0 upgrade' to get the latest version."
+fi
+
+copy_script pi-gen-sources/00-sentryusb-tweaks/files/rc.local "$tmpdir" &> /dev/null
+if cmp -s "$tmpdir/rc.local" /etc/rc.local
+then
+  setup_progress "rc.local is up to date"
+else
+  setup_progress "updating rc.local"
+  mv "$tmpdir/rc.local" /etc/rc.local
+  parent=$(ps -o ppid= $PPID)
+  grandparent=$(ps -o ppid= "$((parent))" )
+  caller=$(ps -o comm= "$((grandparent))")
+  if [ "$caller" = "rc.local" ] && [ ! -t 0 ]
+  then
+    setup_progress "rebooting to run updated rc.local"
+    exec reboot
+  fi
+fi
+
+update_package_index
+
+# set time zone so we get decent timestamps in the rest of the setup log
+set_timezone
+
+# Ensure modules-load=dwc2,g_ether is in cmdline.txt before verifying
+# the UDC. Without this, the dwc2 kernel module may not load on boot
+# (especially on Pi Zero W) and the UDC check will fail.
+if fix_cmdline_txt_modules_load
+then
+  setup_progress "rebooting to apply cmdline.txt modules-load change"
+  reboot
+  exit 0
+fi
+
+# Flash for stage 2 headless (verify requested configuration)
+headless_setup_progress_flash 2
+
+setup_progress "Verifying that the requested configuration is valid..."
+
+verify_configuration
+
+# Flash for Stage 3 headless (grab scripts)
+headless_setup_progress_flash 3
+
+mkdir -p /root/bin
+
+get_common_scripts
+
+install_ble_daemon
+update_sentryusb_binary
+update_sentryusb_service
+install_avahi_service
+
+pushd ~
+
+fix_uas_quirks
+
+# Flash for stage 4 headless (Create backing files)
+headless_setup_progress_flash 4
+
+create_usb_drive_backing_files
+
+if [ "$CONFIGURE_ARCHIVING" = true ]
+then
+  setup_progress "calling configure.sh"
+  export -f curlwrapper
+  export -f copy_script
+  copy_script setup/pi/configure.sh /tmp
+  /tmp/configure.sh
+else
+  setup_progress "skipping configure.sh"
+fi
+
+if [ "$SAMBA_ENABLED" = "true" ]
+then
+  export SAMBA_GUEST
+  copy_script setup/pi/configure-samba.sh /tmp
+  /tmp/configure-samba.sh
+fi
+
+if [ -n "${AP_SSID:+x}" ]
+then
+  copy_script setup/pi/configure-ap.sh /tmp
+  /tmp/configure-ap.sh
+fi
+
+copy_script setup/pi/configure-automount.sh /tmp
+/tmp/configure-automount.sh
+
+copy_script setup/pi/configure-web.sh /tmp
+/tmp/configure-web.sh
+
+copy_script setup/pi/configure-ssh.sh /tmp
+/tmp/configure-ssh.sh
+
+copy_script setup/pi/configure-rtc.sh /tmp
+/tmp/configure-rtc.sh
+
+# source setup-sentryusb from .bashrc to set up completion
+if ! grep -q envsetup.sh /root/.bashrc
+then
+  echo "source /root/bin/envsetup.sh" >> /root/.bashrc
+fi
+sed -i '/source \/root\/bin\/setup-teslausb/d' /root/.bashrc
+
+# UX courtesy reminders
+if ! grep -q SENTRYUSB_TIP1 /root/.bashrc
+then
+  cat >> /root/.bashrc <<- EOC
+	if [ -n "\$PS1" ]; then
+		cat << SENTRYUSB_TIP1
+		Run 'bin/setup-sentryusb upgrade' to update to the latest version of SentryUSB,
+		or run 'bin/remountfs_rw' to allow writing to the root partition.
+
+		SENTRYUSB_TIP1
+	fi
+	EOC
+fi
+
+DEFUSER=$(grep ":1000:1000:" /etc/passwd | awk -F : '{print $1}')
+if [ -n "$DEFUSER" ]
+then
+  if ! grep -q SENTRYUSB_TIP1 "/home/$DEFUSER/.bashrc"
+  then
+    cat >> "/home/$DEFUSER/.bashrc" <<- 'EOC'
+	if [ -n "$PS1" ]; then
+		_SENTRY_IP=$(hostname -I 2>/dev/null | awk '{print $1}')
+		_SENTRY_HOST=$(hostname -s 2>/dev/null)
+		cat << SENTRYUSB_TIP1
+		Run 'sudo -i' if you need to make changes.
+
+		The SentryUSB web interface is at http://${_SENTRY_HOST} or http://${_SENTRY_IP}
+
+		SENTRYUSB_TIP1
+		unset _SENTRY_IP _SENTRY_HOST
+	fi
+	EOC
+  fi
+  if grep -q "/boot/SENTRYUSB_SETUP_FINISHED" "/home/$DEFUSER/.bashrc"
+  then
+    sed -i "s@/boot/SENTRYUSB_SETUP_FINISHED@/sentryusb/SENTRYUSB_SETUP_FINISHED@" "/home/$DEFUSER/.bashrc"
+  fi
+  if grep -q "/boot/SENTRYUSB_SETUP_FINISHED" "/root/.bashrc"
+  then
+    sed -i "s@/boot/SENTRYUSB_SETUP_FINISHED@/sentryusb/SENTRYUSB_SETUP_FINISHED@" "/root/.bashrc"
+  fi
+fi
+
+make_root_fs_readonly
+
+upgrade_packages
+
+if [ -n "${INSTALL_USER_REQUESTED_PACKAGES:-}" ]
+then
+  setup_progress "Installing user requested packages: ${INSTALL_USER_REQUESTED_PACKAGES}"
+  read -r -a EXTRA_PACKAGES <<< "${INSTALL_USER_REQUESTED_PACKAGES[@]}"
+  DEBIAN_FRONTEND=noninteractive apt-get -y --force-yes install "${EXTRA_PACKAGES[@]}"
+fi
+
+setup_progress "Running post-setup tasks"
+(
+  cd "$SOURCE_DIR"
+  mkdir -p /mutable/once
+  for i in setup/pi/once/*
+  do
+    sum="$(sha256sum < "$i" | awk '{print $1}')"
+    if [ ! -e "/mutable/once/$sum" ]
+    then
+      setup_progress "$i"
+      copy_script "$i" /tmp/
+      "/tmp/$(basename "$i")"
+      touch "/mutable/once/$sum"
+    else
+      setup_progress "skipping $i ($sum)"
+    fi
+  done
+)
+
+headless_setup_mark_setup_success
+
+# Flash for stage 5 headless (Mark success, FS readonly)
+headless_setup_progress_flash 5
+
+setup_progress "All done."
+
+if [ -t 0 ] && [ "${NO_REBOOT_PROMPT:-}" != "1" ]
+then
+  setup_progress '(reboot now for changes to take effect)'
+fi

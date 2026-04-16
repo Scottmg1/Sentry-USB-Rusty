@@ -128,6 +128,51 @@ systemctl daemon-reload
 systemctl enable sentryusb
 ok "sentryusb.service installed and enabled"
 
+# ── Step 3b: cttseraser FUSE helper ────────────────────────────────
+
+info "Installing cttseraser FUSE helper..."
+CTTS_INSTALL="$INSTALL_DIR/cttseraser"
+if [ -n "${1:-}" ] && [ -f "$(dirname "$1")/cttseraser" ]; then
+    cp "$(dirname "$1")/cttseraser" "$CTTS_INSTALL"
+    chmod +x "$CTTS_INSTALL"
+    ok "cttseraser installed from local path"
+else
+    CTTS_URL="https://github.com/${REPO}/releases/latest/download/cttseraser-${SUFFIX}"
+    if curl -fsSL "$CTTS_URL" -o "$CTTS_INSTALL" 2>/dev/null; then
+        chmod +x "$CTTS_INSTALL"
+        ok "cttseraser downloaded"
+    else
+        warn "cttseraser binary not available — legacy FUSE feature disabled"
+    fi
+fi
+ln -sf "$CTTS_INSTALL" /usr/local/bin/cttseraser 2>/dev/null || true
+
+# ── Step 3c: BLE daemon (Python) ───────────────────────────────────
+
+info "Installing SentryUSB BLE daemon..."
+BLE_REPO_URL="https://raw.githubusercontent.com/${REPO}/main/server/ble"
+BLE_INSTALL_DIR="/opt/sentryusb/ble"
+mkdir -p "$BLE_INSTALL_DIR"
+
+if curl -fsSL "$BLE_REPO_URL/sentryusb-ble.py" -o "$BLE_INSTALL_DIR/sentryusb-ble.py" 2>/dev/null; then
+    chmod +x "$BLE_INSTALL_DIR/sentryusb-ble.py"
+    curl -fsSL "$BLE_REPO_URL/sentryusb-ble.service" -o /etc/systemd/system/sentryusb-ble.service 2>/dev/null || true
+    curl -fsSL "$BLE_REPO_URL/com.sentryusb.ble.conf" -o /etc/dbus-1/system.d/com.sentryusb.ble.conf 2>/dev/null || true
+
+    # Rewrite service ExecStart to our install path
+    if [ -f /etc/systemd/system/sentryusb-ble.service ]; then
+        sed -i "s|ExecStart=.*sentryusb-ble.py|ExecStart=/usr/bin/python3 $BLE_INSTALL_DIR/sentryusb-ble.py|" /etc/systemd/system/sentryusb-ble.service || true
+    fi
+
+    apt-get install -y python3-dbus python3-gi bluez >/dev/null 2>&1 || warn "BLE daemon apt deps install failed — the daemon may not start"
+    systemctl daemon-reload
+    systemctl enable sentryusb-ble 2>/dev/null || true
+    systemctl restart dbus 2>/dev/null || true
+    ok "BLE daemon installed"
+else
+    warn "Could not fetch BLE daemon — iOS app pairing will be unavailable"
+fi
+
 # ── Step 4: Sample Config ───────────────────────────────────────────
 
 if [ ! -f /root/sentryusb.conf ]; then

@@ -10,6 +10,7 @@ members = [
     "crates/notify",
     "crates/usb_gadget",
     "crates/setup",
+    "crates/cttseraser",
 ]
 
 [workspace.dependencies]

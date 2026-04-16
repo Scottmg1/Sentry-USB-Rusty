@@ -1,0 +1,12 @@
+ctrl_interface=DIR=/var/run/wpa_supplicant GROUP=netdev
+update_config=1
+country=US
+
+network={
+  ssid="TEMPSSID"
+  psk="TEMPPASS"
+  key_mgmt=WPA-PSK
+  # Uncomment the following line, if you are trying
+  # to connect to a network with a _hidden_ SSID
+  #scan_ssid=1
+}

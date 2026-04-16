@@ -1,0 +1,240 @@
+#!/bin/bash -eu
+
+if [[ ( -z "${TESLAFI_API_TOKEN:+x}" ) && ( -z "${TESSIE_API_TOKEN:+x}" ) && ( -z "${TESLA_BLE_VIN:+x}" ) && ( -z "${KEEP_AWAKE_WEBHOOK_URL:+x}" ) ]]
+then
+  exit
+fi
+
+# ---------------------------------------------------------------------------
+# BLE radio restore
+#
+# Restore the GATT daemon (mobile-app Bluetooth) after keep-awake ends.
+# awake_start disables it and creates BLE_LOCK; we restore only when:
+#   1. The lock file exists (we actually disabled it).
+#   2. No other keep-awake nudge loop is still running (overlap safety).
+# If another caller still needs the radio, we leave the lock in place and
+# let that caller's awake_stop handle the restore.
+# ---------------------------------------------------------------------------
+BLE_LOCK="/tmp/ble_keep_awake_active"
+
+ble_restore_gatt_daemon() {
+  if [ ! -e "$BLE_LOCK" ]; then
+    return
+  fi
+
+  # Check if a nudge loop is still running — if so, another keep-awake session
+  # still needs exclusive hci0 access.  Don't restore yet.
+  local nudge_pid_file="/tmp/keep_awake_nudge_pid"
+  if [ -e "$nudge_pid_file" ]; then
+    local nudge_pid
+    nudge_pid=$(cat "$nudge_pid_file" 2>/dev/null || echo "")
+    if [ -n "$nudge_pid" ] && kill -0 "$nudge_pid" 2>/dev/null; then
+      log "Tesla BLE: Keep-awake nudge loop still active (PID $nudge_pid) — mobile-app Bluetooth stays disabled."
+      return
+    fi
+  fi
+
+  rm -f "$BLE_LOCK"
+  log "Tesla BLE: Keep-awake ended. Restoring mobile-app Bluetooth (GATT daemon)..."
+  systemctl start sentryusb-ble 2>/dev/null || true
+  log "Tesla BLE: Mobile-app Bluetooth restored. iOS app can connect via Bluetooth again."
+}
+
+# Returns a label like "Archive", "Drive Processing", "Manual (8m left)"
+function nudge_label {
+  local label="${KEEP_AWAKE_REASON:-Keep Awake}"
+  if [ -n "${KEEP_AWAKE_EXPIRES_AT:-}" ]; then
+    local now remaining
+    now=$(date +%s)
+    remaining=$((KEEP_AWAKE_EXPIRES_AT - now))
+    if [ "$remaining" -gt 0 ]; then
+      label="$label ($((remaining / 60))m left)"
+    fi
+  fi
+  echo "$label"
+}
+
+case "${SENTRY_CASE}" in
+  1 | 2)
+    if [[ ( -n "${TESLAFI_API_TOKEN:+x}" ) ]]
+    # Use TeslaFi API to disable Sentry Mode
+    then
+      http_response=$(curl -s --connect-timeout 10 --max-time 30 -w "%{http_code}" \
+          -H "Authorization: Bearer $TESLAFI_API_TOKEN" \
+          -H "Accept: application/json" \
+          -H "User-Agent: github.com/Scottmg1/Sentry-USB" \
+          "https://www.teslafi.com/feed.php?command=set_sentry_mode&sentryMode=false&noWake=true")
+
+      log "TeslaFi: Command sent to disable Sentry Mode."
+      # Extract HTTP status code
+      http_status="${http_response: -3}"
+
+      # Extract response body (excluding status code)
+      response_body="${http_response:0:${#http_response}-3}"
+
+      # Check if HTTP status code is not 200 (OK)
+      if [ "$http_status" != "200" ]
+      then
+        # Log an error
+        log "TeslaFi: Failed to set Sentry Mode. Check your TESLAFI_API_TOKEN is set correctly. If it is, your car may be offline or asleep."
+      else
+        # Check if the response is in JSON format
+        if ! jq -e . >/dev/null 2>&1 <<<"$response_body"
+        then
+          log "TeslaFi: Failed to set Sentry Mode."
+        else
+          # Parse JSON and check if "result" is true
+          result1=$(jq -r '.response' <<<"$response_body")
+          result2=$(jq -r '.result' <<<"$result1")
+          request_counter=$(jq -r '.tesla_request_counter' <<<"$response_body")
+          commands=$(jq -r '.commands' <<<"$request_counter")
+
+          if [[ "$result2" = "true" ]]
+          then
+            log "TeslaFi: Sentry Mode Disabled. Monthly command counter = $commands."
+          else
+            log "TeslaFi: Failed to set Sentry Mode. Response data: $response_body"
+          fi
+        fi
+      fi
+
+    elif [[ -n "${TESSIE_API_TOKEN:+x}" ]]
+    # Use Tessie API to disable Sentry Mode (up to 3 attempts)
+    then
+      tessie_attempt=1
+      # shellcheck disable=SC2034
+      tessie_success=false
+      while [ "$tessie_attempt" -le 3 ]
+      do
+        http_response=$(curl -s --connect-timeout 10 --max-time 30 -w "%{http_code}" \
+          -H "Authorization: Bearer $TESSIE_API_TOKEN" \
+          -H "Accept: application/json" \
+          -H "User-Agent: github.com/Scottmg1/Sentry-USB" \
+          "https://api.tessie.com/$TESSIE_VIN/command/disable_sentry")
+
+        log "Tessie: Command sent to disable Sentry Mode (attempt $tessie_attempt/3)."
+        # Extract HTTP status code
+        http_status="${http_response: -3}"
+
+        # Extract response body (excluding status code)
+        response_body="${http_response:0:${#http_response}-3}"
+
+        # Try to extract error details from the response body
+        tessie_error=""
+        if jq -e . >/dev/null 2>&1 <<<"$response_body"; then
+          tessie_error=$(jq -r '.error // empty' <<<"$response_body" 2>/dev/null)
+        fi
+
+        # Check if HTTP status code is not 200 (OK)
+        if [ "$http_status" != "200" ]
+        then
+          # Build a descriptive error reason based on HTTP status
+          case "$http_status" in
+            401) tessie_reason="Invalid or expired API token." ;;
+            403) tessie_reason="API token lacks permission for this vehicle." ;;
+            404) tessie_reason="Vehicle not found. Check VIN." ;;
+            408) tessie_reason="Command timed out (Tesla Fleet API). Vehicle may be asleep or out of range." ;;
+            429) tessie_reason="Too many requests. Rate limited." ;;
+            500|502|503) tessie_reason="Tessie server error." ;;
+            *)   tessie_reason="Unexpected error." ;;
+          esac
+          if [ -n "$tessie_error" ]; then
+            tessie_reason="$tessie_reason $tessie_error"
+          fi
+          log "Tessie: Failed to disable Sentry Mode (HTTP $http_status). $tessie_reason"
+          if [ "$tessie_attempt" -lt 3 ]; then
+            log "Tessie: Retrying after 30s (attempt $((tessie_attempt+1))/3)..."
+            tessie_attempt=$((tessie_attempt+1))
+            sleep 30
+            continue
+          else
+            log "Tessie: Giving up after 3 attempts."
+          fi
+        else
+          # Check if the response is in JSON format
+          if ! jq -e . >/dev/null 2>&1 <<<"$response_body"
+          then
+            log "Tessie: Failed to disable Sentry Mode. Invalid response: $response_body"
+            if [ "$tessie_attempt" -lt 3 ]; then
+              log "Tessie: Retrying after 30s (attempt $((tessie_attempt+1))/3)..."
+              tessie_attempt=$((tessie_attempt+1))
+              sleep 30
+              continue
+            else
+              log "Tessie: Giving up after 3 attempts."
+            fi
+          else
+            # Parse JSON and check if "result" is true
+            result=$(jq -r '.result' <<<"$response_body")
+            if [[ "$result" == "true" ]]; then
+              log "Tessie: Sentry Mode Disabled."
+              # shellcheck disable=SC2034
+              tessie_success=true
+            else
+              tessie_error=$(jq -r '.error // "unknown reason"' <<<"$response_body" 2>/dev/null)
+              log "Tessie: API returned failure. $tessie_error"
+              if [ "$tessie_attempt" -lt 3 ]; then
+                log "Tessie: Retrying after 30s (attempt $((tessie_attempt+1))/3)..."
+                tessie_attempt=$((tessie_attempt+1))
+                sleep 30
+                continue
+              else
+                log "Tessie: Giving up after 3 attempts."
+              fi
+            fi
+          fi
+        fi
+        break
+      done
+
+    elif [[ -n "${TESLA_BLE_VIN:+x}" ]]
+    then
+      # Use Tesla BLE API to disable Sentry Mode.
+      # GATT daemon is already disabled (lock held by awake_start) — call directly.
+      if /root/bin/tesla-control -ble -key-file /root/.ble/key_private.pem -vin "${TESLA_BLE_VIN^^}" sentry-mode off
+      then
+        log "Tesla BLE: Sentry Mode disabled [$(nudge_label)]."
+      else
+        log "Tesla BLE: Failed to disable Sentry Mode [$(nudge_label)]."
+      fi
+
+    elif [[ -n "${KEEP_AWAKE_WEBHOOK_URL:+x}" ]]
+    # Use webhook to send stop message
+    then
+      http_response=$(curl -s --connect-timeout 10 --max-time 30 -w "%{http_code}" POST \
+        -d "{\"awake_command\":\"stop\"}" \
+        -H "Content-Type: application/json" \
+        "$KEEP_AWAKE_WEBHOOK_URL")
+
+      log "Awake Webhook: Command sent \"stop\""
+
+      # Extract HTTP status code
+      http_status="${http_response: -3}"
+
+      # Check if HTTP status code is not 200 (OK)
+      if [ "$http_status" -lt 200 ] || [ "$http_status" -ge 300 ]
+      then
+        # Log an error
+        log "Awake Webhook: Failed to send command \"stop\". Check if your KEEP_AWAKE_WEBHOOK_URL is set correctly. If it is, check the service receiving webhooks for logs."
+      fi
+    fi
+
+    # Restore mobile-app Bluetooth now that keep-awake is done.
+    ble_restore_gatt_daemon
+  ;;
+  3)
+    # Stop the single global nudge loop, plus clean up any legacy per-caller PID files
+    for pf in /tmp/keep_awake_nudge_pid /tmp/keep_awake_archive_pid /tmp/keep_awake_webui_pid /tmp/keep_awake_task_pid; do
+      if [ -e "$pf" ]; then
+        log "Stopping background task that is keeping car awake."
+        kill "$(cat "$pf")" 2>/dev/null || true
+        rm -f "$pf"
+      fi
+    done
+    # Restore mobile-app Bluetooth now that keep-awake is done.
+    ble_restore_gatt_daemon
+  ;;
+  *)
+    log "Invalid or no SENTRY_CASE defined."
+  ;;
+esac

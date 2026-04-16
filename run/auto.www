@@ -1,0 +1,43 @@
+#!/bin/dash
+
+case "$1" in
+  Music)
+    diskimage="/backingfiles/music_disk.bin"
+    ;;
+  LightShow)
+    diskimage="/backingfiles/lightshow_disk.bin"
+    ;;
+  Boombox)
+    diskimage="/backingfiles/boombox_disk.bin"
+    ;;
+  *)
+    exit 1
+    ;;
+esac
+
+optfile="${diskimage}.opts"
+
+if [ ! -r "$diskimage" ]
+then
+  exit 1
+fi
+
+if [ -f "$optfile" ] && [ "$diskimage" -nt "$optfile" ]
+then
+  rm -f "$optfile"
+fi
+
+if [ ! -f "$optfile" ]
+then
+  rm -rf "$optfile"
+  /root/bin/mountoptsforimage "${diskimage}" | {
+    read -r fstype opts
+    if [ -z "$fstype" ]
+    then
+      exit 1
+    fi
+    echo "-fstype=${fstype},rw,${opts} :${diskimage}" > "$optfile"
+  }
+fi
+
+cat "$optfile"
