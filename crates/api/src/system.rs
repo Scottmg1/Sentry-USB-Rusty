@@ -6,8 +6,6 @@ use axum::Json;
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
-use serde::Deserialize;
-
 use crate::router::AppState;
 
 /// POST /api/system/reboot
@@ -135,7 +133,6 @@ pub async fn ble_status(
 /// GET /api/system/speedtest — stream 64MB of random data for bandwidth testing
 pub async fn speedtest(State(_s): State<AppState>) -> impl IntoResponse {
     use axum::body::Body;
-    use tokio_stream::StreamExt;
 
     let stream = tokio_stream::iter((0..1000).map(|_| {
         let mut buf = vec![0u8; 65536];

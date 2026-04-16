@@ -122,7 +122,6 @@ pub async fn run_setup(State(s): State<AppState>) -> (StatusCode, Json<serde_jso
 /// POST /api/setup/test-archive
 pub async fn test_archive(
     State(_s): State<AppState>,
-    body: String,
 ) -> (StatusCode, Json<serde_json::Value>) {
     // Read archive server from config and test connectivity
     let config_path = sentryusb_config::find_config_path();

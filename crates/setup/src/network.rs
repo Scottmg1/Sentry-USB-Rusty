@@ -8,7 +8,7 @@ use tracing::info;
 use crate::env::SetupEnv;
 
 /// Configure the WiFi access point via NetworkManager.
-pub async fn configure_ap(env: &SetupEnv, progress: &dyn Fn(&str)) -> Result<()> {
+pub async fn configure_ap(env: &SetupEnv, progress: &(dyn Fn(&str) + Send + Sync)) -> Result<()> {
     let ssid = match env.config.get("AP_SSID") {
         Some(v) if !v.is_empty() => v.clone(),
         _ => {

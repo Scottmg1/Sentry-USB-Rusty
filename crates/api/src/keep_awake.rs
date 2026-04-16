@@ -8,8 +8,6 @@ use axum::extract::State;
 use axum::http::StatusCode;
 use serde::Deserialize;
 use tokio::sync::{Mutex, Notify};
-use tracing::{info, warn};
-
 use crate::router::AppState;
 
 /// Keep-awake state.

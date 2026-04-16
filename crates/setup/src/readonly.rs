@@ -6,13 +6,13 @@
 use std::path::Path;
 use std::time::Duration;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use tracing::info;
 
 use crate::env::SetupEnv;
 
 /// Make the root filesystem read-only.
-pub async fn make_readonly(env: &SetupEnv, progress: &dyn Fn(&str)) -> Result<()> {
+pub async fn make_readonly(env: &SetupEnv, progress: &(dyn Fn(&str) + Send + Sync)) -> Result<()> {
     if env.get_bool("SKIP_READONLY", false) {
         progress("SKIP_READONLY is set, skipping read-only filesystem setup");
         return Ok(());

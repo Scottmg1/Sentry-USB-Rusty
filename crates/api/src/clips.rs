@@ -111,7 +111,7 @@ pub async fn get_clips(
 
 /// GET /api/clips/telemetry
 pub async fn get_clip_telemetry(
-    State(state): State<AppState>,
+    State(_state): State<AppState>,
     Query(params): Query<std::collections::HashMap<String, String>>,
 ) -> (StatusCode, Json<serde_json::Value>) {
     let file = match params.get("file") {

@@ -66,7 +66,7 @@ sentryusb gadget disable "$@"
 "#;
 
 /// Install all runtime helper scripts to /root/bin/.
-pub async fn install_runtime_scripts(progress: &dyn Fn(&str)) -> Result<()> {
+pub async fn install_runtime_scripts(progress: &(dyn Fn(&str) + Send + Sync)) -> Result<()> {
     progress("Installing runtime helper scripts...");
 
     let _ = std::fs::create_dir_all("/root/bin");

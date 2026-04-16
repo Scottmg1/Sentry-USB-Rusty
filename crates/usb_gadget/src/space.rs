@@ -2,8 +2,6 @@
 //!
 //! Monitors disk usage and releases old snapshots when space runs low.
 
-use std::path::Path;
-
 use anyhow::Result;
 use tracing::{info, warn};
 

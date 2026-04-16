@@ -396,8 +396,6 @@ fn walkdir(dir: &std::path::Path) -> std::io::Result<Vec<String>> {
 }
 
 fn find_net_device(pattern: &str) -> String {
-    let glob_path = format!("/sys/class/net/{}", pattern);
-    // Simple glob: just list /sys/class/net/ and match
     let prefix = pattern.trim_end_matches('*');
     if let Ok(entries) = std::fs::read_dir("/sys/class/net/") {
         for entry in entries.flatten() {

@@ -70,7 +70,7 @@ fn validate_archive_config(env: &SetupEnv, system: ArchiveSystem) -> Result<()> 
 }
 
 /// Ensure rsync is installed and working.
-async fn ensure_rsync(progress: &dyn Fn(&str)) -> Result<()> {
+async fn ensure_rsync(progress: &(dyn Fn(&str) + Send + Sync)) -> Result<()> {
     if sentryusb_shell::run("which", &["rsync"]).await.is_err() {
         progress("Installing rsync...");
         sentryusb_shell::run_with_timeout(
@@ -113,7 +113,7 @@ fn validate_sentry_case(env: &SetupEnv) -> Result<()> {
 }
 
 /// Configure Tesla BLE if VIN is set.
-pub async fn configure_tesla_ble(env: &SetupEnv, progress: &dyn Fn(&str)) -> Result<()> {
+pub async fn configure_tesla_ble(env: &SetupEnv, progress: &(dyn Fn(&str) + Send + Sync)) -> Result<()> {
     let vin = match env.config.get("TESLA_BLE_VIN") {
         Some(v) if !v.is_empty() => v.clone(),
         _ => {
@@ -204,7 +204,7 @@ pub async fn configure_tesla_ble(env: &SetupEnv, progress: &dyn Fn(&str)) -> Res
 }
 
 /// Full archive configuration flow.
-pub async fn configure_archive(env: &SetupEnv, progress: &dyn Fn(&str)) -> Result<()> {
+pub async fn configure_archive(env: &SetupEnv, progress: &(dyn Fn(&str) + Send + Sync)) -> Result<()> {
     let archive_system = ArchiveSystem::from_config(&env.get("ARCHIVE_SYSTEM", "none"))?;
     progress(&format!("Configuring archive system: {:?}", archive_system));
 

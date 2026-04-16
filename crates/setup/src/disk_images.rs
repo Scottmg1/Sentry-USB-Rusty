@@ -91,7 +91,7 @@ async fn create_drive(
     label: &str,
     size_kb: u64,
     use_exfat: bool,
-    progress: &dyn Fn(&str),
+    progress: &(dyn Fn(&str) + Send + Sync),
 ) -> Result<()> {
     let filename = format!("{}/{}_disk.bin", BACKINGFILES, name);
     let mountpoint = format!("/mnt/{}", name);
@@ -215,7 +215,7 @@ async fn ensure_vfat_tools() -> Result<()> {
 }
 
 /// Create all disk images based on config settings.
-pub async fn create_disk_images(env: &SetupEnv, progress: &dyn Fn(&str)) -> Result<()> {
+pub async fn create_disk_images(env: &SetupEnv, progress: &(dyn Fn(&str) + Send + Sync)) -> Result<()> {
     progress("Creating disk images...");
 
     let use_exfat_cfg = env.get_bool("USE_EXFAT", false);

@@ -42,7 +42,7 @@ fn partition_prefix(device: &str) -> &'static str {
 }
 
 /// Create partitions on an external DATA_DRIVE.
-pub async fn setup_data_drive(env: &SetupEnv, progress: &dyn Fn(&str)) -> Result<()> {
+pub async fn setup_data_drive(env: &SetupEnv, progress: &(dyn Fn(&str) + Send + Sync)) -> Result<()> {
     let data_drive = env.data_drive.as_deref()
         .context("DATA_DRIVE not set")?;
 
@@ -102,7 +102,7 @@ pub async fn setup_data_drive(env: &SetupEnv, progress: &dyn Fn(&str)) -> Result
 }
 
 /// Create partitions on the SD card (after the root partition).
-pub async fn setup_sd_card(env: &SetupEnv, progress: &dyn Fn(&str)) -> Result<()> {
+pub async fn setup_sd_card(env: &SetupEnv, progress: &(dyn Fn(&str) + Send + Sync)) -> Result<()> {
     let boot_disk = env.boot_disk.as_deref()
         .context("Could not detect boot disk")?;
 

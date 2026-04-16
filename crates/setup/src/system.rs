@@ -11,7 +11,7 @@ use tracing::info;
 use crate::env::SetupEnv;
 
 /// Set the Pi hostname.
-pub async fn configure_hostname(env: &SetupEnv, progress: &dyn Fn(&str)) -> Result<()> {
+pub async fn configure_hostname(env: &SetupEnv, progress: &(dyn Fn(&str) + Send + Sync)) -> Result<()> {
     let hostname = env.get("SENTRYUSB_HOSTNAME", "sentryusb");
     progress(&format!("Setting hostname to '{}'", hostname));
 
@@ -40,7 +40,7 @@ pub async fn configure_hostname(env: &SetupEnv, progress: &dyn Fn(&str)) -> Resu
 }
 
 /// Configure dwc2 USB gadget overlay in config.txt and cmdline.txt.
-pub async fn configure_dwc2(env: &SetupEnv, progress: &dyn Fn(&str)) -> Result<()> {
+pub async fn configure_dwc2(env: &SetupEnv, progress: &(dyn Fn(&str) + Send + Sync)) -> Result<()> {
     progress("Configuring USB gadget (dwc2) overlay...");
 
     // Add dwc2 overlay to config.txt
@@ -70,7 +70,7 @@ pub async fn configure_dwc2(env: &SetupEnv, progress: &dyn Fn(&str)) -> Result<(
 }
 
 /// Set up Avahi mDNS service for local network discovery.
-pub async fn configure_avahi(env: &SetupEnv, progress: &dyn Fn(&str)) -> Result<()> {
+pub async fn configure_avahi(env: &SetupEnv, progress: &(dyn Fn(&str) + Send + Sync)) -> Result<()> {
     progress("Configuring Avahi mDNS service...");
 
     let hostname = env.get("SENTRYUSB_HOSTNAME", "sentryusb");
@@ -107,7 +107,7 @@ pub async fn configure_avahi(env: &SetupEnv, progress: &dyn Fn(&str)) -> Result<
 }
 
 /// Harden SSH configuration.
-pub async fn configure_ssh(progress: &dyn Fn(&str)) -> Result<()> {
+pub async fn configure_ssh(progress: &(dyn Fn(&str) + Send + Sync)) -> Result<()> {
     progress("Hardening SSH...");
 
     let sshd_config = Path::new("/etc/ssh/sshd_config");
@@ -148,7 +148,7 @@ pub async fn configure_ssh(progress: &dyn Fn(&str)) -> Result<()> {
 }
 
 /// Configure Samba shares if enabled.
-pub async fn configure_samba(env: &SetupEnv, progress: &dyn Fn(&str)) -> Result<()> {
+pub async fn configure_samba(env: &SetupEnv, progress: &(dyn Fn(&str) + Send + Sync)) -> Result<()> {
     if !env.get_bool("SAMBA_ENABLED", false) {
         info!("Samba not enabled, skipping");
         return Ok(());
@@ -251,7 +251,7 @@ WantedBy=backingfiles.mount
 }
 
 /// Ensure required system packages are installed.
-pub async fn install_required_packages(progress: &dyn Fn(&str)) -> Result<()> {
+pub async fn install_required_packages(progress: &(dyn Fn(&str) + Send + Sync)) -> Result<()> {
     progress("Checking required packages...");
 
     let packages = ["dos2unix", "parted", "fdisk", "curl", "rsync", "jq"];
@@ -277,7 +277,7 @@ pub async fn install_required_packages(progress: &dyn Fn(&str)) -> Result<()> {
 }
 
 /// Set the system timezone.
-pub async fn configure_timezone(env: &SetupEnv, progress: &dyn Fn(&str)) -> Result<()> {
+pub async fn configure_timezone(env: &SetupEnv, progress: &(dyn Fn(&str) + Send + Sync)) -> Result<()> {
     if let Some(tz) = env.config.get("TIME_ZONE") {
         if !tz.is_empty() {
             progress(&format!("Setting timezone to {}", tz));
@@ -288,7 +288,7 @@ pub async fn configure_timezone(env: &SetupEnv, progress: &dyn Fn(&str)) -> Resu
 }
 
 /// Configure the RTC (DS3231) if enabled.
-pub async fn configure_rtc(env: &SetupEnv, progress: &dyn Fn(&str)) -> Result<()> {
+pub async fn configure_rtc(env: &SetupEnv, progress: &(dyn Fn(&str) + Send + Sync)) -> Result<()> {
     if !env.get_bool("RTC_BATTERY_ENABLED", false) {
         return Ok(());
     }

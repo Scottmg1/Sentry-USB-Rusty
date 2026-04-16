@@ -3,7 +3,6 @@
 //! Ties all setup phases together with progress logging via a callback,
 //! typically wired to both a log file and WebSocket broadcast.
 
-use std::io::Write;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -218,7 +217,7 @@ async fn reboot() {
 }
 
 /// Set WiFi regulatory domain to US if not set.
-async fn configure_wifi_regulatory(env: &SetupEnv, progress: &dyn Fn(&str)) -> Result<bool> {
+async fn configure_wifi_regulatory(_env: &SetupEnv, progress: &(dyn Fn(&str) + Send + Sync)) -> Result<bool> {
     // Check if NetworkManager is managing WiFi
     if sentryusb_shell::run("systemctl", &["-q", "is-enabled", "NetworkManager.service"]).await.is_ok() {
         let output = sentryusb_shell::run(
@@ -235,7 +234,7 @@ async fn configure_wifi_regulatory(env: &SetupEnv, progress: &dyn Fn(&str)) -> R
 }
 
 /// Configure the dwc2 USB gadget overlay in config.txt with proper per-model sections.
-async fn configure_dwc2_overlay(env: &SetupEnv, progress: &dyn Fn(&str)) -> Result<bool> {
+async fn configure_dwc2_overlay(env: &SetupEnv, progress: &(dyn Fn(&str) + Send + Sync)) -> Result<bool> {
     let config_path = match &env.piconfig_path {
         Some(p) => p.clone(),
         None => return Ok(false),
@@ -325,7 +324,7 @@ async fn configure_dwc2_overlay(env: &SetupEnv, progress: &dyn Fn(&str)) -> Resu
 }
 
 /// Check if root needs shrinking (when Pi Imager auto-expanded it).
-async fn check_root_shrink(env: &SetupEnv, progress: &dyn Fn(&str)) -> Result<bool> {
+async fn check_root_shrink(env: &SetupEnv, progress: &(dyn Fn(&str) + Send + Sync)) -> Result<bool> {
     // Only needed on first setup when no partitions exist yet
     if crate::partition::partitions_exist().await {
         return Ok(false);
@@ -378,7 +377,7 @@ async fn check_root_shrink(env: &SetupEnv, progress: &dyn Fn(&str)) -> Result<bo
 }
 
 /// Fix cmdline.txt modules-load to include dwc2 and g_ether.
-async fn fix_cmdline_modules(env: &SetupEnv, progress: &dyn Fn(&str)) -> Result<bool> {
+async fn fix_cmdline_modules(env: &SetupEnv, progress: &(dyn Fn(&str) + Send + Sync)) -> Result<bool> {
     let cmdline_path = match &env.cmdline_path {
         Some(p) => p.clone(),
         None => return Ok(false),
@@ -408,7 +407,7 @@ async fn fix_cmdline_modules(env: &SetupEnv, progress: &dyn Fn(&str)) -> Result<
 }
 
 /// Add UAS quirks for known problematic USB drives.
-async fn fix_uas_quirks(env: &SetupEnv, progress: &dyn Fn(&str)) -> Result<()> {
+async fn fix_uas_quirks(env: &SetupEnv, progress: &(dyn Fn(&str) + Send + Sync)) -> Result<()> {
     let cmdline_path = match &env.cmdline_path {
         Some(p) => p.clone(),
         None => return Ok(()),
@@ -452,7 +451,7 @@ async fn fix_uas_quirks(env: &SetupEnv, progress: &dyn Fn(&str)) -> Result<()> {
 }
 
 /// Update the package index.
-async fn update_package_index(progress: &dyn Fn(&str)) -> Result<()> {
+async fn update_package_index(progress: &(dyn Fn(&str) + Send + Sync)) -> Result<()> {
     progress("Updating package index...");
     let _ = sentryusb_shell::run("dpkg", &["--configure", "-a"]).await;
 
@@ -476,7 +475,7 @@ async fn update_package_index(progress: &dyn Fn(&str)) -> Result<()> {
 }
 
 /// Mount backingfiles and mutable partitions.
-async fn mount_partitions(progress: &dyn Fn(&str)) -> Result<()> {
+async fn mount_partitions(progress: &(dyn Fn(&str) + Send + Sync)) -> Result<()> {
     let _ = std::fs::create_dir_all("/backingfiles");
     let _ = std::fs::create_dir_all("/mutable");
 
@@ -500,7 +499,7 @@ async fn mount_partitions(progress: &dyn Fn(&str)) -> Result<()> {
 }
 
 /// Update fstab with sentryusb mount entries for disk image files.
-async fn update_image_fstab_entries(progress: &dyn Fn(&str)) -> Result<()> {
+async fn update_image_fstab_entries(_progress: &(dyn Fn(&str) + Send + Sync)) -> Result<()> {
     let images = [
         ("/backingfiles/cam_disk.bin", "/mnt/cam"),
         ("/backingfiles/music_disk.bin", "/mnt/music"),
@@ -534,7 +533,7 @@ async fn update_image_fstab_entries(progress: &dyn Fn(&str)) -> Result<()> {
 }
 
 /// Mount each drive image, create required directories, then unmount.
-async fn initialize_drive_directories(progress: &dyn Fn(&str)) -> Result<()> {
+async fn initialize_drive_directories(_progress: &(dyn Fn(&str) + Send + Sync)) -> Result<()> {
     let _ = sentryusb_gadget::disable();
 
     let drives: &[(&str, &[&str])] = &[

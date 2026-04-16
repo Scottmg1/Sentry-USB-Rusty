@@ -67,7 +67,7 @@ fn get_machine_serial() -> String {
     let mid = mid.trim();
     // SHA256 hash of machine-id (matching the bash script)
     use std::process::Command;
-    if let Ok(output) = Command::new("sha256sum").stdin(std::process::Stdio::piped()).output() {
+    if let Ok(_output) = Command::new("sha256sum").stdin(std::process::Stdio::piped()).output() {
         // Fallback: just use the machine-id directly
         return format!("SentryUSB-{}", mid);
     }

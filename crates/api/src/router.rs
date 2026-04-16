@@ -1,5 +1,3 @@
-use std::sync::Arc;
-
 use axum::routing::{delete, get, post, put};
 use axum::Router;
 
@@ -160,7 +158,7 @@ async fn ws_handler(
     ws.on_upgrade(move |socket| handle_ws(socket, state.hub))
 }
 
-async fn handle_ws(mut socket: axum::extract::ws::WebSocket, hub: sentryusb_ws::Hub) {
+async fn handle_ws(socket: axum::extract::ws::WebSocket, hub: sentryusb_ws::Hub) {
     use axum::extract::ws::Message;
     use tokio::time::{interval, Duration};
 

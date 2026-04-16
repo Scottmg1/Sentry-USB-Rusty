@@ -17,7 +17,7 @@ pub async fn handle_terminal(
 
 async fn handle_terminal_ws(mut socket: WebSocket) {
     use portable_pty::{CommandBuilder, PtySize, native_pty_system};
-    use futures_util::{SinkExt, StreamExt};
+    use futures_util::StreamExt;
 
     let pty_system = native_pty_system();
 
@@ -43,7 +43,7 @@ async fn handle_terminal_ws(mut socket: WebSocket) {
     cmd.arg("-l");
     cmd.env("TERM", "xterm-256color");
 
-    let child = match pair.slave.spawn_command(cmd) {
+    let _child = match pair.slave.spawn_command(cmd) {
         Ok(c) => c,
         Err(e) => {
             warn!("Failed to spawn shell: {}", e);
@@ -62,7 +62,7 @@ async fn handle_terminal_ws(mut socket: WebSocket) {
     let writer = pair.master.take_writer().unwrap();
     let writer = std::sync::Arc::new(std::sync::Mutex::new(writer));
 
-    let (mut ws_sender, mut ws_receiver) = socket.split();
+    let (_ws_sender, mut ws_receiver) = socket.split();
 
     // PTY reader -> WebSocket sender
     let read_handle = tokio::task::spawn_blocking(move || {

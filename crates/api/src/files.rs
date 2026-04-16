@@ -4,7 +4,6 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use axum::Json;
-use axum::body::Body;
 use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
@@ -269,7 +268,7 @@ pub async fn delete_file(State(_s): State<AppState>, Query(params): Query<Delete
 }
 
 /// POST /api/files/upload
-pub async fn upload_file(State(_s): State<AppState>, body: axum::body::Bytes) -> (StatusCode, Json<serde_json::Value>) {
+pub async fn upload_file(State(_s): State<AppState>, _body: axum::body::Bytes) -> (StatusCode, Json<serde_json::Value>) {
     // TODO: Implement multipart file upload (requires multipart feature)
     // For now return a helpful error
     crate::json_error(StatusCode::NOT_IMPLEMENTED, "File upload requires multipart support (not yet implemented)")
