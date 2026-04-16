@@ -1,4 +1,4 @@
-use tracing::{info, warn};
+use tracing::info;
 
 /// Run startup migration: update peripheral files if the binary is newer
 /// than the last migration. Runs in background so the HTTP server starts

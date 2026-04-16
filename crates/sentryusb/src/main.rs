@@ -4,10 +4,7 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 use std::sync::Arc;
 
-use axum::response::{Html, IntoResponse, Response};
-use axum::http::{StatusCode, Uri, header};
 use clap::Parser;
-use rust_embed::Embed;
 use tower_http::compression::CompressionLayer;
 use tracing::info;
 
