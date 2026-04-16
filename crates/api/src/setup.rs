@@ -91,37 +91,26 @@ pub async fn run_setup(State(s): State<AppState>) -> (StatusCode, Json<serde_jso
 
     let hub = s.hub.clone();
     tokio::spawn(async move {
-        // Remove finished marker so rc.local will re-run setup
-        for p in SETUP_FINISHED_PATHS {
-            let _ = std::fs::remove_file(p);
-        }
-        // Create started marker
-        for p in SETUP_STARTED_PATHS {
-            let _ = std::fs::remove_file(p);
-        }
-        let _ = std::fs::create_dir_all("/sentryusb");
-        let _ = std::fs::write(SETUP_STARTED_PATHS[0], "");
-        // Remove resize marker
         let _ = std::fs::remove_file("/root/RESIZE_ATTEMPTED");
 
         hub.broadcast("setup_status", &serde_json::json!({"status": "running"}));
-        tracing::info!("[setup] Running /etc/rc.local (SentryUSB setup boot-loop)");
+        tracing::info!("[setup] Starting native Rust setup");
 
-        // rc.local may reboot the system, which is expected.
-        // Timeout is long because setup installs packages, partitions, etc.
-        let result = sentryusb_shell::run_with_timeout(
-            std::time::Duration::from_secs(1800),
-            "/etc/rc.local",
-            &[],
-        ).await;
+        let hub_clone = hub.clone();
+        let progress = sentryusb_setup::runner::make_progress(move |msg: &str| {
+            hub_clone.broadcast("setup_progress", &serde_json::json!({"message": msg}));
+        });
+
+        let result = sentryusb_setup::runner::run_full_setup(progress).await;
 
         SETUP_RUNNING.store(false, Ordering::SeqCst);
 
         match result {
-            Ok(output) => {
-                hub.broadcast("setup", &serde_json::json!({"status": "complete", "output": output}));
+            Ok(()) => {
+                hub.broadcast("setup", &serde_json::json!({"status": "complete"}));
             }
             Err(e) => {
+                tracing::error!("[setup] Failed: {:#}", e);
                 hub.broadcast("setup", &serde_json::json!({"status": "error", "error": e.to_string()}));
             }
         }
@@ -135,15 +124,38 @@ pub async fn test_archive(
     State(_s): State<AppState>,
     body: String,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    // Run the archive test script
+    // Read archive server from config and test connectivity
+    let config_path = sentryusb_config::find_config_path();
+    let server = match sentryusb_config::parse_file(config_path) {
+        Ok((active, commented)) => {
+            sentryusb_config::get_config_value(&active, &commented, "ARCHIVE_SERVER")
+        }
+        Err(_) => None,
+    };
+
+    let server = match server {
+        Some(s) if !s.is_empty() && s != "localhost" => s,
+        _ => {
+            return (StatusCode::OK, Json(serde_json::json!({
+                "success": true,
+                "output": "No archive server configured"
+            })));
+        }
+    };
+
     let result = sentryusb_shell::run_with_timeout(
-        std::time::Duration::from_secs(60),
-        "bash",
-        &["/root/bin/setup-sentryusb", "test-archive"],
+        std::time::Duration::from_secs(10),
+        "ping", &["-c", "1", "-W", "5", &server],
     ).await;
 
     match result {
-        Ok(output) => (StatusCode::OK, Json(serde_json::json!({"success": true, "output": output.trim()}))),
-        Err(e) => (StatusCode::OK, Json(serde_json::json!({"success": false, "error": e.to_string()}))),
+        Ok(_) => (StatusCode::OK, Json(serde_json::json!({
+            "success": true,
+            "output": format!("Archive server {} is reachable", server)
+        }))),
+        Err(_) => (StatusCode::OK, Json(serde_json::json!({
+            "success": false,
+            "error": format!("Archive server {} is unreachable", server)
+        }))),
     }
 }

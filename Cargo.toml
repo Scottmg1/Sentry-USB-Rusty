@@ -9,6 +9,7 @@ members = [
     "crates/api",
     "crates/notify",
     "crates/usb_gadget",
+    "crates/setup",
 ]
 
 [workspace.dependencies]

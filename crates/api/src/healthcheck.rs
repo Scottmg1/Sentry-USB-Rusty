@@ -85,12 +85,76 @@ pub async fn refresh_diagnostics(State(_s): State<AppState>) -> (StatusCode, Jso
     match sentryusb_shell::run_with_timeout(
         std::time::Duration::from_secs(60),
         "bash",
-        &["-c", "(sudo /root/bin/setup-sentryusb diagnose) &> /tmp/diagnostics.txt"],
+        &["-c", DIAGNOSTICS_SCRIPT],
     ).await {
         Ok(_) => crate::json_ok(),
         Err(e) => crate::json_error(StatusCode::INTERNAL_SERVER_ERROR, &format!("Failed to generate diagnostics: {}", e)),
     }
 }
+
+/// Inline diagnostics gathering script — replaces the old `setup-sentryusb diagnose` command.
+const DIAGNOSTICS_SCRIPT: &str = r#"{
+  echo "====== SentryUSB Diagnostics ======"
+  echo "Date: $(date)"
+  echo "Hostname: $(hostname)"
+  echo "Uptime: $(uptime)"
+  echo ""
+
+  echo "====== version ======"
+  cat /opt/sentryusb/version 2>/dev/null || echo "unknown"
+  uname -a
+  cat /sys/firmware/devicetree/base/model 2>/dev/null; echo
+  echo ""
+
+  echo "====== disk / images ======"
+  df -h /sentryusb/ / /backingfiles/ /mutable/ 2>/dev/null
+  for img in cam music lightshow boombox wraps; do
+    f="/backingfiles/${img}_disk.bin"
+    if [ -f "$f" ]; then
+      echo "$img disk: $(du -h "$f" | cut -f1)"
+    fi
+  done
+  echo ""
+
+  echo "====== USB gadget ======"
+  if [ -d /sys/kernel/config/usb_gadget/sentryusb ]; then
+    echo "Gadget: active"
+    for i in 0 1 2 3 4 5; do
+      lun="/sys/kernel/config/usb_gadget/sentryusb/functions/mass_storage.0/lun.${i}/file"
+      [ -e "$lun" ] && echo "  lun${i}: $(cat "$lun")"
+    done
+  else
+    echo "Gadget: inactive"
+  fi
+  cat /sys/class/udc/*/state 2>/dev/null || true
+  echo ""
+
+  echo "====== network ======"
+  ip -4 addr show 2>/dev/null | grep inet || ifconfig 2>/dev/null
+  echo ""
+
+  echo "====== services ======"
+  for svc in sentryusb sentryusb-archive sentryusb-ble avahi-daemon bluetooth; do
+    status=$(systemctl is-active "$svc" 2>/dev/null || echo "not found")
+    echo "  $svc: $status"
+  done
+  echo ""
+
+  echo "====== archiveloop ======"
+  tail -50 /mutable/archiveloop.log 2>/dev/null || echo "no archiveloop log"
+  echo ""
+
+  echo "====== temperatures ======"
+  cat /sys/class/thermal/thermal_zone0/temp 2>/dev/null | awk '{printf "CPU: %.1f°C\n", $1/1000}'
+  vcgencmd measure_temp 2>/dev/null || true
+  echo ""
+
+  echo "====== dmesg (last 30) ======"
+  dmesg -T 2>/dev/null | tail -30
+  echo ""
+
+  echo "====== end of diagnostics ======"
+} &> /tmp/diagnostics.txt"#;
 
 /// GET /api/diagnostics
 pub async fn get_diagnostics(State(_s): State<AppState>) -> impl IntoResponse {
