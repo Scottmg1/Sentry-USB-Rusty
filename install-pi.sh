@@ -218,17 +218,27 @@ fi
 info "Starting SentryUSB..."
 systemctl restart sentryusb
 
-# Get IP address for the user
-IP=$(hostname -I 2>/dev/null | awk '{print $1}')
-HOSTNAME=$(hostname -s 2>/dev/null || echo "sentryusb")
+# Get IP address for the user — retry briefly in case the network just bounced
+IP=""
+for _ in 1 2 3 4 5; do
+    IP=$(hostname -I 2>/dev/null | awk '{print $1}')
+    [ -n "$IP" ] && break
+    sleep 1
+done
+HOSTNAME=$(hostname -s 2>/dev/null || echo "raspberrypi")
 
 echo ""
 echo -e "${GREEN}╔════════════════════════════════════════════════╗${NC}"
 echo -e "${GREEN}║        SentryUSB Installation Complete         ║${NC}"
 echo -e "${GREEN}╚════════════════════════════════════════════════╝${NC}"
 echo ""
-echo -e "  Web UI:  ${BLUE}http://${IP}${NC}"
-echo -e "  mDNS:    ${BLUE}http://${HOSTNAME}.local${NC}"
+if [ -n "$IP" ]; then
+    echo -e "  Web UI:  ${BLUE}http://${IP}${NC}"
+else
+    echo -e "  Web UI:  ${YELLOW}(no IP detected — check 'ip a' once network is up)${NC}"
+fi
+echo -e "  mDNS:    ${BLUE}http://${HOSTNAME}.local${NC}  ${YELLOW}(current hostname)${NC}"
+echo -e "           After setup wizard finishes: ${BLUE}http://sentryusb.local${NC}"
 echo ""
 echo -e "  Open the web UI to complete setup via the wizard."
 echo -e "  All setup (partitions, drives, etc.) is handled by the binary."

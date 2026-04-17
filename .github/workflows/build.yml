@@ -22,16 +22,19 @@ jobs:
             linker: aarch64-linux-gnu-gcc
             gcc: gcc-aarch64-linux-gnu
             artifact: sentryusb-linux-arm64
+            artifact_suffix: linux-arm64
           - name: ARMv7 (Pi 2/3/Zero2W 32-bit)
             target: armv7-unknown-linux-gnueabihf
             linker: arm-linux-gnueabihf-gcc
             gcc: gcc-arm-linux-gnueabihf
             artifact: sentryusb-linux-armv7
+            artifact_suffix: linux-armv7
           - name: ARMv6 (Pi Zero W/1)
             target: arm-unknown-linux-gnueabihf
             linker: arm-linux-gnueabihf-gcc
             gcc: gcc-arm-linux-gnueabihf
             artifact: sentryusb-linux-armv6
+            artifact_suffix: linux-armv6
     steps:
       - uses: actions/checkout@v4
 
@@ -64,24 +67,27 @@ jobs:
             echo '<!DOCTYPE html><html><body>Frontend not bundled</body></html>' > crates/sentryusb/static/index.html
           fi
 
-      - name: Build release binary
-        run: cargo build --release --target ${{ matrix.target }}
+      - name: Build release binaries (sentryusb + cttseraser)
+        run: |
+          cargo build --release --target ${{ matrix.target }} -p sentryusb
+          cargo build --release --target ${{ matrix.target }} -p cttseraser
         env:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: ${{ matrix.linker }}
           CARGO_TARGET_ARMV7_UNKNOWN_LINUX_GNUEABIHF_LINKER: ${{ matrix.linker }}
           CARGO_TARGET_ARM_UNKNOWN_LINUX_GNUEABIHF_LINKER: ${{ matrix.linker }}
 
-      - name: Package binary
+      - name: Package binaries
         run: |
           mkdir -p release
           cp target/${{ matrix.target }}/release/sentryusb release/${{ matrix.artifact }}
+          cp target/${{ matrix.target }}/release/cttseraser release/cttseraser-${{ matrix.artifact_suffix }}
           ls -lh release/
 
-      - name: Upload artifact
+      - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.artifact }}
-          path: release/${{ matrix.artifact }}
+          name: ${{ matrix.artifact }}-bundle
+          path: release/*
 
   test:
     name: Test

@@ -213,7 +213,19 @@ fn am_root() -> bool {
 }
 
 async fn reboot() {
-    let _ = sentryusb_shell::run("reboot", &[]).await;
+    // Don't go through logind — it may be broken/unavailable on minimal images,
+    // which causes `reboot` to hang for 25s+ per dbus-activation timeout.
+    // `systemctl --force reboot` talks to systemd directly; spawn without
+    // capturing pipes so we don't deadlock on shutdown closing our stderr.
+    if tokio::process::Command::new("systemctl")
+        .args(["--force", "reboot"])
+        .spawn()
+        .is_ok()
+    {
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+    }
+    // Fallback: kernel-level reboot via util-linux's reboot(8) -f
+    let _ = tokio::process::Command::new("reboot").arg("-f").spawn();
 }
 
 /// Set WiFi regulatory domain to US if not set. Persists via /etc/default/crda

@@ -173,11 +173,18 @@ fn ensure_sentryusb_symlink() -> Result<()> {
 }
 
 async fn detect_boot_disk() -> Result<String> {
+    // `-p` makes lsblk emit full paths already (e.g. "/dev/sda"), so don't
+    // prepend "/dev/" again — that yields "/dev//dev/sda" and every sfdisk
+    // call on it fails silently, cascading into bogus "not last partition"
+    // errors during the shrink phase.
     let output = sentryusb_shell::run(
         "lsblk", &["-dpno", "pkname", &detect_mount_source("/sentryusb").await?],
     ).await?;
-    let dev = output.trim();
-    Ok(format!("/dev/{}", dev))
+    let dev = output.trim().to_string();
+    if dev.is_empty() {
+        anyhow::bail!("could not determine boot disk for /sentryusb");
+    }
+    Ok(dev)
 }
 
 async fn detect_root_partition() -> Result<String> {
