@@ -581,7 +581,14 @@ write_resize_marker() {{
   fi
   rmdir /tmp/rootmnt 2>/dev/null || true
 }}
-if /sbin/e2fsck -y -v -f "$ROOT_DEVICE"; then
+/sbin/e2fsck -y -v -f "$ROOT_DEVICE"
+FSCK_RC=$?
+# e2fsck exit codes: 0=clean, 1=errors corrected, 2=corrected (reboot suggested),
+# 4+=uncorrected errors. Codes 0/1/2 mean the FS is now consistent.
+if [ "$FSCK_RC" -le 2 ]; then
+  if [ "$FSCK_RC" -ne 0 ]; then
+    echo "e2fsck corrected filesystem errors (rc=$FSCK_RC), continuing with resize"
+  fi
   if /sbin/resize2fs -f -d 8 "$ROOT_DEVICE" "$ROOT_SIZE"; then
     echo "resize2fs completed successfully"
     write_resize_marker "success"
@@ -591,9 +598,8 @@ if /sbin/e2fsck -y -v -f "$ROOT_DEVICE"; then
     write_resize_marker "fail:resize2fs:$RC"
   fi
 else
-  RC=$?
-  echo "e2fsck $ROOT_DEVICE failed with exit code $RC"
-  write_resize_marker "fail:e2fsck:$RC"
+  echo "e2fsck $ROOT_DEVICE failed with uncorrectable errors (rc=$FSCK_RC)"
+  write_resize_marker "fail:e2fsck:$FSCK_RC"
 fi
 "#);
     std::fs::create_dir_all("/etc/initramfs-tools/scripts/init-premount")?;

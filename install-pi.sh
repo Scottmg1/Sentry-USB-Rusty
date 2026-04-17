@@ -213,19 +213,53 @@ if [ ! -f /sentryusb/WIFI_ENABLED ]; then
     touch /sentryusb/WIFI_ENABLED
 fi
 
+# ── Step 5b: Hostname + mDNS (sentryusb.local works immediately) ───
+
+TARGET_HOSTNAME="sentryusb"
+CURRENT_HOSTNAME=$(hostname -s 2>/dev/null || echo "raspberrypi")
+
+if [ "$CURRENT_HOSTNAME" != "$TARGET_HOSTNAME" ]; then
+    info "Setting hostname to ${TARGET_HOSTNAME}..."
+    hostnamectl set-hostname "$TARGET_HOSTNAME" 2>/dev/null \
+        || echo "$TARGET_HOSTNAME" > /etc/hostname
+    # Update /etc/hosts so sudo/local lookups don't warn
+    if grep -qE "^127\.0\.1\.1\s" /etc/hosts; then
+        sed -i "s/^127\.0\.1\.1\s.*/127.0.1.1\t${TARGET_HOSTNAME}/" /etc/hosts
+    else
+        echo -e "127.0.1.1\t${TARGET_HOSTNAME}" >> /etc/hosts
+    fi
+    hostname "$TARGET_HOSTNAME" 2>/dev/null || true
+    ok "Hostname set to ${TARGET_HOSTNAME}"
+fi
+
+info "Ensuring avahi-daemon is installed for mDNS (${TARGET_HOSTNAME}.local)..."
+if ! command -v avahi-daemon >/dev/null 2>&1; then
+    apt-get install -y avahi-daemon >/dev/null 2>&1 \
+        || warn "avahi-daemon install failed — ${TARGET_HOSTNAME}.local may not resolve"
+fi
+systemctl enable avahi-daemon >/dev/null 2>&1 || true
+systemctl restart avahi-daemon >/dev/null 2>&1 || true
+ok "mDNS active: http://${TARGET_HOSTNAME}.local"
+
 # ── Step 6: Start the Service ──────────────────────────────────────
 
 info "Starting SentryUSB..."
 systemctl restart sentryusb
 
-# Get IP address for the user — retry briefly in case the network just bounced
+# Get IP address for the user — try multiple methods, network may have just bounced
 IP=""
 for _ in 1 2 3 4 5; do
     IP=$(hostname -I 2>/dev/null | awk '{print $1}')
+    if [ -z "$IP" ]; then
+        IP=$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}')
+    fi
+    if [ -z "$IP" ]; then
+        IP=$(ip -4 -o addr show scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -1)
+    fi
     [ -n "$IP" ] && break
     sleep 1
 done
-HOSTNAME=$(hostname -s 2>/dev/null || echo "raspberrypi")
+HOSTNAME="$TARGET_HOSTNAME"
 
 echo ""
 echo -e "${GREEN}╔════════════════════════════════════════════════╗${NC}"
@@ -237,8 +271,7 @@ if [ -n "$IP" ]; then
 else
     echo -e "  Web UI:  ${YELLOW}(no IP detected — check 'ip a' once network is up)${NC}"
 fi
-echo -e "  mDNS:    ${BLUE}http://${HOSTNAME}.local${NC}  ${YELLOW}(current hostname)${NC}"
-echo -e "           After setup wizard finishes: ${BLUE}http://sentryusb.local${NC}"
+echo -e "  mDNS:    ${BLUE}http://${HOSTNAME}.local${NC}"
 echo ""
 echo -e "  Open the web UI to complete setup via the wizard."
 echo -e "  All setup (partitions, drives, etc.) is handled by the binary."
