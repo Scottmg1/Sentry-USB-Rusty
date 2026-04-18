@@ -10,6 +10,7 @@ use anyhow::{bail, Context, Result};
 use tracing::info;
 
 use crate::env::SetupEnv;
+use crate::SetupEmitter;
 
 const BACKINGFILES: &str = "/backingfiles";
 
@@ -91,7 +92,7 @@ async fn create_drive(
     label: &str,
     size_kb: u64,
     use_exfat: bool,
-    progress: &(dyn Fn(&str) + Send + Sync),
+    emitter: &SetupEmitter,
 ) -> Result<()> {
     let filename = format!("{}/{}_disk.bin", BACKINGFILES, name);
     let mountpoint = format!("/mnt/{}", name);
@@ -103,7 +104,7 @@ async fn create_drive(
         return Ok(());
     }
 
-    progress(&format!("Allocating {}K for {}...", size_kb, filename));
+    emitter.progress(&format!("Allocating {}K for {}...", size_kb, filename));
     let _ = std::fs::remove_file(&filename);
     sentryusb_shell::run("truncate", &["--size", &format!("{}K", size_kb), &filename]).await
         .context("truncate failed")?;
@@ -125,7 +126,7 @@ async fn create_drive(
     let _ = sentryusb_shell::run("udevadm", &["settle", "--timeout=5"]).await;
 
     // Format
-    progress(&format!("Creating filesystem with label '{}'", label));
+    emitter.progress(&format!("Creating filesystem with label '{}'", label));
     let format_result = if use_exfat {
         sentryusb_shell::run("mkfs.exfat", &[&loopdev, "-L", label]).await
     } else {
@@ -136,7 +137,7 @@ async fn create_drive(
     format_result.context("filesystem creation failed")?;
 
     let _ = std::fs::create_dir_all(&mountpoint);
-    progress(&format!("Drive image {} ready.", filename));
+    emitter.progress(&format!("Drive image {} ready.", filename));
     Ok(())
 }
 
@@ -214,20 +215,16 @@ async fn ensure_vfat_tools() -> Result<()> {
     Ok(())
 }
 
-/// Create all disk images based on config settings.
-pub async fn create_disk_images(env: &SetupEnv, progress: &(dyn Fn(&str) + Send + Sync)) -> Result<()> {
-    progress("Creating disk images...");
-
+/// Create all disk images based on config settings. Returns true if any work was performed.
+pub async fn create_disk_images(env: &SetupEnv, emitter: &SetupEmitter) -> Result<bool> {
     let use_exfat_cfg = env.get_bool("USE_EXFAT", false);
-    let use_exfat = ensure_exfat_tools(use_exfat_cfg).await?;
-    ensure_vfat_tools().await?;
 
-    // Calculate requested sizes
+    // Calculate requested sizes first (before any heavy work) so we can
+    // short-circuit when everything already matches.
     let mut sizes: Vec<(String, String, u64, String)> = Vec::new();
     for spec in DRIVE_SPECS {
         let raw = env.get(spec.config_key, "0");
         let size_kb = if raw.contains('%') {
-            // Percentage sizes deprecated, use default fallback
             dehumanize(spec.default_fallback)?
         } else {
             dehumanize(&raw)?
@@ -236,18 +233,22 @@ pub async fn create_disk_images(env: &SetupEnv, progress: &(dyn Fn(&str) + Send 
         sizes.push((spec.name.to_string(), spec.label.to_string(), size_kb, filename));
     }
 
-    // Check if all images already match
     let all_match = sizes.iter().all(|(_, _, sz, f)| image_matches(f, *sz));
     if all_match {
-        progress("No need to update disk images");
-        return Ok(());
+        return Ok(false);
     }
+
+    emitter.begin_phase("disk_images", "Disk images");
+    emitter.progress("Creating disk images...");
+
+    let use_exfat = ensure_exfat_tools(use_exfat_cfg).await?;
+    ensure_vfat_tools().await?;
 
     // Space check
     let total_requested: u64 = sizes.iter().map(|(_, _, sz, _)| sz).sum();
     let available = available_space_kb().await.unwrap_or(0);
     if total_requested > available {
-        progress(&format!(
+        emitter.progress(&format!(
             "Total requested ({} KB) exceeds available ({} KB), adjusting...",
             total_requested, available
         ));
@@ -293,8 +294,8 @@ pub async fn create_disk_images(env: &SetupEnv, progress: &(dyn Fn(&str) + Send 
         if image_matches(filename, *size_kb) {
             continue;
         }
-        progress(&format!("Recreating {} drive ({}K)...", name, size_kb));
-        create_drive(name, label, *size_kb, use_exfat, progress).await?;
+        emitter.progress(&format!("Recreating {} drive ({}K)...", name, size_kb));
+        create_drive(name, label, *size_kb, use_exfat, emitter).await?;
     }
 
     // Clean up cam-related data when cam drive was changed/removed
@@ -308,6 +309,6 @@ pub async fn create_disk_images(env: &SetupEnv, progress: &(dyn Fn(&str) + Send 
         }
     }
 
-    progress("Disk image creation complete.");
-    Ok(())
+    emitter.progress("Disk image creation complete.");
+    Ok(true)
 }

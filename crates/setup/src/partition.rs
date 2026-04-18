@@ -10,6 +10,7 @@ use anyhow::{bail, Context, Result};
 use tracing::info;
 
 use crate::env::SetupEnv;
+use crate::SetupEmitter;
 
 const BACKINGFILES_MOUNT: &str = "/backingfiles";
 const MUTABLE_MOUNT: &str = "/mutable";
@@ -41,42 +42,48 @@ fn partition_prefix(device: &str) -> &'static str {
     }
 }
 
-/// Create partitions on an external DATA_DRIVE.
-pub async fn setup_data_drive(env: &SetupEnv, progress: &(dyn Fn(&str) + Send + Sync)) -> Result<()> {
+/// Create partitions on an external DATA_DRIVE. Returns true if any work was performed.
+pub async fn setup_data_drive(env: &SetupEnv, emitter: &SetupEmitter) -> Result<bool> {
     let data_drive = env.data_drive.as_deref()
         .context("DATA_DRIVE not set")?;
-
-    progress(&format!("DATA_DRIVE is set to {}", data_drive));
 
     let prefix = partition_prefix(data_drive);
     let p1 = format!("{}{}{}", data_drive, prefix, 1);
     let p2 = format!("{}{}{}", data_drive, prefix, 2);
 
-    // Check if partitions already exist with correct labels/types
     let bf_ok = check_label_matches(&p2, "backingfiles").await;
     let mut_ok = check_label_matches(&p1, "mutable").await;
     let bf_xfs = check_fstype(&p2, "xfs").await;
     let mut_ext4 = check_fstype(&p1, "ext4").await;
 
-    if bf_ok && mut_ok && bf_xfs && mut_ext4 {
-        progress("Existing backingfiles (xfs) and mutable (ext4) partitions found. Keeping them.");
-        // Clean XFS log to prevent slow journal replay
-        progress(&format!("Clearing XFS log on {}...", p2));
+    let already_partitioned = bf_ok && mut_ok && bf_xfs && mut_ext4;
+    let fstab = std::fs::read_to_string("/etc/fstab").unwrap_or_default();
+    let fstab_complete = fstab.contains("LABEL=backingfiles") && fstab.contains("LABEL=mutable");
+
+    if already_partitioned && fstab_complete {
+        return Ok(false);
+    }
+
+    emitter.begin_phase("partitions", "Disk partitioning");
+    emitter.progress(&format!("DATA_DRIVE is set to {}", data_drive));
+
+    if already_partitioned {
+        emitter.progress("Existing backingfiles (xfs) and mutable (ext4) partitions found. Keeping them.");
+        emitter.progress(&format!("Clearing XFS log on {}...", p2));
         let _ = sentryusb_shell::run_with_timeout(
             Duration::from_secs(60), "xfs_repair", &["-L", &p2],
         ).await;
     } else {
-        // Unmount everything on the data drive
-        progress(&format!("Unmounting partitions on {}...", data_drive));
+        emitter.progress(&format!("Unmounting partitions on {}...", data_drive));
         cleanup_mounts().await;
 
-        progress(&format!("WARNING: This will delete EVERYTHING on {}", data_drive));
+        emitter.progress(&format!("WARNING: This will delete EVERYTHING on {}", data_drive));
         sentryusb_shell::run("wipefs", &["-afq", data_drive]).await
             .context("wipefs failed")?;
         sentryusb_shell::run("parted", &[data_drive, "--script", "mktable", "gpt"]).await
             .context("parted mktable failed")?;
 
-        progress("Creating partitions...");
+        emitter.progress("Creating partitions...");
         sentryusb_shell::run(
             "parted", &["-a", "optimal", "-m", data_drive, "mkpart", "primary", "ext4", "0%", "2GB"],
         ).await?;
@@ -86,36 +93,44 @@ pub async fn setup_data_drive(env: &SetupEnv, progress: &(dyn Fn(&str) + Send + 
 
         let _ = sentryusb_shell::run("udevadm", &["settle", "--timeout=10"]).await;
 
-        progress(&format!("Formatting mutable partition (ext4) on {}...", p1));
+        emitter.progress(&format!("Formatting mutable partition (ext4) on {}...", p1));
         sentryusb_shell::run("mkfs.ext4", &["-F", "-L", "mutable", &p1]).await
             .context("mkfs.ext4 failed")?;
 
-        progress(&format!("Formatting backingfiles partition (xfs) on {}...", p2));
+        emitter.progress(&format!("Formatting backingfiles partition (xfs) on {}...", p2));
         sentryusb_shell::run("mkfs.xfs", &["-f", "-m", "reflink=1", "-L", "backingfiles", &p2]).await
             .context("mkfs.xfs failed")?;
 
-        progress("Partition formatting complete.");
+        emitter.progress("Partition formatting complete.");
     }
 
     update_fstab().await?;
-    Ok(())
+    Ok(true)
 }
 
-/// Create partitions on the SD card (after the root partition).
-pub async fn setup_sd_card(env: &SetupEnv, progress: &(dyn Fn(&str) + Send + Sync)) -> Result<()> {
+/// Create partitions on the SD card (after the root partition). Returns true if work was done.
+pub async fn setup_sd_card(env: &SetupEnv, emitter: &SetupEmitter) -> Result<bool> {
     let boot_disk = env.boot_disk.as_deref()
         .context("Could not detect boot disk")?;
 
-    ensure_xfs_tools().await?;
+    let fstab = std::fs::read_to_string("/etc/fstab").unwrap_or_default();
+    let fstab_complete = fstab.contains("LABEL=backingfiles") && fstab.contains("LABEL=mutable");
 
-    // Check if partitions already exist
-    if partitions_exist().await {
-        progress("Using existing backingfiles and mutable partitions");
-        update_fstab().await?;
-        return Ok(());
+    if partitions_exist().await && fstab_complete {
+        return Ok(false);
     }
 
-    progress("Creating backingfiles and mutable partitions on SD card...");
+    emitter.begin_phase("partitions", "Disk partitioning");
+
+    ensure_xfs_tools().await?;
+
+    if partitions_exist().await {
+        emitter.progress("Using existing backingfiles and mutable partitions");
+        update_fstab().await?;
+        return Ok(true);
+    }
+
+    emitter.progress("Creating backingfiles and mutable partitions on SD card...");
 
     // Get last partition info
     let output = sentryusb_shell::run(
@@ -160,7 +175,7 @@ pub async fn setup_sd_card(env: &SetupEnv, progress: &(dyn Fn(&str) + Send + Syn
     // Preserve disk identifier for fstab/cmdline.txt
     let orig_id = get_disk_identifier(boot_disk).await?;
 
-    progress("Creating backingfiles partition...");
+    emitter.progress("Creating backingfiles partition...");
     sentryusb_shell::run(
         "bash", &["-c", &format!(
             "echo '{},{}' | sfdisk --force --no-reread {} -N {}",
@@ -168,7 +183,7 @@ pub async fn setup_sd_card(env: &SetupEnv, progress: &(dyn Fn(&str) + Send + Syn
         )],
     ).await.context("sfdisk backingfiles failed")?;
 
-    progress("Creating mutable partition...");
+    emitter.progress("Creating mutable partition...");
     sentryusb_shell::run(
         "bash", &["-c", &format!(
             "echo '{},' | sfdisk --force --no-reread {} -N {}",
@@ -194,7 +209,7 @@ pub async fn setup_sd_card(env: &SetupEnv, progress: &(dyn Fn(&str) + Send + Syn
     // Update disk identifier in fstab and cmdline.txt
     let new_id = get_disk_identifier(boot_disk).await?;
     if orig_id != new_id {
-        progress("Updating disk identifier in fstab and cmdline.txt...");
+        emitter.progress("Updating disk identifier in fstab and cmdline.txt...");
         let fstab = std::fs::read_to_string("/etc/fstab").unwrap_or_default();
         std::fs::write("/etc/fstab", fstab.replace(&orig_id, &new_id))?;
 
@@ -209,18 +224,18 @@ pub async fn setup_sd_card(env: &SetupEnv, progress: &(dyn Fn(&str) + Send + Syn
     // Calculate mutable inodes: ~1 per 20000 sectors of backingfiles
     let mutable_inodes = bf_num_sectors / 20000;
 
-    progress(&format!("Formatting backingfiles (xfs) on {}...", bf_dev));
+    emitter.progress(&format!("Formatting backingfiles (xfs) on {}...", bf_dev));
     sentryusb_shell::run("mkfs.xfs", &["-f", "-m", "reflink=1", "-L", "backingfiles", &bf_dev]).await
         .context("mkfs.xfs failed")?;
 
-    progress(&format!("Formatting mutable (ext4) on {}...", mut_dev));
+    emitter.progress(&format!("Formatting mutable (ext4) on {}...", mut_dev));
     sentryusb_shell::run(
         "mkfs.ext4", &["-F", "-N", &mutable_inodes.to_string(), "-L", "mutable", &mut_dev],
     ).await.context("mkfs.ext4 failed")?;
 
-    progress("Partition formatting complete.");
+    emitter.progress("Partition formatting complete.");
     update_fstab().await?;
-    Ok(())
+    Ok(true)
 }
 
 async fn get_disk_identifier(disk: &str) -> Result<String> {

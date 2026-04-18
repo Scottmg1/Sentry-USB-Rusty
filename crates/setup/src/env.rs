@@ -110,16 +110,14 @@ impl SetupEnv {
         let boot_disk = detect_boot_disk().await.ok();
         let root_partition = detect_root_partition().await.ok();
 
-        // Load config
+        // Load config. Only use *active* (uncommented) exports — commented
+        // sample lines in sentryusb.conf are documentation, not user choices.
+        // Merging them in would make every optional phase (AP setup, extra
+        // drives, etc.) run against sample defaults the user never picked.
         let config_path = sentryusb_config::find_config_path();
-        let config = match sentryusb_config::parse_file(config_path) {
-            Ok((active, commented)) => {
-                let mut merged = commented;
-                merged.extend(active);
-                merged
-            }
-            Err(_) => std::collections::HashMap::new(),
-        };
+        let config = sentryusb_config::parse_file(config_path)
+            .map(|(active, _commented)| active)
+            .unwrap_or_default();
 
         let data_drive = config.get("DATA_DRIVE")
             .filter(|v| !v.is_empty())

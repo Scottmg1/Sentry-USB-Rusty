@@ -6,9 +6,14 @@ use anyhow::{bail, Context, Result};
 use tracing::info;
 
 use crate::env::SetupEnv;
+use crate::SetupEmitter;
 
 /// Configure the WiFi access point via NetworkManager.
-pub async fn configure_ap(env: &SetupEnv, progress: &(dyn Fn(&str) + Send + Sync)) -> Result<()> {
+///
+/// The runner gates this on both `AP_SSID` and a valid `AP_PASS` being set,
+/// so by the time we get here both are populated. We still defend against
+/// missing values in case this is called directly.
+pub async fn configure_ap(env: &SetupEnv, emitter: &SetupEmitter) -> Result<()> {
     let ssid = match env.config.get("AP_SSID") {
         Some(v) if !v.is_empty() => v.clone(),
         _ => {
@@ -24,7 +29,8 @@ pub async fn configure_ap(env: &SetupEnv, progress: &(dyn Fn(&str) + Send + Sync
         }
     };
 
-    progress(&format!("Configuring WiFi AP: {}", ssid));
+    emitter.begin_phase("wifi_ap", "WiFi access point");
+    emitter.progress(&format!("Configuring WiFi AP: {}", ssid));
 
     // Make sure NetworkManager is available
     if sentryusb_shell::run("which", &["nmcli"]).await.is_err() {
@@ -33,7 +39,7 @@ pub async fn configure_ap(env: &SetupEnv, progress: &(dyn Fn(&str) + Send + Sync
 
     // Find the WiFi client device
     let wlan = find_wifi_device().await?;
-    progress(&format!("WiFi client interface: {}", wlan));
+    emitter.progress(&format!("WiFi client interface: {}", wlan));
 
     // Create virtual AP interface if it doesn't exist
     if sentryusb_shell::run("iw", &["dev", "ap0", "info"]).await.is_err() {
@@ -87,7 +93,7 @@ pub async fn configure_ap(env: &SetupEnv, progress: &(dyn Fn(&str) + Send + Sync
     // Install NM dispatcher script to bring up AP when WiFi connects
     install_ap_dispatcher().await?;
 
-    progress("WiFi AP configured.");
+    emitter.progress("WiFi AP configured.");
     Ok(())
 }
 

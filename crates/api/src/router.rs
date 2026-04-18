@@ -28,6 +28,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/setup/status", get(crate::setup::get_setup_status))
         .route("/api/setup/config", get(crate::setup::get_setup_config).put(crate::setup::save_setup_config))
         .route("/api/setup/run", post(crate::setup::run_setup))
+        .route("/api/setup/phases", get(crate::setup::get_setup_phases))
         .route("/api/setup/test-archive", post(crate::setup::test_archive))
         // Clips
         .route("/api/clips", get(crate::clips::get_clips))

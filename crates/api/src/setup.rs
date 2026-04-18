@@ -114,12 +114,18 @@ fn spawn_setup(hub: sentryusb_ws::Hub) {
         hub.broadcast("setup_status", &serde_json::json!({"status": "running"}));
         info!("[setup] Starting native Rust setup");
 
-        let hub_clone = hub.clone();
-        let progress = sentryusb_setup::runner::make_progress(move |msg: &str| {
-            hub_clone.broadcast("setup_progress", &serde_json::json!({"message": msg}));
-        });
+        let hub_progress = hub.clone();
+        let hub_phase = hub.clone();
+        let emitter = sentryusb_setup::runner::make_emitter(
+            move |msg: &str| {
+                hub_progress.broadcast("setup_progress", &serde_json::json!({"message": msg}));
+            },
+            move |id: &str, label: &str| {
+                hub_phase.broadcast("setup_phase", &serde_json::json!({"id": id, "label": label}));
+            },
+        );
 
-        let result = sentryusb_setup::runner::run_full_setup(progress).await;
+        let result = sentryusb_setup::runner::run_full_setup(emitter).await;
 
         SETUP_RUNNING.store(false, Ordering::SeqCst);
 
@@ -133,6 +139,23 @@ fn spawn_setup(hub: sentryusb_ws::Hub) {
             }
         }
     });
+}
+
+const SETUP_PHASES_FILE: &str = "/sentryusb/setup-phases.jsonl";
+
+/// GET /api/setup/phases — returns the list of phases that have already been
+/// announced during the current (possibly multi-reboot) setup run. The web UI
+/// fetches this on mount and on WebSocket reconnect so it can reconstruct the
+/// phase list that was built up before the tab connected.
+pub async fn get_setup_phases(
+    State(_s): State<AppState>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let phases: Vec<serde_json::Value> = std::fs::read_to_string(SETUP_PHASES_FILE)
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|l| serde_json::from_str(l).ok())
+        .collect();
+    (StatusCode::OK, Json(serde_json::json!({ "phases": phases })))
 }
 
 /// POST /api/setup/run

@@ -1,30 +1,35 @@
 //! Setup runner — the main orchestrator that replaces `setup-sentryusb`.
 //!
-//! Ties all setup phases together with progress logging via a callback,
-//! typically wired to both a log file and WebSocket broadcast.
+//! Every phase function owns its own idempotency check and only announces
+//! itself via `emitter.begin_phase(..)` when it actually has work to do,
+//! so the wizard's live phase list shows only the phases that are being
+//! executed this run. Re-runs after a mid-setup reboot silently skip the
+//! already-completed phases instead of re-lighting every step.
 
 use std::path::Path;
-use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{bail, Result};
 use tracing::info;
 
 use crate::env::SetupEnv;
+use crate::SetupEmitter;
 
 const SETUP_LOG: &str = "/sentryusb/sentryusb-setup.log";
+const SETUP_PHASES_FILE: &str = "/sentryusb/setup-phases.jsonl";
 const SETUP_FINISHED_MARKER: &str = "/sentryusb/SENTRYUSB_SETUP_FINISHED";
 const SETUP_STARTED_MARKER: &str = "/sentryusb/SENTRYUSB_SETUP_STARTED";
 
-/// Progress callback type — receives timestamped messages.
-pub type ProgressFn = Arc<dyn Fn(&str) + Send + Sync>;
-
-/// Create a progress callback that writes to both the log file and an
-/// arbitrary closure (e.g. WebSocket broadcast).
-pub fn make_progress(extra: impl Fn(&str) + Send + Sync + 'static) -> ProgressFn {
-    Arc::new(move |msg: &str| {
+/// Build a `SetupEmitter` whose progress callback writes to the setup log
+/// file and whose phase callback appends to `setup-phases.jsonl`. The two
+/// extra closures are invoked after the file I/O so callers can forward
+/// events over WebSocket (etc).
+pub fn make_emitter(
+    progress_extra: impl Fn(&str) + Send + Sync + 'static,
+    phase_extra: impl Fn(&str, &str) + Send + Sync + 'static,
+) -> SetupEmitter {
+    let progress = move |msg: &str| {
         let stamped = format!("{} : {}", chrono_now(), msg);
-        // Write to log file
         if let Ok(mut f) = std::fs::OpenOptions::new()
             .create(true).append(true).open(SETUP_LOG)
         {
@@ -32,157 +37,147 @@ pub fn make_progress(extra: impl Fn(&str) + Send + Sync + 'static) -> ProgressFn
             let _ = writeln!(f, "{}", stamped);
         }
         info!("[setup] {}", msg);
-        extra(msg);
-    })
+        progress_extra(msg);
+    };
+    let phase = move |id: &str, label: &str| {
+        let line = serde_json::json!({"id": id, "label": label}).to_string();
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true).append(true).open(SETUP_PHASES_FILE)
+        {
+            use std::io::Write;
+            let _ = writeln!(f, "{}", line);
+        }
+        info!("[setup] phase: {} ({})", label, id);
+        phase_extra(id, label);
+    };
+    SetupEmitter::new(progress, phase)
 }
 
 fn chrono_now() -> String {
-    // Use system date command since we don't want to pull in chrono just for this
     std::process::Command::new("date")
         .output()
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
         .unwrap_or_else(|_| "???".to_string())
 }
 
-/// Run the full setup process from scratch.
-///
-/// This replaces the entire `setup-sentryusb` script. It detects the
-/// environment, partitions the disk, creates disk images, configures the
-/// system, and marks setup as complete.
-pub async fn run_full_setup(progress: ProgressFn) -> Result<()> {
-    progress("=== SentryUSB Setup Starting ===");
+/// Run the full setup process. Idempotent on re-runs after reboots.
+pub async fn run_full_setup(emitter: SetupEmitter) -> Result<()> {
+    emitter.progress("=== SentryUSB Setup Starting ===");
 
-    // Root check
     if !am_root() {
         bail!("Setup must run as root");
     }
 
-    // Mark setup as started
     let _ = std::fs::remove_file(SETUP_FINISHED_MARKER);
     let _ = std::fs::create_dir_all("/sentryusb");
     let _ = std::fs::write(SETUP_STARTED_MARKER, "");
 
-    // Remount root filesystem read-write for setup
+    // Clear the phases ledger on a fresh start so the UI list starts empty.
+    // Setup resumes after a mid-flow reboot hit this same code path, so we
+    // only truncate when there are no partitions yet (first run).
+    if !crate::partition::partitions_exist().await {
+        let _ = std::fs::remove_file(SETUP_PHASES_FILE);
+    }
+
     let _ = sentryusb_shell::run("mount", &["/", "-o", "remount,rw"]).await;
 
-    // Phase 1: Detect environment
-    progress("Phase 1: Detecting environment...");
+    // Phase: detect environment (no UI phase — always fast)
     let env = SetupEnv::detect().await?;
-    progress(&format!("Detected: {}", env.pi_model.display_name()));
+    emitter.progress(&format!("Detected: {}", env.pi_model.display_name()));
 
-    // Phase 2: WiFi regulatory domain
-    progress("Phase 2: WiFi regulatory domain...");
-    let needs_reboot = configure_wifi_regulatory(&env, &*progress).await?;
-    if needs_reboot {
-        progress("Rebooting to apply WiFi regulatory domain change...");
+    // WiFi regulatory (silent no-op when already set)
+    configure_wifi_regulatory(&env, &emitter).await?;
+
+    // dwc2 USB gadget overlay — reboots if added.
+    if configure_dwc2_overlay(&env, &emitter).await? {
+        emitter.progress("Rebooting to apply dwc2 overlay change...");
         reboot().await;
         return Ok(());
     }
 
-    // Phase 3: config.txt — dwc2 overlay for USB gadget
-    progress("Phase 3: USB gadget overlay...");
-    let dwc2_changed = configure_dwc2_overlay(&env, &*progress).await?;
-    if dwc2_changed {
-        progress("Rebooting to apply dwc2 overlay change...");
+    // Root partition shrink (reboots twice in its own flow)
+    if check_root_shrink(&env, &emitter).await? {
+        return Ok(());
+    }
+
+    // Hostname + timezone (grouped under "System configuration")
+    let hostname_changed = crate::system::configure_hostname(&env, &emitter).await?;
+    let tz_changed = crate::system::configure_timezone(&env, &emitter).await?;
+    if hostname_changed || tz_changed {
+        // Progress already written; emit the phase retroactively so the UI
+        // records this grouping exactly once, without double-announcing.
+        emitter.begin_phase("system_basics", "System configuration");
+    }
+
+    // Package index refresh.
+    update_package_index(&emitter).await?;
+
+    // cmdline.txt modules — reboots if changed.
+    if fix_cmdline_modules(&env, &emitter).await? {
+        emitter.progress("Rebooting to apply cmdline.txt change...");
         reboot().await;
         return Ok(());
     }
 
-    // Phase 4: Root partition shrink (if auto-expanded by Pi Imager)
-    progress("Phase 4: Checking disk layout...");
-    let shrink_needed = check_root_shrink(&env, &*progress).await?;
-    if shrink_needed {
-        // Shrink triggers a reboot via initramfs; this function doesn't return
-        return Ok(());
-    }
+    // Required packages (announces its own phase on work).
+    crate::system::install_required_packages(&emitter).await?;
 
-    // Phase 5: Hostname
-    progress("Phase 5: System configuration...");
-    crate::system::configure_hostname(&env, &*progress).await?;
+    // Runtime helper scripts.
+    crate::scripts::install_runtime_scripts(&emitter).await?;
 
-    // Phase 6: Update package index
-    progress("Phase 6: Package management...");
-    update_package_index(&*progress).await?;
+    // UAS quirks (silent unless it added an entry).
+    fix_uas_quirks(&env, &emitter).await?;
 
-    // Phase 7: Timezone
-    crate::system::configure_timezone(&env, &*progress).await?;
-
-    // Phase 8: cmdline.txt modules-load
-    progress("Phase 8: Boot configuration...");
-    let modules_changed = fix_cmdline_modules(&env, &*progress).await?;
-    if modules_changed {
-        progress("Rebooting to apply cmdline.txt change...");
-        reboot().await;
-        return Ok(());
-    }
-
-    // Phase 9: Install required packages
-    progress("Phase 9: Required packages...");
-    crate::system::install_required_packages(&*progress).await?;
-
-    // Phase 9b: Runtime helper scripts
-    crate::scripts::install_runtime_scripts(&*progress).await?;
-
-    // Phase 10: UAS quirks for external USB drives
-    fix_uas_quirks(&env, &*progress).await?;
-
-    // Phase 11: Partitions
-    progress("Phase 10: Disk partitioning...");
+    // Partitioning.
     if env.data_drive.is_some() {
-        crate::partition::setup_data_drive(&env, &*progress).await?;
+        crate::partition::setup_data_drive(&env, &emitter).await?;
     } else {
-        crate::partition::setup_sd_card(&env, &*progress).await?;
+        crate::partition::setup_sd_card(&env, &emitter).await?;
     }
 
-    // Mount partitions
-    mount_partitions(&*progress).await?;
+    // Mount partitions (helper phase with its own idempotency).
+    mount_partitions(&emitter).await?;
 
-    // Phase 12: Disk images
-    progress("Phase 11: Disk images...");
-    crate::disk_images::create_disk_images(&env, &*progress).await?;
+    // Disk images.
+    crate::disk_images::create_disk_images(&env, &emitter).await?;
 
-    // Update fstab for disk images
-    update_image_fstab_entries(&*progress).await?;
+    update_image_fstab_entries().await?;
+    initialize_drive_directories().await?;
 
-    // Initialize drive directories
-    initialize_drive_directories(&*progress).await?;
-
-    // Phase 13: Archive configuration
+    // Archive configuration.
     if env.get_bool("CONFIGURE_ARCHIVING", true) {
-        progress("Phase 12: Archive configuration...");
-        crate::archive::configure_archive(&env, &*progress).await?;
+        crate::archive::configure_archive(&env, &emitter).await?;
     }
 
-    // Phase 14: Samba
-    crate::system::configure_samba(&env, &*progress).await?;
+    // Samba.
+    crate::system::configure_samba(&env, &emitter).await?;
 
-    // Phase 15: WiFi AP
-    if env.config.contains_key("AP_SSID") {
-        progress("Phase 13: WiFi AP...");
-        crate::network::configure_ap(&env, &*progress).await?;
+    // WiFi AP — only when both SSID and a valid password are set.
+    let has_ap_ssid = env.config.get("AP_SSID").is_some_and(|v| !v.is_empty());
+    let has_ap_pass = env.config.get("AP_PASS").is_some_and(|v| v.len() >= 8);
+    if has_ap_ssid && has_ap_pass {
+        crate::network::configure_ap(&env, &emitter).await?;
     }
 
-    // Phase 16: SSH hardening
-    progress("Phase 14: SSH hardening...");
-    crate::system::configure_ssh(&*progress).await?;
+    // SSH hardening.
+    crate::system::configure_ssh(&emitter).await?;
 
-    // Phase 17: Avahi mDNS
-    crate::system::configure_avahi(&env, &*progress).await?;
+    // Avahi mDNS.
+    crate::system::configure_avahi(&env, &emitter).await?;
 
-    // Phase 18: RTC
-    crate::system::configure_rtc(&env, &*progress).await?;
+    // RTC.
+    crate::system::configure_rtc(&env, &emitter).await?;
 
-    // Phase 19: BLE daemon
-    progress("Phase 15: BLE peripheral...");
-    crate::archive::configure_tesla_ble(&env, &*progress).await?;
+    // Tesla BLE peripheral (silent if VIN unset or already configured).
+    crate::archive::configure_tesla_ble(&env, &emitter).await?;
 
-    // Phase 20: Read-only filesystem
-    progress("Phase 16: Read-only filesystem...");
-    crate::readonly::make_readonly(&env, &*progress).await?;
+    // Read-only filesystem.
+    crate::readonly::make_readonly(&env, &emitter).await?;
 
-    // Phase 21: Optional package upgrade
+    // Optional package upgrade.
     if env.get_bool("UPGRADE_PACKAGES", false) {
-        progress("Upgrading installed packages...");
+        emitter.begin_phase("upgrade_packages", "Upgrading packages");
+        emitter.progress("Upgrading installed packages...");
         let _ = sentryusb_shell::run("apt-get", &["clean"]).await;
         let _ = sentryusb_shell::run_with_timeout(
             Duration::from_secs(600), "apt-get", &["--assume-yes", "upgrade"],
@@ -190,12 +185,11 @@ pub async fn run_full_setup(progress: ProgressFn) -> Result<()> {
         let _ = sentryusb_shell::run("apt-get", &["clean"]).await;
     }
 
-    // Mark setup complete
     let _ = std::fs::remove_file(SETUP_STARTED_MARKER);
     let _ = std::fs::write(SETUP_FINISHED_MARKER, "");
 
-    progress("=== SentryUSB Setup Complete ===");
-    progress("Reboot now for changes to take effect.");
+    emitter.progress("=== SentryUSB Setup Complete ===");
+    emitter.progress("Reboot now for changes to take effect.");
 
     Ok(())
 }
@@ -203,7 +197,6 @@ pub async fn run_full_setup(progress: ProgressFn) -> Result<()> {
 fn am_root() -> bool {
     #[cfg(target_os = "linux")]
     {
-        // SAFETY: geteuid is always safe to call
         unsafe { libc::geteuid() == 0 }
     }
     #[cfg(not(target_os = "linux"))]
@@ -213,10 +206,9 @@ fn am_root() -> bool {
 }
 
 async fn reboot() {
-    // Don't go through logind — it may be broken/unavailable on minimal images,
-    // which causes `reboot` to hang for 25s+ per dbus-activation timeout.
-    // `systemctl --force reboot` talks to systemd directly; spawn without
-    // capturing pipes so we don't deadlock on shutdown closing our stderr.
+    // Don't go through logind — it may be broken on minimal images and
+    // stall for 25s+ per dbus-activation timeout. Talk to systemd directly
+    // and fall back to kernel reboot.
     if tokio::process::Command::new("systemctl")
         .args(["--force", "reboot"])
         .spawn()
@@ -224,34 +216,36 @@ async fn reboot() {
     {
         tokio::time::sleep(std::time::Duration::from_secs(5)).await;
     }
-    // Fallback: kernel-level reboot via util-linux's reboot(8) -f
     let _ = tokio::process::Command::new("reboot").arg("-f").spawn();
 }
 
-/// Set WiFi regulatory domain to US if not set. Persists via /etc/default/crda
-/// and cfg80211 module param so it survives reboots without needing one.
-async fn configure_wifi_regulatory(_env: &SetupEnv, progress: &(dyn Fn(&str) + Send + Sync)) -> Result<bool> {
-    if sentryusb_shell::run("systemctl", &["-q", "is-enabled", "NetworkManager.service"]).await.is_ok() {
-        let output = sentryusb_shell::run(
-            "bash", &["-c", "iw reg get 2>/dev/null | grep -oP '(?<=country )\\w+' | head -1"],
-        ).await.unwrap_or_default();
-        let reg = output.trim();
-        if reg.is_empty() || reg == "00" {
-            progress("Setting WiFi regulatory domain to US");
-            let _ = sentryusb_shell::run("iw", &["reg", "set", "US"]).await;
-            // Persist so it survives reboots (no reboot needed)
-            let _ = std::fs::write("/etc/default/crda", "REGDOMAIN=US\n");
-            let _ = sentryusb_shell::run(
-                "bash", &["-c", "mkdir -p /etc/modprobe.d && echo 'options cfg80211 ieee80211_regdom=US' > /etc/modprobe.d/cfg80211.conf"],
-            ).await;
-        }
+/// Persist US regulatory domain via module param and /etc/default/crda if not
+/// already set. Silent no-op otherwise.
+async fn configure_wifi_regulatory(_env: &SetupEnv, emitter: &SetupEmitter) -> Result<()> {
+    if sentryusb_shell::run("systemctl", &["-q", "is-enabled", "NetworkManager.service"]).await.is_err() {
+        return Ok(());
     }
-    // Never requires a reboot
-    Ok(false)
+    let output = sentryusb_shell::run(
+        "bash", &["-c", "iw reg get 2>/dev/null | grep -oP '(?<=country )\\w+' | head -1"],
+    ).await.unwrap_or_default();
+    let reg = output.trim();
+    if !(reg.is_empty() || reg == "00") {
+        return Ok(());
+    }
+
+    emitter.begin_phase("wifi_regdom", "WiFi regulatory domain");
+    emitter.progress("Setting WiFi regulatory domain to US");
+    let _ = sentryusb_shell::run("iw", &["reg", "set", "US"]).await;
+    let _ = std::fs::write("/etc/default/crda", "REGDOMAIN=US\n");
+    let _ = sentryusb_shell::run(
+        "bash", &["-c", "mkdir -p /etc/modprobe.d && echo 'options cfg80211 ieee80211_regdom=US' > /etc/modprobe.d/cfg80211.conf"],
+    ).await;
+    Ok(())
 }
 
-/// Configure the dwc2 USB gadget overlay in config.txt with proper per-model sections.
-async fn configure_dwc2_overlay(env: &SetupEnv, progress: &(dyn Fn(&str) + Send + Sync)) -> Result<bool> {
+/// Configure the dwc2 USB gadget overlay in config.txt with proper per-model
+/// sections. Returns true if a change was made (requires a reboot).
+async fn configure_dwc2_overlay(env: &SetupEnv, emitter: &SetupEmitter) -> Result<bool> {
     let config_path = match &env.piconfig_path {
         Some(p) => p.clone(),
         None => return Ok(false),
@@ -260,7 +254,6 @@ async fn configure_dwc2_overlay(env: &SetupEnv, progress: &(dyn Fn(&str) + Send 
     let config = std::fs::read_to_string(&config_path).unwrap_or_default();
     let section = env.pi_model.config_section();
 
-    // Pi 3 uses dr_mode=peripheral
     let overlay_line = if env.pi_model == crate::env::PiModel::Pi3 {
         "dtoverlay=dwc2,dr_mode=peripheral"
     } else {
@@ -268,7 +261,6 @@ async fn configure_dwc2_overlay(env: &SetupEnv, progress: &(dyn Fn(&str) + Send 
     };
 
     if section == "all" {
-        // Global: check before any [section] or in [all]
         let in_global = config.lines()
             .take_while(|l| !l.starts_with('['))
             .any(|l| l.contains("dtoverlay=dwc2"));
@@ -284,6 +276,7 @@ async fn configure_dwc2_overlay(env: &SetupEnv, progress: &(dyn Fn(&str) + Send 
             return Ok(false);
         }
 
+        emitter.begin_phase("dwc2_overlay", "USB gadget overlay");
         if config.contains("[all]") {
             let new = config.replacen("[all]", &format!("[all]\n{}", overlay_line), 1);
             std::fs::write(&config_path, new)?;
@@ -293,7 +286,6 @@ async fn configure_dwc2_overlay(env: &SetupEnv, progress: &(dyn Fn(&str) + Send 
             writeln!(f, "\n{}", overlay_line)?;
         }
     } else {
-        // Model-specific section [pi4], [pi5], [pi02]
         let section_header = format!("[{}]", section);
         let in_section = if let Some(idx) = config.find(&section_header) {
             config[idx..].lines().skip(1)
@@ -307,6 +299,7 @@ async fn configure_dwc2_overlay(env: &SetupEnv, progress: &(dyn Fn(&str) + Send 
             return Ok(false);
         }
 
+        emitter.begin_phase("dwc2_overlay", "USB gadget overlay");
         if config.contains(&section_header) {
             let new = config.replacen(
                 &section_header,
@@ -329,28 +322,19 @@ async fn configure_dwc2_overlay(env: &SetupEnv, progress: &(dyn Fn(&str) + Send 
                 in_section_any = true;
             }
             if !in_section_any && line.trim() == "dtoverlay=dwc2" {
-                continue; // Remove global stale entry
+                continue;
             }
             lines.push(line.to_string());
         }
         std::fs::write(&config_path, lines.join("\n") + "\n")?;
     }
 
-    progress(&format!("Added {} to config.txt under [{}]", overlay_line, section));
+    emitter.progress(&format!("Added {} to config.txt under [{}]", overlay_line, section));
     Ok(true)
 }
 
-/// Check if root needs shrinking (when Pi Imager auto-expanded it).
-///
-/// Shrinking an ext4 root filesystem requires an initramfs premount script
-/// that runs BEFORE the root is mounted. The flow is:
-///
-/// 1. First run: detect need → install initramfs hooks → reboot
-/// 2. During boot: initramfs premount script does e2fsck + resize2fs on
-///    the unmounted root → writes /root/RESIZE_RESULT marker
-/// 3. Next setup run: read RESIZE_RESULT → shrink partition table → reboot
-/// 4. Final setup run: partitions exist, skip this phase entirely
-async fn check_root_shrink(env: &SetupEnv, progress: &(dyn Fn(&str) + Send + Sync)) -> Result<bool> {
+/// Check whether the root partition needs shrinking (Pi Imager auto-expand case).
+async fn check_root_shrink(env: &SetupEnv, emitter: &SetupEmitter) -> Result<bool> {
     if crate::partition::partitions_exist().await {
         return Ok(false);
     }
@@ -368,7 +352,6 @@ async fn check_root_shrink(env: &SetupEnv, progress: &(dyn Fn(&str) + Send + Syn
         "bash", &["-c", &format!("echo '{}' | grep -o '[0-9]*$'", root_dev)],
     ).await.unwrap_or_default().trim().to_string();
 
-    // --- Phase 2: Check if a previous initramfs resize left a result ---
     let resize_result_file = "/root/RESIZE_RESULT";
     let resize_marker = "/root/RESIZE_ATTEMPTED";
 
@@ -378,11 +361,11 @@ async fn check_root_shrink(env: &SetupEnv, progress: &(dyn Fn(&str) + Send + Syn
         let _ = std::fs::remove_file(resize_result_file);
 
         if result == "success" {
-            progress("Root filesystem resize completed successfully during boot.");
+            emitter.begin_phase("root_shrink", "Shrinking root partition");
+            emitter.progress("Root filesystem resize completed successfully during boot.");
             let _ = std::fs::remove_file(resize_marker);
 
-            // Shrink the partition table to match the smaller filesystem
-            progress("Shrinking root partition table entry to match filesystem...");
+            emitter.progress("Shrinking root partition table entry to match filesystem...");
             let sector_size = sentryusb_shell::run(
                 "bash", &["-c", &format!(
                     "cat /sys/block/$(lsblk -no pkname '{}')/queue/hw_sector_size", root_dev
@@ -405,7 +388,7 @@ async fn check_root_shrink(env: &SetupEnv, progress: &(dyn Fn(&str) + Send + Syn
                     "bash", &["-c", &format!("partx --show -g -o START '{}'", root_dev)],
                 ).await.unwrap_or_default().trim().to_string();
 
-                progress(&format!("Resizing partition to {} sectors", fs_sectors));
+                emitter.progress(&format!("Resizing partition to {} sectors", fs_sectors));
                 let _ = sentryusb_shell::run_with_timeout(
                     Duration::from_secs(30),
                     "bash", &["-c", &format!(
@@ -415,7 +398,6 @@ async fn check_root_shrink(env: &SetupEnv, progress: &(dyn Fn(&str) + Send + Syn
                 ).await;
             }
 
-            // Clean up initramfs entries from config.txt
             if Path::new("/sentryusb/config.txt").exists() {
                 let config = std::fs::read_to_string("/sentryusb/config.txt").unwrap_or_default();
                 if config.contains("SENTRYUSB-REMOVE") {
@@ -430,24 +412,23 @@ async fn check_root_shrink(env: &SetupEnv, progress: &(dyn Fn(&str) + Send + Syn
                 }
             }
 
-            progress("Root partition shrink complete, rebooting...");
+            emitter.progress("Root partition shrink complete, rebooting...");
             reboot().await;
             return Ok(true);
 
         } else if result.starts_with("fail:") {
             let _ = std::fs::remove_file(resize_marker);
-            progress(&format!(
+            emitter.progress(&format!(
                 "FATAL: Root filesystem resize failed: {}. Try reflashing with Balena Etcher instead of Raspberry Pi Imager.",
                 result
             ));
             bail!("Root resize failed: {}", result);
         } else {
-            progress(&format!("WARNING: Unrecognized resize result: {}", result));
+            emitter.progress(&format!("WARNING: Unrecognized resize result: {}", result));
             let _ = std::fs::remove_file(resize_marker);
         }
     }
 
-    // --- Phase 1: Check if root partition needs shrinking ---
     let output = sentryusb_shell::run(
         "bash", &["-c", &format!(
             "sfdisk -F '{}' 2>/dev/null | grep -o '[0-9]* bytes' | head -1 | awk '{{print $1}}'",
@@ -458,23 +439,21 @@ async fn check_root_shrink(env: &SetupEnv, progress: &(dyn Fn(&str) + Send + Syn
     let min_space: u64 = 8 * 1024 * 1024 * 1024;
 
     if unpart_bytes >= min_space {
-        progress(&format!("Sufficient unpartitioned space: {} GB", unpart_bytes / 1024 / 1024 / 1024));
         return Ok(false);
     }
 
-    // Check if we already tried and failed (prevent infinite loop)
     if Path::new(resize_marker).exists() {
-        progress("FATAL: Previous root shrink attempt failed. Delete /root/RESIZE_ATTEMPTED and try again, or reflash with Balena Etcher.");
+        emitter.progress("FATAL: Previous root shrink attempt failed. Delete /root/RESIZE_ATTEMPTED and try again, or reflash with Balena Etcher.");
         bail!("Previous root shrink attempt failed. Reflash with Balena Etcher instead of Raspberry Pi Imager.");
     }
 
-    progress(&format!(
+    emitter.begin_phase("root_shrink", "Shrinking root partition");
+    emitter.progress(&format!(
         "Insufficient unpartitioned space ({} MB). Root partition needs shrinking.",
         unpart_bytes / 1024 / 1024
     ));
-    progress("This usually happens when Raspberry Pi Imager is used to flash the image.");
+    emitter.progress("This usually happens when Raspberry Pi Imager is used to flash the image.");
 
-    // Verify root is the last partition (required to free space at the end)
     let last_part = sentryusb_shell::run(
         "bash", &["-c", &format!(
             "sfdisk -q -l '{}' | tail +2 | sort -n -k 2 | tail -1 | awk '{{print $1}}'",
@@ -482,22 +461,20 @@ async fn check_root_shrink(env: &SetupEnv, progress: &(dyn Fn(&str) + Send + Syn
         )],
     ).await.unwrap_or_default().trim().to_string();
     if root_dev != last_part {
-        progress("FATAL: Root is not the last partition. Cannot shrink. Reflash with Balena Etcher.");
+        emitter.progress("FATAL: Root is not the last partition. Cannot shrink. Reflash with Balena Etcher.");
         bail!("Root is not the last partition, cannot shrink");
     }
 
-    // Calculate shrink target: current usage + 2G headroom, minimum 6G
     let used_output = sentryusb_shell::run(
         "bash", &["-c", "df --output=used -k / | tail -1 | tr -d ' '"],
     ).await?;
     let used_kb: u64 = used_output.trim().parse().unwrap_or(0);
     let target_gb = ((used_kb / 1024 / 1024) + 2).max(6);
 
-    progress(&format!("Shrinking root filesystem to {}GB to free space for setup...", target_gb));
+    emitter.progress(&format!("Shrinking root filesystem to {}GB to free space for setup...", target_gb));
 
     let _ = std::fs::write(resize_marker, "");
 
-    // Ensure initramfs is available
     let kernel_ver = sentryusb_shell::run("uname", &["-r"]).await?.trim().to_string();
     let initrd_name = format!("initrd.img-{}", kernel_ver);
     let boot_part = std::fs::read_link("/sentryusb")
@@ -509,7 +486,7 @@ async fn check_root_shrink(env: &SetupEnv, progress: &(dyn Fn(&str) + Send + Syn
 
     if !Path::new(&initrd_on_boot).exists() && !Path::new(&initrd_in_boot).exists() {
         if Path::new("/sentryusb/config.txt").exists() {
-            progress("Temporarily enabling initramfs for root resize...");
+            emitter.progress("Temporarily enabling initramfs for root resize...");
             let _ = sentryusb_shell::run_with_timeout(
                 Duration::from_secs(120),
                 "update-initramfs", &["-c", "-k", &kernel_ver],
@@ -519,28 +496,24 @@ async fn check_root_shrink(env: &SetupEnv, progress: &(dyn Fn(&str) + Send + Syn
             writeln!(f, "initramfs {} followkernel # SENTRYUSB-REMOVE", initrd_name)?;
         } else {
             let _ = std::fs::remove_file(resize_marker);
-            progress("FATAL: Cannot shrink root automatically. Reflash with Balena Etcher.");
+            emitter.progress("FATAL: Cannot shrink root automatically. Reflash with Balena Etcher.");
             bail!("Cannot shrink root: no initramfs and no config.txt");
         }
     }
 
-    // Copy initramfs to boot partition if needed
     if boot_part != "/boot" && Path::new(&initrd_in_boot).exists() {
         let _ = std::fs::copy(&initrd_in_boot, &initrd_on_boot);
     }
 
-    // Install the initramfs resize hooks and premount script
-    progress("Installing initramfs resize hooks...");
+    emitter.progress("Installing initramfs resize hooks...");
     install_initramfs_resize_scripts(target_gb, &kernel_ver).await?;
 
-    progress("Rebooting into initramfs to shrink root filesystem...");
+    emitter.progress("Rebooting into initramfs to shrink root filesystem...");
     reboot().await;
     Ok(true)
 }
 
-/// Install initramfs hooks and premount script for offline root resize.
 async fn install_initramfs_resize_scripts(target_gb: u64, kernel_ver: &str) -> Result<()> {
-    // Hook: copy e2fsck, resize2fs, mount, umount into initrd
     let hook = r#"#!/bin/sh
 PREREQ=""
 prereqs() { echo "$PREREQ"; }
@@ -556,7 +529,6 @@ copy_exec /bin/umount /bin
     std::fs::write("/etc/initramfs-tools/hooks/resize2fs", hook)?;
     let _ = sentryusb_shell::run("chmod", &["+x", "/etc/initramfs-tools/hooks/resize2fs"]).await;
 
-    // Premount script: runs before root is mounted, does e2fsck + resize2fs
     let premount = format!(r#"#!/bin/sh
 PREREQ=""
 ROOT_SIZE="{target_gb}G"
@@ -583,8 +555,6 @@ write_resize_marker() {{
 }}
 /sbin/e2fsck -y -v -f "$ROOT_DEVICE"
 FSCK_RC=$?
-# e2fsck exit codes: 0=clean, 1=errors corrected, 2=corrected (reboot suggested),
-# 4+=uncorrected errors. Codes 0/1/2 mean the FS is now consistent.
 if [ "$FSCK_RC" -le 2 ]; then
   if [ "$FSCK_RC" -ne 0 ]; then
     echo "e2fsck corrected filesystem errors (rc=$FSCK_RC), continuing with resize"
@@ -606,13 +576,11 @@ fi
     std::fs::write("/etc/initramfs-tools/scripts/init-premount/resize", premount)?;
     let _ = sentryusb_shell::run("chmod", &["+x", "/etc/initramfs-tools/scripts/init-premount/resize"]).await;
 
-    // Regenerate initramfs
     sentryusb_shell::run_with_timeout(
         Duration::from_secs(120),
         "update-initramfs", &["-v", "-u", "-k", kernel_ver],
     ).await?;
 
-    // Copy updated initramfs to boot partition if needed
     let initrd_name = format!("initrd.img-{}", kernel_ver);
     let boot_part = std::fs::read_link("/sentryusb")
         .map(|p| p.to_string_lossy().to_string())
@@ -625,29 +593,27 @@ fi
         }
     }
 
-    // Clean up the hook and premount script (they're already baked into initrd)
     let _ = std::fs::remove_file("/etc/initramfs-tools/hooks/resize2fs");
     let _ = std::fs::remove_file("/etc/initramfs-tools/scripts/init-premount/resize");
 
     Ok(())
 }
 
-/// Fix cmdline.txt modules-load to include dwc2 and g_ether.
-async fn fix_cmdline_modules(env: &SetupEnv, progress: &(dyn Fn(&str) + Send + Sync)) -> Result<bool> {
+/// Ensure cmdline.txt has `modules-load=dwc2,g_ether`. Returns true if a change
+/// was made (caller should reboot).
+async fn fix_cmdline_modules(env: &SetupEnv, emitter: &SetupEmitter) -> Result<bool> {
     let cmdline_path = match &env.cmdline_path {
         Some(p) => p.clone(),
         None => return Ok(false),
     };
 
     let content = std::fs::read_to_string(&cmdline_path)?;
-    let has_dwc2 = content.contains("dwc2");
-    let has_gether = content.contains("g_ether");
-
-    if has_dwc2 && has_gether {
+    if content.contains("dwc2") && content.contains("g_ether") {
         return Ok(false);
     }
 
-    // Remove old modules-load param if present
+    emitter.begin_phase("cmdline_modules", "Boot configuration");
+
     let new_content = content.trim().to_string();
     let new_content = if let Some(start) = new_content.find("modules-load=") {
         let end = new_content[start..].find(' ').unwrap_or(new_content.len() - start);
@@ -658,12 +624,12 @@ async fn fix_cmdline_modules(env: &SetupEnv, progress: &(dyn Fn(&str) + Send + S
 
     let final_content = format!("{} modules-load=dwc2,g_ether\n", new_content.trim());
     std::fs::write(&cmdline_path, final_content)?;
-    progress("Updated cmdline.txt with modules-load=dwc2,g_ether");
+    emitter.progress("Updated cmdline.txt with modules-load=dwc2,g_ether");
     Ok(true)
 }
 
-/// Add UAS quirks for known problematic USB drives.
-async fn fix_uas_quirks(env: &SetupEnv, progress: &(dyn Fn(&str) + Send + Sync)) -> Result<()> {
+/// Add UAS quirks for known problematic USB drives. Silent no-op when already present.
+async fn fix_uas_quirks(env: &SetupEnv, emitter: &SetupEmitter) -> Result<()> {
     let cmdline_path = match &env.cmdline_path {
         Some(p) => p.clone(),
         None => return Ok(()),
@@ -679,7 +645,6 @@ async fn fix_uas_quirks(env: &SetupEnv, progress: &(dyn Fn(&str) + Send + Sync))
 
     let content = std::fs::read_to_string(&cmdline_path)?;
     let mut new_entries = Vec::new();
-
     for quirk in &known_quirks {
         if !content.contains(quirk) {
             new_entries.push(format!("{}:u", quirk));
@@ -690,9 +655,9 @@ async fn fix_uas_quirks(env: &SetupEnv, progress: &(dyn Fn(&str) + Send + Sync))
         return Ok(());
     }
 
+    emitter.begin_phase("uas_quirks", "USB drive compatibility");
     let joined = new_entries.join(",");
     let new_content = if content.contains("usb-storage.quirks=") {
-        // Append to existing
         content.replace(
             "usb-storage.quirks=",
             &format!("usb-storage.quirks={},", joined),
@@ -702,13 +667,27 @@ async fn fix_uas_quirks(env: &SetupEnv, progress: &(dyn Fn(&str) + Send + Sync))
     };
 
     std::fs::write(&cmdline_path, new_content)?;
-    progress(&format!("Added UAS quirks: {}", joined));
+    emitter.progress(&format!("Added UAS quirks: {}", joined));
     Ok(())
 }
 
-/// Update the package index.
-async fn update_package_index(progress: &(dyn Fn(&str) + Send + Sync)) -> Result<()> {
-    progress("Updating package index...");
+/// Update the package index. Only announces if we actually need to run apt-get update.
+async fn update_package_index(emitter: &SetupEmitter) -> Result<()> {
+    // Quick heuristic: if /var/lib/apt/lists has been touched in the last
+    // 6 hours, skip. Otherwise we always run it (safe to re-run, but slow).
+    let lists_dir = Path::new("/var/lib/apt/lists");
+    if let Ok(meta) = std::fs::metadata(lists_dir) {
+        if let Ok(modified) = meta.modified() {
+            if let Ok(elapsed) = modified.elapsed() {
+                if elapsed < Duration::from_secs(6 * 3600) {
+                    return Ok(());
+                }
+            }
+        }
+    }
+
+    emitter.begin_phase("apt_update", "Refreshing package index");
+    emitter.progress("Updating package index...");
     let _ = sentryusb_shell::run("dpkg", &["--configure", "-a"]).await;
 
     for attempt in 0..3 {
@@ -718,11 +697,10 @@ async fn update_package_index(progress: &(dyn Fn(&str) + Send + Sync)) -> Result
         ).await.is_ok() {
             return Ok(());
         }
-        progress(&format!("apt-get update failed (attempt {}), retrying...", attempt + 1));
+        emitter.progress(&format!("apt-get update failed (attempt {}), retrying...", attempt + 1));
         tokio::time::sleep(Duration::from_secs(2)).await;
     }
 
-    // Last try with --allow-releaseinfo-change
     sentryusb_shell::run_with_timeout(
         Duration::from_secs(300),
         "apt-get", &["update", "--allow-releaseinfo-change"],
@@ -730,14 +708,21 @@ async fn update_package_index(progress: &(dyn Fn(&str) + Send + Sync)) -> Result
     Ok(())
 }
 
-/// Mount backingfiles and mutable partitions.
-async fn mount_partitions(progress: &(dyn Fn(&str) + Send + Sync)) -> Result<()> {
+/// Mount backingfiles and mutable partitions. Silent when already mounted.
+async fn mount_partitions(emitter: &SetupEmitter) -> Result<()> {
     let _ = std::fs::create_dir_all("/backingfiles");
     let _ = std::fs::create_dir_all("/mutable");
 
-    if sentryusb_shell::run("findmnt", &["--mountpoint", "/backingfiles"]).await.is_err() {
-        progress("Mounting backingfiles partition...");
-        // Clear XFS log first
+    let bf_mounted = sentryusb_shell::run("findmnt", &["--mountpoint", "/backingfiles"]).await.is_ok();
+    let mut_mounted = sentryusb_shell::run("findmnt", &["--mountpoint", "/mutable"]).await.is_ok();
+    if bf_mounted && mut_mounted {
+        return Ok(());
+    }
+
+    emitter.begin_phase("mount_partitions", "Mounting partitions");
+
+    if !bf_mounted {
+        emitter.progress("Mounting backingfiles partition...");
         if let Ok(dev) = sentryusb_shell::run("findfs", &["LABEL=backingfiles"]).await {
             let _ = sentryusb_shell::run_with_timeout(
                 Duration::from_secs(60), "xfs_repair", &["-L", dev.trim()],
@@ -746,8 +731,8 @@ async fn mount_partitions(progress: &(dyn Fn(&str) + Send + Sync)) -> Result<()>
         sentryusb_shell::run("mount", &["/backingfiles"]).await?;
     }
 
-    if sentryusb_shell::run("findmnt", &["--mountpoint", "/mutable"]).await.is_err() {
-        progress("Mounting mutable partition...");
+    if !mut_mounted {
+        emitter.progress("Mounting mutable partition...");
         sentryusb_shell::run("mount", &["/mutable"]).await?;
     }
 
@@ -755,7 +740,7 @@ async fn mount_partitions(progress: &(dyn Fn(&str) + Send + Sync)) -> Result<()>
 }
 
 /// Update fstab with sentryusb mount entries for disk image files.
-async fn update_image_fstab_entries(_progress: &(dyn Fn(&str) + Send + Sync)) -> Result<()> {
+async fn update_image_fstab_entries() -> Result<()> {
     let images = [
         ("/backingfiles/cam_disk.bin", "/mnt/cam"),
         ("/backingfiles/music_disk.bin", "/mnt/music"),
@@ -766,13 +751,11 @@ async fn update_image_fstab_entries(_progress: &(dyn Fn(&str) + Send + Sync)) ->
 
     let mut fstab = std::fs::read_to_string("/etc/fstab").unwrap_or_default();
 
-    // Remove old entries
     let fstab_lines: Vec<&str> = fstab.lines()
         .filter(|l| !images.iter().any(|(img, _)| l.starts_with(img)))
         .collect();
     fstab = fstab_lines.join("\n");
 
-    // Add entries for existing images
     for (img, mnt) in &images {
         if Path::new(img).exists() {
             let _ = std::fs::create_dir_all(mnt);
@@ -789,7 +772,7 @@ async fn update_image_fstab_entries(_progress: &(dyn Fn(&str) + Send + Sync)) ->
 }
 
 /// Mount each drive image, create required directories, then unmount.
-async fn initialize_drive_directories(_progress: &(dyn Fn(&str) + Send + Sync)) -> Result<()> {
+async fn initialize_drive_directories() -> Result<()> {
     let _ = sentryusb_gadget::disable();
 
     let drives: &[(&str, &[&str])] = &[
@@ -809,7 +792,6 @@ async fn initialize_drive_directories(_progress: &(dyn Fn(&str) + Send + Sync)) 
             continue;
         }
 
-        // Try mounting with retry
         let mut mounted = false;
         for _ in 0..5 {
             if sentryusb_shell::run("mount", &[mnt]).await.is_ok() {

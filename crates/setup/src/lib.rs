@@ -5,6 +5,7 @@
 //! setup process, reporting progress via a callback so the web UI can stream
 //! live updates over WebSocket.
 
+pub mod emitter;
 pub mod env;
 pub mod partition;
 pub mod disk_images;
@@ -14,3 +15,5 @@ pub mod network;
 pub mod readonly;
 pub mod scripts;
 pub mod runner;
+
+pub use emitter::SetupEmitter;

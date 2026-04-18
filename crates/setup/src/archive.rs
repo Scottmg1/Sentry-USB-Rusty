@@ -10,6 +10,7 @@ use anyhow::{bail, Context, Result};
 use tracing::info;
 
 use crate::env::SetupEnv;
+use crate::SetupEmitter;
 
 /// Supported archive backends.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -69,15 +70,16 @@ fn validate_archive_config(env: &SetupEnv, system: ArchiveSystem) -> Result<()> 
     Ok(())
 }
 
-/// Ensure rsync is installed and working.
-async fn ensure_rsync(progress: &(dyn Fn(&str) + Send + Sync)) -> Result<()> {
-    if sentryusb_shell::run("which", &["rsync"]).await.is_err() {
-        progress("Installing rsync...");
-        sentryusb_shell::run_with_timeout(
-            Duration::from_secs(120),
-            "apt-get", &["-y", "install", "rsync"],
-        ).await.context("failed to install rsync")?;
+/// Ensure rsync is installed. Silent when already present.
+async fn ensure_rsync(emitter: &SetupEmitter) -> Result<()> {
+    if sentryusb_shell::run("which", &["rsync"]).await.is_ok() {
+        return Ok(());
     }
+    emitter.progress("Installing rsync...");
+    sentryusb_shell::run_with_timeout(
+        Duration::from_secs(120),
+        "apt-get", &["-y", "install", "rsync"],
+    ).await.context("failed to install rsync")?;
     Ok(())
 }
 
@@ -112,21 +114,33 @@ fn validate_sentry_case(env: &SetupEnv) -> Result<()> {
     Ok(())
 }
 
-/// Configure Tesla BLE if VIN is set.
-pub async fn configure_tesla_ble(env: &SetupEnv, progress: &(dyn Fn(&str) + Send + Sync)) -> Result<()> {
+/// Configure Tesla BLE if VIN is set. Returns true if the phase did work.
+///
+/// Idempotent: if the binaries are already installed and keys exist, we do
+/// nothing and return false so the caller can skip announcing a phase.
+pub async fn configure_tesla_ble(env: &SetupEnv, emitter: &SetupEmitter) -> Result<bool> {
     let vin = match env.config.get("TESLA_BLE_VIN") {
         Some(v) if !v.is_empty() => v.clone(),
         _ => {
             info!("Tesla BLE not enabled");
-            return Ok(());
+            return Ok(false);
         }
     };
 
-    progress("Configuring Tesla BLE...");
+    let binaries_present = std::path::Path::new("/usr/local/bin/tesla-control").exists()
+        && std::path::Path::new("/usr/local/bin/tesla-keygen").exists();
+    let keys_present = std::path::Path::new("/root/.ble/key_private.pem").exists();
+
+    if binaries_present && keys_present {
+        return Ok(false);
+    }
+
+    emitter.begin_phase("tesla_ble", "Tesla BLE peripheral");
+    emitter.progress("Configuring Tesla BLE...");
 
     // Install bluez
     if sentryusb_shell::run("dpkg", &["-s", "bluez"]).await.is_err() {
-        progress("Installing bluez...");
+        emitter.progress("Installing bluez...");
         sentryusb_shell::run_with_timeout(
             Duration::from_secs(120),
             "apt-get", &["-y", "install", "bluez"],
@@ -143,38 +157,39 @@ pub async fn configure_tesla_ble(env: &SetupEnv, progress: &(dyn Fn(&str) + Send
         }
     }
 
-    // Download tesla-control and tesla-keygen binaries
-    progress("Downloading Tesla BLE control binaries...");
-    let arch = sentryusb_shell::run("uname", &["-m"]).await?.trim().to_string();
-    let tarball = if arch == "aarch64" || arch.starts_with("arm") {
-        "vehicle-command-binaries-linux-armv6.tar.gz"
-    } else {
-        progress("Unsupported architecture for Tesla BLE binaries");
-        return Ok(());
-    };
+    if !binaries_present {
+        emitter.progress("Downloading Tesla BLE control binaries...");
+        let arch = sentryusb_shell::run("uname", &["-m"]).await?.trim().to_string();
+        let tarball = if arch == "aarch64" || arch.starts_with("arm") {
+            "vehicle-command-binaries-linux-armv6.tar.gz"
+        } else {
+            emitter.progress("Unsupported architecture for Tesla BLE binaries");
+            return Ok(true);
+        };
 
-    let url = format!(
-        "https://github.com/MikeBishop/tesla-vehicle-command-arm-binaries/releases/latest/download/{}",
-        tarball
-    );
-    let _ = std::fs::create_dir_all("/tmp/blebin");
-    sentryusb_shell::run_with_timeout(
-        Duration::from_secs(60),
-        "bash", &["-c", &format!(
-            "curl -sL '{}' | tar xzf - -C /tmp/blebin --strip-components=1", url
-        )],
-    ).await.context("failed to download Tesla BLE binaries")?;
+        let url = format!(
+            "https://github.com/MikeBishop/tesla-vehicle-command-arm-binaries/releases/latest/download/{}",
+            tarball
+        );
+        let _ = std::fs::create_dir_all("/tmp/blebin");
+        sentryusb_shell::run_with_timeout(
+            Duration::from_secs(60),
+            "bash", &["-c", &format!(
+                "curl -sL '{}' | tar xzf - -C /tmp/blebin --strip-components=1", url
+            )],
+        ).await.context("failed to download Tesla BLE binaries")?;
 
-    for binary in &["tesla-control", "tesla-keygen"] {
-        let src = format!("/tmp/blebin/{}", binary);
-        let dst = format!("/usr/local/bin/{}", binary);
-        if std::path::Path::new(&src).exists() {
-            std::fs::copy(&src, &dst)?;
-            sentryusb_shell::run("chmod", &["+x", &dst]).await?;
-            progress(&format!("Installed {}", dst));
+        for binary in &["tesla-control", "tesla-keygen"] {
+            let src = format!("/tmp/blebin/{}", binary);
+            let dst = format!("/usr/local/bin/{}", binary);
+            if std::path::Path::new(&src).exists() {
+                std::fs::copy(&src, &dst)?;
+                sentryusb_shell::run("chmod", &["+x", &dst]).await?;
+                emitter.progress(&format!("Installed {}", dst));
+            }
         }
+        let _ = std::fs::remove_dir_all("/tmp/blebin");
     }
-    let _ = std::fs::remove_dir_all("/tmp/blebin");
 
     // Generate BLE keys if they don't exist
     let _ = std::fs::create_dir_all("/root/.ble");
@@ -185,9 +200,8 @@ pub async fn configure_tesla_ble(env: &SetupEnv, progress: &(dyn Fn(&str) + Send
         sentryusb_shell::run("chmod", &["600", "/root/.ble/key_private.pem"]).await?;
         sentryusb_shell::run("chmod", &["644", "/root/.ble/key_public.pem"]).await?;
         std::fs::write("/root/.ble/key_pending_pairing", "")?;
-        progress("Generated Tesla BLE keys. Pairing required via web UI.");
+        emitter.progress("Generated Tesla BLE keys. Pairing required via web UI.");
     } else {
-        // Try to verify pairing
         let vin_upper = vin.to_uppercase();
         let paired = sentryusb_shell::run_with_timeout(
             Duration::from_secs(35),
@@ -195,34 +209,42 @@ pub async fn configure_tesla_ble(env: &SetupEnv, progress: &(dyn Fn(&str) + Send
         ).await;
 
         match paired {
-            Ok(_) => progress("Tesla BLE keys exist and car is reachable."),
-            Err(_) => progress("Tesla BLE keys exist, but car not reachable. Pairing can be done later."),
+            Ok(_) => emitter.progress("Tesla BLE keys exist and car is reachable."),
+            Err(_) => emitter.progress("Tesla BLE keys exist, but car not reachable. Pairing can be done later."),
         }
     }
 
-    Ok(())
+    Ok(true)
 }
 
-/// Full archive configuration flow.
-pub async fn configure_archive(env: &SetupEnv, progress: &(dyn Fn(&str) + Send + Sync)) -> Result<()> {
+/// Full archive configuration flow. Returns true if the phase did work.
+pub async fn configure_archive(env: &SetupEnv, emitter: &SetupEmitter) -> Result<bool> {
     let archive_system = ArchiveSystem::from_config(&env.get("ARCHIVE_SYSTEM", "none"))?;
-    progress(&format!("Configuring archive system: {:?}", archive_system));
 
     validate_wake_apis(env)?;
     validate_sentry_case(env)?;
     validate_archive_config(env, archive_system)?;
 
-    // Ensure rsync is available (used by archiveloop for all archive types)
-    ensure_rsync(progress).await?;
+    // Idempotency: rsync installed, archive service already installed, already enabled.
+    let rsync_ok = sentryusb_shell::run("which", &["rsync"]).await.is_ok();
+    let service_path = std::path::Path::new("/lib/systemd/system/sentryusb-archive.service");
+    let service_enabled = sentryusb_shell::run(
+        "systemctl", &["is-enabled", "sentryusb-archive.service"],
+    ).await.is_ok();
 
-    // Configure Tesla BLE if needed
-    configure_tesla_ble(env, progress).await?;
+    if rsync_ok && service_path.exists() && service_enabled && archive_system == ArchiveSystem::None {
+        return Ok(false);
+    }
 
-    // Install and enable archive service
+    emitter.begin_phase("archive", "Archive configuration");
+    emitter.progress(&format!("Configuring archive system: {:?}", archive_system));
+
+    ensure_rsync(emitter).await?;
+
     crate::system::install_archive_service()?;
     let _ = sentryusb_shell::run("systemctl", &["daemon-reload"]).await;
     let _ = sentryusb_shell::run("systemctl", &["enable", "sentryusb-archive.service"]).await;
 
-    progress("Archive configuration complete.");
-    Ok(())
+    emitter.progress("Archive configuration complete.");
+    Ok(true)
 }

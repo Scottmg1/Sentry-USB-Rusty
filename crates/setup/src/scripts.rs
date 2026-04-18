@@ -66,9 +66,10 @@ sentryusb gadget disable "$@"
 "#;
 
 /// Install all runtime helper scripts to /root/bin/.
-pub async fn install_runtime_scripts(progress: &(dyn Fn(&str) + Send + Sync)) -> Result<()> {
-    progress("Installing runtime helper scripts...");
-
+///
+/// Only announces a phase if at least one script is missing or has changed —
+/// once installed, re-running setup is a no-op.
+pub async fn install_runtime_scripts(emitter: &crate::SetupEmitter) -> Result<bool> {
     let _ = std::fs::create_dir_all("/root/bin");
 
     let scripts: &[(&str, &str)] = &[
@@ -83,18 +84,32 @@ pub async fn install_runtime_scripts(progress: &(dyn Fn(&str) + Send + Sync)) ->
         ("disable_gadget.sh", DISABLE_GADGET),
     ];
 
+    // Skip the phase entirely if every script is already present and
+    // byte-for-byte identical to what we'd write.
+    let all_current = scripts.iter().all(|(name, content)| {
+        let path = format!("/root/bin/{}", name);
+        std::fs::read_to_string(&path)
+            .map(|existing| existing == *content)
+            .unwrap_or(false)
+    });
+    if all_current {
+        return Ok(false);
+    }
+
+    emitter.begin_phase("runtime_scripts", "Installing runtime scripts");
+    emitter.progress("Installing runtime helper scripts...");
+
     for (name, content) in scripts {
         let path = format!("/root/bin/{}", name);
         std::fs::write(&path, content)?;
         let _ = sentryusb_shell::run("chmod", &["+x", &path]).await;
     }
 
-    // Create mount.sentryusb symlink for autofs
     #[cfg(unix)]
     {
         let _ = std::os::unix::fs::symlink("/root/bin/mountimage", "/sbin/mount.sentryusb");
     }
 
-    progress("Runtime scripts installed.");
-    Ok(())
+    emitter.progress("Runtime scripts installed.");
+    Ok(true)
 }

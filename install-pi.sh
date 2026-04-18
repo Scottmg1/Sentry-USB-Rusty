@@ -248,14 +248,8 @@ systemctl restart sentryusb
 
 # Get IP address for the user — try multiple methods, network may have just bounced
 IP=""
-for _ in 1 2 3 4 5; do
+for _ in $(seq 1 30); do
     IP=$(hostname -I 2>/dev/null | awk '{print $1}')
-    if [ -z "$IP" ]; then
-        IP=$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}')
-    fi
-    if [ -z "$IP" ]; then
-        IP=$(ip -4 -o addr show scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -1)
-    fi
     [ -n "$IP" ] && break
     sleep 1
 done

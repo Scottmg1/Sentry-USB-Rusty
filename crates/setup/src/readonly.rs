@@ -10,15 +10,34 @@ use anyhow::Result;
 use tracing::info;
 
 use crate::env::SetupEnv;
+use crate::SetupEmitter;
 
 /// Make the root filesystem read-only.
-pub async fn make_readonly(env: &SetupEnv, progress: &(dyn Fn(&str) + Send + Sync)) -> Result<()> {
+///
+/// Heavyweight — installs/removes packages and rewrites fstab. Worth
+/// announcing even on re-runs because it touches many files; idempotency
+/// comes from the individual operations being safe to repeat.
+pub async fn make_readonly(env: &SetupEnv, emitter: &SetupEmitter) -> Result<bool> {
     if env.get_bool("SKIP_READONLY", false) {
-        progress("SKIP_READONLY is set, skipping read-only filesystem setup");
-        return Ok(());
+        emitter.progress("SKIP_READONLY is set, skipping read-only filesystem setup");
+        return Ok(false);
     }
 
-    progress("Making root filesystem read-only...");
+    // Skip if root is already read-only and cmdline.txt already has `ro`.
+    let existing_fstab = std::fs::read_to_string("/etc/fstab").unwrap_or_default();
+    let root_ro = existing_fstab.lines().any(|l| {
+        !l.starts_with('#') && l.contains(" / ") && l.contains("ext4") && l.contains(",ro")
+    });
+    let cmdline_ro = env.cmdline_path.as_deref()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .map(|c| c.split_whitespace().any(|w| w == "ro"))
+        .unwrap_or(false);
+    if root_ro && cmdline_ro {
+        return Ok(false);
+    }
+
+    emitter.begin_phase("readonly", "Read-only filesystem");
+    emitter.progress("Making root filesystem read-only...");
 
     // Ensure boot partition is writable for cmdline.txt edits
     for mp in &["/sentryusb", "/boot/firmware", "/boot"] {
@@ -29,7 +48,7 @@ pub async fn make_readonly(env: &SetupEnv, progress: &(dyn Fn(&str) + Send + Syn
     }
 
     // Disable services that write frequently
-    progress("Disabling unnecessary services...");
+    emitter.progress("Disabling unnecessary services...");
     for svc in &["apt-daily.timer", "apt-daily-upgrade.timer"] {
         let _ = sentryusb_shell::run("systemctl", &["disable", svc]).await;
     }
@@ -51,7 +70,7 @@ pub async fn make_readonly(env: &SetupEnv, progress: &(dyn Fn(&str) + Send + Syn
     }
 
     // Remove packages that write constantly
-    progress("Removing packages incompatible with read-only root...");
+    emitter.progress("Removing packages incompatible with read-only root...");
     let _ = sentryusb_shell::run_with_timeout(
         Duration::from_secs(120),
         "apt-get", &["remove", "-y", "--purge", "triggerhappy", "logrotate", "dphys-swapfile"],
@@ -62,14 +81,14 @@ pub async fn make_readonly(env: &SetupEnv, progress: &(dyn Fn(&str) + Send + Syn
     ).await;
 
     // Install busybox-syslogd and ntp
-    progress("Installing ntp and busybox-syslogd...");
+    emitter.progress("Installing ntp and busybox-syslogd...");
     let _ = sentryusb_shell::run_with_timeout(
         Duration::from_secs(120),
         "bash", &["-c", "apt-get -y install ntp busybox-syslogd; dpkg --purge rsyslog"],
     ).await;
 
     // Configure tmpfs mounts for writable directories
-    progress("Configuring tmpfs mounts...");
+    emitter.progress("Configuring tmpfs mounts...");
     configure_tmpfs_mounts(env).await?;
 
     // Add fastboot and read-only to cmdline.txt
@@ -108,8 +127,8 @@ mount / -o remount,rw
     std::fs::write("/root/bin/remountfs_rw", wrapper)?;
     let _ = sentryusb_shell::run("chmod", &["+x", "/root/bin/remountfs_rw"]).await;
 
-    progress("Read-only filesystem setup complete.");
-    Ok(())
+    emitter.progress("Read-only filesystem setup complete.");
+    Ok(true)
 }
 
 /// Append a parameter to cmdline.txt if it's not already present.
