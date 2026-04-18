@@ -197,7 +197,15 @@ pub async fn run_full_setup(emitter: SetupEmitter) -> Result<()> {
     let _ = std::fs::write(SETUP_FINISHED_MARKER, "");
 
     emitter.progress("=== SentryUSB Setup Complete ===");
-    emitter.progress("Reboot now for changes to take effect.");
+    emitter.progress("Rebooting in 5 seconds to apply changes...");
+
+    // Auto-reboot so read-only root, cmdline.txt changes, and partition table
+    // updates take effect without a manual step. Small delay lets SSE clients
+    // flush the completion message.
+    tokio::spawn(async {
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        let _ = sentryusb_shell::run("systemctl", &["reboot"]).await;
+    });
 
     Ok(())
 }

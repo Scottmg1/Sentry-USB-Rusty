@@ -77,6 +77,10 @@ fn build_migration_script(tarball_url: &str) -> String {
 # Remount filesystem as read-write (no-op if already rw)
 /root/bin/remountfs_rw 2>/dev/null || mount -o remount,rw / 2>/dev/null || true
 
+# Ensure /root/bin exists — on fresh Rust installs it isn't created by setup,
+# so cp targets below would otherwise fail.
+mkdir -p /root/bin
+
 TMPDIR=$(mktemp -d)
 trap "rm -rf $TMPDIR" EXIT
 
