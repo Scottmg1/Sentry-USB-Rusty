@@ -17,7 +17,6 @@ fn main() {
 mod linux_impl {
     use std::collections::HashMap;
     use std::ffi::{OsStr, OsString};
-    use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
     use std::path::{Path, PathBuf};
     use std::sync::Mutex;
@@ -34,7 +33,6 @@ mod linux_impl {
     }
 
     pub struct CttsFs {
-        source: PathBuf,
         inodes: Mutex<InodeTable>,
         open_handles: Mutex<HashMap<u64, Opened>>,
         next_fh: std::sync::atomic::AtomicU64,
@@ -74,7 +72,6 @@ mod linux_impl {
     impl CttsFs {
         fn new(source: PathBuf) -> Self {
             Self {
-                source: source.clone(),
                 inodes: Mutex::new(InodeTable::new(source)),
                 open_handles: Mutex::new(HashMap::new()),
                 next_fh: std::sync::atomic::AtomicU64::new(1),
