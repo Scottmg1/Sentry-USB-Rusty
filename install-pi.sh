@@ -177,7 +177,12 @@ fi
 
 if [ ! -f /root/sentryusb.conf ]; then
     info "Creating sample config..."
-    cat > /root/sentryusb.conf << 'CONFEOF'
+    SAMPLE_URL="https://raw.githubusercontent.com/Scottmg1/Sentry-USB/main/pi-gen-sources/00-sentryusb-tweaks/files/sentryusb.conf.sample"
+    if curl -fsSL --max-time 15 "$SAMPLE_URL" -o /root/sentryusb.conf; then
+        ok "Sample config downloaded to /root/sentryusb.conf"
+    else
+        # Fallback minimal template if offline/download fails.
+        cat > /root/sentryusb.conf << 'CONFEOF'
 # SentryUSB Configuration
 # Edit these values and run setup from the web UI.
 #
@@ -204,7 +209,8 @@ export CAM_SIZE=30G
 # Optional: Use exFAT instead of FAT32
 #export USE_EXFAT=false
 CONFEOF
-    ok "Sample config created at /root/sentryusb.conf"
+        ok "Sample config created at /root/sentryusb.conf (offline fallback)"
+    fi
 fi
 
 # ── Step 5: WiFi Marker ────────────────────────────────────────────

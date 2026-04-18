@@ -77,7 +77,7 @@ async fn ensure_rsync(emitter: &SetupEmitter) -> Result<()> {
     }
     emitter.progress("Installing rsync...");
     sentryusb_shell::run_with_timeout(
-        Duration::from_secs(120),
+        Duration::from_secs(600),
         "apt-get", &["-y", "install", "rsync"],
     ).await.context("failed to install rsync")?;
     Ok(())
@@ -142,7 +142,7 @@ pub async fn configure_tesla_ble(env: &SetupEnv, emitter: &SetupEmitter) -> Resu
     if sentryusb_shell::run("dpkg", &["-s", "bluez"]).await.is_err() {
         emitter.progress("Installing bluez...");
         sentryusb_shell::run_with_timeout(
-            Duration::from_secs(120),
+            Duration::from_secs(600),
             "apt-get", &["-y", "install", "bluez"],
         ).await?;
     }
@@ -151,7 +151,7 @@ pub async fn configure_tesla_ble(env: &SetupEnv, emitter: &SetupEmitter) -> Resu
     if sentryusb_shell::run("bash", &["-c", "apt-cache search pi-bluetooth | grep -q pi-bluetooth"]).await.is_ok() {
         if sentryusb_shell::run("dpkg", &["-s", "pi-bluetooth"]).await.is_err() {
             let _ = sentryusb_shell::run_with_timeout(
-                Duration::from_secs(120),
+                Duration::from_secs(600),
                 "apt-get", &["-y", "install", "pi-bluetooth"],
             ).await;
         }

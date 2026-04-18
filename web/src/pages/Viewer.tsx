@@ -473,7 +473,7 @@ export default function Viewer() {
   // Delete clip
   async function handleDeleteClip(clip: ClipEntry) {
     try {
-      const fullPath = `/mutable/TeslaCam/${activeCategory}/${clip.date}`
+      const fullPath = `/mnt/cam/TeslaCam/${activeCategory}/${clip.date}`
       await fetch(`/api/files?path=${encodeURIComponent(fullPath)}`, { method: "DELETE" })
       setGroups((prev) =>
         prev.map((g) =>

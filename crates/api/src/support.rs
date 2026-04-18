@@ -6,7 +6,7 @@ use axum::http::StatusCode;
 
 use crate::router::AppState;
 
-const SUPPORT_API: &str = "https://api.sentryusb.com";
+const SUPPORT_API: &str = "https://api.sentry-six.com";
 
 async fn proxy_get(path: &str) -> (StatusCode, Json<serde_json::Value>) {
     let url = format!("{}{}", SUPPORT_API, path);

@@ -9,104 +9,110 @@ use serde::{Deserialize, Serialize};
 
 use crate::router::AppState;
 
-const TESLACAM_DIR: &str = "/mutable/TeslaCam";
+const TESLACAM_DIR: &str = "/mnt/cam/TeslaCam";
 
 #[derive(Deserialize)]
 pub struct ClipParams {
-    #[serde(rename = "type")]
-    clip_type: Option<String>,
-    date: Option<String>,
-}
-
-#[derive(Serialize)]
-struct ClipGroup {
-    name: String,
-    path: String,
-    clips: Vec<ClipEntry>,
-    timestamp: String,
+    category: Option<String>,
+    limit: Option<usize>,
+    before: Option<String>,
 }
 
 #[derive(Serialize)]
 struct ClipEntry {
-    name: String,
+    date: String,
     path: String,
-    size: i64,
-    camera: String,
+    files: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    event: Option<EventMeta>,
 }
 
-/// GET /api/clips
+#[derive(Serialize, Deserialize)]
+struct EventMeta {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    timestamp: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    city: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    camera: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    latitude: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    longitude: Option<String>,
+}
+
+/// GET /api/clips?category=RecentClips&limit=20[&before=<date>]
 pub async fn get_clips(
     State(_s): State<AppState>,
     Query(params): Query<ClipParams>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    let clip_type = params.clip_type.as_deref().unwrap_or("SavedClips");
-
-    // Validate clip type
-    if !matches!(clip_type, "SavedClips" | "SentryClips" | "RecentClips") {
-        return crate::json_error(StatusCode::BAD_REQUEST, "invalid clip type");
+    let category = params.category.as_deref().unwrap_or("SavedClips");
+    if !matches!(category, "SavedClips" | "SentryClips" | "RecentClips") {
+        return crate::json_error(StatusCode::BAD_REQUEST, "invalid category");
     }
+    let limit = params.limit.unwrap_or(20).min(200);
 
-    let base = Path::new(TESLACAM_DIR).join(clip_type);
+    let base = Path::new(TESLACAM_DIR).join(category);
+    let empty_group = serde_json::json!([{
+        "name": category,
+        "clips": [],
+        "hasMore": false,
+    }]);
     if !base.exists() {
-        return (StatusCode::OK, Json(serde_json::json!({"groups": []})));
+        return (StatusCode::OK, Json(empty_group));
     }
 
-    let mut groups = Vec::new();
-
-    if let Ok(entries) = std::fs::read_dir(&base) {
-        let mut event_dirs: Vec<_> = entries.flatten()
+    // Enumerate event dirs, newest first.
+    let mut event_dirs: Vec<String> = match std::fs::read_dir(&base) {
+        Ok(entries) => entries.flatten()
             .filter(|e| e.path().is_dir())
-            .collect();
-        event_dirs.sort_by(|a, b| b.file_name().cmp(&a.file_name()));
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .collect(),
+        Err(_) => return (StatusCode::OK, Json(empty_group)),
+    };
+    event_dirs.sort_by(|a, b| b.cmp(a));
 
-        // Filter by date if specified
-        if let Some(date) = &params.date {
-            event_dirs.retain(|e| e.file_name().to_string_lossy().starts_with(date.as_str()));
-        }
+    // Pagination: drop everything >= before, then take `limit + 1`
+    if let Some(before) = &params.before {
+        event_dirs.retain(|d| d.as_str() < before.as_str());
+    }
+    let has_more = event_dirs.len() > limit;
+    event_dirs.truncate(limit);
 
-        for event_dir in event_dirs {
-            let dir_name = event_dir.file_name().to_string_lossy().to_string();
-            let dir_path = event_dir.path();
-            let mut clips = Vec::new();
-
-            if let Ok(files) = std::fs::read_dir(&dir_path) {
-                for file in files.flatten() {
-                    let name = file.file_name().to_string_lossy().to_string();
-                    if name.ends_with(".mp4") {
-                        let size = std::fs::metadata(file.path())
-                            .map(|m| m.len() as i64)
-                            .unwrap_or(0);
-
-                        let camera = if name.contains("-front") { "front" }
-                            else if name.contains("-back") { "back" }
-                            else if name.contains("-left_repeater") { "left_repeater" }
-                            else if name.contains("-right_repeater") { "right_repeater" }
-                            else if name.contains("-left_pillar") { "left_pillar" }
-                            else if name.contains("-right_pillar") { "right_pillar" }
-                            else { "unknown" };
-
-                        clips.push(ClipEntry {
-                            path: format!("{}/{}/{}", clip_type, dir_name, name),
-                            name,
-                            size,
-                            camera: camera.to_string(),
-                        });
-                    }
+    let mut clips = Vec::with_capacity(event_dirs.len());
+    for dir_name in event_dirs {
+        let dir_path = base.join(&dir_name);
+        let mut files = Vec::new();
+        if let Ok(items) = std::fs::read_dir(&dir_path) {
+            for item in items.flatten() {
+                let name = item.file_name().to_string_lossy().to_string();
+                if name.ends_with(".mp4") {
+                    files.push(name);
                 }
             }
-
-            clips.sort_by(|a, b| a.name.cmp(&b.name));
-
-            groups.push(ClipGroup {
-                timestamp: dir_name.clone(),
-                path: format!("{}/{}", clip_type, dir_name),
-                name: dir_name,
-                clips,
-            });
         }
+        files.sort();
+
+        let event = std::fs::read_to_string(dir_path.join("event.json"))
+            .ok()
+            .and_then(|s| serde_json::from_str::<EventMeta>(&s).ok());
+
+        clips.push(ClipEntry {
+            date: dir_name.clone(),
+            path: format!("/TeslaCam/{}/{}", category, dir_name),
+            files,
+            event,
+        });
     }
 
-    (StatusCode::OK, Json(serde_json::json!({"groups": groups})))
+    let response = serde_json::json!([{
+        "name": category,
+        "clips": clips,
+        "hasMore": has_more,
+    }]);
+    (StatusCode::OK, Json(response))
 }
 
 /// GET /api/clips/telemetry
@@ -119,8 +125,15 @@ pub async fn get_clip_telemetry(
         None => return crate::json_error(StatusCode::BAD_REQUEST, "missing file parameter"),
     };
 
-    // Extract GPS from the specified clip
-    let full_path = format!("{}/{}", TESLACAM_DIR, file);
+    // The client passes `path` as the relative event-dir path (optionally
+    // prefixed with the `/TeslaCam/` URL mount we serve videos from).
+    let clip_path = params.get("path").map(|s| s.as_str()).unwrap_or("");
+    let clip_rel = clip_path.trim_start_matches('/').trim_start_matches("TeslaCam/");
+    let full_path = if clip_rel.is_empty() {
+        format!("{}/{}", TESLACAM_DIR, file)
+    } else {
+        format!("{}/{}/{}", TESLACAM_DIR, clip_rel, file)
+    };
     match sentryusb_drives::extract::extract_gps_from_file(&full_path) {
         Ok(gps) => {
             (StatusCode::OK, Json(serde_json::json!({

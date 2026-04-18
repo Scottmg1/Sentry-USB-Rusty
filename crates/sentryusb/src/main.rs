@@ -104,10 +104,10 @@ async fn main() {
     // Add compression
     app = app.layer(CompressionLayer::new());
 
-    // Serve TeslaCam video files
+    // Serve TeslaCam video files directly from the cam disk-image mount.
     app = app.nest_service(
         "/TeslaCam",
-        tower_http::services::ServeDir::new("/var/www/html/TeslaCam"),
+        tower_http::services::ServeDir::new("/mnt/cam/TeslaCam"),
     );
 
     // Serve /fs/ for music/lightshow/boombox autofs mounts

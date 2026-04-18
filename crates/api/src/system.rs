@@ -16,12 +16,23 @@ pub async fn reboot(State(_s): State<AppState>) -> (StatusCode, Json<serde_json:
 
 /// POST /api/system/toggle-drives
 pub async fn toggle_drives(State(_s): State<AppState>, _body: String) -> (StatusCode, Json<serde_json::Value>) {
-    if sentryusb_gadget::is_active() {
-        let _ = tokio::task::spawn_blocking(sentryusb_gadget::disable).await;
+    let was_active = sentryusb_gadget::is_active();
+    let result = if was_active {
+        tokio::task::spawn_blocking(sentryusb_gadget::disable).await
     } else {
-        let _ = tokio::task::spawn_blocking(sentryusb_gadget::enable).await;
+        tokio::task::spawn_blocking(sentryusb_gadget::enable).await
+    };
+    match result {
+        Ok(Ok(())) => crate::json_ok(),
+        Ok(Err(e)) => crate::json_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("USB gadget {} failed: {}", if was_active { "disable" } else { "enable" }, e),
+        ),
+        Err(e) => crate::json_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("USB gadget task panicked: {}", e),
+        ),
     }
-    crate::json_ok()
 }
 
 /// POST /api/system/trigger-sync

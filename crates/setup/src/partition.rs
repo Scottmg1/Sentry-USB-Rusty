@@ -26,7 +26,7 @@ async fn ensure_xfs_tools() -> Result<()> {
     if sentryusb_shell::run("which", &["mkfs.xfs"]).await.is_err() {
         info!("Installing xfsprogs...");
         sentryusb_shell::run_with_timeout(
-            Duration::from_secs(120),
+            Duration::from_secs(600),
             "apt-get", &["-y", "install", "xfsprogs"],
         ).await.context("failed to install xfsprogs")?;
     }

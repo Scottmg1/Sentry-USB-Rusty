@@ -15,13 +15,15 @@ use crate::router::AppState;
 /// Allowed base paths for file operations (security).
 const ALLOWED_BASES: &[&str] = &[
     "/mutable",
-    "/mutable/TeslaCam",
-    "/mutable/Wraps",
+    "/mnt/cam",
+    "/mnt/cam/TeslaCam",
+    "/mnt/wraps",
+    "/mnt/wraps/Wraps",
     "/mutable/LicensePlate",
     "/mutable/LockChime",
-    "/var/www/html/fs/Music",
-    "/var/www/html/fs/LightShow",
-    "/var/www/html/fs/Boombox",
+    "/mnt/music",
+    "/mnt/lightshow",
+    "/mnt/boombox",
 ];
 
 /// Validate and clean a path, resolving symlinks and checking against allowed bases.

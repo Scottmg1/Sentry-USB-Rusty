@@ -195,7 +195,7 @@ async fn ensure_exfat_tools(use_exfat: bool) -> Result<bool> {
     // Install exfatprogs if needed
     if sentryusb_shell::run("which", &["mkfs.exfat"]).await.is_err() {
         if sentryusb_shell::run_with_timeout(
-            Duration::from_secs(120), "apt-get", &["-y", "install", "exfatprogs"],
+            Duration::from_secs(600), "apt-get", &["-y", "install", "exfatprogs"],
         ).await.is_err() {
             info!("Could not install exfatprogs, reverting to FAT32");
             return Ok(false);
@@ -209,7 +209,7 @@ async fn ensure_exfat_tools(use_exfat: bool) -> Result<bool> {
 async fn ensure_vfat_tools() -> Result<()> {
     if sentryusb_shell::run("which", &["mkfs.vfat"]).await.is_err() {
         sentryusb_shell::run_with_timeout(
-            Duration::from_secs(120), "apt-get", &["-y", "install", "dosfstools"],
+            Duration::from_secs(600), "apt-get", &["-y", "install", "dosfstools"],
         ).await?;
     }
     Ok(())

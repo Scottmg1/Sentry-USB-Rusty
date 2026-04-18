@@ -1,12 +1,13 @@
 //! Community wraps and lock chimes proxy to backend API.
 
 use axum::Json;
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
+use std::collections::HashMap;
 
 use crate::router::AppState;
 
-const COMMUNITY_API: &str = "https://api.sentryusb.com";
+const COMMUNITY_API: &str = "https://api.sentry-six.com";
 
 async fn proxy_get(path: &str) -> (StatusCode, Json<serde_json::Value>) {
     let url = format!("{}{}", COMMUNITY_API, path);
@@ -16,6 +17,25 @@ async fn proxy_get(path: &str) -> (StatusCode, Json<serde_json::Value>) {
             Err(e) => crate::json_error(StatusCode::BAD_GATEWAY, &e.to_string()),
         },
         Err(e) => crate::json_error(StatusCode::BAD_GATEWAY, &e.to_string()),
+    }
+}
+
+/// Library-style proxy: forwards the client's query string and, on any
+/// upstream failure (DNS/connect/parse), returns an empty library shape so
+/// the UI renders an empty state instead of a 502 error banner.
+async fn proxy_library(
+    path: &str,
+    params: &HashMap<String, String>,
+    key: &str,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let url = format!("{}{}", COMMUNITY_API, path);
+    let client = reqwest::Client::new();
+    match client.get(&url).query(params).send().await {
+        Ok(resp) => match resp.json::<serde_json::Value>().await {
+            Ok(v) => (StatusCode::OK, Json(v)),
+            Err(_) => (StatusCode::OK, Json(serde_json::json!({ key: [], "total": 0 }))),
+        },
+        Err(_) => (StatusCode::OK, Json(serde_json::json!({ key: [], "total": 0 }))),
     }
 }
 
@@ -36,8 +56,11 @@ async fn proxy_post(path: &str, body: &str) -> (StatusCode, Json<serde_json::Val
 }
 
 // Community lock chimes
-pub async fn lock_chime_library(State(_s): State<AppState>) -> (StatusCode, Json<serde_json::Value>) {
-    proxy_get("/lockchime/community/library").await
+pub async fn lock_chime_library(
+    State(_s): State<AppState>,
+    Query(params): Query<HashMap<String, String>>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    proxy_library("/lockchime/community/library", &params, "chimes").await
 }
 
 pub async fn lock_chime_stream(State(_s): State<AppState>, Path(code): Path<String>) -> (StatusCode, Json<serde_json::Value>) {
@@ -81,8 +104,11 @@ pub async fn lock_chime_admin_delete(State(_s): State<AppState>, Path(code): Pat
 }
 
 // Community wraps
-pub async fn wraps_library(State(_s): State<AppState>) -> (StatusCode, Json<serde_json::Value>) {
-    proxy_get("/wraps/library").await
+pub async fn wraps_library(
+    State(_s): State<AppState>,
+    Query(params): Query<HashMap<String, String>>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    proxy_library("/wraps/library", &params, "wraps").await
 }
 
 pub async fn wraps_thumbnail(State(_s): State<AppState>, Path(code): Path<String>) -> (StatusCode, Json<serde_json::Value>) {

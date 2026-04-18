@@ -93,8 +93,9 @@ pub async fn get_version(State(_s): State<AppState>) -> (StatusCode, Json<serde_
     let version = env!("CARGO_PKG_VERSION");
     let sbc_model = get_sbc_model();
 
-    // Read installed version tag if available
-    let installed = std::fs::read_to_string("/root/.sentryusb_version")
+    // Read installed version tag if available (installer writes it here).
+    let installed = std::fs::read_to_string("/opt/sentryusb/version")
+        .or_else(|_| std::fs::read_to_string("/root/.sentryusb_version"))
         .unwrap_or_else(|_| version.to_string());
 
     (StatusCode::OK, Json(serde_json::json!({

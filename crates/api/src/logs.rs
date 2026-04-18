@@ -40,6 +40,7 @@ pub async fn get_log(
         return (StatusCode::BAD_REQUEST, "invalid log name").into_response();
     }
 
+    let known = log_path(&name).is_some();
     let path = match log_path(&name) {
         Some(p) => p.to_string(),
         None => format!("/var/log/{}", name),
@@ -47,6 +48,16 @@ pub async fn get_log(
 
     let mut file = match std::fs::File::open(&path) {
         Ok(f) => f,
+        // Known logs may legitimately be absent (e.g. archiveloop.log when no
+        // NAS is configured yet) — return empty 200 so the UI shows "no log
+        // output" instead of a scary console 404. Unknown names still 404.
+        Err(_) if known => {
+            return (
+                StatusCode::OK,
+                [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+                String::new(),
+            ).into_response();
+        }
         Err(_) => return (StatusCode::NOT_FOUND, "Log file not found").into_response(),
     };
 

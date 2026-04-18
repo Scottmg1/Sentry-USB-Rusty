@@ -62,28 +62,36 @@ fn chrono_now() -> String {
 
 /// Run the full setup process. Idempotent on re-runs after reboots.
 pub async fn run_full_setup(emitter: SetupEmitter) -> Result<()> {
-    emitter.progress("=== SentryUSB Setup Starting ===");
-
     if !am_root() {
         bail!("Setup must run as root");
     }
+
+    let resuming = Path::new(SETUP_STARTED_MARKER).exists();
 
     let _ = std::fs::remove_file(SETUP_FINISHED_MARKER);
     let _ = std::fs::create_dir_all("/sentryusb");
     let _ = std::fs::write(SETUP_STARTED_MARKER, "");
 
     // Clear the phases ledger on a fresh start so the UI list starts empty.
-    // Setup resumes after a mid-flow reboot hit this same code path, so we
-    // only truncate when there are no partitions yet (first run).
-    if !crate::partition::partitions_exist().await {
+    // Only truncate on the very first run (no STARTED marker yet, no
+    // partitions). Resumes after a mid-flow reboot must preserve the ledger.
+    if !resuming && !crate::partition::partitions_exist().await {
         let _ = std::fs::remove_file(SETUP_PHASES_FILE);
+    }
+
+    if !resuming {
+        emitter.progress("=== SentryUSB Setup Starting ===");
+    } else {
+        emitter.progress("--- Resuming setup after reboot ---");
     }
 
     let _ = sentryusb_shell::run("mount", &["/", "-o", "remount,rw"]).await;
 
     // Phase: detect environment (no UI phase — always fast)
     let env = SetupEnv::detect().await?;
-    emitter.progress(&format!("Detected: {}", env.pi_model.display_name()));
+    if !resuming {
+        emitter.progress(&format!("Detected: {}", env.pi_model.display_name()));
+    }
 
     // WiFi regulatory (silent no-op when already set)
     configure_wifi_regulatory(&env, &emitter).await?;

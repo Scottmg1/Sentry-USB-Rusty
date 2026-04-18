@@ -107,7 +107,7 @@ pub async fn configure_avahi(env: &SetupEnv, emitter: &SetupEmitter) -> Result<b
 
     if needs_install {
         sentryusb_shell::run_with_timeout(
-            Duration::from_secs(120),
+            Duration::from_secs(600),
             "apt-get", &["-y", "install", "avahi-daemon"],
         ).await.context("failed to install avahi-daemon")?;
     }

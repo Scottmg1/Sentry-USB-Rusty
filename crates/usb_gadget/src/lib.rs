@@ -80,9 +80,15 @@ pub fn enable() -> Result<()> {
     let configfs = find_configfs_root()?;
     let gadget = configfs.join("usb_gadget").join(GADGET_NAME);
 
+    // Unload legacy g_mass_storage so it doesn't hold the UDC.
+    let _ = std::process::Command::new("modprobe")
+        .args(["-q", "-r", "g_mass_storage"])
+        .status();
+
+    // If the gadget dir already exists, only a UDC (re)bind is required — a
+    // prior enable may have failed to bind (UDC busy) leaving partial state.
     if gadget.exists() {
-        info!("USB gadget already enabled");
-        return Ok(());
+        return bind_udc(&gadget);
     }
 
     // Load the composite module
@@ -152,11 +158,36 @@ pub fn enable() -> Result<()> {
         bail!("USB gadget control requires Linux");
     }
 
-    // Activate: write UDC name
-    let udc = find_udc()?;
-    write_file(&gadget.join("UDC"), &udc)?;
+    info!("USB gadget configured with {} LUN(s)", lun);
+    bind_udc(&gadget)
+}
 
-    info!("USB gadget enabled with {} LUN(s), UDC: {}", lun, udc);
+/// Bind (or rebind) the UDC for an already-configured gadget dir. If the UDC
+/// is busy, blank the UDC slot, wait briefly, and retry so stale bindings
+/// clear. Returns the underlying error if the final attempt fails.
+fn bind_udc(gadget: &Path) -> Result<()> {
+    let udc = find_udc()?;
+    let udc_path = gadget.join("UDC");
+
+    // Clear any stale binding before writing the new one.
+    let _ = fs::write(&udc_path, "");
+
+    for attempt in 1..=5 {
+        match fs::write(&udc_path, &udc) {
+            Ok(()) => {
+                info!("USB gadget bound to UDC: {}", udc);
+                return Ok(());
+            }
+            Err(e) if attempt < 5 => {
+                info!("UDC bind attempt {} failed ({}), retrying", attempt, e);
+                let _ = fs::write(&udc_path, "");
+                std::thread::sleep(std::time::Duration::from_millis(500));
+            }
+            Err(e) => {
+                return Err(anyhow::anyhow!("failed to bind UDC {}: {}", udc, e));
+            }
+        }
+    }
     Ok(())
 }
 
@@ -206,9 +237,14 @@ pub fn disable() -> Result<()> {
     Ok(())
 }
 
-/// Check if the gadget is currently active.
+/// Check if the gadget is currently active — i.e. actually bound to a UDC.
+/// A stale config dir with an empty UDC file is considered inactive so the
+/// user can recover via a fresh toggle.
 pub fn is_active() -> bool {
-    Path::new("/sys/kernel/config/usb_gadget/sentryusb").exists()
+    let udc_file = Path::new("/sys/kernel/config/usb_gadget/sentryusb/UDC");
+    fs::read_to_string(udc_file)
+        .map(|s| !s.trim().is_empty())
+        .unwrap_or(false)
 }
 
 /// Find the first available UDC (USB Device Controller).
