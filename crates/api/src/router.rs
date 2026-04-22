@@ -1,8 +1,11 @@
 use axum::routing::{delete, get, post, put};
 use axum::Router;
 
+use std::sync::Arc;
+
 use crate::auth::AuthState;
 use crate::drives_handler::DriveState;
+use crate::keep_awake::KeepAwakeManager;
 
 /// Shared application state available to all handlers.
 #[derive(Clone)]
@@ -10,6 +13,7 @@ pub struct AppState {
     pub hub: sentryusb_ws::Hub,
     pub auth: AuthState,
     pub drives: DriveState,
+    pub keep_awake: Arc<KeepAwakeManager>,
 }
 
 /// Build the complete Axum router with all API routes.
@@ -52,6 +56,8 @@ pub fn build_router(state: AppState) -> Router {
         // System
         .route("/api/system/reboot", post(crate::system::reboot))
         .route("/api/system/toggle-drives", post(crate::system::toggle_drives))
+        .route("/api/system/gadget-enable", post(crate::system::gadget_enable))
+        .route("/api/system/gadget-disable", post(crate::system::gadget_disable))
         .route("/api/system/trigger-sync", post(crate::system::trigger_sync))
         .route("/api/system/ble-pair", post(crate::system::ble_pair))
         .route("/api/system/ble-status", get(crate::system::ble_status))
@@ -137,6 +143,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/keep-awake/start", post(crate::keep_awake::start))
         .route("/api/keep-awake/stop", post(crate::keep_awake::stop))
         .route("/api/keep-awake/status", get(crate::keep_awake::status))
+        .route("/api/keep-awake/heartbeat", post(crate::keep_awake::heartbeat))
         // Away mode
         .route("/api/away-mode/enable", post(crate::away_mode::enable))
         .route("/api/away-mode/disable", post(crate::away_mode::disable))

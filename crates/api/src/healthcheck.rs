@@ -105,6 +105,170 @@ pub async fn health_check(State(_s): State<AppState>) -> (StatusCode, Json<serde
     }
     categories.push(HealthCategory { name: "Storage".to_string(), items: st });
 
+    // ── Core files ────────────────────────────────────────────────────────
+    //
+    // Matches Go `checkCoreFiles` (server/api/healthcheck.go:74-109). Scripts
+    // marked `exec` must be executable; missing-or-not-executable is a fail/warn
+    // because archiveloop invokes these by path.
+    let mut core = Vec::new();
+    let core_files: &[(&str, &str, bool)] = &[
+        ("/opt/sentryusb/sentryusb", "SentryUSB binary", true),
+        ("/root/bin/archiveloop", "archiveloop script", false),
+        ("/root/bin/envsetup.sh", "envsetup.sh", false),
+        ("/root/bin/enable_gadget.sh", "enable_gadget.sh", true),
+        ("/root/bin/disable_gadget.sh", "disable_gadget.sh", true),
+        ("/root/bin/make_snapshot.sh", "make_snapshot.sh", true),
+        ("/root/bin/release_snapshot.sh", "release_snapshot.sh", true),
+        ("/root/bin/manage_free_space.sh", "manage_free_space.sh", true),
+        ("/root/bin/waitforidle", "waitforidle", false),
+        ("/root/bin/mountimage", "mountimage", false),
+        ("/root/bin/remountfs_rw", "remountfs_rw", false),
+    ];
+    for (path, label, _must_exec) in core_files {
+        match std::fs::metadata(path) {
+            Err(_) => core.push(item(label, "fail", Some(format!("{} missing", path)))),
+            Ok(_md) => {
+                #[cfg(unix)]
+                {
+                    if *_must_exec {
+                        use std::os::unix::fs::PermissionsExt;
+                        if _md.permissions().mode() & 0o111 == 0 {
+                            core.push(item(label, "warn", Some(format!("{} exists but not executable", path))));
+                            continue;
+                        }
+                    }
+                }
+                core.push(item(label, "pass", Some(path.to_string())));
+            }
+        }
+    }
+    categories.push(HealthCategory { name: "Core Files".to_string(), items: core });
+
+    // ── Configuration ─────────────────────────────────────────────────────
+    //
+    // Matches Go `checkConfig` (healthcheck.go:112-162): config file presence,
+    // setup-finished marker, fstab entries for backingfiles/mutable/cam_disk.
+    let mut cfg = Vec::new();
+    let config_path = sentryusb_config::find_config_path();
+    if std::path::Path::new(config_path).exists() {
+        cfg.push(item("Config file", "pass", Some(config_path.to_string())));
+    } else {
+        cfg.push(item("Config file", "fail", Some("No sentryusb.conf found".to_string())));
+    }
+    let setup_markers = [
+        "/sentryusb/SENTRYUSB_SETUP_FINISHED",
+        "/boot/firmware/SENTRYUSB_SETUP_FINISHED",
+        "/boot/SENTRYUSB_SETUP_FINISHED",
+    ];
+    let setup_finished = setup_markers.iter().find(|p| std::path::Path::new(p).exists());
+    match setup_finished {
+        Some(p) => cfg.push(item("Setup finished", "pass", Some(format!("{} exists", p)))),
+        None => cfg.push(item(
+            "Setup finished",
+            "fail",
+            Some("SENTRYUSB_SETUP_FINISHED marker not found".to_string()),
+        )),
+    }
+    match std::fs::read_to_string("/etc/fstab") {
+        Err(_) => cfg.push(item("fstab", "fail", Some("Cannot read /etc/fstab".to_string()))),
+        Ok(fstab) => {
+            cfg.push(item(
+                "backingfiles in fstab",
+                if fstab.contains("backingfiles") { "pass" } else { "fail" },
+                if fstab.contains("backingfiles") { None } else { Some("Missing from /etc/fstab".to_string()) },
+            ));
+            cfg.push(item(
+                "mutable in fstab",
+                if fstab.contains("mutable") { "pass" } else { "fail" },
+                if fstab.contains("mutable") { None } else { Some("Missing from /etc/fstab".to_string()) },
+            ));
+            cfg.push(item(
+                "cam_disk in fstab",
+                if fstab.contains("cam_disk.bin") { "pass" } else { "warn" },
+                if fstab.contains("cam_disk.bin") { None } else { Some("Missing (no cam disk configured?)".to_string()) },
+            ));
+        }
+    }
+    categories.push(HealthCategory { name: "Configuration".to_string(), items: cfg });
+
+    // ── USB gadget ────────────────────────────────────────────────────────
+    //
+    // Goes deeper than the Go check: verify the gadget is not just present in
+    // configfs but actually bound to a UDC and exposing at least `lun.0` with
+    // a real backing file. An enumerated-but-no-LUNs gadget is the failure
+    // mode Phase A.2 / A.4 were fixing.
+    let mut gad = Vec::new();
+    if sentryusb_gadget::is_active() {
+        gad.push(item("Gadget UDC bound", "pass", None));
+        let lun0 = "/sys/kernel/config/usb_gadget/sentryusb/functions/mass_storage.0/lun.0/file";
+        match std::fs::read_to_string(lun0) {
+            Ok(s) if !s.trim().is_empty() => {
+                gad.push(item("lun.0 backing file", "pass", Some(s.trim().to_string())));
+            }
+            _ => gad.push(item(
+                "lun.0 backing file",
+                "fail",
+                Some("gadget is bound but exposes no LUN.0 — car will see the drive but nothing on it".to_string()),
+            )),
+        }
+    } else if std::path::Path::new("/sys/kernel/config/usb_gadget/sentryusb").exists() {
+        gad.push(item(
+            "Gadget UDC bound",
+            "warn",
+            Some("configfs dir exists but UDC is empty — toggle drives to re-bind".to_string()),
+        ));
+    } else {
+        gad.push(item("Gadget UDC bound", "warn", Some("gadget disabled".to_string())));
+    }
+    categories.push(HealthCategory { name: "USB Gadget".to_string(), items: gad });
+
+    // ── BLE ───────────────────────────────────────────────────────────────
+    //
+    // Daemon is a Python service (`sentryusb-ble.service`) bundled by
+    // install-pi.sh. Check that it's running AND that the required D-Bus
+    // policy file is in place — without the policy file the daemon can't own
+    // its well-known name and iOS pairing silently fails.
+    let mut ble = Vec::new();
+    let ble_running = sentryusb_shell::run(
+        "systemctl", &["is-active", "--quiet", "sentryusb-ble"],
+    ).await.is_ok();
+    ble.push(item(
+        "sentryusb-ble daemon",
+        if ble_running { "pass" } else { "warn" },
+        if ble_running { None } else { Some("inactive — iOS pairing unavailable".to_string()) },
+    ));
+    let dbus_policy = std::path::Path::new("/etc/dbus-1/system.d/com.sentryusb.ble.conf").exists();
+    ble.push(item(
+        "D-Bus policy",
+        if dbus_policy { "pass" } else { "warn" },
+        if dbus_policy { None } else { Some("com.sentryusb.ble.conf missing".to_string()) },
+    ));
+    categories.push(HealthCategory { name: "BLE".to_string(), items: ble });
+
+    // ── RTC ───────────────────────────────────────────────────────────────
+    //
+    // Pi 5 ships with a real-time clock; earlier Pis don't. A missing RTC is
+    // informational (away-mode falls back to countdown-based expiration), a
+    // low RTC battery is a warn because time will reset on power loss.
+    let mut rtc = Vec::new();
+    let has_rtc = std::path::Path::new("/dev/rtc0").exists();
+    rtc.push(item(
+        "RTC device",
+        if has_rtc { "pass" } else { "warn" },
+        if has_rtc { None } else { Some("no /dev/rtc0 — clock will reset on power loss".to_string()) },
+    ));
+    if has_rtc {
+        // Pi 5 RTC battery charge level: /sys/class/rtc/rtc0/device/charging_voltage,
+        // battery is a short read via hwclock. Best-effort.
+        if let Ok(v) = std::fs::read_to_string("/sys/class/rtc/rtc0/device/charging_voltage_now") {
+            let uv: i64 = v.trim().parse().unwrap_or(0);
+            let mv = uv / 1000;
+            let status = if mv >= 2800 { "pass" } else if mv >= 2000 { "warn" } else { "fail" };
+            rtc.push(item("RTC battery", status, Some(format!("{} mV", mv))));
+        }
+    }
+    categories.push(HealthCategory { name: "Clock / RTC".to_string(), items: rtc });
+
     // ── Services ──────────────────────────────────────────────────────────
     let mut svcs = Vec::new();
     for (svc, critical) in &[

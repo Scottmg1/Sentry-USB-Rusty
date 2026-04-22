@@ -35,6 +35,45 @@ pub async fn toggle_drives(State(_s): State<AppState>, _body: String) -> (Status
     }
 }
 
+/// POST /api/system/gadget-enable — idempotent set-to-active.
+///
+/// Called from the `/root/bin/enable_gadget.sh` shim so archiveloop coordinates
+/// with this server instead of driving configfs directly in parallel.
+pub async fn gadget_enable(State(_s): State<AppState>) -> (StatusCode, Json<serde_json::Value>) {
+    if sentryusb_gadget::is_active() {
+        return crate::json_ok();
+    }
+    match tokio::task::spawn_blocking(sentryusb_gadget::enable).await {
+        Ok(Ok(())) => crate::json_ok(),
+        Ok(Err(e)) => crate::json_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("USB gadget enable failed: {}", e),
+        ),
+        Err(e) => crate::json_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("USB gadget task panicked: {}", e),
+        ),
+    }
+}
+
+/// POST /api/system/gadget-disable — idempotent set-to-inactive.
+pub async fn gadget_disable(State(_s): State<AppState>) -> (StatusCode, Json<serde_json::Value>) {
+    if !sentryusb_gadget::is_active() {
+        return crate::json_ok();
+    }
+    match tokio::task::spawn_blocking(sentryusb_gadget::disable).await {
+        Ok(Ok(())) => crate::json_ok(),
+        Ok(Err(e)) => crate::json_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("USB gadget disable failed: {}", e),
+        ),
+        Err(e) => crate::json_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("USB gadget task panicked: {}", e),
+        ),
+    }
+}
+
 /// POST /api/system/trigger-sync
 pub async fn trigger_sync(State(_s): State<AppState>) -> (StatusCode, Json<serde_json::Value>) {
     tokio::spawn(async {

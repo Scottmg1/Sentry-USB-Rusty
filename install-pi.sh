@@ -173,6 +173,37 @@ else
     warn "Could not fetch BLE daemon — iOS app pairing will be unavailable"
 fi
 
+# ── Step 3d: archiveloop ↔ gadget shim scripts ─────────────────────
+#
+# archiveloop (shell) calls /root/bin/enable_gadget.sh and disable_gadget.sh
+# directly. On a pre-existing Go install those are real configfs scripts; if
+# we leave them alone they fight with the Rust handler — two concurrent
+# writers to the same /sys/kernel/config/usb_gadget/sentryusb tree produces
+# half-configured gadgets that enumerate without exposing LUNs.
+#
+# Replace them with thin curl shims so archiveloop drives the Rust API
+# instead. The shims are idempotent — archiveloop can call enable while we're
+# already enabled without side effects.
+
+info "Installing archiveloop gadget shims..."
+mkdir -p /root/bin
+
+cat > /root/bin/enable_gadget.sh <<'SHIM'
+#!/bin/bash
+# Rust SentryUSB shim — archiveloop calls this; we forward to the Rust API.
+# Loopback requests bypass the web auth middleware.
+exec curl -fsS --max-time 30 -X POST http://127.0.0.1/api/system/gadget-enable
+SHIM
+chmod +x /root/bin/enable_gadget.sh
+
+cat > /root/bin/disable_gadget.sh <<'SHIM'
+#!/bin/bash
+exec curl -fsS --max-time 30 -X POST http://127.0.0.1/api/system/gadget-disable
+SHIM
+chmod +x /root/bin/disable_gadget.sh
+
+ok "Gadget shims installed at /root/bin/{enable,disable}_gadget.sh"
+
 # ── Step 4: Sample Config ───────────────────────────────────────────
 
 if [ ! -f /root/sentryusb.conf ]; then

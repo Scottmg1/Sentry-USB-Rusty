@@ -170,41 +170,130 @@ pub async fn run_setup(State(s): State<AppState>) -> (StatusCode, Json<serde_jso
 }
 
 /// POST /api/setup/test-archive
+///
+/// Body: JSON map with keys matching sentryusb.conf entries:
+/// `ARCHIVE_SYSTEM` (cifs|rsync|rclone|nfs), plus protocol-specific fields.
+/// Mirrors `server/api/setup.go:testArchive` — an actual mount/connect probe,
+/// not just a ping.
 pub async fn test_archive(
     State(_s): State<AppState>,
+    Json(params): Json<std::collections::HashMap<String, String>>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    // Read archive server from config and test connectivity
-    let config_path = sentryusb_config::find_config_path();
-    let server = match sentryusb_config::parse_file(config_path) {
-        Ok((active, commented)) => {
-            sentryusb_config::get_config_value(&active, &commented, "ARCHIVE_SERVER")
+    let system = params
+        .get("ARCHIVE_SYSTEM")
+        .map(|s| s.as_str())
+        .unwrap_or("");
+    if system.is_empty() || system == "none" {
+        return crate::json_error(StatusCode::BAD_REQUEST, "No archive system specified");
+    }
+
+    let timeout = std::time::Duration::from_secs(15);
+    let tmp_dir = "/tmp/sentryusb-archive-test";
+
+    let test_result: Result<(), String> = match system {
+        "cifs" => {
+            let server = params.get("ARCHIVE_SERVER").cloned().unwrap_or_default();
+            let share = params.get("SHARE_NAME").cloned().unwrap_or_default();
+            let user = params.get("SHARE_USER").cloned().unwrap_or_default();
+            let pass = params.get("SHARE_PASSWORD").cloned().unwrap_or_default();
+            let domain = params.get("SHARE_DOMAIN").cloned().unwrap_or_default();
+            let cifs_ver = params.get("CIFS_VERSION").cloned().unwrap_or_default();
+            if server.is_empty() || share.is_empty() || user.is_empty() || pass.is_empty() {
+                return crate::json_error(StatusCode::BAD_REQUEST, "Missing required CIFS fields");
+            }
+            let _ = std::fs::create_dir_all(tmp_dir);
+            let mut opts = format!("username={},password={},iocharset=utf8", user, pass);
+            if !domain.is_empty() {
+                opts.push_str(&format!(",domain={}", domain));
+            }
+            if !cifs_ver.is_empty() {
+                opts.push_str(&format!(",vers={}", cifs_ver));
+            }
+            let src = format!("//{}/{}", server, share);
+            let res = sentryusb_shell::run_with_timeout(
+                timeout, "mount", &["-t", "cifs", &src, tmp_dir, "-o", &opts],
+            ).await;
+            if res.is_ok() {
+                let _ = sentryusb_shell::run_with_timeout(
+                    std::time::Duration::from_secs(5), "umount", &[tmp_dir],
+                ).await;
+            }
+            let _ = std::fs::remove_dir(tmp_dir);
+            res.map(|_| ()).map_err(|e| e.to_string())
         }
-        Err(_) => None,
+        "rsync" => {
+            let server = params.get("RSYNC_SERVER").cloned().unwrap_or_default();
+            let user = params.get("RSYNC_USER").cloned().unwrap_or_default();
+            let path = params.get("RSYNC_PATH").cloned().unwrap_or_default();
+            if server.is_empty() || user.is_empty() || path.is_empty() {
+                return crate::json_error(StatusCode::BAD_REQUEST, "Missing required rsync fields");
+            }
+            let target = format!("{}@{}", user, server);
+            let res = sentryusb_shell::run_with_timeout(
+                timeout, "ssh", &[
+                    "-o", "ConnectTimeout=10",
+                    "-o", "StrictHostKeyChecking=no",
+                    "-o", "BatchMode=yes",
+                    &target, "echo", "ok",
+                ],
+            ).await;
+            res.map(|_| ()).map_err(|e| e.to_string())
+        }
+        "rclone" => {
+            let drive = params.get("RCLONE_DRIVE").cloned().unwrap_or_default();
+            let rpath = params.get("RCLONE_PATH").cloned().unwrap_or_default();
+            if drive.is_empty() || rpath.is_empty() {
+                return crate::json_error(StatusCode::BAD_REQUEST, "Missing required rclone fields");
+            }
+            let target = format!("{}:{}", drive, rpath);
+            let res = sentryusb_shell::run_with_timeout(
+                timeout, "rclone", &["lsd", &target],
+            ).await;
+            res.map(|_| ()).map_err(|e| e.to_string())
+        }
+        "nfs" => {
+            let server = params.get("ARCHIVE_SERVER").cloned().unwrap_or_default();
+            let export = params.get("SHARE_NAME").cloned().unwrap_or_default();
+            if server.is_empty() || export.is_empty() {
+                return crate::json_error(StatusCode::BAD_REQUEST, "Missing required NFS fields");
+            }
+            let _ = std::fs::create_dir_all(tmp_dir);
+            let src = format!("{}:{}", server, export);
+            let res = sentryusb_shell::run_with_timeout(
+                timeout, "mount", &["-t", "nfs", &src, tmp_dir, "-o", "nolock,soft,timeo=50"],
+            ).await;
+            if res.is_ok() {
+                let _ = sentryusb_shell::run_with_timeout(
+                    std::time::Duration::from_secs(5), "umount", &[tmp_dir],
+                ).await;
+            }
+            let _ = std::fs::remove_dir(tmp_dir);
+            res.map(|_| ()).map_err(|e| e.to_string())
+        }
+        other => {
+            return crate::json_error(
+                StatusCode::BAD_REQUEST,
+                &format!("Unknown archive system: {}", other),
+            );
+        }
     };
 
-    let server = match server {
-        Some(s) if !s.is_empty() && s != "localhost" => s,
-        _ => {
-            return (StatusCode::OK, Json(serde_json::json!({
-                "success": true,
-                "output": "No archive server configured"
-            })));
+    match test_result {
+        Ok(()) => {
+            info!("[setup] Archive test succeeded for {}", system);
+            (StatusCode::OK, Json(serde_json::json!({"success": true})))
         }
-    };
-
-    let result = sentryusb_shell::run_with_timeout(
-        std::time::Duration::from_secs(10),
-        "ping", &["-c", "1", "-W", "5", &server],
-    ).await;
-
-    match result {
-        Ok(_) => (StatusCode::OK, Json(serde_json::json!({
-            "success": true,
-            "output": format!("Archive server {} is reachable", server)
-        }))),
-        Err(_) => (StatusCode::OK, Json(serde_json::json!({
-            "success": false,
-            "error": format!("Archive server {} is unreachable", server)
-        }))),
+        Err(mut err_msg) => {
+            // Strip the "stderr: " prefix the shell helpers prepend, matching
+            // Go's cosmetic cleanup before displaying to the user.
+            if let Some(idx) = err_msg.find("stderr: ") {
+                err_msg = err_msg[idx + "stderr: ".len()..].to_string();
+            }
+            tracing::warn!("[setup] Archive test failed for {}: {}", system, err_msg);
+            (StatusCode::OK, Json(serde_json::json!({
+                "success": false,
+                "error": err_msg.trim(),
+            })))
+        }
     }
 }

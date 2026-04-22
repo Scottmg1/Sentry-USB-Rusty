@@ -7,16 +7,24 @@ use serde::Deserialize;
 
 use crate::router::AppState;
 
-const PREFS_FILE: &str = "/mutable/.sentryusb_preferences.json";
+pub(crate) const PREFS_FILE: &str = "/mutable/.sentryusb_preferences.json";
+/// Legacy Go preferences path — read-only fallback so upgrades don't lose data.
+pub(crate) const LEGACY_PREFS_FILE: &str = "/mutable/sentryusb-prefs.json";
 
-fn load_prefs() -> serde_json::Map<String, serde_json::Value> {
-    std::fs::read_to_string(PREFS_FILE)
+pub(crate) fn load_prefs() -> serde_json::Map<String, serde_json::Value> {
+    // Primary path first, legacy path as fallback.
+    if let Ok(d) = std::fs::read_to_string(PREFS_FILE) {
+        if let Ok(v) = serde_json::from_str(&d) {
+            return v;
+        }
+    }
+    std::fs::read_to_string(LEGACY_PREFS_FILE)
         .ok()
         .and_then(|d| serde_json::from_str(&d).ok())
         .unwrap_or_default()
 }
 
-fn save_prefs(prefs: &serde_json::Map<String, serde_json::Value>) {
+pub(crate) fn save_prefs(prefs: &serde_json::Map<String, serde_json::Value>) {
     let _ = std::fs::write(PREFS_FILE, serde_json::to_string_pretty(prefs).unwrap_or_default());
 }
 

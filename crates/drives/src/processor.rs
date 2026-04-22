@@ -91,6 +91,8 @@ impl Processor {
             .collect();
 
         let total = unprocessed.len();
+        let mut routes_found: usize = 0;
+        let mut files_with_gps: usize = 0;
         info!("found {} unprocessed clip files", total);
 
         {
@@ -117,6 +119,9 @@ impl Processor {
             let full_path = format!("{}/{}", self.clip_dir, file);
             match extract::extract_gps_from_file(&full_path) {
                 Ok(gps) => {
+                    if !gps.points.is_empty() {
+                        files_with_gps += 1;
+                    }
                     let route = Route {
                         file: file.clone(),
                         date: file.split('/').next().unwrap_or("").to_string(),
@@ -129,8 +134,9 @@ impl Processor {
                         raw_frame_count: gps.raw_frame_count,
                         gear_runs: gps.gear_runs,
                     };
-                    if let Err(e) = self.store.upsert_route(&route) {
-                        warn!("failed to save route for {}: {}", file, e);
+                    match self.store.upsert_route(&route) {
+                        Ok(()) => routes_found += 1,
+                        Err(e) => warn!("failed to save route for {}: {}", file, e),
                     }
                 }
                 Err(e) => {
@@ -164,9 +170,14 @@ impl Processor {
             "status": "complete",
             "processed": total,
             "total": total,
+            "routes_found": routes_found,
+            "files_with_gps": files_with_gps,
         }));
 
-        info!("processing complete: {} files processed", total);
+        info!(
+            "processing complete: {} files processed, {} routes found, {} with GPS",
+            total, routes_found, files_with_gps
+        );
         Ok(())
     }
 

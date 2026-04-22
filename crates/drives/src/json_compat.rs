@@ -42,6 +42,15 @@ struct LegacyRoute {
     gear_runs: Vec<GearRun>,
 }
 
+/// Threshold mirroring Go `server/drives/syncguard.go`: a store with at least
+/// this many routes must not be overwritten by an import that shrinks it by
+/// more than `SHRINK_RATIO` — that's a near-certain sign of a truncated or
+/// corrupted file (disk full mid-write, snapshot corruption, etc.), and the
+/// user is better off keeping the existing data than clobbering it with
+/// garbage.
+const SYNCGUARD_MIN_ROUTES: usize = 1000;
+const SYNCGUARD_SHRINK_RATIO: f64 = 0.5;
+
 /// Import a Go-format drive-data.json into the SQLite store.
 pub fn import_json(json_path: &str, store: &DriveStore) -> Result<usize> {
     info!("importing legacy JSON from {}", json_path);
@@ -53,10 +62,30 @@ pub fn import_json(json_path: &str, store: &DriveStore) -> Result<usize> {
         .with_context(|| "failed to parse legacy JSON")?;
 
     let route_count = legacy.routes.len();
+
+    // Corruption guard: refuse to overwrite a large existing store with a
+    // much smaller import. Matches the intent of Go's syncguard.go.
+    let existing_count = store
+        .with_routes(|r| r.len())
+        .unwrap_or(0);
+    if existing_count >= SYNCGUARD_MIN_ROUTES
+        && (route_count as f64) < (existing_count as f64) * SYNCGUARD_SHRINK_RATIO
+    {
+        anyhow::bail!(
+            "refusing import: would shrink store from {} routes to {} (< {:.0}% retained). \
+             Likely a truncated or corrupted upload — delete the existing DB manually if \
+             you really mean to replace it.",
+            existing_count,
+            route_count,
+            SYNCGUARD_SHRINK_RATIO * 100.0,
+        );
+    }
+
     info!(
-        "importing {} routes and {} processed files",
+        "importing {} routes and {} processed files (existing: {})",
         route_count,
-        legacy.processed_files.len()
+        legacy.processed_files.len(),
+        existing_count,
     );
 
     // Import routes

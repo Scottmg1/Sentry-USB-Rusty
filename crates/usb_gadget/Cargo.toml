@@ -8,6 +8,8 @@ tokio = { workspace = true }
 anyhow = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+ring = "0.17"
+hex = "0.4"
 
 sentryusb-shell = { path = "../shell", package = "sentryusb-shell" }
 

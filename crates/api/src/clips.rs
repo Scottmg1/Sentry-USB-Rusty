@@ -115,7 +115,10 @@ pub async fn get_clips(
     (StatusCode::OK, Json(response))
 }
 
-/// GET /api/clips/telemetry
+/// GET /api/clips/telemetry?path=/TeslaCam/SentryClips/<event>&file=<camera>.mp4
+///
+/// Response shape matches the Go `telemetryResponse` the web UI expects:
+/// { frames: [{t, lat, lng, speed_mps, gear, autopilot, accel_pos}], duration_sec, has_gps, has_autopilot }
 pub async fn get_clip_telemetry(
     State(_state): State<AppState>,
     Query(params): Query<std::collections::HashMap<String, String>>,
@@ -124,25 +127,77 @@ pub async fn get_clip_telemetry(
         Some(f) => f,
         None => return crate::json_error(StatusCode::BAD_REQUEST, "missing file parameter"),
     };
-
-    // The client passes `path` as the relative event-dir path (optionally
-    // prefixed with the `/TeslaCam/` URL mount we serve videos from).
     let clip_path = params.get("path").map(|s| s.as_str()).unwrap_or("");
     let clip_rel = clip_path.trim_start_matches('/').trim_start_matches("TeslaCam/");
+
     let full_path = if clip_rel.is_empty() {
         format!("{}/{}", TESLACAM_DIR, file)
     } else {
         format!("{}/{}/{}", TESLACAM_DIR, clip_rel, file)
     };
-    match sentryusb_drives::extract::extract_gps_from_file(&full_path) {
-        Ok(gps) => {
-            (StatusCode::OK, Json(serde_json::json!({
-                "points": gps.points,
-                "gear_states": gps.gear_states,
-                "speeds": gps.speeds,
-                "autopilot_states": gps.autopilot_states,
-            })))
+
+    // Lexical path cleaning + base-prefix check. Mirrors
+    // `clips_telemetry.go:39–45`: reject any path that escapes TESLACAM_DIR
+    // via `..`, absolute rewrites, or symlinks on components we normalize away.
+    let cleaned = {
+        let mut p = std::path::PathBuf::from("/");
+        for component in std::path::Path::new(&full_path).components() {
+            match component {
+                std::path::Component::Normal(c) => p.push(c),
+                std::path::Component::RootDir => p = std::path::PathBuf::from("/"),
+                std::path::Component::ParentDir => {
+                    // Treat any `..` as an attempted escape — refuse.
+                    return crate::json_error(
+                        StatusCode::FORBIDDEN,
+                        "path must be under TeslaCam",
+                    );
+                }
+                _ => {}
+            }
         }
-        Err(e) => crate::json_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+        p
+    };
+    let cleaned_str = cleaned.to_string_lossy();
+    if !cleaned_str.starts_with(TESLACAM_DIR) {
+        return crate::json_error(StatusCode::FORBIDDEN, "path must be under TeslaCam");
     }
+
+    let gps = match sentryusb_drives::extract::extract_gps_from_file(cleaned_str.as_ref()) {
+        Ok(g) => g,
+        Err(e) => return crate::json_error(StatusCode::NOT_FOUND, &format!("could not read file: {}", e)),
+    };
+
+    const FPS: f64 = 36.0;
+    let mut frames = Vec::with_capacity(gps.points.len());
+    let mut has_gps = false;
+    let mut has_autopilot = false;
+    for (i, pt) in gps.points.iter().enumerate() {
+        let ap = *gps.autopilot_states.get(i).unwrap_or(&sentryusb_drives::extract::AUTOPILOT_OFF);
+        let gear = *gps.gear_states.get(i).unwrap_or(&0);
+        let speed = *gps.speeds.get(i).unwrap_or(&0.0);
+        let accel = *gps.accel_positions.get(i).unwrap_or(&0.0);
+        if pt[0] != 0.0 || pt[1] != 0.0 {
+            has_gps = true;
+        }
+        if ap != sentryusb_drives::extract::AUTOPILOT_OFF {
+            has_autopilot = true;
+        }
+        frames.push(serde_json::json!({
+            "t": (i as f64) / FPS,
+            "lat": pt[0],
+            "lng": pt[1],
+            "speed_mps": speed,
+            "gear": gear,
+            "autopilot": ap,
+            "accel_pos": accel,
+        }));
+    }
+    let duration_sec = if frames.is_empty() { 0.0 } else { (frames.len() as f64) / FPS };
+
+    (StatusCode::OK, Json(serde_json::json!({
+        "frames": frames,
+        "duration_sec": duration_sec,
+        "has_gps": has_gps,
+        "has_autopilot": has_autopilot,
+    })))
 }

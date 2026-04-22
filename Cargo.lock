@@ -1860,7 +1860,9 @@ name = "sentryusb-gadget"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "hex",
  "libc",
+ "ring",
  "sentryusb-shell",
  "thiserror 2.0.18",
  "tokio",

@@ -86,17 +86,33 @@ async fn main() {
 
     let drive_state = sentryusb_api::drives_handler::DriveState {
         store: store.clone(),
-        processor,
+        processor: processor.clone(),
+        importing: Arc::new(std::sync::atomic::AtomicBool::new(false)),
     };
+
+    // Keep-awake manager: busy if archiveloop is archiving OR drive processor
+    // is running. Matches Go's isBusy closure (server/api/keepawake.go).
+    let is_busy_processor = processor.clone();
+    let is_busy: Arc<dyn Fn() -> bool + Send + Sync> = Arc::new(move || {
+        sentryusb_api::drives_handler::is_archiving() || is_busy_processor.is_running()
+    });
+    let keep_awake = sentryusb_api::keep_awake::KeepAwakeManager::new(is_busy);
 
     let app_state = sentryusb_api::router::AppState {
         hub: hub.clone(),
         auth: auth.clone(),
         drives: drive_state,
+        keep_awake,
     };
 
     // Resume setup if it was interrupted by a reboot (e.g. dwc2 overlay, root shrink)
     sentryusb_api::setup::auto_resume_setup(hub.clone());
+
+    // Announce this device + current version to the telemetry endpoint.
+    sentryusb_api::update::spawn_startup_telemetry();
+
+    // Resume Away Mode if the flag file still has time remaining.
+    sentryusb_api::away_mode::restore_from_file();
 
     // Build the API router
     let mut app = sentryusb_api::build_router(app_state.clone());

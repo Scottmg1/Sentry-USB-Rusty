@@ -110,16 +110,23 @@ fn write_chime_file_atomic(dest_path: &str, data: &[u8]) -> Result<(), String> {
         let _ = d.sync_all();
     }
 
-    // 6. Touch timestamps
-    // On Linux we can use filetime or just call touch; just open+close suffices
-    // to update mtime on many filesystems. We also write a single byte and rewrite.
-    // For simplicity, use std::fs::File::open + set_len to touch.
-    // Actually, the simplest portable approach: rewrite with same data is too expensive.
-    // Instead, we'll use libc::utimensat via the nix crate or just skip on non-Linux.
-    // Since this runs on Linux (Pi), we can shell out to touch if needed, but
-    // the rename itself updates mtime on most filesystems. Keep it simple.
+    // 6. Touch timestamps via utimensat(UTIME_NOW). Some filesystems
+    //    (notably exFAT) don't update mtime on rename alone, and Tesla's
+    //    firmware uses mtime to invalidate its chime cache when the file
+    //    size is identical.
+    #[cfg(target_os = "linux")]
+    unsafe {
+        use std::ffi::CString;
+        if let Ok(c_path) = CString::new(dest_path) {
+            let times = [
+                libc::timespec { tv_sec: 0, tv_nsec: libc::UTIME_NOW },
+                libc::timespec { tv_sec: 0, tv_nsec: libc::UTIME_NOW },
+            ];
+            libc::utimensat(libc::AT_FDCWD, c_path.as_ptr(), times.as_ptr(), 0);
+        }
+    }
 
-    // 7. Full system sync
+    // 7. Full system sync for exFAT / backing-file durability
     let _ = std::process::Command::new("sync").status();
 
     Ok(())

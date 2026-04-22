@@ -61,17 +61,30 @@ fn get_max_power() -> u32 {
     }
 }
 
-/// Get the machine ID for the serial number.
+/// Machine-ID-derived serial: `SentryUSB-<hex sha256(machine-id)>`.
+/// Matches Go `enable_gadget.sh:36` so Tesla's cached pairing survives the
+/// Go→Rust transition.
 fn get_machine_serial() -> String {
     let mid = fs::read_to_string("/etc/machine-id").unwrap_or_default();
     let mid = mid.trim();
-    // SHA256 hash of machine-id (matching the bash script)
-    use std::process::Command;
-    if let Ok(_output) = Command::new("sha256sum").stdin(std::process::Stdio::piped()).output() {
-        // Fallback: just use the machine-id directly
-        return format!("SentryUSB-{}", mid);
+    if mid.is_empty() {
+        return "SentryUSB-unknown".to_string();
     }
-    format!("SentryUSB-{}", mid)
+    let h = ring::digest::digest(&ring::digest::SHA256, mid.as_bytes());
+    format!("SentryUSB-{}", hex::encode(h.as_ref()))
+}
+
+/// True if a configured gadget dir looks complete enough to safely re-bind.
+/// Checks that the mass_storage function exists with a readable lun.0/file
+/// pointing at a real backing file. Anything weaker than this means a prior
+/// enable crashed mid-setup and we should start fresh.
+fn gadget_dir_is_complete(gadget: &Path) -> bool {
+    let func = gadget.join("functions/mass_storage.0");
+    let lun0_file = func.join("lun.0/file");
+    match fs::read_to_string(&lun0_file) {
+        Ok(s) => !s.trim().is_empty(),
+        Err(_) => false,
+    }
 }
 
 /// Enable the USB gadget by setting up configfs.
@@ -80,15 +93,27 @@ pub fn enable() -> Result<()> {
     let configfs = find_configfs_root()?;
     let gadget = configfs.join("usb_gadget").join(GADGET_NAME);
 
-    // Unload legacy g_mass_storage so it doesn't hold the UDC.
+    // Unload legacy g_mass_storage so it doesn't hold the UDC. (Matches Go
+    // `enable_gadget.sh:8` — drop the single-function legacy gadget before
+    // assembling the composite one.)
     let _ = std::process::Command::new("modprobe")
         .args(["-q", "-r", "g_mass_storage"])
         .status();
 
-    // If the gadget dir already exists, only a UDC (re)bind is required — a
-    // prior enable may have failed to bind (UDC busy) leaving partial state.
+    // If the gadget dir already exists AND looks complete, only a UDC
+    // (re)bind is required — a prior enable may have failed to bind because
+    // the UDC was busy, leaving an otherwise-valid config.
+    //
+    // If it exists but is INCOMPLETE (crashed mid-enable), tear it down and
+    // rebuild from scratch — trying to bind a half-configured gadget produces
+    // a device that enumerates but exposes no LUNs. Matches the defensive
+    // stance of `enable_gadget.sh:19-23`.
     if gadget.exists() {
-        return bind_udc(&gadget);
+        if gadget_dir_is_complete(&gadget) {
+            return bind_udc(&gadget);
+        }
+        info!("USB gadget dir exists but is incomplete — tearing down and rebuilding");
+        disable()?;
     }
 
     // Load the composite module
@@ -131,9 +156,11 @@ pub fn enable() -> Result<()> {
     for (image_path, label) in DISK_IMAGES {
         if Path::new(image_path).exists() {
             let lun_dir = func_dir.join(format!("lun.{}", lun));
-            if lun > 0 {
-                fs::create_dir_all(&lun_dir)?;
-            }
+            // Create every LUN dir, including lun.0 — depending on the
+            // kernel's configfs version, lun.0 is NOT guaranteed to be
+            // auto-created when the mass_storage function is instantiated.
+            // Writing to `lun.0/file` before the dir exists silently fails.
+            fs::create_dir_all(&lun_dir)?;
             write_file(&lun_dir.join("file"), image_path)?;
 
             // Get file size for inquiry string
@@ -194,7 +221,12 @@ fn bind_udc(gadget: &Path) -> Result<()> {
 /// Disable the USB gadget by tearing down configfs.
 /// This is equivalent to `disable_gadget.sh`.
 pub fn disable() -> Result<()> {
-    // Remove legacy g_mass_storage if loaded
+    // Unload g_mass_storage FIRST so it releases the UDC before we try to
+    // deactivate it. If we leave this for the end, the kernel may keep the
+    // UDC bound, the `echo "" > UDC` below silently no-ops, and the next
+    // `enable()` hangs on "UDC busy" forever.
+    //
+    // Go `disable_gadget.sh:5` does this as step 1 for the same reason.
     let _ = std::process::Command::new("modprobe")
         .args(["-q", "-r", "g_mass_storage"])
         .status();
@@ -216,9 +248,9 @@ pub fn disable() -> Result<()> {
     let cfg_strings = cfg_dir.join(format!("strings/{}", LANG));
     let _ = fs::remove_dir(&cfg_strings);
 
-    // Remove extra LUNs (lun.1 through lun.4)
+    // Remove all LUNs (lun.0 through lun.4)
     let func_dir = gadget.join("functions/mass_storage.0");
-    for i in 1..=4 {
+    for i in 0..=4 {
         let _ = fs::remove_dir(func_dir.join(format!("lun.{}", i)));
     }
     let _ = fs::remove_dir(&func_dir);
@@ -228,7 +260,7 @@ pub fn disable() -> Result<()> {
     let _ = fs::remove_dir(gadget.join(format!("strings/{}", LANG)));
     let _ = fs::remove_dir(&gadget);
 
-    // Unload modules
+    // Unload remaining function modules (mass storage is already gone).
     let _ = std::process::Command::new("modprobe")
         .args(["-r", "usb_f_mass_storage", "g_ether", "usb_f_ecm", "usb_f_rndis", "libcomposite"])
         .status();
