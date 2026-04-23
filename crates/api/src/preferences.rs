@@ -1,4 +1,17 @@
 //! User preferences (key-value store).
+//!
+//! Concurrency: the load→modify→save flow used by [`set_preference`] is
+//! racy without a lock — two concurrent PUTs would both read the same
+//! baseline, each insert their own key, and the second write would
+//! silently clobber the first. Go guarded this with `prefsMu.RWMutex`;
+//! we do the same here with a process-wide `Mutex<()>` held for the
+//! duration of the RMW.
+//!
+//! Durability: saves go through tmp+rename so a power cut mid-write
+//! can't leave the preferences file half-formed (parseable as empty,
+//! losing every stored flag).
+
+use std::sync::Mutex;
 
 use axum::Json;
 use axum::extract::{Query, State};
@@ -10,6 +23,10 @@ use crate::router::AppState;
 pub(crate) const PREFS_FILE: &str = "/mutable/.sentryusb_preferences.json";
 /// Legacy Go preferences path — read-only fallback so upgrades don't lose data.
 pub(crate) const LEGACY_PREFS_FILE: &str = "/mutable/sentryusb-prefs.json";
+
+/// Serializes concurrent preference reads + writes. Held around the
+/// RMW in `set_preference` so interleaved PUTs can't lose updates.
+static PREFS_LOCK: Mutex<()> = Mutex::new(());
 
 pub(crate) fn load_prefs() -> serde_json::Map<String, serde_json::Value> {
     // Primary path first, legacy path as fallback.
@@ -25,7 +42,20 @@ pub(crate) fn load_prefs() -> serde_json::Map<String, serde_json::Value> {
 }
 
 pub(crate) fn save_prefs(prefs: &serde_json::Map<String, serde_json::Value>) {
-    let _ = std::fs::write(PREFS_FILE, serde_json::to_string_pretty(prefs).unwrap_or_default());
+    // Atomic tmp+rename — a direct `fs::write` leaves the file in an
+    // intermediate zero-length state if the kernel panics mid-write,
+    // which on next boot would silently reset every toggle (away-mode
+    // notifications, update channel, etc.) to its default.
+    let data = serde_json::to_string_pretty(prefs).unwrap_or_default();
+    let tmp = format!("{}.tmp", PREFS_FILE);
+    if let Err(e) = std::fs::write(&tmp, &data) {
+        tracing::warn!("[preferences] failed to write tmp: {}", e);
+        return;
+    }
+    if let Err(e) = std::fs::rename(&tmp, PREFS_FILE) {
+        let _ = std::fs::remove_file(&tmp);
+        tracing::warn!("[preferences] failed to rename into place: {}", e);
+    }
 }
 
 #[derive(Deserialize)]
@@ -63,6 +93,12 @@ pub async fn set_preference(
         Err(_) => return crate::json_error(StatusCode::BAD_REQUEST, "invalid request body"),
     };
 
+    // Hold the lock across the entire load→modify→save so two concurrent
+    // PUTs serialize rather than racing on the same baseline snapshot.
+    // Poisoned-guard recovery: treat `into_inner` as "lock was dropped
+    // while held" — safe because we always restore the file from a
+    // complete in-memory map on every save.
+    let _guard = PREFS_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     let mut prefs = load_prefs();
     prefs.insert(req.key, req.value);
     save_prefs(&prefs);

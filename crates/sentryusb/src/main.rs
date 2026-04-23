@@ -4,7 +4,7 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 use std::sync::Arc;
 
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use tower_http::compression::CompressionLayer;
 use tracing::info;
 
@@ -15,7 +15,7 @@ mod migrate;
 #[derive(Parser)]
 #[command(name = "sentryusb", about = "SentryUSB server")]
 struct Args {
-    /// HTTP server port
+    /// HTTP server port (only used when no subcommand is given)
     #[arg(short, long, default_value_t = 8788)]
     port: u16,
 
@@ -26,6 +26,76 @@ struct Args {
     /// Path to static files directory (overrides embedded)
     #[arg(long)]
     r#static: Option<String>,
+
+    /// Optional subcommand. Without one, the HTTP server runs.
+    ///
+    /// Subcommands are invoked by the `/root/bin/{make,release}_snapshot.sh`,
+    /// `enable/disable_gadget.sh`, and `manage_free_space.sh` wrappers
+    /// installed by the setup wizard — archiveloop calls those wrappers
+    /// every cycle, so keeping the subcommands working here keeps the
+    /// archive flow alive.
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    /// USB gadget control (configfs + UDC bind/unbind).
+    Gadget {
+        #[command(subcommand)]
+        action: GadgetAction,
+    },
+    /// Cam-disk snapshot management (reflink-backed).
+    Snapshot {
+        #[command(subcommand)]
+        action: SnapshotAction,
+    },
+    /// Free-space management on `/backingfiles`.
+    Space {
+        #[command(subcommand)]
+        action: SpaceAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum GadgetAction {
+    /// Attach the USB mass-storage gadget + bind the UDC.
+    Enable {
+        /// Ignored — the shim in `/root/bin/enable_gadget.sh` splats
+        /// `"$@"`, so callers may pass through args we don't use.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+    /// Unbind the UDC + tear down the configfs hierarchy.
+    Disable {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum SnapshotAction {
+    /// Create a new reflink snapshot of `/backingfiles/cam_disk.bin`.
+    Make {
+        /// Reserved for future compat (e.g. `nofsck`); ignored for now.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+    /// Release (delete) an existing snapshot by name (`snap-NNNNNN`).
+    Release {
+        /// Snapshot name passed through by the `release_snapshot.sh` wrapper.
+        name: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum SpaceAction {
+    /// Delete old snapshots until `/backingfiles` has enough free space.
+    Manage {
+        /// Reserved for future compat (e.g. reserve size); ignored for now.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
 }
 
 #[tokio::main]
@@ -39,6 +109,12 @@ async fn main() {
         .init();
 
     let args = Args::parse();
+
+    // Subcommand dispatch — the wrappers in /root/bin/ expect these to
+    // run to completion synchronously and exit with a status code.
+    if let Some(cmd) = args.command {
+        std::process::exit(run_subcommand(cmd).await);
+    }
 
     info!("SentryUSB server starting on port {}", args.port);
 
@@ -158,4 +234,77 @@ async fn shutdown_signal() {
         .await
         .expect("failed to install CTRL+C handler");
     info!("Shutdown signal received, draining connections...");
+}
+
+/// Dispatch a subcommand. Returns the exit code the wrapper scripts should
+/// propagate back to their caller. `0` on success; `1` (or a shell-friendly
+/// non-zero) on failure. Errors are printed to stderr so archiveloop's
+/// existing `ERROR: make_snapshot.sh failed (exit $?)` log lines stay useful.
+async fn run_subcommand(cmd: Command) -> i32 {
+    match cmd {
+        Command::Gadget { action } => run_gadget(action).await,
+        Command::Snapshot { action } => run_snapshot(action).await,
+        Command::Space { action } => run_space(action).await,
+    }
+}
+
+async fn run_gadget(action: GadgetAction) -> i32 {
+    // usb_gadget::enable/disable are synchronous and touch configfs; run
+    // them on a blocking thread so they don't panic inside a tokio worker
+    // on slow udc bind retries.
+    let result = match action {
+        GadgetAction::Enable { .. } => {
+            tokio::task::spawn_blocking(sentryusb_gadget::enable).await
+        }
+        GadgetAction::Disable { .. } => {
+            tokio::task::spawn_blocking(sentryusb_gadget::disable).await
+        }
+    };
+    match result {
+        Ok(Ok(())) => 0,
+        Ok(Err(e)) => {
+            eprintln!("gadget: {}", e);
+            1
+        }
+        Err(e) => {
+            eprintln!("gadget task panicked: {}", e);
+            1
+        }
+    }
+}
+
+async fn run_snapshot(action: SnapshotAction) -> i32 {
+    match action {
+        SnapshotAction::Make { .. } => match sentryusb_gadget::snapshot::make_snapshot().await {
+            Ok(name) => {
+                println!("{}", name);
+                0
+            }
+            Err(e) => {
+                eprintln!("snapshot make: {}", e);
+                1
+            }
+        },
+        SnapshotAction::Release { name } => {
+            match sentryusb_gadget::snapshot::release_snapshot(&name).await {
+                Ok(()) => 0,
+                Err(e) => {
+                    eprintln!("snapshot release {}: {}", name, e);
+                    1
+                }
+            }
+        }
+    }
+}
+
+async fn run_space(action: SpaceAction) -> i32 {
+    match action {
+        SpaceAction::Manage { .. } => match sentryusb_gadget::space::manage_free_space().await {
+            Ok(()) => 0,
+            Err(e) => {
+                eprintln!("space manage: {}", e);
+                1
+            }
+        },
+    }
 }

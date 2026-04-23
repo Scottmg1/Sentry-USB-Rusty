@@ -114,11 +114,55 @@ mod linux_impl {
         Some(u32::from_be_bytes(buf))
     }
 
-    /// Read an MP4 chunk header (size, fourcc) at `offset`.
-    fn get_chunk(file: &std::fs::File, offset: u64) -> Option<(i32, u32)> {
-        let size = read_be_u32_at(file, offset)? as i32;
+    /// Read a big-endian u64 from `file` at `offset`. Returns None on short read.
+    fn read_be_u64_at(file: &std::fs::File, offset: u64) -> Option<u64> {
+        use std::os::unix::fs::FileExt;
+        let mut buf = [0u8; 8];
+        file.read_exact_at(&mut buf, offset).ok()?;
+        Some(u64::from_be_bytes(buf))
+    }
+
+    /// An MP4 box header. `total_size` is the entire box size (header +
+    /// payload) in bytes; `header_len` is the number of header bytes the
+    /// caller must skip to reach the payload.
+    ///
+    /// Two reserved values of the 32-bit size field require special handling
+    /// per ISO/IEC 14496-12 §4.2 "Object Structure":
+    ///   * `size == 1`: the next 8 bytes are a 64-bit "largesize" field;
+    ///     header_len becomes 16 instead of 8. Required for any box >4 GB,
+    ///     which includes mdat on long Tesla clips.
+    ///   * `size == 0`: the box extends to end-of-file. We don't chase this
+    ///     in cttseraser (ctts lives inside moov which is always sized) so
+    ///     we treat it as "stop descending" — matches the C++ original's
+    ///     `size <= 0` early return.
+    struct BoxHeader {
+        total_size: u64,
+        header_len: u64,
+        fourcc: u32,
+    }
+
+    /// Read an MP4 box header (size + fourcc, plus optional largesize) at
+    /// `offset`. Returns `None` on short read / truncated file; returns
+    /// `Some(None)` when the box uses the end-of-file sentinel (size==0),
+    /// so callers can stop descending without confusing it with "read
+    /// failed".
+    fn get_chunk(file: &std::fs::File, offset: u64) -> Option<Option<BoxHeader>> {
+        let size32 = read_be_u32_at(file, offset)?;
         let fourcc = read_be_u32_at(file, offset + 4)?;
-        Some((size, fourcc))
+        let (total_size, header_len) = match size32 {
+            0 => return Some(None), // extends to EOF — don't descend
+            1 => {
+                // 64-bit largesize follows the fourcc.
+                let large = read_be_u64_at(file, offset + 8)?;
+                // A valid largesize must cover at least the 16-byte header.
+                if large < 16 {
+                    return Some(None);
+                }
+                (large, 16u64)
+            }
+            n => (n as u64, 8u64),
+        };
+        Some(Some(BoxHeader { total_size, header_len, fourcc }))
     }
 
     const fn fourcc(tag: &[u8; 4]) -> u32 {
@@ -128,11 +172,15 @@ mod linux_impl {
     fn parse_chunks(file: &std::fs::File, start: u64, end: u64) -> Option<u64> {
         let mut cur = start;
         while cur + 8 <= end {
-            let (size, tag) = get_chunk(file, cur)?;
-            if size <= 0 {
+            let header = match get_chunk(file, cur)? {
+                Some(h) => h,
+                None => return Some(0), // EOF-sentinel / invalid: stop descending
+            };
+            if header.total_size < header.header_len {
+                // Malformed — box can't be smaller than its own header.
                 return Some(0);
             }
-            match tag {
+            match header.fourcc {
                 t if t == fourcc(b"ctts") => return Some(cur),
                 t if t == fourcc(b"moov")
                     || t == fourcc(b"trak")
@@ -140,7 +188,9 @@ mod linux_impl {
                     || t == fourcc(b"minf")
                     || t == fourcc(b"stbl") =>
                 {
-                    if let Some(off) = parse_chunks(file, cur + 8, cur + size as u64) {
+                    let child_start = cur.saturating_add(header.header_len);
+                    let child_end = cur.saturating_add(header.total_size);
+                    if let Some(off) = parse_chunks(file, child_start, child_end) {
                         if off > 0 {
                             return Some(off);
                         }
@@ -150,20 +200,20 @@ mod linux_impl {
                 }
                 _ => {}
             }
-            cur = cur.saturating_add(size as u64);
+            cur = cur.saturating_add(header.total_size);
         }
         Some(0)
     }
 
     fn find_ctts(file: &std::fs::File) -> u64 {
-        let (size, tag) = match get_chunk(file, 0) {
-            Some(v) => v,
-            None => return 0,
+        let header = match get_chunk(file, 0) {
+            Some(Some(h)) => h,
+            _ => return 0,
         };
-        if tag != fourcc(b"ftyp") || size <= 0 {
+        if header.fourcc != fourcc(b"ftyp") {
             return 0;
         }
-        parse_chunks(file, size as u64, u64::MAX / 2).unwrap_or(0)
+        parse_chunks(file, header.total_size, u64::MAX / 2).unwrap_or(0)
     }
 
     impl Filesystem for CttsFs {

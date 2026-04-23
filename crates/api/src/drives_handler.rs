@@ -311,6 +311,29 @@ pub async fn download_data(
     }
 }
 
+/// POST /api/drives/data/export-for-sync
+///
+/// Regenerate `/mutable/drive-data.json` from the live SQLite store so
+/// `post-archive-process.sh` can ship it to the rsync / rclone archive
+/// server. Returns the byte count of the regenerated file so the shell
+/// script can log it.
+pub async fn export_for_sync(
+    State(state): State<AppState>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    match state.drives.store.export_json_for_sync() {
+        Ok(()) => {
+            let bytes = std::fs::metadata(sentryusb_drives::db::DEFAULT_JSON_MIRROR_PATH)
+                .map(|m| m.len())
+                .unwrap_or(0);
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({ "status": "ok", "bytes": bytes })),
+            )
+        }
+        Err(e) => crate::json_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    }
+}
+
 /// Max accepted drive-data upload size. Mirrors Go's streamed-file size guard
 /// at drives.go:518-605 — prevents OOM on a malicious/malformed upload before
 /// we hand the payload to the JSON parser.
@@ -384,10 +407,28 @@ pub async fn upload_data(
         return crate::json_error(status, &msg);
     }
 
+    // Emit `drive_import` WebSocket events so the web UI can show a
+    // progress state during what may be a multi-minute restore. Matches
+    // Go's per-phase broadcasts in server/api/drives.go:557-609 —
+    // starting → progress → complete/error. Our progress fires once
+    // with the total route count (the JSON decoder materializes the
+    // whole StoreData before we see routes). The phases still give the
+    // frontend enough signal to swap the "uploading" UI for an
+    // "importing 5243 routes" UI instead of a stale spinner.
+    let hub = state.hub.clone();
+    hub.broadcast("drive_import", &serde_json::json!({"phase": "starting"}));
+
     let store = state.drives.store.clone();
     let importing = state.drives.importing.clone();
+    let hub_task = hub.clone();
     let result = tokio::task::spawn_blocking(move || {
-        let res = store.import_json_file(tmp);
+        let hub_cb = hub_task.clone();
+        let res = store.import_json_file_with_progress(tmp, move |routes| {
+            hub_cb.broadcast(
+                "drive_import",
+                &serde_json::json!({"phase": "progress", "routes": routes}),
+            );
+        });
         importing.store(false, Ordering::SeqCst);
         res
     })
@@ -397,17 +438,40 @@ pub async fn upload_data(
     let _ = std::fs::remove_file(tmp);
 
     match result {
-        Ok(Ok(stats)) => (
-            StatusCode::OK,
-            Json(serde_json::json!({
-                "imported": stats.routes,
-                "routes": stats.routes,
-                "processedFiles": stats.processed_files,
-                "driveTags": stats.drive_tags,
-            })),
-        ),
-        Ok(Err(e)) => crate::json_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
-        Err(e) => crate::json_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+        Ok(Ok(stats)) => {
+            hub.broadcast(
+                "drive_import",
+                &serde_json::json!({
+                    "phase": "complete",
+                    "routes": stats.routes,
+                    "processedFiles": stats.processed_files,
+                    "driveTags": stats.drive_tags,
+                }),
+            );
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "imported": stats.routes,
+                    "routes": stats.routes,
+                    "processedFiles": stats.processed_files,
+                    "driveTags": stats.drive_tags,
+                })),
+            )
+        }
+        Ok(Err(e)) => {
+            hub.broadcast(
+                "drive_import",
+                &serde_json::json!({"phase": "error", "error": e.to_string()}),
+            );
+            crate::json_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string())
+        }
+        Err(e) => {
+            hub.broadcast(
+                "drive_import",
+                &serde_json::json!({"phase": "error", "error": e.to_string()}),
+            );
+            crate::json_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string())
+        }
     }
 }
 

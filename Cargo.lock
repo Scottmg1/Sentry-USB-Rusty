@@ -1780,6 +1780,7 @@ dependencies = [
  "sentryusb-api",
  "sentryusb-config",
  "sentryusb-drives",
+ "sentryusb-gadget",
  "sentryusb-setup",
  "sentryusb-shell",
  "sentryusb-ws",

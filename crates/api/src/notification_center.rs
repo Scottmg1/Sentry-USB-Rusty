@@ -195,10 +195,27 @@ pub async fn append_history(
     State(_s): State<AppState>,
     body: String,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    let mut event: NotificationEvent = match serde_json::from_str(&body) {
+    let event: NotificationEvent = match serde_json::from_str(&body) {
         Ok(e) => e,
         Err(_) => return crate::json_error(StatusCode::BAD_REQUEST, "Invalid event data"),
     };
+    match record_event(event) {
+        Ok(saved) => (StatusCode::OK, Json(serde_json::to_value(saved).unwrap_or_default())),
+        Err(e) => crate::json_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("Failed to save notification history: {}", e),
+        ),
+    }
+}
+
+/// Prepend `event` to the history file and save. Usable from other
+/// handlers without going through HTTP self-calls. Fills in `id` +
+/// `timestamp` if the caller left them zero/empty.
+///
+/// Returns the event as persisted (with any auto-filled fields).
+pub(crate) fn record_event(
+    mut event: NotificationEvent,
+) -> std::io::Result<NotificationEvent> {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
@@ -207,7 +224,6 @@ pub async fn append_history(
         event.timestamp = now;
     }
     if event.id.is_empty() {
-        // base36 of nanos — matches Go's strconv.FormatInt(…, 36).
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos() as u64)
@@ -217,18 +233,36 @@ pub async fn append_history(
 
     let _guard = HISTORY_LOCK.write().unwrap_or_else(|p| p.into_inner());
     let mut events = load_history_locked();
-    // Prepend (newest-first) and trim.
     events.insert(0, event.clone());
     if events.len() > MAX_HISTORY {
         events.truncate(MAX_HISTORY);
     }
-    if let Err(e) = save_history_locked(&events) {
-        return crate::json_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            &format!("Failed to save notification history: {}", e),
-        );
+    save_history_locked(&events)?;
+    Ok(event)
+}
+
+/// Evaluate the notification-type gate for a given type.
+/// `None` or empty → always allowed (matches bash behavior of skipping
+/// the gate when no type is provided).
+pub(crate) fn is_type_enabled(notification_type: Option<&str>) -> bool {
+    let Some(ntype) = notification_type else { return true };
+    if ntype.is_empty() {
+        return true;
     }
-    (StatusCode::OK, Json(serde_json::to_value(event).unwrap_or_default()))
+    let s = load_settings();
+    match ntype {
+        "archive_start" => s.archive_start,
+        "archive_complete" => s.archive_complete,
+        "archive_error" => s.archive_error,
+        "temperature" => s.temperature,
+        "keep_awake_failure" => s.keep_awake,
+        "update" => s.update,
+        "drives" => s.drives,
+        "rtc_battery" => s.rtc_battery,
+        "music_sync" => s.music_sync,
+        // Unknown types default to allowed — matches Go's fall-through.
+        _ => true,
+    }
 }
 
 /// DELETE /api/notifications/history

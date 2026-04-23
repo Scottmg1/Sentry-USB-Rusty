@@ -111,9 +111,21 @@ async fn check_xfs_support(emitter: &SetupEmitter) -> Result<()> {
     let img = "/tmp/xfs.img";
     let mnt = "/tmp/xfsmnt";
 
-    // Cleanup any leftovers from a previous interrupted run before we
-    // start — matches bash's implicit "fresh start" assumption.
+    // Cleanup any leftovers from a previous interrupted run. A stuck
+    // mount at `mnt` (umount failed silently, or we crashed mid-check)
+    // would otherwise make the fresh mount below fail with "mount point
+    // busy" and we'd incorrectly report "STOP: xfs does not support
+    // required features". Escalate: plain umount → lazy umount → bail.
     let _ = sentryusb_shell::run("umount", &[mnt]).await;
+    if sentryusb_shell::run("findmnt", &[mnt]).await.is_ok() {
+        let _ = sentryusb_shell::run("umount", &["-l", mnt]).await;
+        if sentryusb_shell::run("findmnt", &[mnt]).await.is_ok() {
+            bail!(
+                "STOP: {} is still a mount point after umount + lazy umount — reboot and re-run setup",
+                mnt
+            );
+        }
+    }
     let _ = std::fs::remove_file(img);
     let _ = std::fs::remove_dir_all(mnt);
 

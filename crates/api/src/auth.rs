@@ -206,6 +206,22 @@ pub fn init_auth() -> AuthState {
     state
 }
 
+/// True when any of the SENTRYUSB_SETUP_FINISHED marker files exists.
+/// Used by the auth middleware to decide whether `/api/setup/*` still
+/// needs to be reachable without credentials.
+///
+/// Checks both boot partition paths — the setup wizard writes one or the
+/// other depending on whether `/sentryusb` resolves to `/boot/firmware`
+/// (Bookworm+) or `/boot` (older images).
+fn setup_is_finished() -> bool {
+    const MARKERS: &[&str] = &[
+        "/sentryusb/SENTRYUSB_SETUP_FINISHED",
+        "/boot/firmware/SENTRYUSB_SETUP_FINISHED",
+        "/boot/SENTRYUSB_SETUP_FINISHED",
+    ];
+    MARKERS.iter().any(|p| std::path::Path::new(p).exists())
+}
+
 /// Axum middleware for authentication.
 pub async fn auth_middleware(
     axum::extract::State(auth): axum::extract::State<AuthState>,
@@ -232,19 +248,27 @@ pub async fn auth_middleware(
         }
     }
 
-    // Exempt paths
-    const EXEMPT_EXACT: &[&str] = &[
+    // Always-exempt: login, logout, session check, and the status
+    // endpoint that the frontend uses to decide whether to show the
+    // login screen in the first place. These must work without a
+    // session cookie even after the device is fully set up.
+    const EXEMPT_ALWAYS: &[&str] = &[
         "/api/status",
         "/api/auth/login",
         "/api/auth/logout",
         "/api/auth/check",
-        "/api/setup/status",
-        "/api/setup/config",
-        "/api/setup/run",
-        "/api/setup/test-archive",
     ];
+    if EXEMPT_ALWAYS.contains(&path.as_str()) {
+        return next.run(req).await;
+    }
 
-    if EXEMPT_EXACT.contains(&path.as_str()) || path.starts_with("/api/setup/") {
+    // Conditionally-exempt: `/api/setup/*` is only open while the
+    // setup wizard hasn't finished. On a fresh flash the user has no
+    // credentials yet, so the wizard needs to be reachable; once
+    // SENTRYUSB_SETUP_FINISHED exists, the same endpoints become
+    // privileged (otherwise anyone on the LAN could repoint archive
+    // URLs, change hostnames, re-run setup, etc. on a provisioned Pi).
+    if path.starts_with("/api/setup/") && !setup_is_finished() {
         return next.run(req).await;
     }
 

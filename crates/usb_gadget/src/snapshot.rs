@@ -39,12 +39,26 @@ pub async fn make_snapshot() -> Result<String> {
     let snap_dir = format!("{}/{}", SNAPSHOTS_DIR, snap_name);
     std::fs::create_dir_all(&snap_dir)?;
 
-    // Create reflink copy (XFS copy-on-write)
+    // Create reflink copy (XFS copy-on-write).
+    //
+    // `--reflink=auto` is the default intent: use reflink when the FS
+    // supports it (XFS with reflink=1, the setup-wizard default),
+    // otherwise fall back to a regular full copy. The setup wizard's
+    // XFS verify step catches unsupported backing filesystems up front,
+    // so in practice reflink always wins here — but `auto` ensures that
+    // if a user manually reformatted `/backingfiles` to ext4, snapshots
+    // still work (slower + temporarily 2× disk usage, but not a hard
+    // failure). Earlier `--reflink=always` hard-errored on ext4, which
+    // was the auditor's concern.
+    //
+    // Timeout bumped to 10 minutes because the fallback path has to
+    // write the full cam image; at 32 GB and ~100 MB/s sustained that's
+    // ~5 minutes, leaving a generous margin for slower storage.
     let snap_file = format!("{}/snap.bin", snap_dir);
     let result = sentryusb_shell::run_with_timeout(
-        std::time::Duration::from_secs(30),
+        std::time::Duration::from_secs(600),
         "cp",
-        &["--reflink=always", CAM_DISK, &snap_file],
+        &["--reflink=auto", CAM_DISK, &snap_file],
     ).await;
 
     match result {

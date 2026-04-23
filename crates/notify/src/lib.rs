@@ -152,18 +152,56 @@ impl NotifyConfig {
     }
 }
 
-/// Send a notification to all enabled providers.
-/// Returns the list of provider names that were attempted and their results.
+/// Request-level context for a single notification dispatch. Only
+/// mobile push (Sentry Connect) currently consumes the extras — the
+/// other channels are title + message only.
+#[derive(Debug, Clone, Default)]
+pub struct NotifyRequest<'a> {
+    pub title: &'a str,
+    pub message: &'a str,
+    /// `start` / `finish` — matches the bash `$3` positional arg. Drives
+    /// the live_activity branch on mobile push.
+    pub type_hint: Option<&'a str>,
+    /// Notification category (`archive_start`, `temperature`, `drives`,
+    /// …). Echoed to the mobile push server for categorization and used
+    /// for the gate check upstream.
+    pub notification_type: Option<&'a str>,
+    /// Total clip count for the pending archive run — enables the
+    /// live_activity payload on `archive_start`.
+    pub archive_total_count: Option<u32>,
+}
+
+/// Send a notification to all enabled providers using only title + message.
+/// Kept for callers (e.g. the `/api/notifications/test` endpoint) that
+/// don't need to drive live-activity or notification-type plumbing.
 pub async fn send_to_all(
     config: &NotifyConfig,
     title: &str,
     message: &str,
+) -> Vec<(String, Result<()>)> {
+    send_to_all_with_context(
+        config,
+        &NotifyRequest { title, message, ..Default::default() },
+    )
+    .await
+}
+
+/// Context-aware dispatch — preferred entry point for runtime
+/// notifications. Passes the extra context through to providers that
+/// can use it (currently just Sentry Connect); others ignore the extras
+/// and use title + message.
+pub async fn send_to_all_with_context(
+    config: &NotifyConfig,
+    req: &NotifyRequest<'_>,
 ) -> Vec<(String, Result<()>)> {
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
         .connect_timeout(std::time::Duration::from_secs(10))
         .build()
         .unwrap_or_default();
+
+    let title = req.title;
+    let message = req.message;
 
     let mut results = Vec::new();
 
@@ -228,7 +266,21 @@ pub async fn send_to_all(
     }
 
     if config.mobile_push_enabled {
-        let r = sentry_connect::send(&client, &config.mobile_push_device_id, &config.mobile_push_secret, title, message).await;
+        let ctx = sentry_connect::SendContext {
+            type_hint: req.type_hint,
+            notification_type: req.notification_type,
+            archive_total_count: req.archive_total_count,
+            device_name: Some(title),
+        };
+        let r = sentry_connect::send_with_context(
+            &client,
+            &config.mobile_push_device_id,
+            &config.mobile_push_secret,
+            title,
+            message,
+            &ctx,
+        )
+        .await;
         log_result("Mobile Push", &r);
         results.push(("mobile_push".to_string(), r));
     }

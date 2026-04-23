@@ -202,8 +202,39 @@ fn bind_udc(gadget: &Path) -> Result<()> {
     for attempt in 1..=5 {
         match fs::write(&udc_path, &udc) {
             Ok(()) => {
-                info!("USB gadget bound to UDC: {}", udc);
-                return Ok(());
+                // Sysfs writes to `UDC` can return Ok even when the kernel
+                // silently rejected the bind — e.g. the gadget config is
+                // incomplete or the UDC refused attachment. Read back to
+                // confirm the binding actually stuck; if not, treat as a
+                // retryable error rather than a silent success.
+                match fs::read_to_string(&udc_path) {
+                    Ok(s) if s.trim() == udc.trim() => {
+                        info!("USB gadget bound to UDC: {}", udc);
+                        return Ok(());
+                    }
+                    Ok(other) if attempt < 5 => {
+                        info!(
+                            "UDC bind attempt {} wrote {:?} but sysfs reads back {:?}; retrying",
+                            attempt, udc, other.trim()
+                        );
+                        let _ = fs::write(&udc_path, "");
+                        std::thread::sleep(std::time::Duration::from_millis(500));
+                    }
+                    Ok(other) => {
+                        return Err(anyhow::anyhow!(
+                            "UDC bind silently rejected: wrote {:?}, readback {:?}",
+                            udc,
+                            other.trim()
+                        ));
+                    }
+                    Err(_) => {
+                        // UDC file unreadable post-write — treat as success
+                        // rather than false-failing. Trust the Ok from the
+                        // write call in this edge case.
+                        info!("USB gadget bound to UDC: {} (readback failed)", udc);
+                        return Ok(());
+                    }
+                }
             }
             Err(e) if attempt < 5 => {
                 info!("UDC bind attempt {} failed ({}), retrying", attempt, e);
@@ -269,14 +300,25 @@ pub fn disable() -> Result<()> {
     Ok(())
 }
 
-/// Check if the gadget is currently active — i.e. actually bound to a UDC.
-/// A stale config dir with an empty UDC file is considered inactive so the
-/// user can recover via a fresh toggle.
+/// Check if the gadget is currently active and healthy — bound to a UDC
+/// AND has a populated `lun.0/file` entry.
+///
+/// Earlier versions only checked the UDC file, which meant a gadget that
+/// was bound but had lost its LUN backing file (e.g. a manual tear-down
+/// that removed `lun.0/file` without unbinding the UDC) showed as
+/// "active" and the idempotent `gadget_enable` API handler skipped the
+/// full rebuild — leaving Tesla plugged into a device with no LUNs.
+/// Requiring both signals means a partially-torn-down gadget correctly
+/// reports as inactive so the next enable call reconstructs it.
 pub fn is_active() -> bool {
-    let udc_file = Path::new("/sys/kernel/config/usb_gadget/sentryusb/UDC");
-    fs::read_to_string(udc_file)
+    let root = Path::new("/sys/kernel/config/usb_gadget/sentryusb");
+    let udc_bound = fs::read_to_string(root.join("UDC"))
         .map(|s| !s.trim().is_empty())
-        .unwrap_or(false)
+        .unwrap_or(false);
+    if !udc_bound {
+        return false;
+    }
+    gadget_dir_is_complete(root)
 }
 
 /// Find the first available UDC (USB Device Controller).

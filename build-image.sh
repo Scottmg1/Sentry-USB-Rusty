@@ -50,11 +50,18 @@ if $BUILD_32BIT; then
     ARCH_LABEL="32-bit (armhf — Pi Zero W)"
     BINARY_SUFFIX="linux-armv7"
     RUST_TARGET="armv7-unknown-linux-gnueabihf"
+    # Tesla vehicle-command is Go; cross-compile targets map independently
+    # from our Rust targets. GOARM=6 keeps the tesla binaries runnable on
+    # the original Pi Zero W, which is the lowest bar on this image path.
+    GO_ARCH="arm"
+    GO_ARM="6"
     CONFIG_FILE="pi-gen-config-32bit"
 else
     ARCH_LABEL="64-bit (arm64 — Pi 3/4/5/Zero 2)"
     BINARY_SUFFIX="linux-arm64"
     RUST_TARGET="aarch64-unknown-linux-gnu"
+    GO_ARCH="arm64"
+    GO_ARM=""
     CONFIG_FILE="pi-gen-config"
 fi
 
@@ -101,6 +108,40 @@ fi
 
 [ -f "$BINARY_PATH" ] || error "Binary not found at $BINARY_PATH"
 
+# ── Step 1b: Build tesla-control + tesla-keygen ────────────────────────
+# These binaries drive Tesla vehicles over BLE — they power the `awake_start`
+# Keep-Awake BLE mode. Tesla does not publish pre-built binaries, so we
+# cross-compile from their vehicle-command repo. Go 1.23+ required.
+#
+# Without these in the image, the iOS app's Keep-Awake toggle has no way
+# to reach the car and the Tesla pairing flow can't hand out keys.
+TESLA_CONTROL_PATH=""
+TESLA_KEYGEN_PATH=""
+if command -v go &>/dev/null; then
+    info "Building tesla-control and tesla-keygen from source..."
+    TESLA_VC_DIR="/tmp/sentryusb-vehicle-command"
+    rm -rf "$TESLA_VC_DIR"
+    if git clone --depth 1 https://github.com/teslamotors/vehicle-command.git "$TESLA_VC_DIR" 2>/dev/null; then
+        (
+            cd "$TESLA_VC_DIR"
+            if [ -n "$GO_ARM" ]; then
+                GOOS=linux GOARCH=$GO_ARCH GOARM=$GO_ARM go build -o tesla-control ./cmd/tesla-control
+                GOOS=linux GOARCH=$GO_ARCH GOARM=$GO_ARM go build -o tesla-keygen ./cmd/tesla-keygen
+            else
+                GOOS=linux GOARCH=$GO_ARCH go build -o tesla-control ./cmd/tesla-control
+                GOOS=linux GOARCH=$GO_ARCH go build -o tesla-keygen ./cmd/tesla-keygen
+            fi
+        )
+        TESLA_CONTROL_PATH="$TESLA_VC_DIR/tesla-control"
+        TESLA_KEYGEN_PATH="$TESLA_VC_DIR/tesla-keygen"
+        ok "tesla-control and tesla-keygen built"
+    else
+        info "Could not clone vehicle-command — tesla binaries will NOT be bundled. Keep-Awake BLE mode will be unavailable on the resulting image."
+    fi
+else
+    info "Go not available locally — tesla binaries will NOT be bundled. Keep-Awake BLE mode will be unavailable on the resulting image."
+fi
+
 # ── Step 2: Clone pi-gen ──
 info "Setting up pi-gen..."
 rm -rf "$WORK_DIR"
@@ -125,6 +166,14 @@ if [ -n "${CTTS_BINARY:-}" ] && [ -f "$CTTS_BINARY" ]; then
     info "Injecting cttseraser FUSE binary..."
     cp "$CTTS_BINARY" "$WORK_DIR/stage_sentryusb/00-sentryusb-tweaks/files/cttseraser"
     chmod +x "$WORK_DIR/stage_sentryusb/00-sentryusb-tweaks/files/cttseraser"
+fi
+
+if [ -n "$TESLA_CONTROL_PATH" ] && [ -f "$TESLA_CONTROL_PATH" ]; then
+    info "Injecting tesla-control and tesla-keygen..."
+    cp "$TESLA_CONTROL_PATH" "$WORK_DIR/stage_sentryusb/00-sentryusb-tweaks/files/tesla-control"
+    cp "$TESLA_KEYGEN_PATH"  "$WORK_DIR/stage_sentryusb/00-sentryusb-tweaks/files/tesla-keygen"
+    chmod +x "$WORK_DIR/stage_sentryusb/00-sentryusb-tweaks/files/tesla-control"
+    chmod +x "$WORK_DIR/stage_sentryusb/00-sentryusb-tweaks/files/tesla-keygen"
 fi
 
 info "Injecting BLE daemon files..."

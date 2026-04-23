@@ -461,16 +461,27 @@ impl DriveStore {
 
     /// Import a drive-data.json file into the store. Thin wrapper around
     /// [`json_compat::import_json`](crate::json_compat::import_json) that
-    /// takes care of locking the shared connection. Progress callback
-    /// no-ops by default — callers that want progress should use
-    /// [`json_compat::import_json`] directly.
+    /// takes care of locking the shared connection.
     pub fn import_json_file(
         &self,
         path: &str,
     ) -> Result<crate::json_compat::ImportStats> {
+        self.import_json_file_with_progress(path, |_| {})
+    }
+
+    /// Like [`import_json_file`] but invokes `on_progress(routes_seen)`
+    /// once the decoder knows the total route count. Used by the
+    /// upload handler to forward `drive_import` WebSocket broadcasts
+    /// so the web UI can show the user progress instead of a stale
+    /// spinner during a large restore.
+    pub fn import_json_file_with_progress<F: Fn(usize)>(
+        &self,
+        path: &str,
+        on_progress: F,
+    ) -> Result<crate::json_compat::ImportStats> {
         let stats = {
             let mut conn = self.conn.lock().unwrap();
-            crate::json_compat::import_json(&mut conn, path, |_| {})?
+            crate::json_compat::import_json(&mut conn, path, on_progress)?
         };
         self.refresh_counts()?;
         Ok(stats)

@@ -1,17 +1,52 @@
 #!/bin/bash -eu
-# shellcheck disable=SC2317,SC2329  # Functions are called indirectly via run_provider
+# Thin forwarder around POST /api/notifications/send.
+#
+# The old implementation here spoke directly to every notifier (Discord,
+# Slack, Pushover, …). The Rust server now owns that logic — this script
+# just converts the positional-arg call contract into a JSON POST so
+# existing callers (archiveloop, temperature_monitor, post-archive-process.sh,
+# api handlers, etc.) keep working without modification.
+#
+# What stays on the bash side:
+#   * The gate check (GET /api/notifications/settings/check) so we don't
+#     run user-defined NOTIFICATION_COMMAND_* side effects when the
+#     notification type is disabled.
+#   * NOTIFICATION_COMMAND_START / NOTIFICATION_COMMAND_FINISH — user
+#     shell snippets that need access to the *caller's* environment
+#     (e.g. CURRENT_ARCHIVE_FILE set by archiveloop). Moving these into
+#     the server would lose that env inheritance.
+#
+# Everything else — per-channel HTTP, mobile push, history logging — is
+# handled by the Rust endpoint in a single server-side transaction.
+#
+# Call contract (unchanged from the previous bash implementation):
+#   send-push-message <title> <message> [type] [notification_type]
+#
+# Reads env:
+#   SENTRYUSB_PORT             — API port (default 80)
+#   ARCHIVE_TOTAL_COUNT        — used for live_activity on archive_start
+#   NOTIFICATION_COMMAND_ENABLED / _START / _FINISH — local shell hook
 
 title="$1"
 message="$2"
 type="${3:-}"
 notification_type="${4:-}"
 
-# --- Notification type gate check ---
-# If a notification_type is specified, check if it's enabled in user settings.
-# The API server runs locally and responds to localhost without auth.
+LOG_FILE="${LOG_FILE:-/mutable/archiveloop.log}"
+log() {
+  echo "$(date): $*" >> "$LOG_FILE" 2>/dev/null || true
+}
+
+SENTRYUSB_PORT="${SENTRYUSB_PORT:-80}"
+API_BASE="http://127.0.0.1:${SENTRYUSB_PORT}"
+
+# --- Type gate (same semantics as the old bash script) ---------------------
+# Skip entirely when the notification type is toggled off in user settings.
+# Fail-open on API errors so transient server hiccups don't silently drop
+# notifications (matches the defensive `|| true` approach in the old script).
 if [ -n "$notification_type" ]; then
   gate_response=$(curl -sf --connect-timeout 2 --max-time 5 \
-    "http://127.0.0.1:8788/api/notifications/settings/check?type=${notification_type}" 2>/dev/null) || true
+    "${API_BASE}/api/notifications/settings/check?type=${notification_type}" 2>/dev/null) || true
   if [ -n "$gate_response" ]; then
     gate_enabled=$(echo "$gate_response" | sed -n 's/.*"enabled" *: *\(true\|false\).*/\1/p')
     if [ "$gate_enabled" = "false" ]; then
@@ -21,234 +56,79 @@ if [ -n "$notification_type" ]; then
   fi
 fi
 
-# Helper: run curl and check the HTTP status code. Logs errors with response body.
-# Usage: checked_curl "ServiceName" curl_args...
-function checked_curl () {
-  local service="$1"; shift
-  local response http_code body
-  response=$(curl -s --connect-timeout 10 --max-time 30 -w "\n%{http_code}" "$@") || {
-    log "ERROR: $service — curl failed (exit code $?)"
-    return 1
-  }
-  http_code=$(echo "$response" | tail -1)
-  body=$(echo "$response" | sed '$d')
-  if [ "$http_code" -lt 200 ] 2>/dev/null || [ "$http_code" -ge 300 ] 2>/dev/null; then
-    log "ERROR: $service — HTTP $http_code — $body"
-    return 1
-  fi
-}
-
-function send_signal () {
-  log "Sending Signal message."
-
-  checked_curl "Signal" -X POST -H "Content-Type: application/json" "$SIGNAL_URL/v2/send" \
-     -d '{"message": "'"$message"'", "number": "'"$SIGNAL_FROM_NUM"'", "recipients": [ "'"$SIGNAL_TO_NUM"'" ]}'
-}
-
-function send_pushover () {
-  log "Sending Pushover message."
-
-  checked_curl "Pushover" \
-    -F "token=$PUSHOVER_APP_KEY" \
-    -F "user=$PUSHOVER_USER_KEY" \
-    -F "title=$title" \
-    -F "message=$message" \
-    https://api.pushover.net/1/messages
-}
-
-function send_gotify () {
-  log "Sending Gotify message."
-
-  checked_curl "Gotify" -X POST \
-    -F "title=$title" \
-    -F "message=$message" \
-    -F "priority=$GOTIFY_PRIORITY" \
-    "$GOTIFY_DOMAIN/message?token=$GOTIFY_APP_TOKEN"
-}
-
-function send_discord() {
-  log "Sending Discord message."
-
-  checked_curl "Discord" -H "Content-Type: application/json" -d \
-    '{"username": "'"$title"'", "content": "'"$message"'"}' \
-    "$DISCORD_WEBHOOK_URL"
-}
-
-function send_ifttt () {
-  log "Sending IFTTT message."
-
-  checked_curl "IFTTT" -X POST -H "Content-Type: application/json" -d \
-    '{"value1":"'"$title"'","value2":"'"$message"'"}' \
-    "https://maker.ifttt.com/trigger/$IFTTT_EVENT_NAME/with/key/$IFTTT_KEY"
-}
-
-function send_sns () {
-  log "Sending SNS message."
-
-  if ! python3 /root/bin/send_sns.py -t "$AWS_SNS_TOPIC_ARN" -s "$title" -m "$message"; then
-    log "ERROR: SNS — python script failed (exit code $?)"
-  fi
-}
-
-function send_matrix() {
-  log "Send Matrix message."
-
-  if ! python3 /root/bin/send_matrix.py "$MATRIX_SERVER_URL" "$MATRIX_USERNAME" "$MATRIX_PASSWORD" "$MATRIX_ROOM" "$title: $message"; then
-    log "ERROR: Matrix — python script failed (exit code $?)"
-  fi
-}
-
-function send_telegram () {
-  log "Sending Telegram message."
-  checked_curl "Telegram" -H "Content-Type: application/json" -d \
-    '{"chat_id": "'"$TELEGRAM_CHAT_ID"'", "text": "'"$title: $message"'", "disable_notification": '"$TELEGRAM_SILENT_NOTIFY"' }' \
-    https://api.telegram.org/"$TELEGRAM_BOT_TOKEN"/sendMessage
-}
-
-function send_webhook () {
-  log "Sending Webhook message."
-
-  checked_curl "Webhook" -X POST \
-    -d "{\"value1\":\"${title}\",\"value2\":\"${message}\"}" \
-    -H "Content-Type: application/json" \
-    "$WEBHOOK_URL"
-}
-
-function send_slack () {
-  log "Sending Slack message."
-  payload="{\"text\":\"$title: $message\",\"username\": \"Tesla\",\"icon_emoji\": \":tesla:\"}"
-  checked_curl "Slack" -X POST --data-urlencode "payload=$payload" "$SLACK_WEBHOOK_URL"
-}
-
-function send_ntfy () {
-  log "Sending ntfy message."
-
-  checked_curl "ntfy" -X POST \
-    -H "Title: $title" \
-    -H "Priority: ${NTFY_PRIORITY:-3}" \
-    ${NTFY_TOKEN:+-H "Authorization: Bearer $NTFY_TOKEN"} \
-    -d "$message" \
-    "$NTFY_URL"
-}
-
-function send_mobile_push () {
-  log "Sending mobile app notification."
-
-  if [ -z "${MOBILE_PUSH_DEVICE_ID:-}" ] || [ -z "${MOBILE_PUSH_SECRET:-}" ]; then
-    log "ERROR: Mobile App Notification — credentials not found. Re-pair your device in Settings."
-    return 1
-  fi
-
-  local payload="{\"title\":\"${title}\",\"message\":\"${message}\",\"device_id\":\"${MOBILE_PUSH_DEVICE_ID}\""
-  if [ -n "$notification_type" ]; then
-    payload+=",\"notification_type\":\"${notification_type}\""
-  fi
-  # For archive start notifications, include live_activity data so the visible
-  # notification also wakes the app to create the Live Activity (more reliable
-  # than silent push for terminated apps)
-  if [ "$type" = "start" ] && [ "$notification_type" = "archive_start" ] && [ -n "${ARCHIVE_TOTAL_COUNT:-}" ]; then
-    local device_name="${title%:}"
-    payload+=",\"live_activity\":{\"action\":\"start\",\"phase\":\"archiving\",\"current\":0,\"total\":${ARCHIVE_TOTAL_COUNT},\"device_name\":\"${device_name}\"}"
-  fi
-  payload+="}"
-
-  local response http_code body
-  response=$(curl -s --connect-timeout 10 --max-time 30 -w "\n%{http_code}" -X POST \
-    -H "Content-Type: application/json" \
-    -H "X-Device-Secret: $MOBILE_PUSH_SECRET" \
-    -d "$payload" \
-    "https://notifications.sentry-six.com/send") || {
-    log "ERROR: Mobile App Notification — failed to connect to notification server (exit code $?)"
-    return 1
-  }
-  http_code=$(echo "$response" | tail -1)
-  body=$(echo "$response" | sed '$d')
-
-  if [ "$http_code" -ge 200 ] 2>/dev/null && [ "$http_code" -lt 300 ] 2>/dev/null; then
-    local sent failed msg
-    sent=$(echo "$body" | sed -n 's/.*"sent" *: *\([0-9]*\).*/\1/p')
-    failed=$(echo "$body" | sed -n 's/.*"failed" *: *\([0-9]*\).*/\1/p')
-    msg=$(echo "$body" | sed -n 's/.*"message" *: *"\([^"]*\)".*/\1/p')
-    if [ -n "$msg" ]; then
-      log "Mobile App Notification — $msg"
-    elif [ -n "$sent" ]; then
-      local device_word="device"
-      [ "$sent" -ne 1 ] && device_word="devices"
-      if [ "${failed:-0}" -gt 0 ]; then
-        log "Mobile App Notification — sent to $sent $device_word ($failed failed)"
-      else
-        log "Mobile App Notification — sent to $sent $device_word"
-      fi
-    fi
-  else
-    local error_msg
-    error_msg=$(echo "$body" | sed -n 's/.*"error" *: *"\([^"]*\)".*/\1/p')
-    if [ -n "$error_msg" ]; then
-      log "ERROR: Mobile App Notification — HTTP $http_code — $error_msg"
-    else
-      log "ERROR: Mobile App Notification — HTTP $http_code — $body"
-    fi
-    return 1
-  fi
-}
-
-function send_shell () {
-  log "Sending Shell command."
-  if [[ -n "$NOTIFICATION_COMMAND_START" && "$type" = "start" ]]; then
+# --- NOTIFICATION_COMMAND_* (runs locally with caller env) ---------------
+# eval'd because users' config snippets may legitimately contain pipes,
+# variable references, etc. Fire-and-forget via `&` so a slow / broken
+# user command can't block the caller.
+if [ "${NOTIFICATION_COMMAND_ENABLED:-false}" = "true" ]; then
+  if [ -n "${NOTIFICATION_COMMAND_START:-}" ] && [ "$type" = "start" ]; then
     eval "$NOTIFICATION_COMMAND_START" &
   fi
-  if [[ -n "$NOTIFICATION_COMMAND_FINISH" &&  "$type" = "finish" ]]; then
+  if [ -n "${NOTIFICATION_COMMAND_FINISH:-}" ] && [ "$type" = "finish" ]; then
     eval "$NOTIFICATION_COMMAND_FINISH" &
   fi
-}
+fi
 
+# --- Forward everything else to the server -------------------------------
+# Build the JSON with python3 so title / message can contain any printable
+# character (quotes, backslashes, newlines from error messages, …)
+# without breaking the request. python3 is already a hard dep because of
+# the BLE daemon and the RTC service, so no new requirement.
+payload=$(ARG_TITLE="$title" \
+  ARG_MESSAGE="$message" \
+  ARG_TYPE="$type" \
+  ARG_NOTIFICATION_TYPE="$notification_type" \
+  ARG_ARCHIVE_TOTAL_COUNT="${ARCHIVE_TOTAL_COUNT:-}" \
+  python3 - <<'PYEOF'
+import json, os
+body = {
+    "title":   os.environ.get("ARG_TITLE", ""),
+    "message": os.environ.get("ARG_MESSAGE", ""),
+}
+t = os.environ.get("ARG_TYPE", "")
+if t:
+    body["type"] = t
+nt = os.environ.get("ARG_NOTIFICATION_TYPE", "")
+if nt:
+    body["notification_type"] = nt
+atc = os.environ.get("ARG_ARCHIVE_TOTAL_COUNT", "")
+if atc.isdigit():
+    body["archive_total_count"] = int(atc)
+print(json.dumps(body))
+PYEOF
+)
+
+# Log the message the user asked us to send, matching the old script's
+# behavior of echoing to the log before any network IO.
 log "$message"
 
-# --- Track providers and results for history logging ---
-providers_json="[]"
-results_json="{}"
-
-function track_provider() {
-  local name="$1"
-  local status="$2"
-  providers_json=$(echo "$providers_json" | sed "s/\]$/,\"$name\"]/" | sed 's/\[,/[/')
-  results_json=$(echo "$results_json" | sed "s/}$/,\"$name\":\"$status\"}/" | sed 's/{,/{/')
-}
-
-function run_provider() {
-  local name="$1"
-  local func="$2"
-  if $func; then
-    track_provider "$name" "ok"
-  else
-    track_provider "$name" "error"
-  fi
-}
-
-[ "${SIGNAL_ENABLED:-false}" = "true" ] && run_provider "signal" send_signal
-[ "${PUSHOVER_ENABLED:-false}" = "true" ] && run_provider "pushover" send_pushover
-[ "${GOTIFY_ENABLED:-false}" = "true" ] && run_provider "gotify" send_gotify
-[ "${DISCORD_ENABLED:-false}" = "true" ] && run_provider "discord" send_discord
-[ "${IFTTT_ENABLED:-false}" = "true" ] && run_provider "ifttt" send_ifttt
-[ "${SNS_ENABLED:-false}" = "true" ] && run_provider "sns" send_sns
-[ "${WEBHOOK_ENABLED:-false}" = "true" ] && run_provider "webhook" send_webhook
-[ "${TELEGRAM_ENABLED:-false}" = "true" ] && run_provider "telegram" send_telegram
-[ "${MATRIX_ENABLED:-false}" = "true" ] && run_provider "matrix" send_matrix
-[ "${SLACK_ENABLED:-false}" = "true" ] && run_provider "slack" send_slack
-[ "${NTFY_ENABLED:-false}" = "true" ] && run_provider "ntfy" send_ntfy
-[ "${MOBILE_PUSH_ENABLED:-false}" = "true" ] && run_provider "mobile_push" send_mobile_push
-[ "${NOTIFICATION_COMMAND_ENABLED:-false}" = "true" ] && run_provider "shell" send_shell
-
-# --- Log notification event to history ---
-# Always log to history so the user can see what was triggered, even if no
-# providers are configured yet (the history shows provider delivery status).
-history_payload=$(cat <<HISTEOF
-{"type":"${notification_type:-general}","title":"${title}","message":"${message}","providers":${providers_json},"results":${results_json}}
-HISTEOF
-)
-curl -sf --connect-timeout 2 --max-time 5 -X POST \
+# Best-effort POST. Keep bash's fail-soft stance: the API running the
+# binary may be temporarily down (crash, update in progress); we log and
+# move on rather than break the caller.
+response=$(curl -s --connect-timeout 5 --max-time 30 -w "\n%{http_code}" \
+  -X POST \
   -H "Content-Type: application/json" \
-  -d "$history_payload" \
-  "http://127.0.0.1:8788/api/notifications/history" >/dev/null 2>&1 || true
+  -d "$payload" \
+  "${API_BASE}/api/notifications/send" 2>/dev/null) || {
+    log "ERROR: notifications/send — curl failed (exit code $?)"
+    exit 0
+  }
+
+http_code=$(echo "$response" | tail -1)
+body=$(echo "$response" | sed '$d')
+
+if [ "$http_code" -ge 200 ] 2>/dev/null && [ "$http_code" -lt 300 ] 2>/dev/null; then
+  # Log summary if present so the user can tell from /mutable/archiveloop.log
+  # whether the notification went through.
+  skipped=$(echo "$body" | sed -n 's/.*"skipped" *: *true.*/true/p')
+  if [ "$skipped" = "true" ]; then
+    log "Notifications skipped (type disabled by server)"
+  else
+    attempted=$(echo "$body" | sed -n 's/.*"attempted" *: *\([0-9]*\).*/\1/p')
+    [ -n "$attempted" ] && log "Notifications attempted: $attempted"
+  fi
+else
+  log "ERROR: notifications/send — HTTP $http_code — $body"
+fi
 
 exit 0

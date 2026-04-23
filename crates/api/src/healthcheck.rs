@@ -95,13 +95,32 @@ pub async fn health_check(State(_s): State<AppState>) -> (StatusCode, Json<serde
     for (img, label) in &[
         ("/backingfiles/cam_disk.bin", "cam disk image"),
         ("/backingfiles/music_disk.bin", "music disk image"),
+        ("/backingfiles/lightshow_disk.bin", "lightshow disk image"),
+        ("/backingfiles/boombox_disk.bin", "boombox disk image"),
+        ("/backingfiles/wraps_disk.bin", "wraps disk image"),
     ] {
         if std::path::Path::new(img).exists() {
             st.push(item(label, "pass", None));
         } else {
+            // cam is critical — everything else is optional content the
+            // user may never have uploaded, so a missing lightshow /
+            // boombox / wraps disk is a warn, not a fail.
             let status = if *label == "cam disk image" { "fail" } else { "warn" };
             st.push(item(label, status, Some("missing".to_string())));
         }
+    }
+    // TeslaCam directory on /mutable — the bind-mount target for
+    // `mount.ctts`. Without it, the FUSE wrapper can't expose the cam
+    // content to Samba/web downloads, and the dashboard would otherwise
+    // show "all green" while TeslaCam is silently empty.
+    if std::path::Path::new("/mutable/TeslaCam").is_dir() {
+        st.push(item("TeslaCam directory", "pass", None));
+    } else {
+        st.push(item(
+            "TeslaCam directory",
+            "fail",
+            Some("/mutable/TeslaCam missing — Samba + web listing will be empty".to_string()),
+        ));
     }
     categories.push(HealthCategory { name: "Storage".to_string(), items: st });
 
@@ -270,9 +289,14 @@ pub async fn health_check(State(_s): State<AppState>) -> (StatusCode, Json<serde
     categories.push(HealthCategory { name: "Clock / RTC".to_string(), items: rtc });
 
     // ── Services ──────────────────────────────────────────────────────────
+    // sentryusb-archive is the archiveloop unit — marked critical so a
+    // crashed archive loop shows up as RED on the dashboard instead of
+    // being invisible (the previous list omitted it, so users would see
+    // "all green" while their Tesla footage wasn't being archived).
     let mut svcs = Vec::new();
     for (svc, critical) in &[
         ("sentryusb", true),
+        ("sentryusb-archive", true),
         ("avahi-daemon", false),
         ("bluetooth", false),
         ("sentryusb-ble", false),

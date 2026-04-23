@@ -55,6 +55,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/system/health-check", get(crate::healthcheck::health_check))
         // System
         .route("/api/system/reboot", post(crate::system::reboot))
+        .route("/api/system/shutdown", post(crate::system::shutdown))
         .route("/api/system/toggle-drives", post(crate::system::toggle_drives))
         .route("/api/system/gadget-enable", post(crate::system::gadget_enable))
         .route("/api/system/gadget-disable", post(crate::system::gadget_disable))
@@ -78,6 +79,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/notifications/paired-devices", get(crate::notifications::list_paired_devices))
         .route("/api/notifications/paired-devices/{id}", delete(crate::notifications::remove_paired_device))
         .route("/api/notifications/test", post(crate::notifications::send_test_notification))
+        .route("/api/notifications/send", post(crate::notifications::send_notification))
         .route("/api/notifications/settings", get(crate::notification_center::get_settings).put(crate::notification_center::update_settings))
         .route("/api/notifications/history", get(crate::notification_center::get_history).post(crate::notification_center::append_history).delete(crate::notification_center::clear_history))
         .route("/api/notifications/history/{id}", delete(crate::notification_center::delete_history_item))
@@ -135,6 +137,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/drives/status", get(crate::drives_handler::processing_status))
         .route("/api/drives/data/download", get(crate::drives_handler::download_data))
         .route("/api/drives/data/upload", post(crate::drives_handler::upload_data))
+        .route("/api/drives/data/export-for-sync", post(crate::drives_handler::export_for_sync))
         .route("/api/drives/stats", get(crate::drives_handler::drive_stats))
         .route("/api/drives/fsd-analytics", get(crate::drives_handler::fsd_analytics))
         .route("/api/drives/{id}/tags", put(crate::drives_handler::set_drive_tags))
@@ -142,11 +145,19 @@ pub fn build_router(state: AppState) -> Router {
         // Keep-awake
         .route("/api/keep-awake/start", post(crate::keep_awake::start))
         .route("/api/keep-awake/stop", post(crate::keep_awake::stop))
+        // Frontend (useKeepAwake.tsx:123, 152) disables Keep Awake via
+        // `DELETE /api/keep-awake`. Route to the same `stop` handler so
+        // both shapes work — matches the `DELETE /api/away-mode` pattern.
+        .route("/api/keep-awake", axum::routing::delete(crate::keep_awake::stop))
         .route("/api/keep-awake/status", get(crate::keep_awake::status))
         .route("/api/keep-awake/heartbeat", post(crate::keep_awake::heartbeat))
         // Away mode
         .route("/api/away-mode/enable", post(crate::away_mode::enable))
         .route("/api/away-mode/disable", post(crate::away_mode::disable))
+        // Frontend calls `DELETE /api/away-mode` to turn Away Mode off —
+        // keep the more specific POST handlers above and alias the bare
+        // path here so both shapes work.
+        .route("/api/away-mode", delete(crate::away_mode::disable))
         .route("/api/away-mode/status", get(crate::away_mode::status))
         // Terminal WebSocket
         .route("/api/terminal", get(crate::terminal::handle_terminal))

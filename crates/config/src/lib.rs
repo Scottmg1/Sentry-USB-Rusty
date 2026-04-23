@@ -87,13 +87,33 @@ pub fn write_file(path: &str, new_config: &SetupConfig) -> Result<()> {
         }
     }
 
-    let mut file = fs::File::create(path)
-        .with_context(|| format!("failed to write config file: {}", path))?;
-    let mut writer = io::BufWriter::new(&mut file);
-    for line in &output {
-        writeln!(writer, "{}", line)?;
+    // Atomic write: tmp + fsync + rename. A direct `fs::File::create`
+    // followed by streaming writes is vulnerable to a torn file on power
+    // cut mid-write, which on a Pi that loses power the instant the
+    // user's Tesla disconnects is a real scenario. Config corruption
+    // means the next boot can't parse sentryusb.conf and setup defaults
+    // to unset everything — including archive URLs, hostnames, WiFi AP
+    // creds. Write to `<path>.tmp`, fsync, rename over.
+    let tmp = format!("{}.tmp", path);
+    {
+        let mut file = fs::File::create(&tmp)
+            .with_context(|| format!("failed to write config tmp file: {}", tmp))?;
+        {
+            let mut writer = io::BufWriter::new(&mut file);
+            for line in &output {
+                writeln!(writer, "{}", line)?;
+            }
+            writer.flush()?;
+        }
+        // Drop the writer above, then fsync the underlying file so the
+        // rename below doesn't expose an empty-but-renamed file after
+        // a crash.
+        let _ = file.sync_all();
     }
-    writer.flush()?;
+    if let Err(e) = fs::rename(&tmp, path) {
+        let _ = fs::remove_file(&tmp);
+        return Err(e).with_context(|| format!("failed to rename config tmp into place: {}", path));
+    }
 
     Ok(())
 }

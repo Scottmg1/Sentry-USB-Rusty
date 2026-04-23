@@ -14,6 +14,25 @@ pub async fn reboot(State(_s): State<AppState>) -> (StatusCode, Json<serde_json:
     crate::json_ok()
 }
 
+/// POST /api/system/shutdown
+///
+/// Power off the device. Spawned so the HTTP response can flush before
+/// the kernel starts tearing things down. Falls back through `poweroff`
+/// → `shutdown -h now` → `systemctl poweroff` since some minimal images
+/// only ship one of the three.
+pub async fn shutdown(State(_s): State<AppState>) -> (StatusCode, Json<serde_json::Value>) {
+    tokio::spawn(async {
+        if sentryusb_shell::run("poweroff", &[]).await.is_ok() {
+            return;
+        }
+        if sentryusb_shell::run("shutdown", &["-h", "now"]).await.is_ok() {
+            return;
+        }
+        let _ = sentryusb_shell::run("systemctl", &["poweroff"]).await;
+    });
+    crate::json_ok()
+}
+
 /// POST /api/system/toggle-drives
 pub async fn toggle_drives(State(_s): State<AppState>, _body: String) -> (StatusCode, Json<serde_json::Value>) {
     let was_active = sentryusb_gadget::is_active();

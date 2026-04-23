@@ -622,9 +622,19 @@ fn update_fstab() -> Result<()> {
             continue;
         }
         // Ensure the mount point directory exists, since tmpfs mounts over it.
-        // /var/lib/ntp is a special case: bash wipes and recreates it.
-        if *mp == "/var/lib/ntp" && !Path::new(mp).is_dir() {
-            let _ = std::fs::remove_file(mp);
+        // /var/lib/ntp is a special case: bash wipes and recreates it to
+        // guarantee a clean dir at the tmpfs mount target. Use
+        // `symlink_metadata` (doesn't follow symlinks) so we reset even
+        // when the path is a symlink pointing at a real directory —
+        // mounting a tmpfs over a symlink doesn't do what we want.
+        if *mp == "/var/lib/ntp" {
+            let needs_reset = match std::fs::symlink_metadata(mp) {
+                Err(_) => false, // doesn't exist — just create_dir_all
+                Ok(meta) => meta.file_type().is_symlink() || !meta.is_dir(),
+            };
+            if needs_reset {
+                let _ = std::fs::remove_file(mp);
+            }
             let _ = std::fs::create_dir_all(mp);
         } else {
             let _ = std::fs::create_dir_all(mp);

@@ -73,15 +73,15 @@ pub async fn run_update(State(s): State<AppState>) -> (StatusCode, Json<serde_js
 
     let hub = s.hub.clone();
     tokio::spawn(async move {
-        hub.broadcast("update", &serde_json::json!({"status": "running"}));
+        hub.broadcast("update_status", &serde_json::json!({"status": "running"}));
 
         let result = self_update().await;
 
         UPDATE_RUNNING.store(false, Ordering::SeqCst);
 
         match result {
-            Ok(msg) => hub.broadcast("update", &serde_json::json!({"status": "complete", "output": msg})),
-            Err(e) => hub.broadcast("update", &serde_json::json!({"status": "error", "error": e.to_string()})),
+            Ok(msg) => hub.broadcast("update_status", &serde_json::json!({"status": "complete", "output": msg})),
+            Err(e) => hub.broadcast("update_status", &serde_json::json!({"status": "error", "error": e.to_string()})),
         }
     });
 
