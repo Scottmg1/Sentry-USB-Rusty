@@ -206,37 +206,118 @@ fn read_current_version() -> String {
 }
 
 /// POST /api/system/check-update
+///
+/// Fetches the GitHub "latest release" JSON via reqwest and parses it
+/// properly. The previous implementation shelled to `curl | grep | head`
+/// which hid curl failures (pipeline exit code is `head`'s, always 0
+/// on empty input) — a 403 rate limit or DNS blip would silently
+/// return `available: false` and the UI would tell the user they were
+/// up to date when they weren't.
+///
+/// The response shape carries both the simple fields (`available`,
+/// `latest`, `current`) kept for backward compatibility with earlier
+/// Rust clients **and** the richer fields the current web UI reads
+/// (`update_available`, `latest_version`, `release_url`,
+/// `release_notes`). Settings.tsx checks for `data.update_available`
+/// / `data.latest_version`; without them the UI defaults to "up to
+/// date" regardless of the actual result. This was the root cause of
+/// the user-reported "update never appears" bug even when the backend
+/// correctly found a newer release.
 pub async fn check_for_update(State(_s): State<AppState>) -> (StatusCode, Json<serde_json::Value>) {
-    let cmd = format!(
-        "curl -fsSL --max-time 10 https://api.github.com/repos/{}/releases/latest 2>/dev/null \
-         | grep -o '\"tag_name\": *\"[^\"]*\"' | head -1",
-        UPDATE_REPO
-    );
-    match sentryusb_shell::run("bash", &["-c", &cmd]).await {
-        Ok(output) => {
-            let latest = output.trim()
-                .trim_start_matches("\"tag_name\":")
-                .trim()
-                .trim_matches('"')
-                .to_string();
-            let current = read_current_version();
-            let available = !latest.is_empty() && is_version_newer(&latest, &current);
+    let url = format!("https://api.github.com/repos/{}/releases/latest", UPDATE_REPO);
 
-            // Fire-and-forget telemetry so support server can track install base.
-            let cur_clone = current.clone();
-            let lat_clone = latest.clone();
-            tokio::spawn(async move {
-                send_telemetry(&cur_clone, available, &lat_clone).await;
-            });
-
-            (StatusCode::OK, Json(serde_json::json!({
-                "available": available,
-                "latest": latest,
-                "current": current,
-            })))
+    let client = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .user_agent(concat!("sentryusb-updater/", env!("CARGO_PKG_VERSION")))
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            return (StatusCode::OK, Json(serde_json::json!({
+                "available": false,
+                "update_available": false,
+                "error": format!("http client init failed: {}", e),
+            })));
         }
-        Err(_) => (StatusCode::OK, Json(serde_json::json!({"available": false, "error": "could not check"}))),
+    };
+
+    let resp = match client.get(&url).send().await {
+        Ok(r) => r,
+        Err(e) => {
+            let msg = if e.is_timeout() {
+                "GitHub API request timed out".to_string()
+            } else if e.is_connect() {
+                format!("could not reach GitHub: {}", e)
+            } else {
+                format!("GitHub API request failed: {}", e)
+            };
+            return (StatusCode::OK, Json(serde_json::json!({
+                "available": false,
+                "update_available": false,
+                "error": msg,
+            })));
+        }
+    };
+
+    let status = resp.status();
+    if !status.is_success() {
+        let err_msg = if status.as_u16() == 403 || status.as_u16() == 429 {
+            "GitHub API rate limit hit — wait about an hour and try again".to_string()
+        } else {
+            format!("GitHub API returned HTTP {}", status)
+        };
+        return (StatusCode::OK, Json(serde_json::json!({
+            "available": false,
+            "update_available": false,
+            "error": err_msg,
+        })));
     }
+
+    let body: serde_json::Value = match resp.json().await {
+        Ok(v) => v,
+        Err(e) => {
+            return (StatusCode::OK, Json(serde_json::json!({
+                "available": false,
+                "update_available": false,
+                "error": format!("GitHub API returned unparseable JSON: {}", e),
+            })));
+        }
+    };
+
+    let latest = body.get("tag_name").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let release_url = body.get("html_url").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let release_notes = body.get("body").and_then(|v| v.as_str()).unwrap_or("").to_string();
+
+    if latest.is_empty() {
+        return (StatusCode::OK, Json(serde_json::json!({
+            "available": false,
+            "update_available": false,
+            "error": "GitHub API response missing tag_name",
+        })));
+    }
+
+    let current = read_current_version();
+    let available = is_version_newer(&latest, &current);
+
+    // Fire-and-forget telemetry so support server can track install base.
+    let cur_clone = current.clone();
+    let lat_clone = latest.clone();
+    tokio::spawn(async move {
+        send_telemetry(&cur_clone, available, &lat_clone).await;
+    });
+
+    (StatusCode::OK, Json(serde_json::json!({
+        // Legacy field names — keep for any older clients.
+        "available": available,
+        "latest": latest,
+        "current": current,
+        // Field names the current web UI (Settings.tsx) actually reads.
+        "update_available": available,
+        "latest_version": latest,
+        "current_version": current,
+        "release_url": release_url,
+        "release_notes": release_notes,
+    })))
 }
 
 /// POST {fingerprint, current_version, update_available, new_version, arch, model}

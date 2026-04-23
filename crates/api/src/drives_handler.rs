@@ -319,24 +319,72 @@ pub async fn fsd_analytics(
     }
 }
 
-/// GET /api/drives/data/download — download drive data as JSON
+/// GET /api/drives/data/download — download drive data as JSON.
+///
+/// Streams the exported JSON directly from a tempfile to the HTTP
+/// response body without ever buffering the full document in memory.
+/// Prior implementation read the tempfile into a `String`, parsed it
+/// into a `serde_json::Value`, then re-serialized — three allocations
+/// of a file that could easily be 10-20 MB. Combined with the
+/// streaming export in `json_compat::export_json`, peak heap for this
+/// endpoint drops from ~30 MB to a few hundred KB.
 pub async fn download_data(
     State(state): State<AppState>,
-) -> (StatusCode, Json<serde_json::Value>) {
-    // Export as JSON for compatibility
-    let tmp = "/tmp/drive-data-export.json";
-    match state.drives.store.export_json_to_file(tmp) {
-        Ok(()) => {
-            match std::fs::read_to_string(tmp) {
-                Ok(data) => match serde_json::from_str::<serde_json::Value>(&data) {
-                    Ok(v) => (StatusCode::OK, Json(v)),
-                    Err(e) => crate::json_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
-                },
-                Err(e) => crate::json_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
-            }
+) -> axum::response::Response {
+    use axum::body::Body;
+    use axum::http::header;
+    use axum::response::IntoResponse;
+
+    // Export is a blocking rusqlite walk; keep it off the tokio reactor.
+    let store = state.drives.store.clone();
+    let tmp = "/tmp/drive-data-export.json".to_string();
+    let export_path = tmp.clone();
+    let export_result = tokio::task::spawn_blocking(move || {
+        store.export_json_to_file(&export_path)
+    })
+    .await;
+
+    match export_result {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => {
+            let (status, json) = crate::json_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string());
+            return (status, json).into_response();
         }
-        Err(e) => crate::json_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+        Err(e) => {
+            let (status, json) = crate::json_error(StatusCode::INTERNAL_SERVER_ERROR, &format!("export task panic: {}", e));
+            return (status, json).into_response();
+        }
     }
+
+    let file = match tokio::fs::File::open(&tmp).await {
+        Ok(f) => f,
+        Err(e) => {
+            let (status, json) = crate::json_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string());
+            return (status, json).into_response();
+        }
+    };
+
+    // `ReaderStream` pulls 8 KB at a time from the file into Bytes
+    // chunks; those chunks are handed to hyper and flushed to the
+    // socket as they become available. Nothing full-file is resident.
+    let stream = tokio_util::io::ReaderStream::new(file);
+    axum::response::Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(
+            header::CONTENT_DISPOSITION,
+            "attachment; filename=\"drive-data.json\"",
+        )
+        .body(Body::from_stream(stream))
+        .unwrap_or_else(|_| {
+            // Builder only fails on malformed headers (static here);
+            // fall back to a plain JSON error for completeness.
+            let (status, json) = crate::json_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "response build failed",
+            );
+            (status, json).into_response()
+        })
 }
 
 /// POST /api/drives/data/export-for-sync

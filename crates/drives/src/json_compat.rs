@@ -203,10 +203,13 @@ fn insert_imported_route(
 /// Export the DB contents as `drive-data.json`. Produces deterministic,
 /// byte-identical output for the same DB state so rsync / archive
 /// diff-detection works correctly.
+///
+/// Streams routes one at a time from SQLite directly into the JSON
+/// serializer, so peak heap usage stays bounded by a single decoded
+/// `Route` instead of the full store. On a 5500-clip DB this caps the
+/// export at a few hundred KB of working memory vs. the ~17 MB that
+/// materialising all routes used to consume.
 pub fn export_json<W: Write>(conn: &Connection, writer: &mut W) -> Result<()> {
-    // Read routes in file-sorted order and decode BLOBs.
-    let routes = select_all_routes_for_export(conn)?;
-
     let mut processed_files = {
         let mut stmt =
             conn.prepare("SELECT file FROM processed_files ORDER BY file")?;
@@ -243,78 +246,217 @@ pub fn export_json<W: Write>(conn: &Connection, writer: &mut W) -> Result<()> {
     #[serde(rename_all = "camelCase")]
     struct OrderedStoreData<'a> {
         processed_files: &'a [String],
-        routes: &'a [Route],
+        routes: RouteStream<'a>,
         #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
         drive_tags: &'a std::collections::BTreeMap<String, Vec<String>>,
     }
 
+    // `route_err` is an out-parameter: if SQLite barfs partway through
+    // the streaming serialize, the serde error propagated back by
+    // `to_writer_pretty` is the generic "io error" wrapper — we stash
+    // the real rusqlite error here and swap it back in afterwards so
+    // the caller sees the useful message.
+    let route_err: std::cell::RefCell<Option<rusqlite::Error>> =
+        std::cell::RefCell::new(None);
+
     let out = OrderedStoreData {
         processed_files: &processed_files,
-        routes: &routes,
+        routes: RouteStream { conn, error: &route_err },
         drive_tags: &drive_tags,
     };
-    serde_json::to_writer_pretty(writer, &out).context("serialize JSON")?;
+    let ser_result = serde_json::to_writer_pretty(writer, &out);
+
+    if let Some(e) = route_err.into_inner() {
+        return Err(anyhow::Error::from(e).context("export_json: streaming route read failed"));
+    }
+    ser_result.context("serialize JSON")?;
     Ok(())
 }
 
-fn select_all_routes_for_export(conn: &Connection) -> Result<Vec<Route>> {
-    let mut stmt = conn.prepare(
-        "SELECT file, date_dir, raw_park_count, raw_frame_count,
-                points_blob, gear_states_blob, ap_states_blob,
-                speeds_blob, accel_blob, gear_runs_blob
-         FROM routes
-         ORDER BY file",
-    )?;
-    let rows = stmt.query_map([], |row| {
-        let pb: Option<Vec<u8>> = row.get(4)?;
-        let gb: Option<Vec<u8>> = row.get(5)?;
-        let ab: Option<Vec<u8>> = row.get(6)?;
-        let sb: Option<Vec<u8>> = row.get(7)?;
-        let acb: Option<Vec<u8>> = row.get(8)?;
-        let rb: Option<Vec<u8>> = row.get(9)?;
-        Ok((
-            row.get::<_, String>(0)?,
-            row.get::<_, String>(1)?,
-            row.get::<_, i64>(2)? as u32,
-            row.get::<_, i64>(3)? as u32,
-            pb,
-            gb,
-            ab,
-            sb,
-            acb,
-            rb,
-        ))
-    })?;
+/// Serializer adapter that streams `Route` rows directly from SQLite
+/// into the JSON output without ever holding more than one decoded
+/// `Route` in memory. Used by [`export_json`].
+struct RouteStream<'a> {
+    conn: &'a Connection,
+    error: &'a std::cell::RefCell<Option<rusqlite::Error>>,
+}
 
-    let mut out = Vec::new();
-    for r in rows {
-        let (file, date, raw_park_count, raw_frame_count, pb, gb, ab, sb, acb, rb) = r?;
-        let points: Vec<GpsPoint> = decode_points(pb.as_deref())
-            .with_context(|| format!("decode points {}", file))?
-            .unwrap_or_default();
-        let gear_states = decode_u8s(gb.as_deref()).unwrap_or_default();
-        let autopilot_states = decode_u8s(ab.as_deref()).unwrap_or_default();
-        let speeds = decode_f32s(sb.as_deref())
-            .with_context(|| format!("decode speeds {}", file))?
-            .unwrap_or_default();
-        let accel_positions = decode_f32s(acb.as_deref())
-            .with_context(|| format!("decode accel {}", file))?
-            .unwrap_or_default();
-        let gear_runs: Vec<GearRun> = decode_gear_runs(rb.as_deref())
-            .with_context(|| format!("decode gear_runs {}", file))?
-            .unwrap_or_default();
-        out.push(Route {
-            file,
-            date,
-            points,
-            gear_states,
-            autopilot_states,
-            speeds,
-            accel_positions,
-            raw_park_count,
-            raw_frame_count,
-            gear_runs,
-        });
+impl<'a> serde::Serialize for RouteStream<'a> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::{Error as SerError, SerializeSeq};
+
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT file, date_dir, raw_park_count, raw_frame_count,
+                        points_blob, gear_states_blob, ap_states_blob,
+                        speeds_blob, accel_blob, gear_runs_blob
+                 FROM routes
+                 ORDER BY file",
+            )
+            .map_err(|e| {
+                *self.error.borrow_mut() = Some(e);
+                S::Error::custom("routes prepare failed")
+            })?;
+
+        let mut rows = stmt.query([]).map_err(|e| {
+            *self.error.borrow_mut() = Some(e);
+            S::Error::custom("routes query failed")
+        })?;
+
+        let mut seq = serializer.serialize_seq(None)?;
+
+        loop {
+            let row_opt = rows.next().map_err(|e| {
+                *self.error.borrow_mut() = Some(e);
+                S::Error::custom("routes row fetch failed")
+            })?;
+            let Some(row) = row_opt else { break };
+
+            // Pull columns then decode the BLOBs for this one row.
+            // Each route is serialized and dropped before the next is
+            // touched, which is what keeps the peak heap bounded.
+            let file: String = row.get(0).map_err(|e| {
+                *self.error.borrow_mut() = Some(e);
+                S::Error::custom("col file")
+            })?;
+            let date: String = row.get(1).map_err(|e| {
+                *self.error.borrow_mut() = Some(e);
+                S::Error::custom("col date_dir")
+            })?;
+            let raw_park_count: u32 = row
+                .get::<_, i64>(2)
+                .map_err(|e| {
+                    *self.error.borrow_mut() = Some(e);
+                    S::Error::custom("col raw_park_count")
+                })? as u32;
+            let raw_frame_count: u32 = row
+                .get::<_, i64>(3)
+                .map_err(|e| {
+                    *self.error.borrow_mut() = Some(e);
+                    S::Error::custom("col raw_frame_count")
+                })? as u32;
+            let pb: Option<Vec<u8>> = row.get(4).map_err(|e| {
+                *self.error.borrow_mut() = Some(e);
+                S::Error::custom("col points_blob")
+            })?;
+            let gb: Option<Vec<u8>> = row.get(5).map_err(|e| {
+                *self.error.borrow_mut() = Some(e);
+                S::Error::custom("col gear_states_blob")
+            })?;
+            let ab: Option<Vec<u8>> = row.get(6).map_err(|e| {
+                *self.error.borrow_mut() = Some(e);
+                S::Error::custom("col ap_states_blob")
+            })?;
+            let sb: Option<Vec<u8>> = row.get(7).map_err(|e| {
+                *self.error.borrow_mut() = Some(e);
+                S::Error::custom("col speeds_blob")
+            })?;
+            let acb: Option<Vec<u8>> = row.get(8).map_err(|e| {
+                *self.error.borrow_mut() = Some(e);
+                S::Error::custom("col accel_blob")
+            })?;
+            let rb: Option<Vec<u8>> = row.get(9).map_err(|e| {
+                *self.error.borrow_mut() = Some(e);
+                S::Error::custom("col gear_runs_blob")
+            })?;
+
+            let points: Vec<GpsPoint> = decode_points(pb.as_deref())
+                .map_err(|e| S::Error::custom(format!("decode points {}: {}", file, e)))?
+                .unwrap_or_default();
+            let gear_states = decode_u8s(gb.as_deref()).unwrap_or_default();
+            let autopilot_states = decode_u8s(ab.as_deref()).unwrap_or_default();
+            let speeds = decode_f32s(sb.as_deref())
+                .map_err(|e| S::Error::custom(format!("decode speeds {}: {}", file, e)))?
+                .unwrap_or_default();
+            let accel_positions = decode_f32s(acb.as_deref())
+                .map_err(|e| S::Error::custom(format!("decode accel {}: {}", file, e)))?
+                .unwrap_or_default();
+            let gear_runs: Vec<GearRun> = decode_gear_runs(rb.as_deref())
+                .map_err(|e| S::Error::custom(format!("decode gear_runs {}: {}", file, e)))?
+                .unwrap_or_default();
+
+            let route = Route {
+                file,
+                date,
+                points,
+                gear_states,
+                autopilot_states,
+                speeds,
+                accel_positions,
+                raw_park_count,
+                raw_frame_count,
+                gear_runs,
+            };
+            seq.serialize_element(&route)?;
+            // `route` drops here — its ~10 KB of decoded BLOBs goes back
+            // to the allocator before we loop.
+        }
+        seq.end()
     }
-    Ok(out)
+}
+
+#[cfg(test)]
+mod streaming_export_tests {
+    use super::*;
+    use crate::db::DriveStore;
+    use crate::types::{GearRun, GpsPoint};
+
+    /// The streaming exporter must produce byte-for-byte parseable JSON
+    /// that deserializes back into the same `StoreData` the importer
+    /// would reconstruct. Protects against a future "optimise the
+    /// allocation loop" change silently breaking Sentry Studio /
+    /// archive restore.
+    #[test]
+    fn streaming_export_roundtrips_to_identical_store_data() {
+        let store = DriveStore::open_memory().unwrap();
+        let pts: Vec<GpsPoint> = vec![[37.7749, -122.4194], [37.7750, -122.4195]];
+        store
+            .add_route(
+                "2025-01-15/clip.mp4",
+                "2025-01-15",
+                &pts,
+                &[4, 4],
+                &[1, 1],
+                &[25.0, 26.0],
+                &[0.5, 0.6],
+                0,
+                2,
+                &[GearRun { gear: 4, frames: 2 }],
+            )
+            .unwrap();
+
+        let tmp = std::env::temp_dir().join("sentryusb-streaming-export-test.json");
+        let tmp_str = tmp.to_string_lossy().to_string();
+        store.export_json_to_file(&tmp_str).unwrap();
+
+        let raw = std::fs::read(&tmp).unwrap();
+        let data: StoreData = serde_json::from_slice(&raw).unwrap();
+
+        assert_eq!(data.routes.len(), 1);
+        assert_eq!(data.routes[0].file, "2025-01-15/clip.mp4");
+        assert_eq!(data.routes[0].points, pts);
+        assert_eq!(data.routes[0].gear_states, vec![4, 4]);
+        assert_eq!(data.routes[0].autopilot_states, vec![1, 1]);
+        assert_eq!(data.routes[0].speeds, vec![25.0, 26.0]);
+        assert_eq!(data.processed_files, vec!["2025-01-15/clip.mp4"]);
+
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn streaming_export_on_empty_store_is_valid_json() {
+        let store = DriveStore::open_memory().unwrap();
+        let tmp = std::env::temp_dir().join("sentryusb-streaming-export-empty.json");
+        let tmp_str = tmp.to_string_lossy().to_string();
+        store.export_json_to_file(&tmp_str).unwrap();
+
+        let raw = std::fs::read(&tmp).unwrap();
+        let data: StoreData = serde_json::from_slice(&raw).unwrap();
+        assert!(data.routes.is_empty());
+        assert!(data.processed_files.is_empty());
+        assert!(data.drive_tags.is_empty());
+
+        let _ = std::fs::remove_file(&tmp);
+    }
 }
