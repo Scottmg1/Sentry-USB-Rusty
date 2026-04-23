@@ -15,5 +15,6 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 bincode = "1"
 memmap2 = "0.9"
 byteorder = "1"
+base64 = "0.22"
 
 sentryusb-ws = { path = "../ws", package = "sentryusb-ws" }

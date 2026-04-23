@@ -3,6 +3,66 @@ use serde::{Deserialize, Serialize};
 /// A GPS point as [latitude, longitude].
 pub type GpsPoint = [f64; 2];
 
+/// Serde adapter that makes `Vec<u8>` roundtrip-compatible with Go's
+/// `encoding/json` treatment of `[]uint8`.
+///
+/// Go marshals `[]byte` / `[]uint8` as a **standard-base64 string** rather
+/// than a JSON array of numbers. So the existing `drive-data.json` files
+/// that users already have on disk (produced by the Go server) look like:
+///
+/// ```json
+/// { "gearStates": "AAABAA==" }
+/// ```
+///
+/// A plain `Vec<u8>` field deserializes that as "invalid type: string,
+/// expected a sequence". This helper accepts **either** the Go shape
+/// (base64 string) **or** the natural JSON shape (array of u8) on read,
+/// and always writes the Go shape on export so Sentry Studio and existing
+/// archive tooling keep working bit-identically.
+pub(crate) mod go_byte_slice {
+    use base64::{engine::general_purpose::STANDARD, Engine};
+    use serde::de::{Error, SeqAccess, Visitor};
+    use serde::{Deserializer, Serializer};
+    use std::fmt;
+
+    pub fn serialize<S: Serializer>(v: &Vec<u8>, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(&STANDARD.encode(v))
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<u8>, D::Error> {
+        struct V;
+        impl<'de> Visitor<'de> for V {
+            type Value = Vec<u8>;
+            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                f.write_str("base64 string or array of u8")
+            }
+            fn visit_str<E: Error>(self, s: &str) -> Result<Vec<u8>, E> {
+                STANDARD.decode(s).map_err(E::custom)
+            }
+            fn visit_borrowed_str<E: Error>(self, s: &str) -> Result<Vec<u8>, E> {
+                self.visit_str(s)
+            }
+            fn visit_string<E: Error>(self, s: String) -> Result<Vec<u8>, E> {
+                self.visit_str(&s)
+            }
+            fn visit_unit<E: Error>(self) -> Result<Vec<u8>, E> {
+                Ok(Vec::new())
+            }
+            fn visit_none<E: Error>(self) -> Result<Vec<u8>, E> {
+                Ok(Vec::new())
+            }
+            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Vec<u8>, A::Error> {
+                let mut out = Vec::with_capacity(seq.size_hint().unwrap_or(0));
+                while let Some(b) = seq.next_element::<u8>()? {
+                    out.push(b);
+                }
+                Ok(out)
+            }
+        }
+        d.deserialize_any(V)
+    }
+}
+
 // -----------------------------------------------------------------------------
 // Autopilot + Gear constants (match Tesla's Dashcam.proto and Go extract.go).
 // Re-exported from extract.rs so consumers don't have to reach into a
@@ -36,14 +96,23 @@ pub struct Route {
     pub file: String,
     pub date: String,
     pub points: Vec<GpsPoint>,
+    #[serde(default, with = "go_byte_slice", skip_serializing_if = "Vec::is_empty")]
     pub gear_states: Vec<u8>,
+    #[serde(default, with = "go_byte_slice", skip_serializing_if = "Vec::is_empty")]
     pub autopilot_states: Vec<u8>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub speeds: Vec<f32>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub accel_positions: Vec<f32>,
+    #[serde(default, skip_serializing_if = "u32_is_zero")]
     pub raw_park_count: u32,
+    #[serde(default, skip_serializing_if = "u32_is_zero")]
     pub raw_frame_count: u32,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub gear_runs: Vec<GearRun>,
 }
+
+fn u32_is_zero(n: &u32) -> bool { *n == 0 }
 
 /// FSD event location (disengagement or accel push).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -318,4 +387,58 @@ pub struct StoreData {
     pub routes: Vec<Route>,
     #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
     pub drive_tags: std::collections::HashMap<String, Vec<String>>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn go_format_base64_gear_states_deserialize() {
+        // Produced by Go's encoding/json on []uint8{0, 1, 0, 0}.
+        let json = r#"{"file":"a.mp4","date":"2026-04-20_14-30-00","points":[[40.7,-74.0]],"gearStates":"AAEAAA==","autopilotStates":"AAAAAQ=="}"#;
+        let r: Route = serde_json::from_str(json).unwrap();
+        assert_eq!(r.gear_states, vec![0, 1, 0, 0]);
+        assert_eq!(r.autopilot_states, vec![0, 0, 0, 1]);
+    }
+
+    #[test]
+    fn rust_array_shape_still_deserializes() {
+        // A hand-authored or older Rust-exported file with arrays works too.
+        let json = r#"{"file":"a.mp4","date":"2026-04-20_14-30-00","points":[[40.7,-74.0]],"gearStates":[0,1,0,0],"autopilotStates":[0,0,0,1]}"#;
+        let r: Route = serde_json::from_str(json).unwrap();
+        assert_eq!(r.gear_states, vec![0, 1, 0, 0]);
+        assert_eq!(r.autopilot_states, vec![0, 0, 0, 1]);
+    }
+
+    #[test]
+    fn missing_optional_fields_default_to_empty() {
+        let json = r#"{"file":"a.mp4","date":"2026-04-20_14-30-00","points":[[40.7,-74.0]]}"#;
+        let r: Route = serde_json::from_str(json).unwrap();
+        assert!(r.gear_states.is_empty());
+        assert!(r.autopilot_states.is_empty());
+        assert!(r.speeds.is_empty());
+    }
+
+    #[test]
+    fn serializes_back_to_go_base64_shape() {
+        let r = Route {
+            file: "a.mp4".into(),
+            date: "2026-04-20_14-30-00".into(),
+            points: vec![[40.7, -74.0]],
+            gear_states: vec![0, 1, 0, 0],
+            autopilot_states: vec![0, 0, 0, 1],
+            speeds: vec![],
+            accel_positions: vec![],
+            raw_park_count: 0,
+            raw_frame_count: 0,
+            gear_runs: vec![],
+        };
+        let s = serde_json::to_string(&r).unwrap();
+        assert!(s.contains(r#""gearStates":"AAEAAA==""#), "serialized: {}", s);
+        assert!(s.contains(r#""autopilotStates":"AAAAAQ==""#), "serialized: {}", s);
+        // omitempty fields are dropped on export — matches Go output.
+        assert!(!s.contains("speeds"), "empty speeds should be omitted: {}", s);
+        assert!(!s.contains("rawParkCount"), "zero park count should be omitted: {}", s);
+    }
 }

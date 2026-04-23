@@ -432,24 +432,51 @@ pub async fn install_required_packages(emitter: &SetupEmitter) -> Result<bool> {
 }
 
 /// Set the system timezone. Idempotent — silent if already matching.
+///
+/// Previously this only read `/etc/timezone`, but on Raspberry Pi OS
+/// (bookworm/bullseye) `timedatectl set-timezone` primarily rewrites the
+/// `/etc/localtime` symlink and `/etc/timezone` is often absent. That
+/// meant every mid-setup resume (dwc2 reboot, root-shrink reboot,
+/// cmdline reboot…) would re-decide the timezone wasn't set and re-emit
+/// the progress line, flooding the setup log with duplicate "Setting
+/// timezone to X" messages on a single run. Read both sources before
+/// acting, and keep `/etc/timezone` in sync ourselves so legacy tools
+/// that consult it (apt, logrotate, some cron jobs) agree with systemd.
 pub async fn configure_timezone(env: &SetupEnv, emitter: &SetupEmitter) -> Result<bool> {
     let tz = match env.config.get("TIME_ZONE") {
         Some(v) if !v.is_empty() => v.clone(),
         _ => return Ok(false),
     };
 
-    // Check current timezone; /etc/timezone is simpler than parsing timedatectl
-    let current = std::fs::read_to_string("/etc/timezone")
-        .unwrap_or_default()
-        .trim()
-        .to_string();
-    if current == tz {
+    if current_timezone().as_deref() == Some(tz.as_str()) {
         return Ok(false);
     }
 
     emitter.progress(&format!("Setting timezone to {}", tz));
     sentryusb_shell::run("timedatectl", &["set-timezone", &tz]).await?;
+
+    // Keep /etc/timezone in sync with the symlink. On images where the
+    // file is missing this also creates it, which makes our own
+    // idempotency check cheap on the next resume.
+    let _ = std::fs::write("/etc/timezone", format!("{}\n", tz));
+
     Ok(true)
+}
+
+/// Best-effort detection of the system's current timezone. Tries
+/// `/etc/timezone` first (cheap, textual), falls back to the target of
+/// the `/etc/localtime` symlink (systemd's source of truth on Pi OS).
+/// Returns `None` only when neither source is usable.
+fn current_timezone() -> Option<String> {
+    if let Ok(raw) = std::fs::read_to_string("/etc/timezone") {
+        let trimmed = raw.trim();
+        if !trimmed.is_empty() {
+            return Some(trimmed.to_string());
+        }
+    }
+    let link = std::fs::read_link("/etc/localtime").ok()?;
+    let s = link.to_string_lossy();
+    s.find("/zoneinfo/").map(|idx| s[idx + "/zoneinfo/".len()..].to_string())
 }
 
 /// Configure the RTC if enabled.
