@@ -49,25 +49,66 @@ pub async fn run_startup_migration() {
 
     let script = build_migration_script(&tarball_url);
 
-    match sentryusb_shell::run_with_timeout(
-        Duration::from_secs(180),
-        "bash",
-        &["-c", &script],
-    )
-    .await
-    {
-        Ok(_) => {
-            let _ = tokio::fs::create_dir_all(MIGRATE_DIR).await;
-            if let Err(e) = tokio::fs::write(&marker_file, b"migrated\n").await {
-                warn!("[migrate] Failed to write marker {}: {}", marker_file, e);
+    // Retry up to 3 times with exponential backoff. The script itself
+    // fails fast on `curl: Could not resolve host: github.com` when DNS
+    // isn't ready yet — and that's exactly the state we hit racing
+    // network-online.target at boot. Every retry is a full script run;
+    // `set -e` + idempotent file writes mean re-running after a partial
+    // success is safe (existing files get overwritten with identical
+    // bytes from the tarball).
+    //
+    // The `nss-lookup.target` dependency on the service unit is the
+    // primary fix; this is belt-and-suspenders for the edge case where
+    // the resolver comes up but its first query fails because the
+    // upstream DNS cache is cold.
+    let mut last_err: Option<String> = None;
+    for attempt in 1..=3 {
+        match sentryusb_shell::run_with_timeout(
+            Duration::from_secs(180),
+            "bash",
+            &["-c", &script],
+        )
+        .await
+        {
+            Ok(_) => {
+                let _ = tokio::fs::create_dir_all(MIGRATE_DIR).await;
+                if let Err(e) = tokio::fs::write(&marker_file, b"migrated\n").await {
+                    warn!("[migrate] Failed to write marker {}: {}", marker_file, e);
+                }
+                info!("[migrate] Startup migration complete for {}", current_version);
+                return;
             }
-            info!("[migrate] Startup migration complete for {}", current_version);
-        }
-        Err(e) => {
-            warn!("[migrate] Warning: startup migration failed: {}", e);
-            // Don't write marker — retry on next boot.
+            Err(e) => {
+                let msg = e.to_string();
+                // Only retry for transient failure signatures. A genuine
+                // 404 on the tarball URL, a write permission error, or
+                // an archive-corrupt error isn't going to fix itself on
+                // a second try, and we don't want to burn 30+ seconds
+                // on guaranteed-failing retries.
+                let transient = msg.contains("Could not resolve host")
+                    || msg.contains("Temporary failure in name resolution")
+                    || msg.contains("Connection timed out")
+                    || msg.contains("Network is unreachable");
+                if attempt < 3 && transient {
+                    let wait = Duration::from_secs(5 * attempt as u64);
+                    warn!(
+                        "[migrate] Startup migration attempt {}/3 hit a transient failure ({}); retrying in {:?}",
+                        attempt, msg, wait
+                    );
+                    tokio::time::sleep(wait).await;
+                    last_err = Some(msg);
+                    continue;
+                }
+                last_err = Some(msg);
+                break;
+            }
         }
     }
+    warn!(
+        "[migrate] Warning: startup migration failed after retries: {}",
+        last_err.as_deref().unwrap_or("unknown")
+    );
+    // Don't write marker — retry on next boot.
 }
 
 fn build_migration_script(tarball_url: &str) -> String {

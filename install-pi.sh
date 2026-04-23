@@ -105,8 +105,8 @@ info "Installing systemd service..."
 cat > /etc/systemd/system/sentryusb.service << 'EOF'
 [Unit]
 Description=SentryUSB Web Server
-After=network-online.target
-Wants=network-online.target
+After=network-online.target nss-lookup.target
+Wants=network-online.target nss-lookup.target
 Conflicts=nginx.service
 
 [Service]
