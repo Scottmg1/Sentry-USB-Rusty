@@ -1,23 +1,26 @@
 //! Pre-setup sanity checks — port of `verify-configuration.sh`.
 //!
-//! Split into two phases so we can bail loudly on conditions we can
+//! Split into three phases so we can bail loudly on conditions we can
 //! detect up-front without also false-failing on conditions that the
 //! setup wizard is *about* to fix:
 //!
 //!   * [`early_verify`] — hardware model, XFS+reflink support,
-//!     required config keys, disk space. Runs BEFORE any destructive
-//!     operation and BEFORE the dwc2 overlay phase. These can all be
-//!     checked on a stock Pi OS image without any SentryUSB-specific
+//!     required config keys. Runs BEFORE any destructive operation
+//!     and BEFORE the dwc2 overlay phase. Checks that are safe to
+//!     run on a stock Pi OS image without any SentryUSB-specific
 //!     kernel modules loaded yet.
 //!   * [`verify_udc`] — at least one UDC driver exposed under
 //!     `/sys/class/udc/`. MUST run **after** the dwc2 overlay phase
 //!     has completed (either "already set" or "just added + rebooted
-//!     + resuming"), because on a fresh Pi OS image `dtoverlay=dwc2`
-//!     isn't in `config.txt` yet, so the DWC2 UDC driver isn't
-//!     loaded, so the check would always fail on the very first pass
-//!     of a fresh install. Earlier versions of this module bundled
-//!     the UDC check into `early_verify` and that's exactly what bit
-//!     the install-pi.sh path in production.
+//!     + resuming"). On a fresh Pi OS image `dtoverlay=dwc2` isn't
+//!     in `config.txt` yet, so `/sys/class/udc/` is empty — the
+//!     check would always false-fail on the very first pass.
+//!   * [`verify_disk_space`] — SD card or USB drive has enough room
+//!     for the backing-files partition. MUST run **after** the root
+//!     shrink phase, because on a fresh Pi OS install the root
+//!     partition fills the entire disk and the `sfdisk -F` query
+//!     would report 0 bytes free. The shrink is what creates the
+//!     8 GB we need; checking before it runs is a false-fail.
 //!
 //! On failure the returned `anyhow::Error` is logged and the runner
 //! aborts before touching the filesystem.
@@ -39,14 +42,14 @@ const MIN_SD_SPACE_BYTES: u64 = 8 * (1 << 30);
 /// the bash threshold).
 const MIN_USB_SIZE_BYTES: u64 = 59 * (1 << 30);
 
-/// Early sanity checks: hardware, XFS, config vars, disk space. Call
-/// before the dwc2 overlay phase. Does NOT include the UDC check — see
-/// [`verify_udc`] for that half.
+/// Early sanity checks: hardware, XFS, config vars. Call before the
+/// dwc2 overlay phase. Deliberately excludes checks that depend on
+/// kernel state the overlay/shrink phases will establish — see
+/// [`verify_udc`] and [`verify_disk_space`] for those.
 pub async fn early_verify(env: &SetupEnv, emitter: &SetupEmitter) -> Result<()> {
     check_supported_hardware(env)?;
     check_xfs_support(emitter).await?;
     check_required_config(env)?;
-    check_available_space(env, emitter).await?;
     Ok(())
 }
 
@@ -57,6 +60,15 @@ pub async fn early_verify(env: &SetupEnv, emitter: &SetupEmitter) -> Result<()> 
 /// the USB gadget will come up.
 pub fn verify_udc() -> Result<()> {
     check_udc()
+}
+
+/// Disk-space availability check. Call **after** the root shrink phase
+/// has completed, because on a fresh Pi OS image root fills the whole
+/// disk and there's zero unpartitioned space until shrink runs. On
+/// repeat runs the fast-path (backingfiles/mutable labels already
+/// present) makes this a cheap O(1) query.
+pub async fn verify_disk_space(env: &SetupEnv, emitter: &SetupEmitter) -> Result<()> {
+    check_available_space(env, emitter).await
 }
 
 // -----------------------------------------------------------------------------

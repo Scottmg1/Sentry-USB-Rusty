@@ -128,6 +128,15 @@ pub async fn run_full_setup(emitter: SetupEmitter) -> Result<()> {
         return Ok(());
     }
 
+    // Disk-space verification. Runs here (AFTER root shrink) rather
+    // than in early_verify because on a fresh Pi OS install the root
+    // partition fills the entire SD/SSD and `sfdisk -F` reports 0
+    // bytes unpartitioned — the shrink above is what creates the
+    // 8 GB we need for backingfiles+mutable. Fast path via the
+    // `/dev/disk/by-label/backingfiles` check short-circuits on
+    // repeat runs.
+    crate::verify::verify_disk_space(&env, &emitter).await?;
+
     // Hostname + timezone (grouped under "System configuration")
     let hostname_changed = crate::system::configure_hostname(&env, &emitter).await?;
     let tz_changed = crate::system::configure_timezone(&env, &emitter).await?;

@@ -190,6 +190,29 @@ pub async fn test_archive(
     let timeout = std::time::Duration::from_secs(15);
     let tmp_dir = "/tmp/sentryusb-archive-test";
 
+    // `mount -t nfs` / `-t cifs` need userspace helpers (`mount.nfs` from
+    // nfs-common, `mount.cifs` from cifs-utils). Without them the kernel
+    // falls through to its own mount API which can't parse `server:/export`
+    // or `//server/share` — the user-visible symptom is:
+    //   "NFS: mount program didn't pass remote address. fsconfig() failed"
+    // so we install the helper on demand before running the mount test.
+    // Idempotent: apt-get skips already-installed packages quickly.
+    async fn ensure_mount_helper(pkg: &str, helper_path: &str) -> Result<(), String> {
+        if std::path::Path::new(helper_path).exists() {
+            return Ok(());
+        }
+        // `apt-get install` is interactive-ish; give it a generous window
+        // but bail cleanly if there's no network / repos are broken.
+        sentryusb_shell::run_with_timeout(
+            std::time::Duration::from_secs(120),
+            "apt-get",
+            &["install", "-y", "--no-install-recommends", pkg],
+        )
+        .await
+        .map(|_| ())
+        .map_err(|e| format!("{} helper missing and apt-get install failed: {}", pkg, e))
+    }
+
     let test_result: Result<(), String> = match system {
         "cifs" => {
             let server = params.get("ARCHIVE_SERVER").cloned().unwrap_or_default();
@@ -200,6 +223,9 @@ pub async fn test_archive(
             let cifs_ver = params.get("CIFS_VERSION").cloned().unwrap_or_default();
             if server.is_empty() || share.is_empty() || user.is_empty() || pass.is_empty() {
                 return crate::json_error(StatusCode::BAD_REQUEST, "Missing required CIFS fields");
+            }
+            if let Err(e) = ensure_mount_helper("cifs-utils", "/sbin/mount.cifs").await {
+                return crate::json_error(StatusCode::INTERNAL_SERVER_ERROR, &e);
             }
             let _ = std::fs::create_dir_all(tmp_dir);
             let mut opts = format!("username={},password={},iocharset=utf8", user, pass);
@@ -256,6 +282,9 @@ pub async fn test_archive(
             let export = params.get("SHARE_NAME").cloned().unwrap_or_default();
             if server.is_empty() || export.is_empty() {
                 return crate::json_error(StatusCode::BAD_REQUEST, "Missing required NFS fields");
+            }
+            if let Err(e) = ensure_mount_helper("nfs-common", "/sbin/mount.nfs").await {
+                return crate::json_error(StatusCode::INTERNAL_SERVER_ERROR, &e);
             }
             let _ = std::fs::create_dir_all(tmp_dir);
             let src = format!("{}:{}", server, export);
