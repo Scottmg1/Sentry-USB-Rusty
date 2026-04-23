@@ -3,6 +3,24 @@ use serde::{Deserialize, Serialize};
 /// A GPS point as [latitude, longitude].
 pub type GpsPoint = [f64; 2];
 
+// -----------------------------------------------------------------------------
+// Autopilot + Gear constants (match Tesla's Dashcam.proto and Go extract.go).
+// Re-exported from extract.rs so consumers don't have to reach into a
+// platform-gated module.
+// -----------------------------------------------------------------------------
+
+/// Gear state: parked.
+pub const GEAR_PARK: u8 = 0;
+
+/// Autopilot state: off / manual driving.
+pub const AUTOPILOT_OFF: u8 = 0;
+/// Autopilot state: Full Self-Driving (Supervised).
+pub const AUTOPILOT_FSD: u8 = 1;
+/// Autopilot state: Autopilot (Autosteer).
+pub const AUTOPILOT_AUTOSTEER: u8 = 2;
+/// Autopilot state: Traffic-Aware Cruise Control.
+pub const AUTOPILOT_TACC: u8 = 3;
+
 /// A contiguous run of a single gear state across frames.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -235,4 +253,69 @@ pub struct ProcessingStatus {
 pub struct TimedRoute {
     pub route: Route,
     pub timestamp: chrono::NaiveDateTime,
+}
+
+/// Per-clip scalar summary computed once from a Route's BLOB-backed
+/// parallel slices. Port of Go `drives.RouteAggregates`.
+///
+/// Cached as columns on the `routes` table so the Drives-page summary
+/// endpoints never have to decode a Points/GearStates/AutopilotStates
+/// BLOB to produce a list view. Semantics match Go's
+/// `ComputeAggregateStatsFromRoutes` inner loop (null-island filter +
+/// GPS-teleport guard, no group-level median); for clean data this is
+/// bit-identical to the group-filtered path in `GroupSummaries`.
+#[derive(Debug, Clone, Default)]
+pub struct RouteAggregates {
+    pub distance_m: f64,
+    pub max_speed_mps: f64,
+    pub avg_speed_mps: f64,
+    pub speed_sample_count: i64,
+    pub valid_point_count: i64,
+    pub fsd_engaged_ms: i64,
+    pub autosteer_engaged_ms: i64,
+    pub tacc_engaged_ms: i64,
+    pub fsd_distance_m: f64,
+    pub autosteer_distance_m: f64,
+    pub tacc_distance_m: f64,
+    pub assisted_distance_m: f64,
+    pub fsd_disengagements: i32,
+    pub fsd_accel_pushes: i32,
+    /// Start/End points are the first/last non-null-island Points on the
+    /// clip. `None` when the clip has no valid points — explicit Option
+    /// rather than overloading (0, 0) as a sentinel.
+    pub start_lat: Option<f64>,
+    pub start_lng: Option<f64>,
+    pub end_lat: Option<f64>,
+    pub end_lng: Option<f64>,
+}
+
+/// BLOB-free row shape used by the summary endpoints. Carries the
+/// metadata that `groupClips` needs plus all pre-computed scalars from
+/// `RouteAggregates`. Reading 5500 summary rows costs ~5 MB of heap
+/// versus ~300 MB for the full Route slice.
+#[derive(Debug, Clone)]
+pub struct RouteSummary {
+    pub file: String,
+    pub date: String,
+    pub raw_park_count: u32,
+    pub raw_frame_count: u32,
+    pub gear_runs: Vec<GearRun>,
+    pub aggregates: RouteAggregates,
+}
+
+/// Archive-side JSON structure that Sentry Studio reads from the archive
+/// server (rsync/CIFS/rclone). Also the payload for
+/// `/api/drives/data/download` and `/api/drives/data/upload`.
+///
+/// Shape is locked by existing Sentry Studio clients; the SQLite store
+/// translates to/from this on demand at the archive-sync boundary.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StoreData {
+    #[serde(default)]
+    pub processed_files: Vec<String>,
+    #[serde(default)]
+    pub routes: Vec<Route>,
+    #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
+    pub drive_tags: std::collections::HashMap<String, Vec<String>>,
 }

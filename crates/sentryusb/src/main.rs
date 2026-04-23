@@ -64,19 +64,10 @@ async fn main() {
         }
     };
 
-    // Check for legacy JSON migration
-    if sentryusb_drives::DriveStore::needs_migration(
-        sentryusb_drives::LEGACY_JSON_PATH,
-        db_path,
-    ) {
-        info!("Migrating legacy drive-data.json to SQLite...");
-        if let Err(e) = sentryusb_drives::json_compat::import_json(
-            sentryusb_drives::LEGACY_JSON_PATH,
-            &store,
-        ) {
-            tracing::warn!("JSON migration failed: {}", e);
-        }
-    }
+    // Legacy-JSON migration is now handled automatically inside
+    // DriveStore::open via the one-shot import dance (matches Go Store.Load).
+    // No manual step needed here — the import marker in the meta table
+    // ensures it only runs once across the lifetime of the DB.
 
     // Drive processor
     let processor = Arc::new(sentryusb_drives::processor::Processor::new(

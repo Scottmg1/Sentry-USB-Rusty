@@ -209,6 +209,27 @@ fi
 # ── Restart BLE daemon ──
 systemctl enable sentryusb-ble 2>/dev/null || true
 systemctl restart sentryusb-ble 2>/dev/null || true
+
+# ── Post-migration patches (persist across upstream script updates) ──
+# These heal existing installs whose run/ scripts above were just replaced
+# with upstream copies that don't yet carry the user-facing fixes shipped
+# in PRs #31 / #35. Idempotent — the `grep -q` guards prevent re-patching.
+
+# Patch 1: send-push-message — respect SENTRY_NOTIFICATION_URL (PR #31)
+if grep -q 'https://notifications.sentry-six.com/send"' /root/bin/send-push-message 2>/dev/null; then
+  sed -i 's|"https://notifications.sentry-six.com/send"|"${{SENTRY_NOTIFICATION_URL:-https://notifications.sentry-six.com}}/send"|' /root/bin/send-push-message
+fi
+
+# Patch 2: archiveloop — read active chime from library dir instead of flat file (PR #35)
+if grep -q '[ -f "/mutable/LockChime.wav" ]' /root/bin/archiveloop 2>/dev/null; then
+  python3 - <<'PYEOF'
+content = open('/root/bin/archiveloop').read()
+old = '    if [ -f "/mutable/LockChime.wav" ]\n    then\n      cp -f "/mutable/LockChime.wav" "$CAM_MOUNT/LockChime.wav"'
+new = '    _active_chime=$(cat /mutable/LockChime/.active_name 2>/dev/null || true)\n    if [ -n "$_active_chime" ] && [ -f "/mutable/LockChime/$_active_chime" ]\n    then\n      cp -f "/mutable/LockChime/$_active_chime" "$CAM_MOUNT/LockChime.wav"'
+if old in content:
+    open('/root/bin/archiveloop','w').write(content.replace(old, new, 1))
+PYEOF
+fi
 "#,
         tarball_url = tarball_url,
         repo = MIGRATE_REPO,

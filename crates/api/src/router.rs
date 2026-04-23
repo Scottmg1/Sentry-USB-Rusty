@@ -203,10 +203,18 @@ async fn handle_ws(socket: axum::extract::ws::WebSocket, hub: sentryusb_ws::Hub)
         }
     });
 
-    // Reader task: keep connection alive, reset read deadline on any message
+    // Reader task: any message (including pong) resets the 60-second read
+    // deadline. Two missed pings (30s each) tears down the socket — matches
+    // Go's `SetReadDeadline(60s)` in hub.go and means a JS tab that's been
+    // paused by the browser stops holding a server-side goroutine within a
+    // minute, instead of however long it takes the TCP send buffer to fill.
     let mut recv_task = tokio::spawn(async move {
-        while let Some(Ok(_msg)) = receiver.next().await {
-            // Any message (including pong) keeps the connection alive
+        loop {
+            match tokio::time::timeout(Duration::from_secs(60), receiver.next()).await {
+                Ok(Some(Ok(_))) => continue,   // message/pong → deadline resets
+                Ok(Some(Err(_))) | Ok(None) => break, // socket error / closed
+                Err(_) => break,               // deadline — tear down
+            }
         }
     });
 

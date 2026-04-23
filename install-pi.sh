@@ -151,24 +151,26 @@ ln -sf "$CTTS_INSTALL" /usr/local/bin/cttseraser 2>/dev/null || true
 
 info "Installing SentryUSB BLE daemon..."
 BLE_REPO_URL="https://raw.githubusercontent.com/${REPO}/main/server/ble"
-BLE_INSTALL_DIR="/opt/sentryusb/ble"
-mkdir -p "$BLE_INSTALL_DIR"
+# Install at /root/bin/ — this matches both the vendored service unit's
+# hardcoded ExecStart path AND what pi-gen 00-run.sh installs, so the same
+# binary is reachable whether the user came in via image-flash or
+# install-pi.sh. Previously we installed to /opt/sentryusb/ble/ and
+# post-patched the service unit with sed — which could silently fail on
+# older sed or SELinux-restricted systems, leaving the service pointing at
+# a path with no file. The only safe thing is to not transform.
+BLE_INSTALL_PATH="/root/bin/sentryusb-ble.py"
+mkdir -p /root/bin
 
-if curl -fsSL "$BLE_REPO_URL/sentryusb-ble.py" -o "$BLE_INSTALL_DIR/sentryusb-ble.py" 2>/dev/null; then
-    chmod +x "$BLE_INSTALL_DIR/sentryusb-ble.py"
+if curl -fsSL "$BLE_REPO_URL/sentryusb-ble.py" -o "$BLE_INSTALL_PATH" 2>/dev/null; then
+    chmod +x "$BLE_INSTALL_PATH"
     curl -fsSL "$BLE_REPO_URL/sentryusb-ble.service" -o /etc/systemd/system/sentryusb-ble.service 2>/dev/null || true
     curl -fsSL "$BLE_REPO_URL/com.sentryusb.ble.conf" -o /etc/dbus-1/system.d/com.sentryusb.ble.conf 2>/dev/null || true
-
-    # Rewrite service ExecStart to our install path
-    if [ -f /etc/systemd/system/sentryusb-ble.service ]; then
-        sed -i "s|ExecStart=.*sentryusb-ble.py|ExecStart=/usr/bin/python3 $BLE_INSTALL_DIR/sentryusb-ble.py|" /etc/systemd/system/sentryusb-ble.service || true
-    fi
 
     apt-get install -y python3-dbus python3-gi bluez >/dev/null 2>&1 || warn "BLE daemon apt deps install failed — the daemon may not start"
     systemctl daemon-reload
     systemctl enable sentryusb-ble 2>/dev/null || true
     systemctl restart dbus 2>/dev/null || true
-    ok "BLE daemon installed"
+    ok "BLE daemon installed at $BLE_INSTALL_PATH"
 else
     warn "Could not fetch BLE daemon — iOS app pairing will be unavailable"
 fi

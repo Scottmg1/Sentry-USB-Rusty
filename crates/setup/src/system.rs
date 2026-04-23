@@ -176,8 +176,14 @@ pub async fn configure_ssh(emitter: &SetupEmitter) -> Result<bool> {
     Ok(true)
 }
 
-/// Configure Samba shares if enabled. Gated at runner level, but this
-/// function is still idempotent if called with SAMBA_ENABLED unset.
+/// Configure Samba shares if enabled. Port of `configure-samba.sh`.
+///
+/// Critical bits the first port missed:
+///   * tmpfs entries for /var/run/samba + /var/cache/samba (without them
+///     smbd can't write PID/cache on a read-only root).
+///   * /var/lib/samba → /mutable/varlib/samba symlink (so bond databases
+///     survive reboots).
+///   * Default password for the `pi` user (so shares are actually usable).
 pub async fn configure_samba(env: &SetupEnv, emitter: &SetupEmitter) -> Result<bool> {
     if !env.get_bool("SAMBA_ENABLED", false) {
         info!("Samba not enabled, skipping");
@@ -187,49 +193,166 @@ pub async fn configure_samba(env: &SetupEnv, emitter: &SetupEmitter) -> Result<b
     emitter.begin_phase("samba", "Samba share");
     emitter.progress("Configuring Samba...");
 
-    if sentryusb_shell::run("which", &["smbd"]).await.is_err() {
-        sentryusb_shell::run_with_timeout(
-            Duration::from_secs(300),
-            "apt-get", &["-y", "install", "samba"],
-        ).await.context("failed to install samba")?;
-    }
-
     let guest = env.get_bool("SAMBA_GUEST", false);
     let guest_ok = if guest { "yes" } else { "no" };
 
+    let smbd_installed = sentryusb_shell::run("which", &["smbd"]).await.is_ok();
+
+    if !smbd_installed {
+        emitter.progress("Installing samba and dependencies...");
+
+        // Move writable dirs off root BEFORE the package install — apt may
+        // run smbd briefly and we don't want those writes to land on the
+        // soon-to-be-readonly root.
+        let _ = std::fs::create_dir_all("/var/cache/samba");
+        let _ = std::fs::create_dir_all("/var/run/samba");
+
+        let fstab = std::fs::read_to_string("/etc/fstab").unwrap_or_default();
+        if !fstab.contains("samba") {
+            let mut new_fstab = fstab;
+            if !new_fstab.ends_with('\n') {
+                new_fstab.push('\n');
+            }
+            new_fstab.push_str("tmpfs /var/run/samba tmpfs nodev,nosuid 0 0\n");
+            new_fstab.push_str("tmpfs /var/cache/samba tmpfs nodev,nosuid 0 0\n");
+            std::fs::write("/etc/fstab", new_fstab)?;
+        }
+        let _ = sentryusb_shell::run("mount", &["/var/cache/samba"]).await;
+        let _ = sentryusb_shell::run("mount", &["/var/run/samba"]).await;
+
+        // Migrate /var/lib/samba to /mutable so bond databases persist.
+        if !Path::new("/var/lib/samba").is_symlink() {
+            if sentryusb_shell::run("findmnt", &["--mountpoint", "/mutable"])
+                .await
+                .is_err()
+            {
+                let _ = sentryusb_shell::run("mount", &["/mutable"]).await;
+            }
+            let _ = std::fs::create_dir_all("/mutable/varlib");
+            if Path::new("/var/lib/samba").is_dir() {
+                let _ = sentryusb_shell::run(
+                    "mv", &["/var/lib/samba", "/mutable/varlib/"],
+                ).await;
+            } else {
+                let _ = std::fs::create_dir_all("/mutable/varlib/samba");
+            }
+            #[cfg(unix)]
+            let _ = std::os::unix::fs::symlink("/mutable/varlib/samba", "/var/lib/samba");
+        }
+
+        // Install samba non-interactively.
+        let mut install = tokio::process::Command::new("apt-get");
+        install.env("DEBIAN_FRONTEND", "noninteractive")
+            .args(["-y", "install", "samba"]);
+        let status = tokio::time::timeout(
+            Duration::from_secs(300),
+            install.status(),
+        ).await.context("apt-get install samba timed out")??;
+        if !status.success() {
+            anyhow::bail!("apt-get install samba failed");
+        }
+
+        // Start smbd so smbpasswd can register the `pi` user, then stop.
+        let _ = sentryusb_shell::run("service", &["smbd", "start"]).await;
+        set_default_samba_password().await;
+        let _ = sentryusb_shell::run("service", &["smbd", "stop"]).await;
+
+        emitter.progress("Samba installed.");
+    }
+
+    // Remove obsolete fstab entry.
+    sed_delete_line_matching("/etc/fstab", |l| {
+        l == "tmpfs /mnt/smbexport tmpfs nodev,nosuid 0 0"
+    })?;
+
+    // Move link folder from backingfiles to mutable if needed.
+    if !Path::new("/mutable/TeslaCam").is_dir() && Path::new("/backingfiles/TeslaCam").is_dir() {
+        emitter.progress("Moving TeslaCam symlink folder from backingfiles to mutable");
+        let _ = sentryusb_shell::run(
+            "mv", &["/backingfiles/TeslaCam", "/mutable/TeslaCam"],
+        ).await;
+    }
+
+    // Always update smb.conf — matches bash behavior so upgrade installs
+    // pick up config improvements. Exact contents mirror configure-samba.sh
+    // so Samba clients behave identically across Go and Rust builds.
     let smb_conf = format!(
         r#"[global]
-workgroup = WORKGROUP
-server string = SentryUSB
-security = user
-map to guest = Bad User
-log level = 1
+   deadtime = 2
+   workgroup = WORKGROUP
+   dns proxy = no
+   log file = /var/log/samba.log.%m
+   max log size = 1000
+   syslog = 0
+   panic action = /usr/share/samba/panic-action %d
+   server role = standalone server
+   passdb backend = tdbsam
+   obey pam restrictions = yes
+   unix password sync = yes
+   passwd program = /usr/bin/passwd %u
+   passwd chat = *Enter\snew\s*\spassword:* %n\n *Retype\snew\s*\spassword:* %n\n *password\supdated\ssuccessfully* .
+   pam password change = yes
+   map to guest = bad user
+   min protocol = SMB2
+   usershare allow guests = yes
+   unix extensions = no
+   wide links = yes
 
-[cam]
-path = /mnt/cam
-read only = yes
-guest ok = {guest_ok}
-browseable = yes
-
-[music]
-path = /mnt/music
-read only = no
-guest ok = {guest_ok}
-browseable = yes
-
-[lightshow]
-path = /mnt/lightshow
-read only = no
-guest ok = {guest_ok}
-browseable = yes
+[TeslaCam]
+   read only = yes
+   locking = no
+   path = /mutable/TeslaCam
+   guest ok = {guest_ok}
+   create mask = 0775
+   veto files = /._*/.DS_Store/
+   delete veto files = yes
+   root preexec = /root/bin/make_snapshot.sh
 "#
     );
-
+    let _ = std::fs::create_dir_all("/etc/samba");
     std::fs::write("/etc/samba/smb.conf", smb_conf)?;
     let _ = sentryusb_shell::run("systemctl", &["enable", "smbd"]).await;
     let _ = sentryusb_shell::run("systemctl", &["restart", "smbd"]).await;
 
     Ok(true)
+}
+
+/// Set the default Samba password for the `pi` user by piping
+/// `raspberry\nraspberry\n` through `smbpasswd -s -a pi`.
+async fn set_default_samba_password() {
+    use tokio::io::AsyncWriteExt;
+
+    let mut child = match tokio::process::Command::new("smbpasswd")
+        .args(["-s", "-a", "pi"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            info!("smbpasswd spawn failed: {}", e);
+            return;
+        }
+    };
+    if let Some(mut stdin) = child.stdin.take() {
+        let _ = stdin.write_all(b"raspberry\nraspberry\n").await;
+        drop(stdin);
+    }
+    let _ = child.wait().await;
+}
+
+/// Remove lines from a file where `pred(line) == true`.
+fn sed_delete_line_matching<F: Fn(&str) -> bool>(path: &str, pred: F) -> Result<()> {
+    let content = std::fs::read_to_string(path).unwrap_or_default();
+    let had_trailing = content.ends_with('\n');
+    let kept: Vec<&str> = content.lines().filter(|l| !pred(l)).collect();
+    let mut out = kept.join("\n");
+    if had_trailing {
+        out.push('\n');
+    }
+    std::fs::write(path, out)?;
+    Ok(())
 }
 
 /// Install the sentryusb systemd service.
@@ -329,9 +452,104 @@ pub async fn configure_timezone(env: &SetupEnv, emitter: &SetupEmitter) -> Resul
     Ok(true)
 }
 
-/// Configure the RTC (DS3231) if enabled. Idempotent — silent when the
-/// overlay is already configured.
+/// Configure the RTC if enabled.
+///
+/// Dispatches on Pi model:
+///   * Pi 5: uses the built-in RTC via `/dev/rtc0`; installs
+///     `sentryusb-hwclock.service` for boot-time hctosys sync and optionally
+///     enables trickle charging via `dtparam=rtc_bbat_vchg`.
+///   * Other models: adds a DS3231 I²C overlay to config.txt (for users
+///     wiring in an external RTC module).
 pub async fn configure_rtc(env: &SetupEnv, emitter: &SetupEmitter) -> Result<bool> {
+    if env.pi_model == crate::env::PiModel::Pi5 {
+        return configure_rtc_pi5(env, emitter).await;
+    }
+    configure_rtc_ds3231(env, emitter).await
+}
+
+/// Pi 5 built-in RTC — port of `configure-rtc.sh`.
+async fn configure_rtc_pi5(env: &SetupEnv, emitter: &SetupEmitter) -> Result<bool> {
+    let config_path = match &env.piconfig_path {
+        Some(p) => p.clone(),
+        None => return Ok(false),
+    };
+
+    let enabled = env.get_bool("RTC_BATTERY_ENABLED", false);
+    let trickle = env.get_bool("RTC_TRICKLE_CHARGE", false);
+
+    // Quick idempotency check. If already in the desired state, silent skip.
+    let service_path = "/lib/systemd/system/sentryusb-hwclock.service";
+    let config = std::fs::read_to_string(&config_path).unwrap_or_default();
+    let service_installed = Path::new(service_path).exists();
+    let trickle_present = config.lines().any(|l| l.starts_with("dtparam=rtc_bbat_vchg"));
+
+    if enabled && service_installed && (trickle == trickle_present) {
+        return Ok(false);
+    }
+    if !enabled && !service_installed && !trickle_present {
+        return Ok(false);
+    }
+
+    emitter.begin_phase("rtc", "Real-time clock");
+
+    if enabled {
+        emitter.progress("Enabling RTC battery support");
+
+        // Disable fake-hwclock so it doesn't fight the real RTC.
+        if sentryusb_shell::run("systemctl", &["is-enabled", "fake-hwclock.service"])
+            .await
+            .map(|o| o.trim() == "enabled")
+            .unwrap_or(false)
+        {
+            emitter.progress("Disabling fake-hwclock");
+            let _ = sentryusb_shell::run("systemctl", &["stop", "fake-hwclock.service"]).await;
+            let _ = sentryusb_shell::run("systemctl", &["disable", "fake-hwclock.service"]).await;
+        }
+
+        emitter.progress("Creating sentryusb-hwclock.service");
+        std::fs::write(service_path, SENTRYUSB_HWCLOCK_SERVICE)?;
+        let _ = sentryusb_shell::run("systemctl", &["daemon-reload"]).await;
+        let _ = sentryusb_shell::run("systemctl", &["enable", "sentryusb-hwclock.service"]).await;
+
+        // Sync current system time to the RTC right now so reboots during
+        // the rest of setup have a good time source.
+        rtc_sync_systohc(emitter).await;
+
+        // Trickle charging (only relevant for rechargeable cells).
+        update_trickle_charge(&config_path, trickle, emitter)?;
+
+        emitter.progress("RTC battery support enabled");
+    } else {
+        emitter.progress("RTC battery support disabled, ensuring fake-hwclock is active");
+
+        if Path::new(service_path).exists() {
+            let _ = sentryusb_shell::run("systemctl", &["stop", "sentryusb-hwclock.service"]).await;
+            let _ = sentryusb_shell::run("systemctl", &["disable", "sentryusb-hwclock.service"]).await;
+            let _ = std::fs::remove_file(service_path);
+            let _ = sentryusb_shell::run("systemctl", &["daemon-reload"]).await;
+        }
+
+        update_trickle_charge(&config_path, false, emitter)?;
+
+        // Re-enable fake-hwclock if it was disabled.
+        if sentryusb_shell::run("systemctl", &["is-enabled", "fake-hwclock.service"])
+            .await
+            .map(|o| o.trim() == "disabled")
+            .unwrap_or(false)
+        {
+            emitter.progress("Re-enabling fake-hwclock");
+            let _ = sentryusb_shell::run("systemctl", &["enable", "fake-hwclock.service"]).await;
+        }
+
+        emitter.progress("fake-hwclock restored");
+    }
+
+    Ok(true)
+}
+
+/// External DS3231 I²C RTC — kept as a feature addition for non-Pi5 users
+/// who wire their own RTC module (the Go/bash project never had this path).
+async fn configure_rtc_ds3231(env: &SetupEnv, emitter: &SetupEmitter) -> Result<bool> {
     if !env.get_bool("RTC_BATTERY_ENABLED", false) {
         return Ok(false);
     }
@@ -356,3 +574,96 @@ pub async fn configure_rtc(env: &SetupEnv, emitter: &SetupEmitter) -> Result<boo
     std::fs::write(&config_path, format!("{}{}", config, addition))?;
     Ok(true)
 }
+
+/// Add or remove `dtparam=rtc_bbat_vchg=3000000` in config.txt.
+fn update_trickle_charge(config_path: &str, enable: bool, emitter: &SetupEmitter) -> Result<()> {
+    let content = std::fs::read_to_string(config_path).unwrap_or_default();
+    let has_active = content.lines().any(|l| l.starts_with("dtparam=rtc_bbat_vchg"));
+
+    if enable {
+        if has_active {
+            // Normalize any existing value to 3000000.
+            let new: String = content
+                .lines()
+                .map(|l| {
+                    if l.trim_start_matches('#').starts_with("dtparam=rtc_bbat_vchg") {
+                        "dtparam=rtc_bbat_vchg=3000000".to_string()
+                    } else {
+                        l.to_string()
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            std::fs::write(config_path, new + "\n")?;
+        } else {
+            emitter.progress("Enabling RTC trickle charging (3.0V)");
+            let mut new = content;
+            if !new.ends_with('\n') {
+                new.push('\n');
+            }
+            new.push_str("dtparam=rtc_bbat_vchg=3000000\n");
+            std::fs::write(config_path, new)?;
+        }
+    } else if has_active {
+        emitter.progress("Removing RTC trickle charging");
+        let kept: Vec<&str> = content
+            .lines()
+            .filter(|l| !l.starts_with("dtparam=rtc_bbat_vchg"))
+            .collect();
+        let mut new = kept.join("\n");
+        if content.ends_with('\n') {
+            new.push('\n');
+        }
+        std::fs::write(config_path, new)?;
+    }
+    Ok(())
+}
+
+/// Write current system time to the RTC via `/dev/rtc0` ioctl. Uses an
+/// embedded Python one-liner because hwclock is not on minimal images and
+/// `/sys/class/rtc/rtc0/since_epoch` is read-only on rpi-rtc.
+async fn rtc_sync_systohc(emitter: &SetupEmitter) {
+    if !Path::new("/dev/rtc0").exists() {
+        info!("RTC: /dev/rtc0 not found, skipping systohc sync");
+        return;
+    }
+    let py = r#"
+import fcntl, struct, time
+t = time.gmtime()
+# struct rtc_time: sec, min, hour, mday, mon(0-based), year-1900, wday, yday, isdst
+data = struct.pack('9i', t.tm_sec, t.tm_min, t.tm_hour, t.tm_mday, t.tm_mon-1, t.tm_year-1900, t.tm_wday, t.tm_yday, -1)
+with open('/dev/rtc0', 'wb') as f:
+    fcntl.ioctl(f.fileno(), 0x4024700a, data)  # RTC_SET_TIME
+"#;
+    match sentryusb_shell::run("python3", &["-c", py]).await {
+        Ok(_) => emitter.progress("Synced system time to RTC"),
+        Err(_) => emitter.progress("Warning: failed to sync time to RTC"),
+    }
+}
+
+const SENTRYUSB_HWCLOCK_SERVICE: &str = r#"[Unit]
+Description=SentryUSB hardware clock sync
+DefaultDependencies=no
+After=dev-rtc0.device
+Before=time-sync.target sysinit.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/bash -c '\
+  epoch=$(python3 -c "\
+import fcntl, struct, calendar, time;\
+f=open(\"/dev/rtc0\",\"rb\");\
+d=fcntl.ioctl(f.fileno(),0x80247009,b\"\\x00\"*36);\
+f.close();\
+v=struct.unpack(\"9i\",d);\
+t=time.struct_time((v[5]+1900,v[4]+1,v[3],v[2],v[1],v[0],v[6],v[7],v[8]));\
+print(int(calendar.timegm(t)))\
+" 2>/dev/null);\
+  if [ -n "$epoch" ] && [ "$epoch" -gt 1704067200 ]; then\
+    date -u -s "@$epoch" > /dev/null;\
+  fi'
+
+[Install]
+WantedBy=sysinit.target
+"#;

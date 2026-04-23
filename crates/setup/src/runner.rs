@@ -93,6 +93,14 @@ pub async fn run_full_setup(emitter: SetupEmitter) -> Result<()> {
         emitter.progress(&format!("Detected: {}", env.pi_model.display_name()));
     }
 
+    // Pre-setup sanity checks — bail out BEFORE any destructive operation
+    // if the hardware / kernel / config can't support SentryUSB. On a
+    // resume we skip re-verifying since the first pass already passed
+    // (and some checks like XFS loopback mount are expensive to repeat).
+    if !resuming {
+        crate::verify::verify_setup(&env, &emitter).await?;
+    }
+
     // WiFi regulatory (silent no-op when already set)
     configure_wifi_regulatory(&env, &emitter).await?;
 
@@ -172,6 +180,15 @@ pub async fn run_full_setup(emitter: SetupEmitter) -> Result<()> {
 
     // Avahi mDNS.
     crate::system::configure_avahi(&env, &emitter).await?;
+
+    // Snapshot automount (autofs → /tmp/snapshots). Needed before the
+    // readonly phase so /etc/auto.master.d is writable.
+    crate::automount::configure_automount(&emitter).await?;
+
+    // TeslaCam FUSE mount wiring (cttseraser). Writes /sbin/mount.ctts,
+    // fstab entry, enables user_allow_other. Must run before readonly so
+    // /etc/fstab and /etc/fuse.conf are writable.
+    crate::cttseraser_mount::configure_web_mount(&emitter).await?;
 
     // RTC.
     crate::system::configure_rtc(&env, &emitter).await?;

@@ -1,5 +1,14 @@
-// Directory scanning, GPS extraction orchestration, progress reporting.
-// Will be fully implemented in Phase 2 Task 10.
+//! Clip processor — scans the TeslaCam tree, extracts GPS, feeds the DB.
+//!
+//! Incremental save semantics match Go's processor.go:
+//!   * Each file is marked processed via `add_route` (which opens a short
+//!     transaction per clip — already durable after each call).
+//!   * A passive WAL checkpoint fires every `SAVE_EVERY` files so the
+//!     `-wal` file doesn't grow unbounded on long reprocess runs.
+//!   * Per-file errors are collected and broadcast via the WebSocket hub
+//!     so the web UI can show which clips failed and why.
+//!   * 10ms throttle between files keeps the processor from pegging a Pi
+//!     4 at 100% CPU while the car is recording.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -10,7 +19,18 @@ use tracing::{info, warn};
 
 use crate::db::DriveStore;
 use crate::extract;
-use crate::types::{ProcessingStatus, Route};
+use crate::types::ProcessingStatus;
+
+/// Fire a `PRAGMA wal_checkpoint(PASSIVE)` every N files processed. Keeps
+/// the `-wal` file bounded during long processing runs without blocking
+/// other readers/writers.
+const SAVE_EVERY: usize = 50;
+
+/// Maximum per-file error messages retained for UI display. Anything
+/// past this is counted but not individually surfaced — keeps memory
+/// bounded on pathological datasets (corrupted SD card with thousands
+/// of unreadable files).
+const MAX_ERROR_MESSAGES: usize = 200;
 
 /// Orchestrates GPS extraction from TeslaCam clip files.
 pub struct Processor {
@@ -59,14 +79,15 @@ impl Processor {
         result
     }
 
-    /// Reprocess all clip files (clear processed list first).
+    /// Reprocess all clip files. Just clears `processed_files`; routes
+    /// are upserted in place by `add_route`, so there's no need to wipe
+    /// them first (matches Go's `ClearProcessedForReprocess` behavior).
     pub async fn reprocess_all(&self) -> Result<()> {
         if self.running.swap(true, Ordering::SeqCst) {
             anyhow::bail!("processing already in progress");
         }
 
-        self.store.clear_processed()?;
-        self.store.clear_routes()?;
+        self.store.clear_processed_for_reprocess()?;
         let result = self.do_process(true).await;
         self.running.store(false, Ordering::SeqCst);
         result
@@ -93,6 +114,8 @@ impl Processor {
         let total = unprocessed.len();
         let mut routes_found: usize = 0;
         let mut files_with_gps: usize = 0;
+        let mut errors: Vec<String> = Vec::new();
+        let mut error_count: usize = 0;
         info!("found {} unprocessed clip files", total);
 
         {
@@ -115,49 +138,78 @@ impl Processor {
                 status.processed_files = i;
             }
 
-            // Extract GPS from the file
+            // Extract GPS from the file.
             let full_path = format!("{}/{}", self.clip_dir, file);
+            let date = file.split('/').next().unwrap_or("").to_string();
             match extract::extract_gps_from_file(&full_path) {
                 Ok(gps) => {
                     if !gps.points.is_empty() {
                         files_with_gps += 1;
                     }
-                    let route = Route {
-                        file: file.clone(),
-                        date: file.split('/').next().unwrap_or("").to_string(),
-                        points: gps.points,
-                        gear_states: gps.gear_states,
-                        autopilot_states: gps.autopilot_states,
-                        speeds: gps.speeds,
-                        accel_positions: gps.accel_positions,
-                        raw_park_count: gps.raw_park_count,
-                        raw_frame_count: gps.raw_frame_count,
-                        gear_runs: gps.gear_runs,
-                    };
-                    match self.store.upsert_route(&route) {
+                    // add_route both marks the file processed AND writes
+                    // the route row (with v2 aggregate columns). Single
+                    // transaction per clip — durable on return.
+                    match self.store.add_route(
+                        file,
+                        &date,
+                        &gps.points,
+                        &gps.gear_states,
+                        &gps.autopilot_states,
+                        &gps.speeds,
+                        &gps.accel_positions,
+                        gps.raw_park_count,
+                        gps.raw_frame_count,
+                        &gps.gear_runs,
+                    ) {
                         Ok(()) => routes_found += 1,
-                        Err(e) => warn!("failed to save route for {}: {}", file, e),
+                        Err(e) => {
+                            warn!("failed to save route for {}: {}", file, e);
+                            error_count += 1;
+                            if errors.len() < MAX_ERROR_MESSAGES {
+                                errors.push(format!("{}: save failed — {}", file, e));
+                            }
+                            // Still mark processed so we don't retry forever.
+                            let _ = self.store.mark_processed(file);
+                        }
                     }
                 }
                 Err(e) => {
                     warn!("failed to extract GPS from {}: {}", file, e);
+                    error_count += 1;
+                    if errors.len() < MAX_ERROR_MESSAGES {
+                        errors.push(format!("{}: extract failed — {}", file, e));
+                    }
+                    // Mark processed anyway — clip has no extractable GPS,
+                    // retrying won't change that.
+                    self.store.mark_processed(file)?;
                 }
             }
 
-            self.store.mark_processed(file)?;
-
-            // Broadcast progress every 10 files
+            // Broadcast progress every 10 files.
             if (i + 1) % 10 == 0 || i + 1 == total {
                 self.hub.broadcast("drive_process", &serde_json::json!({
                     "status": "progress",
                     "processed": i + 1,
                     "total": total,
+                    "errorCount": error_count,
                 }));
             }
 
-            // Yield to other tasks (10ms throttle like Go version)
+            // Passive WAL checkpoint every SAVE_EVERY files so the WAL
+            // doesn't grow unbounded on a long reprocess run.
+            if (i + 1) % SAVE_EVERY == 0 {
+                if let Err(e) = self.store.save() {
+                    warn!("processor WAL checkpoint failed: {}", e);
+                }
+            }
+
+            // 10 ms throttle — matches Go processor.go so we don't peg a
+            // Pi 4 while the car is still recording clips behind us.
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
+
+        // Final checkpoint on the way out.
+        let _ = self.store.save();
 
         {
             let mut status = self.status.lock().await;
@@ -172,11 +224,13 @@ impl Processor {
             "total": total,
             "routes_found": routes_found,
             "files_with_gps": files_with_gps,
+            "errorCount": error_count,
+            "errors": errors,
         }));
 
         info!(
-            "processing complete: {} files processed, {} routes found, {} with GPS",
-            total, routes_found, files_with_gps
+            "processing complete: {} files processed, {} routes found, {} with GPS, {} errors",
+            total, routes_found, files_with_gps, error_count
         );
         Ok(())
     }

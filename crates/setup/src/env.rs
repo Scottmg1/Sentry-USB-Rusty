@@ -115,9 +115,14 @@ impl SetupEnv {
         // Merging them in would make every optional phase (AP setup, extra
         // drives, etc.) run against sample defaults the user never picked.
         let config_path = sentryusb_config::find_config_path();
-        let config = sentryusb_config::parse_file(config_path)
+        let mut config = sentryusb_config::parse_file(config_path)
             .map(|(active, _commented)| active)
             .unwrap_or_default();
+
+        // Migrate legacy key names (teslausb-era lowercase, renamed
+        // settings). Copies the old value to the new key only if the new
+        // key isn't already set — so user edits to the new name always win.
+        migrate_legacy_config_keys(&mut config);
 
         let data_drive = config.get("DATA_DRIVE")
             .filter(|v| !v.is_empty())
@@ -150,6 +155,86 @@ impl SetupEnv {
     }
 }
 
+/// Mobile push credentials loaded from the JSON file the API server
+/// manages. Returned as `(device_id, device_secret)`.
+///
+/// The JSON file is the single source of truth for these values to avoid
+/// conf-file write races (the bash version was `envsetup.sh:142-150`).
+/// Returns `None` if the file doesn't exist, can't be parsed, or either
+/// field is missing.
+pub fn mobile_push_credentials() -> Option<(String, String)> {
+    let json = std::fs::read_to_string("/root/.sentryusb/notification-credentials.json").ok()?;
+    let device_id = extract_json_string(&json, "device_id")?;
+    let device_secret = extract_json_string(&json, "device_secret")?;
+    Some((device_id, device_secret))
+}
+
+/// Minimal JSON string-value extractor. Matches the bash `sed` pattern
+/// used by envsetup.sh so behavior is identical across ports — we don't
+/// need full serde here because the credentials file is a flat object
+/// written by our own API.
+fn extract_json_string(json: &str, key: &str) -> Option<String> {
+    let needle = format!("\"{}\"", key);
+    let start = json.find(&needle)?;
+    let after = &json[start + needle.len()..];
+    let colon = after.find(':')?;
+    let rest = &after[colon + 1..];
+    let quote = rest.find('"')?;
+    let value_start = quote + 1;
+    let value_end = rest[value_start..].find('"')?;
+    Some(rest[value_start..value_start + value_end].to_string())
+}
+
+/// Copy legacy config keys to their current names, matching the table in
+/// bash `envsetup.sh:62-94`. New-name wins: if the user has already set
+/// the new key, we don't overwrite it from the old one.
+fn migrate_legacy_config_keys(config: &mut std::collections::HashMap<String, String>) {
+    const LEGACY_MAP: &[(&str, &str)] = &[
+        ("archiveserver", "ARCHIVE_SERVER"),
+        ("camsize", "CAM_SIZE"),
+        ("musicsize", "MUSIC_SIZE"),
+        ("sharename", "SHARE_NAME"),
+        ("musicsharename", "MUSIC_SHARE_NAME"),
+        ("shareuser", "SHARE_USER"),
+        ("sharepassword", "SHARE_PASSWORD"),
+        ("tesla_email", "TESLA_EMAIL"),
+        ("tesla_password", "TESLA_PASSWORD"),
+        ("tesla_vin", "TESLA_VIN"),
+        ("timezone", "TIME_ZONE"),
+        ("usb_drive", "DATA_DRIVE"),
+        ("USB_DRIVE", "DATA_DRIVE"),
+        ("archivedelay", "ARCHIVE_DELAY"),
+        ("trigger_file_saved", "TRIGGER_FILE_SAVED"),
+        ("trigger_file_sentry", "TRIGGER_FILE_SENTRY"),
+        ("trigger_file_any", "TRIGGER_FILE_ANY"),
+        ("pushover_enabled", "PUSHOVER_ENABLED"),
+        ("pushover_user_key", "PUSHOVER_USER_KEY"),
+        ("pushover_app_key", "PUSHOVER_APP_KEY"),
+        ("gotify_enabled", "GOTIFY_ENABLED"),
+        ("gotify_domain", "GOTIFY_DOMAIN"),
+        ("gotify_app_token", "GOTIFY_APP_TOKEN"),
+        ("gotify_priority", "GOTIFY_PRIORITY"),
+        ("ifttt_enabled", "IFTTT_ENABLED"),
+        ("ifttt_event_name", "IFTTT_EVENT_NAME"),
+        ("ifttt_key", "IFTTT_KEY"),
+        ("sns_enabled", "SNS_ENABLED"),
+        ("aws_region", "AWS_REGION"),
+        ("aws_access_key_id", "AWS_ACCESS_KEY_ID"),
+        ("aws_secret_key", "AWS_SECRET_ACCESS_KEY"),
+        ("aws_sns_topic_arn", "AWS_SNS_TOPIC_ARN"),
+    ];
+
+    for (old, new) in LEGACY_MAP {
+        if config.contains_key(*new) {
+            continue;
+        }
+        if let Some(val) = config.get(*old).cloned() {
+            config.insert((*new).to_string(), val);
+            config.remove(*old);
+        }
+    }
+}
+
 /// Creates /sentryusb -> /boot/firmware (or /boot) if it doesn't exist.
 fn ensure_sentryusb_symlink() -> Result<()> {
     let link = Path::new("/sentryusb");
@@ -157,15 +242,15 @@ fn ensure_sentryusb_symlink() -> Result<()> {
         return Ok(());
     }
 
-    // Determine target
-    let target = if Path::new("/boot/firmware").exists() {
-        "/boot/firmware"
-    } else {
-        "/boot"
-    };
-
     #[cfg(unix)]
-    std::os::unix::fs::symlink(target, "/sentryusb")?;
+    {
+        let target = if Path::new("/boot/firmware").exists() {
+            "/boot/firmware"
+        } else {
+            "/boot"
+        };
+        std::os::unix::fs::symlink(target, "/sentryusb")?;
+    }
 
     Ok(())
 }

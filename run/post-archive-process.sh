@@ -2,6 +2,14 @@
 # Post-archive hook: process newly archived dashcam clips for GPS/drive data.
 # Called by archiveloop after archive_clips completes, before awake_stop.
 # Only runs if DRIVE_MAP_ENABLED is set to true in the config.
+#
+# Error handling: -u catches typos in variable names; -o pipefail makes
+# size-check pipelines (wc | tr) fail loudly instead of silently producing
+# empty strings that the size-guard would then treat as "0 bytes = allow".
+# We deliberately do NOT set -e: the script is structured to tolerate
+# individual curl/grep failures and continue with fallbacks, and flipping
+# that behavior would turn every transient API hiccup into a skipped sync.
+set -uo pipefail
 
 source /root/bin/envsetup.sh 2>/dev/null || true
 
@@ -14,6 +22,85 @@ LOG_FILE="${LOG_FILE:-/mutable/archiveloop.log}"
 function log() {
   echo "$(date): [drive-map] $*" >> "$LOG_FILE"
 }
+
+# --- drive-data.json archive size-guard -------------------------------------
+# Shared with the Rust server's SyncToArchive(): both update the same cache at
+# DRIVE_DATA_SYNC_CACHE so the guard stays consistent across CIFS/NFS (Rust)
+# and rsync/rclone (shell) archive backends.
+#
+# The cache holds the byte count of the last successful sync. Before each
+# sync we refuse to overwrite if the new local file is less than 50% of
+# that recorded size AND the recorded size is above 10 MB. This catches
+# the failure mode where a corrupted/empty local drive-data.json would
+# otherwise blow away a healthy archive backup.
+DRIVE_DATA_SYNC_CACHE="/mutable/.drive-data-last-sync"
+DRIVE_DATA_SYNC_MIN_THRESHOLD=$((10 * 1024 * 1024)) # 10 MB
+
+# drive_data_size_guard_ok <local_file> <destination_label>
+# Returns 0 (allow) if the sync may proceed, 1 (refuse) otherwise.
+# On refuse, logs the reason and sends a mobile notification.
+function drive_data_size_guard_ok() {
+  local local_file="$1"
+  local dest_label="$2"
+
+  if [ ! -f "$local_file" ]; then
+    # Nothing to sync; caller will no-op. Let it through.
+    return 0
+  fi
+
+  local new_size
+  new_size=$(wc -c < "$local_file" 2>/dev/null | tr -d ' ')
+  new_size=${new_size:-0}
+
+  local last_size=0
+  if [ -f "$DRIVE_DATA_SYNC_CACHE" ]; then
+    last_size=$(cat "$DRIVE_DATA_SYNC_CACHE" 2>/dev/null | tr -d ' \n')
+    # Require non-empty, digits only — fail open on corrupt cache.
+    if ! [[ "$last_size" =~ ^[0-9]+$ ]]; then
+      last_size=0
+    fi
+  fi
+
+  # No baseline → allow (first-ever sync, or cache corrupted/missing).
+  if [ "$last_size" -le 0 ]; then
+    return 0
+  fi
+  # Tiny baseline → allow (nothing big to protect yet).
+  if [ "$last_size" -lt "$DRIVE_DATA_SYNC_MIN_THRESHOLD" ]; then
+    return 0
+  fi
+  # new >= last/2 → allow (integer math; boundary matches Rust-side).
+  local half=$((last_size / 2))
+  if [ "$new_size" -ge "$half" ]; then
+    return 0
+  fi
+
+  log "SIZE GUARD: refusing ${dest_label} sync — new=${new_size} bytes < 50% of last-good=${last_size} bytes. Local file may be corrupted; archive preserved."
+  if [ -x /root/bin/send-push-message ]; then
+    /root/bin/send-push-message "${NOTIFICATION_TITLE:-SentryUSB}:" \
+      "Drive data sync blocked — local file shrunk to $((new_size / 1024 / 1024)) MB from $((last_size / 1024 / 1024)) MB. Archive backup preserved. Check /mutable/drive-data.json." \
+      warning drives > /dev/null 2>&1 || true
+  fi
+  return 1
+}
+
+# update_drive_data_sync_cache <local_file>
+# Record the byte size of local_file as the new baseline, atomically.
+# Called after every successful sync (Rust-side writes the same file).
+function update_drive_data_sync_cache() {
+  local local_file="$1"
+  if [ ! -f "$local_file" ]; then
+    return 0
+  fi
+  local size
+  size=$(wc -c < "$local_file" 2>/dev/null | tr -d ' ')
+  size=${size:-0}
+  local tmp="${DRIVE_DATA_SYNC_CACHE}.tmp"
+  if echo -n "$size" > "$tmp" 2>/dev/null; then
+    mv -f "$tmp" "$DRIVE_DATA_SYNC_CACHE" 2>/dev/null || rm -f "$tmp"
+  fi
+}
+# ----------------------------------------------------------------------------
 
 # Find the SentryUSB API port
 SENTRYUSB_PORT="${SENTRYUSB_PORT:-80}"
@@ -156,29 +243,57 @@ if [ -x /root/bin/archive-is-reachable.sh ]; then
   fi
 fi
 
+# Regenerate /mutable/drive-data.json from the SQLite store before any
+# remote sync. Post-SQLite-migration the live store is /mutable/drive-data.db
+# and the JSON file is rebuilt on demand for archive consumers (Sentry
+# Studio reads the archive-side JSON copy).
+#
+# On older binaries that don't yet expose /api/drives/data/export-for-sync
+# this is a no-op (curl returns non-zero) and the rsync/rclone blocks
+# below ship whatever JSON is on disk, same as before.
+if [ "$ARCHIVE_REACHABLE" = "true" ] && { [ -n "${RSYNC_SERVER:-}" ] || [ -n "${RCLONE_DRIVE:-}" ]; }; then
+  log "Regenerating drive-data.json mirror for archive sync..."
+  EXPORT_RESULT=$(curl -sf -X POST "${API_URL}/api/drives/data/export-for-sync" 2>/dev/null)
+  if [ $? -eq 0 ]; then
+    EXPORT_BYTES=$(echo "$EXPORT_RESULT" | grep -o '"bytes":[0-9]*' | cut -d: -f2)
+    log "Regenerated drive-data.json mirror (${EXPORT_BYTES:-?} bytes)."
+  else
+    log "Note: export-for-sync endpoint unavailable; shipping existing /mutable/drive-data.json (pre-SQLite binary?)."
+  fi
+fi
+
 # Sync drive-data.json to the rsync archive server.
-# For CIFS/NFS archive types, the Go server's SyncToArchive() handles this
+# For CIFS/NFS archive types, the Rust server's SyncToArchive() handles this
 # while /mnt/archive is still mounted.  For rsync archive there is no local
 # mount, so SyncToArchive() silently skips — we handle it here instead.
+#
+# Size-guard: refuse if local file is dramatically smaller than the last
+# successful sync (see drive_data_size_guard_ok above).
 if [ "$ARCHIVE_REACHABLE" = "true" ] && [ -n "${RSYNC_SERVER:-}" ] && [ -n "${RSYNC_USER:-}" ] && [ -f /mutable/drive-data.json ]; then
-  log "Syncing drive-data.json to rsync archive..."
-  if rsync -avh --no-perms --omit-dir-times --timeout=60 \
-      /mutable/drive-data.json \
-      "$RSYNC_USER@$RSYNC_SERVER:${RSYNC_PATH}/drive-data.json" > /dev/null 2>&1; then
-    log "Synced drive-data.json to archive ($(wc -c < /mutable/drive-data.json) bytes)."
-  else
-    log "Warning: failed to sync drive-data.json to rsync archive."
+  if drive_data_size_guard_ok /mutable/drive-data.json "rsync archive"; then
+    log "Syncing drive-data.json to rsync archive..."
+    if rsync -avh --no-perms --omit-dir-times --timeout=60 \
+        /mutable/drive-data.json \
+        "$RSYNC_USER@$RSYNC_SERVER:${RSYNC_PATH}/drive-data.json" > /dev/null 2>&1; then
+      log "Synced drive-data.json to archive ($(wc -c < /mutable/drive-data.json) bytes)."
+      update_drive_data_sync_cache /mutable/drive-data.json
+    else
+      log "Warning: failed to sync drive-data.json to rsync archive."
+    fi
   fi
 fi
 
 # For rclone archive (no local mount; rclone pushes directly to cloud storage).
 if [ "$ARCHIVE_REACHABLE" = "true" ] && [ -n "${RCLONE_DRIVE:-}" ] && [ -f /mutable/drive-data.json ]; then
-  log "Syncing drive-data.json to rclone archive..."
-  if rclone --config /root/.config/rclone/rclone.conf copy \
-      /mutable/drive-data.json "$RCLONE_DRIVE:${RCLONE_PATH}/drive-data.json" > /dev/null 2>&1; then
-    log "Synced drive-data.json to rclone archive ($(wc -c < /mutable/drive-data.json) bytes)."
-  else
-    log "Warning: failed to sync drive-data.json to rclone archive."
+  if drive_data_size_guard_ok /mutable/drive-data.json "rclone archive"; then
+    log "Syncing drive-data.json to rclone archive..."
+    if rclone --config /root/.config/rclone/rclone.conf copy \
+        /mutable/drive-data.json "$RCLONE_DRIVE:${RCLONE_PATH}/drive-data.json" > /dev/null 2>&1; then
+      log "Synced drive-data.json to rclone archive ($(wc -c < /mutable/drive-data.json) bytes)."
+      update_drive_data_sync_cache /mutable/drive-data.json
+    else
+      log "Warning: failed to sync drive-data.json to rclone archive."
+    fi
   fi
 fi
 

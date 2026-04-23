@@ -154,7 +154,7 @@ pub async fn all_routes(
 pub async fn list_tags(
     State(state): State<AppState>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    match state.drives.store.get_all_tags() {
+    match state.drives.store.get_all_tag_names() {
         Ok(tags) => (StatusCode::OK, Json(serde_json::to_value(tags).unwrap_or_default())),
         Err(e) => crate::json_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
     }
@@ -247,7 +247,7 @@ pub async fn reprocess_all(
 pub async fn drive_stats(
     State(state): State<AppState>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    let processed_count = state.drives.store.processed_count().unwrap_or(0);
+    let processed_count = state.drives.store.processed_count();
     match state.drives.store.with_routes(|routes| {
         grouper::compute_aggregate_stats(routes)
     }) {
@@ -297,7 +297,7 @@ pub async fn download_data(
 ) -> (StatusCode, Json<serde_json::Value>) {
     // Export as JSON for compatibility
     let tmp = "/tmp/drive-data-export.json";
-    match sentryusb_drives::json_compat::export_json(&state.drives.store, tmp) {
+    match state.drives.store.export_json_to_file(tmp) {
         Ok(()) => {
             match std::fs::read_to_string(tmp) {
                 Ok(data) => match serde_json::from_str::<serde_json::Value>(&data) {
@@ -387,7 +387,7 @@ pub async fn upload_data(
     let store = state.drives.store.clone();
     let importing = state.drives.importing.clone();
     let result = tokio::task::spawn_blocking(move || {
-        let res = sentryusb_drives::json_compat::import_json(tmp, &store);
+        let res = store.import_json_file(tmp);
         importing.store(false, Ordering::SeqCst);
         res
     })
@@ -397,7 +397,15 @@ pub async fn upload_data(
     let _ = std::fs::remove_file(tmp);
 
     match result {
-        Ok(Ok(count)) => (StatusCode::OK, Json(serde_json::json!({"imported": count}))),
+        Ok(Ok(stats)) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "imported": stats.routes,
+                "routes": stats.routes,
+                "processedFiles": stats.processed_files,
+                "driveTags": stats.drive_tags,
+            })),
+        ),
         Ok(Err(e)) => crate::json_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
         Err(e) => crate::json_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
     }
@@ -409,7 +417,7 @@ pub async fn set_drive_tags(
     Path(id): Path<String>,
     Json(body): Json<SetTagsRequest>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    match state.drives.store.set_tags(&id, &body.tags) {
+    match state.drives.store.set_drive_tags(&id, &body.tags) {
         Ok(()) => crate::json_ok(),
         Err(e) => crate::json_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
     }

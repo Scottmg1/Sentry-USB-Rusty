@@ -65,6 +65,93 @@ const DISABLE_GADGET: &str = r#"#!/bin/bash -eu
 sentryusb gadget disable "$@"
 "#;
 
+/// autofs map script for `/tmp/snapshots` — resolves snap-NNN names to the
+/// right disk image + fstype for on-demand read-only mounts.
+const AUTO_SENTRYUSB: &str = r#"#!/bin/dash
+
+diskimage="/backingfiles/snapshots/$1/snap.bin"
+mountpoint="/backingfiles/snapshots/$1/mnt"
+optfile="${diskimage}.opts"
+
+case $1 in
+  snap-*)
+    ;;
+  *)
+    exit 1
+    ;;
+esac
+
+if [ ! -r "$diskimage" ]
+then
+  /root/bin/release_snapshot.sh "$1"
+  exit 1
+fi
+
+if [ ! -L "$mountpoint" ] && [ -d "$mountpoint" ]
+then
+  rmdir "$mountpoint"
+  ln -s "/tmp/snapshots/$1" "$mountpoint"
+fi
+
+if [ ! -f "$optfile" ]
+then
+  rm -rf "$optfile"
+  /root/bin/mountoptsforimage "${diskimage}" | {
+    read -r fstype opts
+    echo "-fstype=${fstype},ro,${opts} :${diskimage}" > "$optfile"
+  }
+fi
+
+cat "$optfile"
+"#;
+
+/// autofs map script for `/var/www/html/fs` — resolves Music/LightShow/Boombox
+/// to the corresponding backing disk image with an rw mount.
+const AUTO_WWW: &str = r#"#!/bin/dash
+
+case "$1" in
+  Music)
+    diskimage="/backingfiles/music_disk.bin"
+    ;;
+  LightShow)
+    diskimage="/backingfiles/lightshow_disk.bin"
+    ;;
+  Boombox)
+    diskimage="/backingfiles/boombox_disk.bin"
+    ;;
+  *)
+    exit 1
+    ;;
+esac
+
+optfile="${diskimage}.opts"
+
+if [ ! -r "$diskimage" ]
+then
+  exit 1
+fi
+
+if [ -f "$optfile" ] && [ "$diskimage" -nt "$optfile" ]
+then
+  rm -f "$optfile"
+fi
+
+if [ ! -f "$optfile" ]
+then
+  rm -rf "$optfile"
+  /root/bin/mountoptsforimage "${diskimage}" | {
+    read -r fstype opts
+    if [ -z "$fstype" ]
+    then
+      exit 1
+    fi
+    echo "-fstype=${fstype},rw,${opts} :${diskimage}" > "$optfile"
+  }
+fi
+
+cat "$optfile"
+"#;
+
 /// Install all runtime helper scripts to /root/bin/.
 ///
 /// Only announces a phase if at least one script is missing or has changed —
@@ -82,6 +169,8 @@ pub async fn install_runtime_scripts(emitter: &crate::SetupEmitter) -> Result<bo
         ("force_sync.sh", FORCE_SYNC),
         ("enable_gadget.sh", ENABLE_GADGET),
         ("disable_gadget.sh", DISABLE_GADGET),
+        ("auto.sentryusb", AUTO_SENTRYUSB),
+        ("auto.www", AUTO_WWW),
     ];
 
     // Skip the phase entirely if every script is already present and
