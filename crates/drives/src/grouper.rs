@@ -139,12 +139,20 @@ pub fn fsd_analytics_from_summaries(summaries: &[RouteSummary]) -> FsdAnalytics 
     build_fsd_analytics(&drives, "week")
 }
 
-/// Resolve a drive id (numeric index or start-time string) to the set of
-/// file paths whose clips make up that drive. Used by `single_drive` to
-/// scope the full-BLOB decode to just the clips in the requested drive
-/// rather than the whole store. Returns `None` if the id doesn't match
-/// any drive.
-pub fn find_drive_files(summaries: &[RouteSummary], id: &str) -> Option<Vec<String>> {
+/// Resolve a drive id (numeric index or start-time string) to the
+/// summary-path index **and** the file list that makes up that drive.
+/// Used by `single_drive` to scope the full-BLOB decode to just the
+/// clips in the requested drive rather than the whole store.
+///
+/// Returning both is load-bearing: the handler needs the numeric index
+/// to stamp onto the resulting `Drive.id` so the UI's subsequent
+/// `/api/drives/:id/*` calls keep lining up, and it needs the file
+/// list for the targeted BLOB fetch. Returns `None` if the id doesn't
+/// match any drive.
+pub fn find_drive_files(
+    summaries: &[RouteSummary],
+    id: &str,
+) -> Option<(usize, Vec<String>)> {
     let groups = group_summary_clips(summaries);
 
     let pick = |idx: usize| -> Vec<String> {
@@ -156,7 +164,7 @@ pub fn find_drive_files(summaries: &[RouteSummary], id: &str) -> Option<Vec<Stri
 
     if let Ok(idx) = id.parse::<usize>() {
         if idx < groups.len() {
-            return Some(pick(idx));
+            return Some((idx, pick(idx)));
         }
     }
     for (idx, group) in groups.iter().enumerate() {
@@ -168,10 +176,45 @@ pub fn find_drive_files(summaries: &[RouteSummary], id: &str) -> Option<Vec<Stri
             .format("%Y-%m-%dT%H:%M:%S")
             .to_string();
         if st == id {
-            return Some(pick(idx));
+            return Some((idx, pick(idx)));
         }
     }
     None
+}
+
+/// Build a full `Drive` (with all merged point data, gear/FSD arrays,
+/// and FSD events) from a slice of routes that are **already known to
+/// belong to a single drive**. Skips `group_clips` entirely so the
+/// caller can scope the expensive BLOB decode via the summary path
+/// without paying the cost to re-run the full grouper against the
+/// whole store.
+///
+/// `idx` is the drive's numeric index in the summary-path global list
+/// — stamped onto `Drive.id` so the frontend's subsequent per-drive
+/// calls line up.
+pub fn build_single_drive_from_clips(
+    routes: &[Route],
+    idx: i32,
+    tags: &HashMap<String, Vec<String>>,
+) -> Option<Drive> {
+    if routes.is_empty() {
+        return None;
+    }
+
+    let mut timed: Vec<TimedRoute> = routes
+        .iter()
+        .filter_map(|r| {
+            parse_file_timestamp(&r.file).map(|ts| TimedRoute {
+                route: r.clone(),
+                timestamp: ts,
+            })
+        })
+        .collect();
+    if timed.is_empty() {
+        return None;
+    }
+    timed.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
+    Some(build_drive_stats(&timed, idx, tags))
 }
 
 // ---------------------------------------------------------------------------

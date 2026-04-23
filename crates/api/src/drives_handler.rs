@@ -146,19 +146,28 @@ pub async fn single_drive(
 ) -> (StatusCode, Json<serde_json::Value>) {
     let tags = state.drives.store.get_all_drive_tags().unwrap_or_default();
 
-    let files = match state
+    let (idx, files) = match state
         .drives
         .store
         .with_route_summaries(|summaries| grouper::find_drive_files(summaries, &id))
     {
-        Ok(Some(f)) => f,
+        Ok(Some((i, f))) => (i, f),
         Ok(None) => return crate::json_error(StatusCode::NOT_FOUND, "drive not found"),
         Err(e) => return crate::json_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
     };
 
     let file_refs: Vec<&str> = files.iter().map(|s| s.as_str()).collect();
+    // Use the `_from_clips` builder that skips `group_clips` — the
+    // routes we just fetched are already scoped to this one drive via
+    // the summary-path lookup. Re-grouping them would either produce
+    // no match for the requested id (only one group, at index 0) or
+    // split the drive at an internal park gap that the summary path
+    // didn't. Either way the old `build_single_drive` returned None
+    // on the narrowed set, which the frontend rendered as a 404 body
+    // being mis-assigned to `selectedDrive` — which then crashed at
+    // `selectedDrive.points.reduce(...)`.
     match state.drives.store.with_routes_by_files(&file_refs, |routes| {
-        grouper::build_single_drive(routes, &id, &tags)
+        grouper::build_single_drive_from_clips(routes, idx as i32, &tags)
     }) {
         Ok(Some(drive)) => (StatusCode::OK, Json(serde_json::to_value(drive).unwrap_or_default())),
         Ok(None) => crate::json_error(StatusCode::NOT_FOUND, "drive not found"),
