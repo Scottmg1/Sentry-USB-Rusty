@@ -37,7 +37,12 @@ pub fn make_emitter(
             let _ = writeln!(f, "{}", stamped);
         }
         info!("[setup] {}", msg);
-        progress_extra(msg);
+        // Forward the *stamped* line so the WebSocket-delivered log
+        // matches the on-disk format byte-for-byte. Without this the
+        // frontend would see a raw message land via WS and then the
+        // 2s HTTP poll would replace it with the stamped version,
+        // causing a visible flicker on every new line.
+        progress_extra(&stamped);
     };
     let phase = move |id: &str, label: &str| {
         let line = serde_json::json!({"id": id, "label": label}).to_string();

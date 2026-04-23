@@ -89,7 +89,13 @@ export function SetupProgress({ complete, phase = "running" }: SetupProgressProp
   const prevLenRef = useRef(0)
   const lastChangeRef = useRef(Date.now())
 
-  // Poll setup log
+  // Poll setup log as a fallback / catch-up mechanism only. Real-time log
+  // lines arrive via the `setup_progress` WebSocket event in the next
+  // effect — polling alone used to be the only source, which meant the
+  // UI could be up to 3 seconds behind reality and the Pi would reboot
+  // before the "Rebooting..." line ever showed up. The poll still
+  // matters for (a) seeding on mount, (b) catching up after the server
+  // disappears during a reboot.
   useEffect(() => {
     if (complete) return
     let cancelled = false
@@ -105,7 +111,7 @@ export function SetupProgress({ complete, phase = "running" }: SetupProgressProp
       }
     }
     poll()
-    const id = setInterval(poll, 3000)
+    const id = setInterval(poll, 2000)
     return () => { cancelled = true; clearInterval(id) }
   }, [complete])
 
@@ -158,6 +164,19 @@ export function SetupProgress({ complete, phase = "running" }: SetupProgressProp
               setPhases((prev) => {
                 if (prev.some((p) => p.id === id)) return prev
                 return [...prev, { id, label }]
+              })
+            } else if (msg.type === "setup_progress") {
+              // Live log append — the backend broadcasts this for every
+              // `emitter.progress()` call, so lines land here well before
+              // the 2s HTTP poll would pick them up. The next poll will
+              // authoritative-rewrite the whole list, which papers over
+              // any transient duplicate if the line is already in our
+              // array from a previous poll.
+              const text: string = msg.data?.message ?? ""
+              if (!text) return
+              setLogLines((prev) => {
+                if (prev.length > 0 && prev[prev.length - 1] === text) return prev
+                return [...prev, text]
               })
             }
           } catch { /* ignore */ }

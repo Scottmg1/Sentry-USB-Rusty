@@ -1,4 +1,4 @@
-import { useState } from "react"
+import { useEffect, useState } from "react"
 import { Archive, Loader2, CheckCircle, XCircle, HardDrive, Save } from "lucide-react"
 import type { StepProps } from "../SetupWizard"
 import { SecretInput } from "../SecretInput"
@@ -66,7 +66,38 @@ function Field({
 export function ArchiveStep({ data, onChange }: StepProps) {
   const system = data.ARCHIVE_SYSTEM ?? "cifs"
   const [testing, setTesting] = useState(false)
+  const [testStage, setTestStage] = useState<string | null>(null)
   const [testResult, setTestResult] = useState<{ success: boolean; error?: string } | null>(null)
+
+  // Backend broadcasts `archive_test_status` for the long-running stages of
+  // Test Connection — specifically the on-demand `apt-get install` of
+  // nfs-common / cifs-utils when the userspace mount helper is missing.
+  // Without this, the button just sits on "Testing..." for up to 4 minutes
+  // (apt can wait on the dpkg frontend lock if setup is concurrently
+  // running) with no indication of what's actually happening.
+  useEffect(() => {
+    if (!testing) return
+    let ws: WebSocket | null = null
+    let cancelled = false
+    try {
+      const protocol = window.location.protocol === "https:" ? "wss:" : "ws:"
+      ws = new WebSocket(`${protocol}//${window.location.host}/api/ws`)
+      ws.onmessage = (event) => {
+        if (cancelled) return
+        try {
+          const msg = JSON.parse(event.data)
+          if (msg.type !== "archive_test_status") return
+          const d = msg.data ?? {}
+          if (d.stage === "installing") {
+            setTestStage(`Installing ${d.package ?? "package"}...`)
+          } else if (d.stage === "testing") {
+            setTestStage("Probing mount...")
+          }
+        } catch { /* ignore */ }
+      }
+    } catch { /* ws unavailable — button stays on "Testing..." */ }
+    return () => { cancelled = true; ws?.close() }
+  }, [testing])
 
   function req(field: string, systems: string[]): boolean {
     return systems.includes(system) && !data[field]?.trim()
@@ -83,6 +114,7 @@ export function ArchiveStep({ data, onChange }: StepProps) {
 
   async function handleTest() {
     setTesting(true)
+    setTestStage(null)
     setTestResult(null)
     try {
       const res = await fetch("/api/setup/test-archive", {
@@ -96,6 +128,7 @@ export function ArchiveStep({ data, onChange }: StepProps) {
       setTestResult({ success: false, error: "Unable to connect to device" })
     }
     setTesting(false)
+    setTestStage(null)
   }
 
   return (
@@ -189,7 +222,7 @@ export function ArchiveStep({ data, onChange }: StepProps) {
             {testing ? (
               <>
                 <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                Testing...
+                {testStage ?? "Testing..."}
               </>
             ) : (
               "Test Connection"

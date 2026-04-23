@@ -176,7 +176,7 @@ pub async fn run_setup(State(s): State<AppState>) -> (StatusCode, Json<serde_jso
 /// Mirrors `server/api/setup.go:testArchive` — an actual mount/connect probe,
 /// not just a ping.
 pub async fn test_archive(
-    State(_s): State<AppState>,
+    State(s): State<AppState>,
     Json(params): Json<std::collections::HashMap<String, String>>,
 ) -> (StatusCode, Json<serde_json::Value>) {
     let system = params
@@ -197,16 +197,39 @@ pub async fn test_archive(
     //   "NFS: mount program didn't pass remote address. fsconfig() failed"
     // so we install the helper on demand before running the mount test.
     // Idempotent: apt-get skips already-installed packages quickly.
-    async fn ensure_mount_helper(pkg: &str, helper_path: &str) -> Result<(), String> {
+    //
+    // Runs in a single request: the frontend's fetch awaits this whole
+    // flow, so the "Testing..." spinner stays up through install +
+    // mount probe. We also broadcast `archive_test_status` so the UI can
+    // show a more specific label ("Installing nfs-common...") instead of
+    // leaving the user wondering what's taking so long.
+    async fn ensure_mount_helper(
+        hub: &sentryusb_ws::Hub,
+        pkg: &str,
+        helper_path: &str,
+    ) -> Result<(), String> {
         if std::path::Path::new(helper_path).exists() {
             return Ok(());
         }
-        // `apt-get install` is interactive-ish; give it a generous window
-        // but bail cleanly if there's no network / repos are broken.
+        hub.broadcast(
+            "archive_test_status",
+            &serde_json::json!({ "stage": "installing", "package": pkg }),
+        );
+        // `DPkg::Lock::Timeout` tells apt to wait up to N seconds for
+        // the dpkg frontend lock instead of failing immediately. The
+        // common collision is the setup wizard's own
+        // install_required_packages phase holding the lock when the
+        // user clicks "Test connection" in the Archive step — both
+        // are legitimate apt invocations racing for the same lock.
+        // Shell timeout is a little higher than the apt wait so a
+        // pathological hang surfaces cleanly.
         sentryusb_shell::run_with_timeout(
-            std::time::Duration::from_secs(120),
+            std::time::Duration::from_secs(240),
             "apt-get",
-            &["install", "-y", "--no-install-recommends", pkg],
+            &[
+                "-o", "DPkg::Lock::Timeout=180",
+                "install", "-y", "--no-install-recommends", pkg,
+            ],
         )
         .await
         .map(|_| ())
@@ -224,9 +247,13 @@ pub async fn test_archive(
             if server.is_empty() || share.is_empty() || user.is_empty() || pass.is_empty() {
                 return crate::json_error(StatusCode::BAD_REQUEST, "Missing required CIFS fields");
             }
-            if let Err(e) = ensure_mount_helper("cifs-utils", "/sbin/mount.cifs").await {
+            if let Err(e) = ensure_mount_helper(&s.hub, "cifs-utils", "/sbin/mount.cifs").await {
                 return crate::json_error(StatusCode::INTERNAL_SERVER_ERROR, &e);
             }
+            s.hub.broadcast(
+                "archive_test_status",
+                &serde_json::json!({ "stage": "testing" }),
+            );
             let _ = std::fs::create_dir_all(tmp_dir);
             let mut opts = format!("username={},password={},iocharset=utf8", user, pass);
             if !domain.is_empty() {
@@ -283,9 +310,13 @@ pub async fn test_archive(
             if server.is_empty() || export.is_empty() {
                 return crate::json_error(StatusCode::BAD_REQUEST, "Missing required NFS fields");
             }
-            if let Err(e) = ensure_mount_helper("nfs-common", "/sbin/mount.nfs").await {
+            if let Err(e) = ensure_mount_helper(&s.hub, "nfs-common", "/sbin/mount.nfs").await {
                 return crate::json_error(StatusCode::INTERNAL_SERVER_ERROR, &e);
             }
+            s.hub.broadcast(
+                "archive_test_status",
+                &serde_json::json!({ "stage": "testing" }),
+            );
             let _ = std::fs::create_dir_all(tmp_dir);
             let src = format!("{}:{}", server, export);
             let res = sentryusb_shell::run_with_timeout(

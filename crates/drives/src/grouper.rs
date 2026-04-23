@@ -92,6 +92,89 @@ pub fn route_overviews(routes: &[Route], max_points_per_drive: usize) -> Vec<Rou
 }
 
 // ---------------------------------------------------------------------------
+// Public API — summary-based, no point BLOBs
+//
+// These drive the Drives list / stats / FSD-analytics endpoints using
+// `RouteSummary` rows (metadata + pre-computed per-clip aggregate columns).
+// The `Route`-taking versions above re-walk every point in the store on
+// every request (~300 MB on a 5500-clip DB); these trade bit-for-bit
+// numerical parity for a 50–100× drop in heap by trusting the aggregates
+// that `compute_route_aggregates` populated on insert.
+//
+// The aggregates were computed with the same null-island + GPS-teleport
+// filters the live path uses, so for any drive whose clips have clean GPS
+// the numbers match. Dirty GPS is where the paths can drift by fractions
+// of a percent on distance-derived fields — invisible after the UI's
+// 0.1-mi / whole-percent rounding.
+// ---------------------------------------------------------------------------
+
+/// BLOB-free analogue of [`group_summaries`]. Builds the same
+/// `DriveSummary` list for the Drives page by summing each clip's
+/// pre-computed aggregate columns instead of re-walking their point
+/// arrays.
+pub fn group_summaries_fast(
+    summaries: &[RouteSummary],
+    tags: &HashMap<String, Vec<String>>,
+) -> Vec<DriveSummary> {
+    let groups = group_summary_clips(summaries);
+    groups
+        .iter()
+        .enumerate()
+        .map(|(idx, clips)| build_summary_from_aggregates(clips, idx, tags))
+        .collect()
+}
+
+/// BLOB-free analogue of [`compute_aggregate_stats`].
+pub fn compute_aggregate_stats_from_summaries(
+    summaries: &[RouteSummary],
+) -> AggregateStats {
+    compute_aggregate_stats_summary_impl(summaries)
+}
+
+/// BLOB-free analogue of [`fsd_analytics`]. Builds the DriveSummary list
+/// via `group_summaries_fast` and runs the existing analytics aggregator.
+pub fn fsd_analytics_from_summaries(summaries: &[RouteSummary]) -> FsdAnalytics {
+    let empty_tags = HashMap::new();
+    let drives = group_summaries_fast(summaries, &empty_tags);
+    build_fsd_analytics(&drives, "week")
+}
+
+/// Resolve a drive id (numeric index or start-time string) to the set of
+/// file paths whose clips make up that drive. Used by `single_drive` to
+/// scope the full-BLOB decode to just the clips in the requested drive
+/// rather than the whole store. Returns `None` if the id doesn't match
+/// any drive.
+pub fn find_drive_files(summaries: &[RouteSummary], id: &str) -> Option<Vec<String>> {
+    let groups = group_summary_clips(summaries);
+
+    let pick = |idx: usize| -> Vec<String> {
+        groups[idx]
+            .iter()
+            .map(|c| c.summary.file.clone())
+            .collect()
+    };
+
+    if let Ok(idx) = id.parse::<usize>() {
+        if idx < groups.len() {
+            return Some(pick(idx));
+        }
+    }
+    for (idx, group) in groups.iter().enumerate() {
+        if group.is_empty() {
+            continue;
+        }
+        let st = group[0]
+            .timestamp
+            .format("%Y-%m-%dT%H:%M:%S")
+            .to_string();
+        if st == id {
+            return Some(pick(idx));
+        }
+    }
+    None
+}
+
+// ---------------------------------------------------------------------------
 // Internal: clip grouping
 // ---------------------------------------------------------------------------
 
@@ -1824,6 +1907,336 @@ impl Route {
             gear_runs: Vec::new(),
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Summary-based internals (no point data)
+// ---------------------------------------------------------------------------
+
+/// A `RouteSummary` tagged with its parsed filename timestamp, used as the
+/// working item for the summary-side grouper. Borrows to avoid cloning
+/// the gear_runs vec.
+struct TimedSummary<'a> {
+    summary: &'a RouteSummary,
+    timestamp: NaiveDateTime,
+}
+
+/// Dedup by normalised path, parse timestamps, sort, split on 5-minute
+/// gaps, and split within clips at long Park periods. Mirrors
+/// `group_clips` but operates on summary rows that don't carry point
+/// arrays. See module-level comment for the accuracy contract.
+fn group_summary_clips<'a>(summaries: &'a [RouteSummary]) -> Vec<Vec<TimedSummary<'a>>> {
+    if summaries.is_empty() {
+        return Vec::new();
+    }
+
+    let mut seen = HashMap::with_capacity(summaries.len());
+    let mut unique: Vec<&RouteSummary> = Vec::with_capacity(summaries.len());
+    for s in summaries {
+        let norm = s.file.replace('\\', "/");
+        if seen.insert(norm, ()).is_none() {
+            unique.push(s);
+        }
+    }
+
+    let mut timed: Vec<TimedSummary> = unique
+        .into_iter()
+        .filter_map(|s| {
+            let ts = parse_file_timestamp(&s.file)?;
+            Some(TimedSummary { summary: s, timestamp: ts })
+        })
+        .collect();
+    if timed.is_empty() {
+        return Vec::new();
+    }
+    timed.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
+
+    // Time-gap split.
+    let mut time_groups: Vec<Vec<TimedSummary>> = Vec::new();
+    let mut current = vec![timed.remove(0)];
+    for tr in timed {
+        let gap_ms = (tr.timestamp - current.last().unwrap().timestamp).num_milliseconds();
+        if gap_ms > DRIVE_GAP_MS {
+            time_groups.push(std::mem::take(&mut current));
+        }
+        current.push(tr);
+    }
+    if !current.is_empty() {
+        time_groups.push(current);
+    }
+
+    // Gear-state split.
+    let mut groups = Vec::new();
+    for tg in time_groups {
+        let mut splits = split_summary_by_gear_state(tg);
+        groups.append(&mut splits);
+    }
+    groups
+}
+
+/// Summary-side equivalent of `split_by_gear_state`. Since we can't chop
+/// point arrays, any clip that contains an internal long-Park run ends
+/// the current drive after its aggregates are added — the entire clip's
+/// per-clip aggregates stay with whichever drive it started in. This is
+/// the fractions-of-a-percent divergence flagged in the module header.
+fn split_summary_by_gear_state<'a>(
+    group: Vec<TimedSummary<'a>>,
+) -> Vec<Vec<TimedSummary<'a>>> {
+    if group.is_empty() {
+        return Vec::new();
+    }
+
+    let has_gear_runs = group.iter().any(|c| !c.summary.gear_runs.is_empty());
+    if !has_gear_runs {
+        return split_summary_by_gear_state_legacy(group);
+    }
+
+    let mut result: Vec<Vec<TimedSummary<'a>>> = Vec::new();
+    let mut current: Vec<TimedSummary<'a>> = Vec::new();
+
+    for clip in group {
+        let total_frames: u32 = clip.summary.gear_runs.iter().map(|r| r.frames).sum();
+        let has_park_gap = if total_frames > 0 {
+            let spf = 60.0 / total_frames as f64;
+            clip.summary.gear_runs.iter().any(|r| {
+                r.gear == GEAR_PARK
+                    && (r.frames as f64 * spf) >= PARK_GAP_SECONDS
+                    && r.frames < total_frames // park-gap must be *internal* to split
+            })
+        } else {
+            false
+        };
+
+        // Whole-clip park (all frames parked) → clip is itself a boundary;
+        // attach it to nothing and close out the current drive.
+        let all_parked = total_frames > 0
+            && clip
+                .summary
+                .gear_runs
+                .iter()
+                .filter(|r| r.gear == GEAR_PARK)
+                .map(|r| r.frames)
+                .sum::<u32>()
+                == total_frames;
+
+        if all_parked {
+            if !current.is_empty() {
+                result.push(std::mem::take(&mut current));
+            }
+            continue;
+        }
+
+        current.push(clip);
+
+        if has_park_gap && !current.is_empty() {
+            result.push(std::mem::take(&mut current));
+        }
+    }
+    if !current.is_empty() {
+        result.push(current);
+    }
+    if result.is_empty() {
+        // All clips were parked — return nothing so drives_count stays 0.
+        return Vec::new();
+    }
+    result
+}
+
+fn split_summary_by_gear_state_legacy<'a>(
+    group: Vec<TimedSummary<'a>>,
+) -> Vec<Vec<TimedSummary<'a>>> {
+    if group.len() <= 1 {
+        return vec![group];
+    }
+    let mut result: Vec<Vec<TimedSummary<'a>>> = Vec::new();
+    let mut current: Vec<TimedSummary<'a>> = Vec::new();
+    for clip in group {
+        let mostly_park = if clip.summary.raw_frame_count > 0 {
+            (clip.summary.raw_park_count as f64 / clip.summary.raw_frame_count as f64) > 0.5
+        } else {
+            false
+        };
+        if mostly_park {
+            if !current.is_empty() {
+                result.push(std::mem::take(&mut current));
+            }
+        } else {
+            current.push(clip);
+        }
+    }
+    if !current.is_empty() {
+        result.push(current);
+    }
+    result
+}
+
+/// Build a single `DriveSummary` by summing the per-clip
+/// `RouteAggregates` columns. No point arrays touched.
+fn build_summary_from_aggregates(
+    clips: &[TimedSummary],
+    idx: usize,
+    tags: &HashMap<String, Vec<String>>,
+) -> DriveSummary {
+    let first_clip = &clips[0];
+    let last_clip = &clips[clips.len() - 1];
+    let start_time = first_clip.timestamp;
+    let end_time = last_clip.timestamp + chrono::Duration::minutes(1);
+    let duration_ms = (end_time - start_time).num_milliseconds();
+
+    let mut total_dist_m: f64 = 0.0;
+    let mut max_speed_mps: f64 = 0.0;
+    let mut speed_sum: f64 = 0.0;
+    let mut speed_count: i64 = 0;
+    let mut point_count: i64 = 0;
+    let mut fsd_engaged_ms: i64 = 0;
+    let mut autosteer_engaged_ms: i64 = 0;
+    let mut tacc_engaged_ms: i64 = 0;
+    let mut fsd_dist_m: f64 = 0.0;
+    let mut autosteer_dist_m: f64 = 0.0;
+    let mut tacc_dist_m: f64 = 0.0;
+    let mut assisted_dist_m: f64 = 0.0;
+    let mut fsd_disengagements: i32 = 0;
+    let mut fsd_accel_pushes: i32 = 0;
+
+    let mut start_point: Option<GpsPoint> = None;
+    let mut end_point: Option<GpsPoint> = None;
+
+    for clip in clips {
+        let a = &clip.summary.aggregates;
+        total_dist_m += a.distance_m;
+        if a.max_speed_mps > max_speed_mps {
+            max_speed_mps = a.max_speed_mps;
+        }
+        speed_sum += a.avg_speed_mps * a.speed_sample_count as f64;
+        speed_count += a.speed_sample_count;
+        point_count += a.valid_point_count;
+        fsd_engaged_ms += a.fsd_engaged_ms;
+        autosteer_engaged_ms += a.autosteer_engaged_ms;
+        tacc_engaged_ms += a.tacc_engaged_ms;
+        fsd_dist_m += a.fsd_distance_m;
+        autosteer_dist_m += a.autosteer_distance_m;
+        tacc_dist_m += a.tacc_distance_m;
+        assisted_dist_m += a.assisted_distance_m;
+        fsd_disengagements += a.fsd_disengagements;
+        fsd_accel_pushes += a.fsd_accel_pushes;
+
+        if start_point.is_none() {
+            if let (Some(lat), Some(lng)) = (a.start_lat, a.start_lng) {
+                start_point = Some([lat, lng]);
+            }
+        }
+        if let (Some(lat), Some(lng)) = (a.end_lat, a.end_lng) {
+            end_point = Some([lat, lng]);
+        }
+    }
+
+    let avg_speed_mps = if speed_count > 0 {
+        speed_sum / speed_count as f64
+    } else {
+        0.0
+    };
+    let (fsd_percent, autosteer_percent, tacc_percent, assisted_percent) =
+        compute_autopilot_percents(
+            total_dist_m,
+            fsd_dist_m,
+            autosteer_dist_m,
+            tacc_dist_m,
+            assisted_dist_m,
+        );
+
+    let start_time_str = start_time.format("%Y-%m-%dT%H:%M:%S").to_string();
+    let drive_tags = tags.get(&start_time_str).cloned().unwrap_or_default();
+
+    DriveSummary {
+        id: idx as i32,
+        date: first_clip.summary.date.clone(),
+        start_time: start_time_str,
+        end_time: end_time.format("%Y-%m-%dT%H:%M:%S").to_string(),
+        duration_ms,
+        distance_mi: round2(total_dist_m / 1609.344),
+        distance_km: round2(total_dist_m / 1000.0),
+        avg_speed_mph: round2(avg_speed_mps * 2.23694),
+        max_speed_mph: round2(max_speed_mps * 2.23694),
+        avg_speed_kmh: round2(avg_speed_mps * 3.6),
+        max_speed_kmh: round2(max_speed_mps * 3.6),
+        clip_count: clips.len(),
+        point_count: point_count as usize,
+        start_point,
+        end_point,
+        tags: drive_tags,
+        fsd_engaged_ms,
+        fsd_disengagements,
+        fsd_accel_pushes,
+        fsd_percent,
+        fsd_distance_km: round2(fsd_dist_m / 1000.0),
+        fsd_distance_mi: round2(fsd_dist_m / 1609.344),
+        autosteer_engaged_ms,
+        autosteer_percent,
+        autosteer_distance_km: round2(autosteer_dist_m / 1000.0),
+        autosteer_distance_mi: round2(autosteer_dist_m / 1609.344),
+        tacc_engaged_ms,
+        tacc_percent,
+        tacc_distance_km: round2(tacc_dist_m / 1000.0),
+        tacc_distance_mi: round2(tacc_dist_m / 1609.344),
+        assisted_percent,
+    }
+}
+
+/// Summary-side implementation of `compute_aggregate_stats`. Drives the
+/// `/api/drives/stats` header cards.
+fn compute_aggregate_stats_summary_impl(summaries: &[RouteSummary]) -> AggregateStats {
+    let mut s = AggregateStats::default();
+    if summaries.is_empty() {
+        return s;
+    }
+    s.routes_count = summaries.len();
+
+    let groups = group_summary_clips(summaries);
+    s.drives_count = groups.len();
+
+    let mut total_duration_ms: i64 = 0;
+    for grp in &groups {
+        if grp.is_empty() {
+            continue;
+        }
+        let start = grp[0].timestamp;
+        let end = grp[grp.len() - 1].timestamp + chrono::Duration::minutes(1);
+        total_duration_ms += (end - start).num_milliseconds();
+    }
+    s.total_duration_ms = total_duration_ms;
+
+    let mut total_m: f64 = 0.0;
+    let mut fsd_m: f64 = 0.0;
+    let mut autosteer_m: f64 = 0.0;
+    let mut tacc_m: f64 = 0.0;
+    for sum in summaries {
+        let a = &sum.aggregates;
+        total_m += a.distance_m;
+        fsd_m += a.fsd_distance_m;
+        autosteer_m += a.autosteer_distance_m;
+        tacc_m += a.tacc_distance_m;
+        s.fsd_engaged_ms += a.fsd_engaged_ms;
+        s.autosteer_engaged_ms += a.autosteer_engaged_ms;
+        s.tacc_engaged_ms += a.tacc_engaged_ms;
+        s.fsd_disengagements += a.fsd_disengagements;
+        s.fsd_accel_pushes += a.fsd_accel_pushes;
+    }
+    s.total_distance_km = total_m / 1000.0;
+    s.total_distance_mi = total_m / 1609.344;
+    s.fsd_distance_km = fsd_m / 1000.0;
+    s.fsd_distance_mi = fsd_m / 1609.344;
+    s.autosteer_distance_km = autosteer_m / 1000.0;
+    s.autosteer_distance_mi = autosteer_m / 1609.344;
+    s.tacc_distance_km = tacc_m / 1000.0;
+    s.tacc_distance_mi = tacc_m / 1609.344;
+
+    if s.total_distance_km > 0.0 {
+        s.fsd_percent = round1(s.fsd_distance_km / s.total_distance_km * 100.0);
+        let total_assisted_km =
+            s.fsd_distance_km + s.autosteer_distance_km + s.tacc_distance_km;
+        s.assisted_percent = round1(total_assisted_km / s.total_distance_km * 100.0);
+    }
+    s
 }
 
 // ---------------------------------------------------------------------------

@@ -292,6 +292,22 @@ impl DriveStore {
         Ok(f(&summaries))
     }
 
+    /// Fetch full `Route` rows (with all BLOB columns decoded) for the
+    /// named files. Intended for the single-drive detail view: after
+    /// [`with_route_summaries`] has identified which ~1-20 clips make up
+    /// a drive, this avoids materialising the ~5500-row full store just
+    /// to answer a single-drive request. Missing files are silently
+    /// skipped — the caller can compare input vs. output lengths if it
+    /// needs to detect a tag/race gap.
+    pub fn with_routes_by_files<F, R>(&self, files: &[&str], f: F) -> Result<R>
+    where
+        F: FnOnce(&[Route]) -> R,
+    {
+        let conn = self.conn.lock().unwrap();
+        let routes = select_routes_by_files(&conn, files)?;
+        Ok(f(&routes))
+    }
+
     /// Wipe routes + processed_files + drive_tags and bulk-insert `data`.
     /// Used by `POST /api/drives/data/upload` to restore a previously-
     /// downloaded `drive-data.json`.
@@ -765,6 +781,72 @@ fn select_all_routes(conn: &Connection) -> Result<Vec<Route>> {
             raw_park_count,
             raw_frame_count,
             gear_runs,
+        });
+    }
+    Ok(out)
+}
+
+/// Select full routes for a specific set of files. Uses an IN (...) clause
+/// bound with positional parameters so the query planner can still use the
+/// `file` primary-key index. Falls back to empty when `files` is empty
+/// (SQLite disallows `IN ()`).
+fn select_routes_by_files(conn: &Connection, files: &[&str]) -> Result<Vec<Route>> {
+    if files.is_empty() {
+        return Ok(Vec::new());
+    }
+    let placeholders = std::iter::repeat("?").take(files.len()).collect::<Vec<_>>().join(",");
+    let sql = format!(
+        "SELECT file, date_dir, raw_park_count, raw_frame_count,
+                points_blob, gear_states_blob, ap_states_blob,
+                speeds_blob, accel_blob, gear_runs_blob
+         FROM routes
+         WHERE file IN ({})
+         ORDER BY file",
+        placeholders
+    );
+    // The normalized path is what's stored in the routes table; callers
+    // pass already-normalized strings (from RouteSummary.file, which came
+    // out of the same column).
+    let normalized: Vec<String> = files.iter().map(|f| normalize_path(f)).collect();
+    let params: Vec<&dyn ToSql> = normalized.iter().map(|s| s as &dyn ToSql).collect();
+
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(params.as_slice(), |row| {
+        let pb: Option<Vec<u8>> = row.get(4)?;
+        let gb: Option<Vec<u8>> = row.get(5)?;
+        let ab: Option<Vec<u8>> = row.get(6)?;
+        let sb: Option<Vec<u8>> = row.get(7)?;
+        let acb: Option<Vec<u8>> = row.get(8)?;
+        let rb: Option<Vec<u8>> = row.get(9)?;
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, i64>(2)? as u32,
+            row.get::<_, i64>(3)? as u32,
+            pb, gb, ab, sb, acb, rb,
+        ))
+    })?;
+
+    let mut out = Vec::with_capacity(files.len());
+    for r in rows {
+        let (file, date, raw_park_count, raw_frame_count, pb, gb, ab, sb, acb, rb) = r?;
+        let points = decode_points(pb.as_deref())
+            .with_context(|| format!("decode points {}", file))?
+            .unwrap_or_default();
+        let gear_states = decode_u8s(gb.as_deref()).unwrap_or_default();
+        let autopilot_states = decode_u8s(ab.as_deref()).unwrap_or_default();
+        let speeds = decode_f32s(sb.as_deref())
+            .with_context(|| format!("decode speeds {}", file))?
+            .unwrap_or_default();
+        let accel_positions = decode_f32s(acb.as_deref())
+            .with_context(|| format!("decode accel {}", file))?
+            .unwrap_or_default();
+        let gear_runs = decode_gear_runs(rb.as_deref())
+            .with_context(|| format!("decode gear_runs {}", file))?
+            .unwrap_or_default();
+        out.push(Route {
+            file, date, points, gear_states, autopilot_states,
+            speeds, accel_positions, raw_park_count, raw_frame_count, gear_runs,
         });
     }
     Ok(out)

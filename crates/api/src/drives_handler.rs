@@ -110,26 +110,54 @@ pub struct ProcessBody {
     pub throttle_ms: Option<u64>,
 }
 
-/// GET /api/drives — list all drives (summaries only)
+/// GET /api/drives — list all drives (summaries only).
+///
+/// Reads BLOB-free `RouteSummary` rows and sums their pre-computed
+/// per-clip aggregate columns into per-drive totals. On a 5500-clip
+/// store this is ~5 MB of heap per request vs. the ~300 MB the old
+/// `with_routes` path allocated just to re-derive numbers SQLite
+/// already had.
 pub async fn list_drives(
     State(state): State<AppState>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    match state.drives.store.with_routes(|routes| {
-        let tags = state.drives.store.get_all_drive_tags().unwrap_or_default();
-        grouper::group_summaries(routes, &tags)
+    let tags = state.drives.store.get_all_drive_tags().unwrap_or_default();
+    match state.drives.store.with_route_summaries(|summaries| {
+        grouper::group_summaries_fast(summaries, &tags)
     }) {
         Ok(summaries) => (StatusCode::OK, Json(serde_json::to_value(summaries).unwrap_or_default())),
         Err(e) => crate::json_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
     }
 }
 
-/// GET /api/drives/{id} — single drive with full point data
+/// GET /api/drives/{id} — single drive with full point data.
+///
+/// Two-stage fetch to keep heap usage proportional to the one drive
+/// being rendered rather than the whole store:
+///
+/// 1. Load BLOB-free summaries and resolve `id` to the list of file
+///    paths that make up that drive (typically 1-20 clips).
+/// 2. Decode full BLOBs for only those files via
+///    `with_routes_by_files`. `build_single_drive` still expects a
+///    `&[Route]` slice, so the second fetch produces exactly that
+///    subset.
 pub async fn single_drive(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    match state.drives.store.with_routes(|routes| {
-        let tags = state.drives.store.get_all_drive_tags().unwrap_or_default();
+    let tags = state.drives.store.get_all_drive_tags().unwrap_or_default();
+
+    let files = match state
+        .drives
+        .store
+        .with_route_summaries(|summaries| grouper::find_drive_files(summaries, &id))
+    {
+        Ok(Some(f)) => f,
+        Ok(None) => return crate::json_error(StatusCode::NOT_FOUND, "drive not found"),
+        Err(e) => return crate::json_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    };
+
+    let file_refs: Vec<&str> = files.iter().map(|s| s.as_str()).collect();
+    match state.drives.store.with_routes_by_files(&file_refs, |routes| {
         grouper::build_single_drive(routes, &id, &tags)
     }) {
         Ok(Some(drive)) => (StatusCode::OK, Json(serde_json::to_value(drive).unwrap_or_default())),
@@ -248,8 +276,8 @@ pub async fn drive_stats(
     State(state): State<AppState>,
 ) -> (StatusCode, Json<serde_json::Value>) {
     let processed_count = state.drives.store.processed_count();
-    match state.drives.store.with_routes(|routes| {
-        grouper::compute_aggregate_stats(routes)
+    match state.drives.store.with_route_summaries(|summaries| {
+        grouper::compute_aggregate_stats_from_summaries(summaries)
     }) {
         Ok(stats) => {
             let r = |v: f64| -> f64 { (v * 100.0).round() / 100.0 };
@@ -283,8 +311,8 @@ pub async fn drive_stats(
 pub async fn fsd_analytics(
     State(state): State<AppState>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    match state.drives.store.with_routes(|routes| {
-        grouper::fsd_analytics(routes)
+    match state.drives.store.with_route_summaries(|summaries| {
+        grouper::fsd_analytics_from_summaries(summaries)
     }) {
         Ok(analytics) => (StatusCode::OK, Json(serde_json::to_value(analytics).unwrap_or_default())),
         Err(e) => crate::json_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
