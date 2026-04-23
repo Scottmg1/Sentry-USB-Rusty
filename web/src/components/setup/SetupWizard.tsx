@@ -323,10 +323,8 @@ export function SetupWizard({ initialData, onClose }: SetupWizardProps) {
             const msg = JSON.parse(event.data)
             if (msg.type === "setup_status") {
               const d = msg.data
-              if (d.status === "starting" || d.status === "downloading_scripts") {
+              if (d.status === "running") {
                 setPhase("running")
-                setSetupMessage("Downloading setup scripts...")
-              } else if (d.status === "running") {
                 setSetupMessage("Running setup... This may take several minutes.")
               } else if (d.status === "complete") {
                 setPhase("finalizing")

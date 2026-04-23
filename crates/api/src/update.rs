@@ -274,11 +274,85 @@ pub async fn send_telemetry(current: &str, update_available: bool, new_version: 
 }
 
 /// Called once at startup to announce this device + current version.
+///
+/// The HTTP call races DNS at boot (same failure mode as the migrate
+/// task — `nss-lookup.target` helps but the resolver's first query can
+/// still time out on a cold router DNS cache). Telemetry is best-effort
+/// so we can't afford to burn a lot of time on retries, but failing on
+/// every boot until the resolver warms up and then staying failed until
+/// the next reboot is needlessly noisy in the logs. Retry up to 3
+/// times with 5s/10s backoff, only on transient errors — permanent
+/// failures (HTTP 5xx, SSL verify) fail fast so we don't hammer the
+/// backend.
 pub fn spawn_startup_telemetry() {
     tokio::spawn(async move {
         let current = read_current_version();
-        send_telemetry(&current, false, "").await;
+        for attempt in 1..=3 {
+            if try_send_telemetry(&current, false, "").await {
+                return;
+            }
+            if attempt < 3 {
+                let wait = std::time::Duration::from_secs(5 * attempt as u64);
+                tokio::time::sleep(wait).await;
+            }
+        }
     });
+}
+
+/// Single-shot telemetry attempt. Returns `true` on success or on a
+/// "no point retrying" failure (non-transient HTTP error, missing
+/// fingerprint) — i.e. true means "stop trying". Returns `false` only
+/// when a retry is likely to help (DNS, connect, timeout).
+async fn try_send_telemetry(current: &str, update_available: bool, new_version: &str) -> bool {
+    let fp = get_fingerprint();
+    if fp.is_empty() {
+        return true; // no fingerprint → no reason to retry
+    }
+    let arch = sentryusb_shell::run("uname", &["-m"])
+        .await
+        .ok()
+        .map(|s| s.trim().to_string())
+        .unwrap_or_else(|| std::env::consts::ARCH.to_string());
+    let payload = serde_json::json!({
+        "fingerprint": fp,
+        "current_version": current,
+        "update_available": update_available,
+        "new_version": new_version,
+        "arch": arch,
+        "model": get_sbc_model(),
+    });
+    let url = "https://api.sentry-six.com/sentryusb/telemetry";
+    let client = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+    {
+        Ok(c) => c,
+        Err(_) => return true, // client setup broken → won't fix with retry
+    };
+    match client.post(url).json(&payload).send().await {
+        Ok(r) => {
+            tracing::info!("[telemetry] sent (status {})", r.status());
+            true
+        }
+        Err(e) => {
+            // `is_timeout` / `is_connect` / the DNS-shaped error strings
+            // are the ones worth retrying. Anything else (TLS mismatch,
+            // bad URL) won't resolve itself on a second attempt.
+            let transient = e.is_timeout() || e.is_connect() || {
+                let s = e.to_string();
+                s.contains("dns error")
+                    || s.contains("Could not resolve host")
+                    || s.contains("Temporary failure in name resolution")
+            };
+            if transient {
+                tracing::warn!("[telemetry] transient failure, will retry: {}", e);
+                false
+            } else {
+                tracing::warn!("[telemetry] failed: {}", e);
+                true
+            }
+        }
+    }
 }
 
 /// GET /api/system/update-status

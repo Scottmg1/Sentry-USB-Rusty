@@ -47,6 +47,13 @@ const MIN_USB_SIZE_BYTES: u64 = 59 * (1 << 30);
 /// kernel state the overlay/shrink phases will establish — see
 /// [`verify_udc`] and [`verify_disk_space`] for those.
 pub async fn early_verify(env: &SetupEnv, emitter: &SetupEmitter) -> Result<()> {
+    // Announce the phase up-front. The XFS loopback check inside
+    // `check_xfs_support` typically takes 30-60s (xfsprogs install on
+    // fresh Pi OS images + the 1 GB truncate/mkfs/mount probe) and
+    // without this the wizard's phase list sits empty for that whole
+    // window — the user sees no progress even though we're actively
+    // working. Idempotent: the phase is logged once per setup run.
+    emitter.begin_phase("verify", "Verifying configuration");
     check_supported_hardware(env)?;
     check_xfs_support(emitter).await?;
     check_required_config(env)?;
@@ -121,8 +128,13 @@ fn check_udc() -> Result<()> {
 async fn check_xfs_support(emitter: &SetupEmitter) -> Result<()> {
     emitter.progress("Checking XFS support");
 
-    // Install xfsprogs if the mkfs binary is missing.
+    // Install xfsprogs if the mkfs binary is missing. This is the slow
+    // step on a fresh Pi OS image — 30-60s for apt-get to fetch +
+    // install — so we log before and after to keep the UI from looking
+    // hung. Subsequent setup runs skip this entirely because the
+    // binary is already on disk.
     if sentryusb_shell::run("which", &["mkfs.xfs"]).await.is_err() {
+        emitter.progress("Installing xfsprogs (this can take 30-60 seconds)...");
         sentryusb_shell::run_with_timeout(
             Duration::from_secs(180),
             "apt-get",
@@ -130,6 +142,7 @@ async fn check_xfs_support(emitter: &SetupEmitter) -> Result<()> {
         )
         .await
         .context("failed to install xfsprogs")?;
+        emitter.progress("xfsprogs installed");
     }
 
     let img = "/tmp/xfs.img";
@@ -153,7 +166,8 @@ async fn check_xfs_support(emitter: &SetupEmitter) -> Result<()> {
     let _ = std::fs::remove_file(img);
     let _ = std::fs::remove_dir_all(mnt);
 
-    // 1 GB loopback image.
+    // 1 GB sparse loopback image — metadata-only truncate, near-instant.
+    emitter.progress("Creating test XFS image");
     sentryusb_shell::run_with_timeout(
         Duration::from_secs(30),
         "truncate",
@@ -165,6 +179,7 @@ async fn check_xfs_support(emitter: &SetupEmitter) -> Result<()> {
     // reflink=1 is the feature Sentry USB actually needs (copy-on-write
     // snapshots of the cam image). If mkfs can make the fs but mount
     // fails, the kernel doesn't support the required features.
+    emitter.progress("Formatting test image with XFS (reflink=1)");
     sentryusb_shell::run_with_timeout(
         Duration::from_secs(30),
         "mkfs.xfs",
@@ -173,6 +188,7 @@ async fn check_xfs_support(emitter: &SetupEmitter) -> Result<()> {
     .await
     .context("mkfs.xfs failed — kernel likely lacks reflink support")?;
 
+    emitter.progress("Mounting test image");
     std::fs::create_dir_all(mnt)?;
     if sentryusb_shell::run("mount", &[img, mnt]).await.is_err() {
         let _ = std::fs::remove_file(img);
