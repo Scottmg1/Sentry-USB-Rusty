@@ -210,7 +210,12 @@ ok "Gadget shims installed at /root/bin/{enable,disable}_gadget.sh"
 
 if [ ! -f /root/sentryusb.conf ]; then
     info "Creating sample config..."
-    SAMPLE_URL="https://raw.githubusercontent.com/Scottmg1/Sentry-USB/main/pi-gen-sources/00-sentryusb-tweaks/files/sentryusb.conf.sample"
+    # NOTE: this MUST be the Rust port repo (Sentry-USB-Rusty). Earlier
+    # versions pointed at the legacy Go repo, so the download silently
+    # returned the Go-era sample OR fell back to the tiny offline stub
+    # below — both of which left the "raw config editor" in the web UI
+    # showing only a handful of keys instead of the full documented set.
+    SAMPLE_URL="https://raw.githubusercontent.com/${REPO}/main/pi-gen-sources/00-sentryusb-tweaks/files/sentryusb.conf.sample"
     if curl -fsSL --max-time 15 "$SAMPLE_URL" -o /root/sentryusb.conf; then
         ok "Sample config downloaded to /root/sentryusb.conf"
     else

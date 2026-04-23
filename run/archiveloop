@@ -12,8 +12,14 @@ modprobe -r g_ether
 export LOG_FILE=/mutable/archiveloop.log
 
 # If /mutable is full, try to recover by truncating the log file
-# so archiveloop can start instead of crash-looping.
-if ! echo "test" >> "$LOG_FILE" 2>/dev/null; then
+# so archiveloop can start instead of crash-looping. The literal
+# append here doubles as a log-writability test: on disk-full the
+# append fails, we truncate the log, and the subsequent log() calls
+# take over from a clean zero-byte file. Earlier versions wrote a
+# literal "test" string which showed up to users as noise in the log;
+# using a dated startup marker is both useful on success and
+# indistinguishable from a real log line to readers.
+if ! echo "$(date): archiveloop starting" >> "$LOG_FILE" 2>/dev/null; then
   : > "$LOG_FILE" 2>/dev/null || true
 fi
 

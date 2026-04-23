@@ -65,7 +65,18 @@ where
         &bytes
     };
 
-    let data: StoreData = serde_json::from_slice(slice).context("parse JSON")?;
+    // Surface serde's detailed error (line/column/classification) instead
+    // of the bare "parse JSON" we used to emit — on a user-facing upload
+    // the original error text is what tells them whether the file is
+    // truncated, has a BOM we didn't strip, or is just the wrong shape.
+    let data: StoreData = serde_json::from_slice(slice).map_err(|e| {
+        anyhow::anyhow!(
+            "parse JSON (line {}, column {}): {}",
+            e.line(),
+            e.column(),
+            e
+        )
+    })?;
 
     let route_count = data.routes.len();
 

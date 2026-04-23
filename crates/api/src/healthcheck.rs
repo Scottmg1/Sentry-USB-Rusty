@@ -92,20 +92,51 @@ pub async fn health_check(State(_s): State<AppState>) -> (StatusCode, Json<serde
         Some(p) => st.push(item("Backingfiles free space", "pass", Some(format!("{:.1}% free", p)))),
         None => st.push(item("Backingfiles free space", "warn", Some("partition not mounted".to_string()))),
     }
-    for (img, label) in &[
-        ("/backingfiles/cam_disk.bin", "cam disk image"),
-        ("/backingfiles/music_disk.bin", "music disk image"),
-        ("/backingfiles/lightshow_disk.bin", "lightshow disk image"),
-        ("/backingfiles/boombox_disk.bin", "boombox disk image"),
-        ("/backingfiles/wraps_disk.bin", "wraps disk image"),
-    ] {
+    // Load the active config so we only nag about disks the user
+    // actually asked for. If MUSIC_SIZE=0 (or unset) the user opted
+    // out of the music disk entirely — warning "music disk image
+    // missing" when they never configured it is just noise.
+    let active_cfg: std::collections::HashMap<String, String> =
+        sentryusb_config::parse_file(sentryusb_config::find_config_path())
+            .map(|(active, _commented)| active)
+            .unwrap_or_default();
+    let user_wants = |size_key: &str| -> bool {
+        // "0", "0G", "0M", "0K", empty, unset → disabled. Any non-zero
+        // numeric prefix → enabled. Strict-enough for health: the
+        // actual size value is the installer/setup's problem.
+        let Some(raw) = active_cfg.get(size_key) else { return false; };
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            return false;
+        }
+        let digits: String = trimmed
+            .chars()
+            .take_while(|c| c.is_ascii_digit() || *c == '.')
+            .collect();
+        digits.parse::<f64>().map(|n| n > 0.0).unwrap_or(false)
+    };
+
+    let disks: &[(&str, &str, Option<&str>)] = &[
+        // cam disk is always expected — hard fail if it's missing.
+        ("/backingfiles/cam_disk.bin", "cam disk image", None),
+        ("/backingfiles/music_disk.bin", "music disk image", Some("MUSIC_SIZE")),
+        ("/backingfiles/lightshow_disk.bin", "lightshow disk image", Some("LIGHTSHOW_SIZE")),
+        ("/backingfiles/boombox_disk.bin", "boombox disk image", Some("BOOMBOX_SIZE")),
+        ("/backingfiles/wraps_disk.bin", "wraps disk image", Some("WRAPS_SIZE")),
+    ];
+    for (img, label, size_key) in disks {
+        // Optional disk the user didn't ask for → skip the check entirely.
+        if let Some(key) = size_key {
+            if !user_wants(key) {
+                continue;
+            }
+        }
         if std::path::Path::new(img).exists() {
             st.push(item(label, "pass", None));
         } else {
-            // cam is critical — everything else is optional content the
-            // user may never have uploaded, so a missing lightshow /
-            // boombox / wraps disk is a warn, not a fail.
-            let status = if *label == "cam disk image" { "fail" } else { "warn" };
+            // cam is critical; configured-but-missing optional disks are
+            // warn (something went wrong during setup/archiving).
+            let status = if size_key.is_none() { "fail" } else { "warn" };
             st.push(item(label, status, Some("missing".to_string())));
         }
     }
@@ -266,27 +297,31 @@ pub async fn health_check(State(_s): State<AppState>) -> (StatusCode, Json<serde
 
     // ── RTC ───────────────────────────────────────────────────────────────
     //
-    // Pi 5 ships with a real-time clock; earlier Pis don't. A missing RTC is
-    // informational (away-mode falls back to countdown-based expiration), a
-    // low RTC battery is a warn because time will reset on power loss.
-    let mut rtc = Vec::new();
-    let has_rtc = std::path::Path::new("/dev/rtc0").exists();
-    rtc.push(item(
-        "RTC device",
-        if has_rtc { "pass" } else { "warn" },
-        if has_rtc { None } else { Some("no /dev/rtc0 — clock will reset on power loss".to_string()) },
-    ));
-    if has_rtc {
-        // Pi 5 RTC battery charge level: /sys/class/rtc/rtc0/device/charging_voltage,
-        // battery is a short read via hwclock. Best-effort.
-        if let Ok(v) = std::fs::read_to_string("/sys/class/rtc/rtc0/device/charging_voltage_now") {
-            let uv: i64 = v.trim().parse().unwrap_or(0);
-            let mv = uv / 1000;
-            let status = if mv >= 2800 { "pass" } else if mv >= 2000 { "warn" } else { "fail" };
-            rtc.push(item("RTC battery", status, Some(format!("{} mV", mv))));
+    // Only surface this category when the user opted in (RTC_BATTERY_ENABLED).
+    // Pi 4 and earlier ship without an RTC; warning "no /dev/rtc0" on a Pi 4
+    // whose owner never configured an external RTC module is just noise.
+    // On Pi 5 with RTC_BATTERY_ENABLED=true we expect /dev/rtc0 and a
+    // readable battery voltage; missing either is a warn/fail.
+    let rtc_opted_in = active_cfg.get("RTC_BATTERY_ENABLED").map(|v| v.trim() == "true").unwrap_or(false);
+    if rtc_opted_in {
+        let mut rtc = Vec::new();
+        let has_rtc = std::path::Path::new("/dev/rtc0").exists();
+        rtc.push(item(
+            "RTC device",
+            if has_rtc { "pass" } else { "warn" },
+            if has_rtc { None } else { Some("no /dev/rtc0 — clock will reset on power loss".to_string()) },
+        ));
+        if has_rtc {
+            // Pi 5 RTC battery charge level.
+            if let Ok(v) = std::fs::read_to_string("/sys/class/rtc/rtc0/device/charging_voltage_now") {
+                let uv: i64 = v.trim().parse().unwrap_or(0);
+                let mv = uv / 1000;
+                let status = if mv >= 2800 { "pass" } else if mv >= 2000 { "warn" } else { "fail" };
+                rtc.push(item("RTC battery", status, Some(format!("{} mV", mv))));
+            }
         }
+        categories.push(HealthCategory { name: "Clock / RTC".to_string(), items: rtc });
     }
-    categories.push(HealthCategory { name: "Clock / RTC".to_string(), items: rtc });
 
     // ── Services ──────────────────────────────────────────────────────────
     // sentryusb-archive is the archiveloop unit — marked critical so a

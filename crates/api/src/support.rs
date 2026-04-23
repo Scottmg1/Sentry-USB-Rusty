@@ -116,7 +116,7 @@ pub async fn create_ticket(
     let clean = sanitize_json(&body);
     proxy_request(
         reqwest::Method::POST,
-        "/support/ticket",
+        "/chat/ticket",
         Some(clean),
         forward_headers(&headers),
         JSON_TIMEOUT,
@@ -133,7 +133,7 @@ pub async fn send_message(
     let clean = sanitize_json(&body);
     proxy_request(
         reqwest::Method::POST,
-        &format!("/support/ticket/{}/message", id),
+        &format!("/chat/ticket/{}/message", id),
         Some(clean),
         forward_headers(&headers),
         JSON_TIMEOUT,
@@ -147,7 +147,7 @@ pub async fn upload_media(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    let url = format!("{}/support/ticket/{}/media", SUPPORT_API, id);
+    let url = format!("{}/chat/ticket/{}/media", SUPPORT_API, id);
     let client = match reqwest::Client::builder()
         .timeout(MEDIA_TIMEOUT)
         .build()
@@ -189,7 +189,7 @@ pub async fn fetch_messages(
     Query(q): Query<FetchQuery>,
     headers: HeaderMap,
 ) -> Response {
-    let mut path = format!("/support/ticket/{}/messages", id);
+    let mut path = format!("/chat/ticket/{}/messages", id);
     if let Some(since) = q.since {
         if !since.is_empty() {
             path.push_str(&format!("?since={}", since));
@@ -218,7 +218,7 @@ pub async fn close_ticket(
     };
     proxy_request(
         reqwest::Method::POST,
-        &format!("/support/ticket/{}/close", id),
+        &format!("/chat/ticket/{}/close", id),
         Some(body),
         forward_headers(&headers),
         Duration::from_secs(15),
@@ -233,7 +233,7 @@ pub async fn mark_read(
 ) -> Response {
     proxy_request(
         reqwest::Method::POST,
-        &format!("/support/ticket/{}/mark-read", id),
+        &format!("/chat/ticket/{}/mark-read", id),
         Some(b"{}".to_vec()),
         forward_headers(&headers),
         Duration::from_secs(15),
@@ -249,7 +249,7 @@ pub async fn register_device(
 ) -> Response {
     proxy_request(
         reqwest::Method::POST,
-        &format!("/support/ticket/{}/register-device", id),
+        &format!("/chat/ticket/{}/register-device", id),
         Some(body.to_vec()),
         forward_headers(&headers),
         Duration::from_secs(15),
@@ -265,7 +265,7 @@ pub async fn unregister_device(
 ) -> Response {
     proxy_request(
         reqwest::Method::POST,
-        &format!("/support/ticket/{}/unregister-device", id),
+        &format!("/chat/ticket/{}/unregister-device", id),
         Some(body.to_vec()),
         forward_headers(&headers),
         Duration::from_secs(15),

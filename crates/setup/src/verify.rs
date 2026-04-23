@@ -1,20 +1,23 @@
 //! Pre-setup sanity checks — port of `verify-configuration.sh`.
 //!
-//! Runs before any destructive operation and bails loudly (and early) if
-//! the Pi isn't actually capable of running SentryUSB. Each check mirrors
-//! a bash function in `verify-configuration.sh` so behavior is identical
-//! across the Go and Rust setup paths.
+//! Split into two phases so we can bail loudly on conditions we can
+//! detect up-front without also false-failing on conditions that the
+//! setup wizard is *about* to fix:
 //!
-//! Checks, in order:
-//!   1. [`check_supported_hardware`] — Pi Zero W / Zero 2 W / 3 / 4 / 5.
-//!   2. [`check_udc`] — at least one UDC driver exposed under
-//!      `/sys/class/udc/`. Implies `dtoverlay=dwc2` is in config.txt.
-//!   3. [`check_xfs_support`] — `mkfs.xfs -m reflink=1` succeeds on a
-//!      loopback image (installs `xfsprogs` if missing).
-//!   4. [`check_required_config`] — critical config variables present
-//!      (`CAM_SIZE`).
-//!   5. [`check_available_space`] — SD card or USB drive has enough room
-//!      for the backing files partition.
+//!   * [`early_verify`] — hardware model, XFS+reflink support,
+//!     required config keys, disk space. Runs BEFORE any destructive
+//!     operation and BEFORE the dwc2 overlay phase. These can all be
+//!     checked on a stock Pi OS image without any SentryUSB-specific
+//!     kernel modules loaded yet.
+//!   * [`verify_udc`] — at least one UDC driver exposed under
+//!     `/sys/class/udc/`. MUST run **after** the dwc2 overlay phase
+//!     has completed (either "already set" or "just added + rebooted
+//!     + resuming"), because on a fresh Pi OS image `dtoverlay=dwc2`
+//!     isn't in `config.txt` yet, so the DWC2 UDC driver isn't
+//!     loaded, so the check would always fail on the very first pass
+//!     of a fresh install. Earlier versions of this module bundled
+//!     the UDC check into `early_verify` and that's exactly what bit
+//!     the install-pi.sh path in production.
 //!
 //! On failure the returned `anyhow::Error` is logged and the runner
 //! aborts before touching the filesystem.
@@ -36,15 +39,24 @@ const MIN_SD_SPACE_BYTES: u64 = 8 * (1 << 30);
 /// the bash threshold).
 const MIN_USB_SIZE_BYTES: u64 = 59 * (1 << 30);
 
-/// Run all pre-setup sanity checks. Returns `Ok(())` when it's safe to
-/// proceed; `Err` aborts the runner before any destructive operation.
-pub async fn verify_setup(env: &SetupEnv, emitter: &SetupEmitter) -> Result<()> {
+/// Early sanity checks: hardware, XFS, config vars, disk space. Call
+/// before the dwc2 overlay phase. Does NOT include the UDC check — see
+/// [`verify_udc`] for that half.
+pub async fn early_verify(env: &SetupEnv, emitter: &SetupEmitter) -> Result<()> {
     check_supported_hardware(env)?;
-    check_udc()?;
     check_xfs_support(emitter).await?;
     check_required_config(env)?;
     check_available_space(env, emitter).await?;
     Ok(())
+}
+
+/// UDC driver presence check. Call **after** the dwc2 overlay phase has
+/// completed (either the overlay was already in `config.txt`, or we
+/// added it and are now resuming post-reboot with it loaded). Fails
+/// loudly so we don't proceed into partition/gadget phases that assume
+/// the USB gadget will come up.
+pub fn verify_udc() -> Result<()> {
+    check_udc()
 }
 
 // -----------------------------------------------------------------------------

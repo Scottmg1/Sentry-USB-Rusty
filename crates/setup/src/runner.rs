@@ -93,12 +93,17 @@ pub async fn run_full_setup(emitter: SetupEmitter) -> Result<()> {
         emitter.progress(&format!("Detected: {}", env.pi_model.display_name()));
     }
 
-    // Pre-setup sanity checks — bail out BEFORE any destructive operation
-    // if the hardware / kernel / config can't support SentryUSB. On a
-    // resume we skip re-verifying since the first pass already passed
-    // (and some checks like XFS loopback mount are expensive to repeat).
+    // Pre-setup sanity checks — hardware model, XFS + reflink support,
+    // required config vars, disk space. Deliberately does NOT include
+    // the UDC check yet: on a fresh Pi OS image (install-pi.sh path)
+    // `dtoverlay=dwc2` isn't in config.txt yet, so `/sys/class/udc/` is
+    // empty and a UDC check here would always fail before we got a
+    // chance to add the overlay. See verify.rs for the rationale.
+    //
+    // On a resume we skip these — the first pass already passed, and
+    // the XFS loopback check is expensive to redo.
     if !resuming {
-        crate::verify::verify_setup(&env, &emitter).await?;
+        crate::verify::early_verify(&env, &emitter).await?;
     }
 
     // WiFi regulatory (silent no-op when already set)
@@ -110,6 +115,13 @@ pub async fn run_full_setup(emitter: SetupEmitter) -> Result<()> {
         reboot().await;
         return Ok(());
     }
+
+    // dwc2 is now either already-loaded (the normal resume path) or
+    // already in config.txt from a previous run. Either way the kernel
+    // should have the DWC2 UDC exposed under /sys/class/udc/. Bail
+    // loudly if not — proceeding into partitioning / gadget setup with
+    // a missing UDC gives confusing downstream errors.
+    crate::verify::verify_udc()?;
 
     // Root partition shrink (reboots twice in its own flow)
     if check_root_shrink(&env, &emitter).await? {
