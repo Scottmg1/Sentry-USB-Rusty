@@ -406,7 +406,16 @@ WantedBy=backingfiles.mount
 /// Ensure required system packages are installed. Only announces a phase if
 /// one or more packages actually need installing.
 pub async fn install_required_packages(emitter: &SetupEmitter) -> Result<bool> {
-    let packages = ["dos2unix", "parted", "fdisk", "curl", "rsync", "jq"];
+    // `ntpsec-ntpdig` provides the `ntpdig` binary that
+    // `run/archiveloop`'s `set_time()` calls via
+    //   `ntpdig -S time.google.com || sntp -S 129.6.15.28`
+    // On a fresh Pi OS bookworm image neither tool is present; without
+    // this, archiveloop logs "sntp failed, retrying..." five times per
+    // cycle and falls through with "Failed to set time" — harmless for
+    // the clock (systemd-timesyncd keeps sync quietly in the background)
+    // but it floods the archive log and causes a cold-boot window where
+    // clip folder timestamps are wrong until timesyncd catches up.
+    let packages = ["dos2unix", "parted", "fdisk", "curl", "rsync", "jq", "ntpsec-ntpdig"];
     let mut to_install = Vec::new();
 
     for pkg in &packages {
