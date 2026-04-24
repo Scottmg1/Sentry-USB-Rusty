@@ -97,6 +97,22 @@ impl NotifyConfig {
             get(key).to_lowercase() == "true"
         };
 
+        let mobile_push_enabled = is_true("MOBILE_PUSH_ENABLED");
+
+        // MOBILE_PUSH_DEVICE_ID and MOBILE_PUSH_SECRET are intentionally NOT
+        // stored in sentryusb.conf — they live in the credentials JSON managed
+        // by the server (same as Go). envsetup.sh reads them from that file;
+        // we do the same here when the conf values are absent.
+        let (mobile_push_device_id, mobile_push_secret) = {
+            let from_conf = (get("MOBILE_PUSH_DEVICE_ID"), get("MOBILE_PUSH_SECRET"));
+            if !from_conf.0.is_empty() && !from_conf.1.is_empty() {
+                from_conf
+            } else {
+                read_mobile_credentials_from_json()
+                    .unwrap_or_else(|| (String::new(), String::new()))
+            }
+        };
+
         NotifyConfig {
             pushover_enabled: is_true("PUSHOVER_ENABLED"),
             pushover_app_key: get("PUSHOVER_APP_KEY"),
@@ -145,11 +161,25 @@ impl NotifyConfig {
             sns_topic_arn: get("AWS_SNS_TOPIC_ARN"),
             sns_region: get("AWS_REGION"),
 
-            mobile_push_enabled: is_true("MOBILE_PUSH_ENABLED"),
-            mobile_push_device_id: get("MOBILE_PUSH_DEVICE_ID"),
-            mobile_push_secret: get("MOBILE_PUSH_SECRET"),
+            mobile_push_enabled,
+            mobile_push_device_id,
+            mobile_push_secret,
         }
     }
+}
+
+/// Read device_id and device_secret from the credentials JSON file.
+/// Mirrors envsetup.sh's fallback for mobile push credentials.
+fn read_mobile_credentials_from_json() -> Option<(String, String)> {
+    const CREDS_PATH: &str = "/root/.sentryusb/notification-credentials.json";
+    let data = std::fs::read_to_string(CREDS_PATH).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&data).ok()?;
+    let id = v.get("device_id").and_then(|x| x.as_str()).unwrap_or("").to_string();
+    let secret = v.get("device_secret").and_then(|x| x.as_str()).unwrap_or("").to_string();
+    if id.is_empty() || secret.is_empty() {
+        return None;
+    }
+    Some((id, secret))
 }
 
 /// Request-level context for a single notification dispatch. Only
