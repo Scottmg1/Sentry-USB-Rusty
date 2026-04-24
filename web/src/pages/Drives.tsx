@@ -138,6 +138,14 @@ function haversine(lat1: number, lon1: number, lat2: number, lon2: number) {
   return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a))
 }
 
+function samplePoints(pts: [number, number][], every: number): [number, number][] {
+  if (pts.length <= 2) return pts
+  const out: [number, number][] = [pts[0]]
+  for (let i = every; i < pts.length - 1; i += every) out.push(pts[i])
+  out.push(pts[pts.length - 1])
+  return out
+}
+
 type MapStyle = "dark" | "streets" | "google" | "satellite"
 
 const TILE_LAYERS: Record<MapStyle, { url: string; attribution: string; subdomains?: string; maxZoom?: number }> = {
@@ -237,7 +245,15 @@ export default function Drives() {
       maxZoom: initCfg.maxZoom || 20,
     }).addTo(map)
     mapInstance.current = map
-    return () => { map.remove(); mapInstance.current = null }
+    return () => {
+      overviewLayers.current.forEach((l) => { l.off(); map.removeLayer(l) })
+      overviewLayers.current = []
+      selectionLayers.current.forEach((l) => { l.off(); map.removeLayer(l) })
+      selectionLayers.current = []
+      fsdEventLayers.current = []
+      map.remove()
+      mapInstance.current = null
+    }
   }, [])
 
   // ── Swap tile layer on style change ──
@@ -290,13 +306,13 @@ export default function Drives() {
   function drawOverview(routes: RouteOverview[]) {
     const map = mapInstance.current
     if (!map) return
-    // Clear old
-    overviewLayers.current.forEach((l) => map.removeLayer(l))
+    overviewLayers.current.forEach((l) => { l.off(); map.removeLayer(l) })
     overviewLayers.current = []
 
     for (const r of routes) {
       if (r.points && r.points.length > 1) {
-        const line = L.polyline(r.points as L.LatLngExpression[], {
+        const pts = samplePoints(r.points, 5)
+        const line = L.polyline(pts as L.LatLngExpression[], {
           color: "#3b82f6", weight: 2, opacity: 0.4, smoothFactor: 1.2,
         }).addTo(map)
           ; (line as any)._driveId = r.id
@@ -313,7 +329,7 @@ export default function Drives() {
   function clearSelection() {
     const map = mapInstance.current
     if (!map) return
-    selectionLayers.current.forEach((l) => map.removeLayer(l))
+    selectionLayers.current.forEach((l) => { l.off(); map.removeLayer(l) })
     selectionLayers.current = []
     fsdEventLayers.current = []
     if (arrowMarker.current) { map.removeLayer(arrowMarker.current); arrowMarker.current = null }
