@@ -60,10 +60,6 @@ interface DriveDetail extends Omit<DriveSummary, "startPoint" | "endPoint"> {
   tags?: string[]
 }
 
-interface RouteOverview {
-  id: number
-  points: [number, number][]
-}
 
 interface DriveStats {
   drives_count: number
@@ -138,14 +134,6 @@ function haversine(lat1: number, lon1: number, lat2: number, lon2: number) {
   return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a))
 }
 
-function samplePoints(pts: [number, number][], every: number): [number, number][] {
-  if (pts.length <= 2) return pts
-  const out: [number, number][] = [pts[0]]
-  for (let i = every; i < pts.length - 1; i += every) out.push(pts[i])
-  out.push(pts[pts.length - 1])
-  return out
-}
-
 type MapStyle = "dark" | "streets" | "google" | "satellite"
 
 const TILE_LAYERS: Record<MapStyle, { url: string; attribution: string; subdomains?: string; maxZoom?: number }> = {
@@ -178,7 +166,6 @@ const TILE_LAYERS: Record<MapStyle, { url: string; attribution: string; subdomai
 export default function Drives() {
   const mapRef = useRef<HTMLDivElement>(null)
   const mapInstance = useRef<L.Map | null>(null)
-  const overviewLayers = useRef<L.Polyline[]>([])
   const selectionLayers = useRef<L.Layer[]>([])
   const arrowMarker = useRef<L.Marker | null>(null)
   const tileLayerRef = useRef<L.TileLayer | null>(null)
@@ -246,8 +233,6 @@ export default function Drives() {
     }).addTo(map)
     mapInstance.current = map
     return () => {
-      overviewLayers.current.forEach((l) => { l.off(); map.removeLayer(l) })
-      overviewLayers.current = []
       selectionLayers.current.forEach((l) => { l.off(); map.removeLayer(l) })
       selectionLayers.current = []
       fsdEventLayers.current = []
@@ -275,25 +260,18 @@ export default function Drives() {
   const loadDrives = useCallback(async () => {
     setLoading(true)
     try {
-      const [drivesRes, statsRes] = await Promise.all([
+      const [drivesRes, statsRes, tagsRes] = await Promise.all([
         fetch("/api/drives"),
         fetch("/api/drives/stats"),
+        fetch("/api/drives/tags"),
       ])
       const drivesData: DriveSummary[] = await drivesRes.json()
       const statsData: DriveStats = await statsRes.json()
+      const tagsData: string[] = await tagsRes.json()
       drivesData.sort((a, b) => new Date(b.startTime).getTime() - new Date(a.startTime).getTime())
       setDrives(drivesData)
       setStats(statsData)
-
-      // Draw overview routes
-      const [routesRes, tagsRes] = await Promise.all([
-        fetch("/api/drives/routes"),
-        fetch("/api/drives/tags"),
-      ])
-      const routes: RouteOverview[] = await routesRes.json()
-      const tagsData: string[] = await tagsRes.json()
       setAllTags(tagsData ?? [])
-      drawOverview(routes)
     } catch {
       // API may not be available in dev
     } finally {
@@ -302,29 +280,6 @@ export default function Drives() {
   }, [])
 
   useEffect(() => { loadDrives() }, [loadDrives])
-
-  function drawOverview(routes: RouteOverview[]) {
-    const map = mapInstance.current
-    if (!map) return
-    overviewLayers.current.forEach((l) => { l.off(); map.removeLayer(l) })
-    overviewLayers.current = []
-
-    for (const r of routes) {
-      if (r.points && r.points.length > 1) {
-        const pts = samplePoints(r.points, 5)
-        const line = L.polyline(pts as L.LatLngExpression[], {
-          color: "#3b82f6", weight: 2, opacity: 0.4, smoothFactor: 1.2,
-        }).addTo(map)
-          ; (line as any)._driveId = r.id
-        line.on("click", () => selectDrive(r.id))
-        overviewLayers.current.push(line)
-      }
-    }
-    if (overviewLayers.current.length > 0) {
-      const group = L.featureGroup(overviewLayers.current)
-      map.fitBounds(group.getBounds(), { padding: [40, 40] })
-    }
-  }
 
   function clearSelection() {
     const map = mapInstance.current
@@ -380,7 +335,6 @@ export default function Drives() {
       setSelectedDrive(data)
 
       clearSelection()
-      overviewLayers.current.forEach((l) => map.removeLayer(l))
 
       const pts = data.points
       if (!pts || pts.length < 2) return
@@ -480,10 +434,7 @@ export default function Drives() {
     clearSelection()
     const map = mapInstance.current
     if (!map) return
-    overviewLayers.current.forEach((l) => l.addTo(map))
-    if (overviewLayers.current.length > 0) {
-      map.fitBounds(L.featureGroup(overviewLayers.current).getBounds(), { padding: [40, 40] })
-    }
+    map.setView([39.8, -98.6], 5)
     requestAnimationFrame(() => map.invalidateSize())
   }
 
