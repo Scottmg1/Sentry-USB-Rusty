@@ -576,15 +576,14 @@ export default function Drives() {
     setImporting(true)
     setImportMsg("")
     try {
-      const text = await file.text()
       const res = await fetch("/api/drives/data/upload", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: text,
+        body: file,
       })
       if (res.ok) {
         const result = await res.json()
-        setImportMsg(`Imported ${result.routes_count} drive${result.routes_count !== 1 ? "s" : ""}`)
+        setImportMsg(`Imported ${result.routes} route${result.routes !== 1 ? "s" : ""}`)
         loadDrives()
       } else {
         const err = await res.json().catch(() => null)

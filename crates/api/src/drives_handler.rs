@@ -457,21 +457,12 @@ pub async fn export_for_sync(
     }
 }
 
-/// Max accepted drive-data upload size. Mirrors Go's streamed-file size guard
-/// at drives.go:518-605 — prevents OOM on a malicious/malformed upload before
-/// we hand the payload to the JSON parser.
-const MAX_UPLOAD_BYTES: usize = 256 * 1024 * 1024; // 256 MiB
-
 /// POST /api/drives/data/upload — upload drive data JSON.
 ///
-/// Streams the request body to a temp file chunk-by-chunk with a running
-/// byte counter. If the cap is exceeded mid-stream, we abort, unlink the
-/// partial file, and return 413 without ever holding the full payload in
-/// memory. Mirrors Go's streamed implementation (drives.go:518-605) so OOM
-/// risk on Pi Zero stays tied to the cap, not the body size.
-///
-/// The import itself runs in a blocking task; `importing` is held for the
-/// duration so concurrent `process`/`reprocess` requests 409.
+/// Streams the request body to a temp file chunk-by-chunk, then runs the
+/// JSON import in a blocking task. The import itself runs in a blocking task;
+/// `importing` is held for the duration so concurrent `process`/`reprocess`
+/// requests 409.
 pub async fn upload_data(
     State(state): State<AppState>,
     body: axum::body::Body,
@@ -495,7 +486,7 @@ pub async fn upload_data(
 
     let tmp = "/tmp/drive-data-upload.json";
 
-    // Stream body → temp file, bailing if we cross the cap.
+    // Stream body → temp file.
     let stream_result: Result<usize, (StatusCode, String)> = async {
         let file = std::fs::File::create(tmp)
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
@@ -506,16 +497,6 @@ pub async fn upload_data(
             let chunk = chunk
                 .map_err(|e| (StatusCode::BAD_REQUEST, format!("read body: {}", e)))?;
             written += chunk.len();
-            if written > MAX_UPLOAD_BYTES {
-                let _ = std::fs::remove_file(tmp);
-                return Err((
-                    StatusCode::PAYLOAD_TOO_LARGE,
-                    format!(
-                        "upload exceeds {} MiB",
-                        MAX_UPLOAD_BYTES / (1024 * 1024)
-                    ),
-                ));
-            }
             file.write_all(&chunk)
                 .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
         }
