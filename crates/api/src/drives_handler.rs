@@ -111,19 +111,21 @@ pub struct ProcessBody {
 
 /// GET /api/drives — list all drives (summaries only).
 ///
-/// Reads BLOB-free `RouteSummary` rows and sums their pre-computed
-/// per-clip aggregate columns into per-drive totals. On a 5500-clip
-/// store this is ~5 MB of heap per request vs. the ~300 MB the old
-/// `with_routes` path allocated just to re-derive numbers SQLite
-/// already had.
+/// Returns a pre-computed JSON string stored in the `meta` table. The
+/// cache is built once at startup (or after any mutation) and served
+/// directly on every subsequent request — no grouper work, no BLOB
+/// decoding, no ORDER-BY sorter allocation.
 pub async fn list_drives(
     State(state): State<AppState>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    let tags = state.drives.store.get_all_drive_tags().unwrap_or_default();
-    match state.drives.store.with_route_summaries(|summaries| {
-        grouper::group_summaries_fast(summaries, &tags)
-    }) {
-        Ok(summaries) => (StatusCode::OK, Json(serde_json::to_value(summaries).unwrap_or_default())),
+    match state.drives.store.get_cached_drives_json() {
+        Ok(json) => match serde_json::from_str(&json) {
+            Ok(v) => (StatusCode::OK, Json(v)),
+            Err(e) => crate::json_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("drive cache parse: {}", e),
+            ),
+        },
         Err(e) => crate::json_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
     }
 }

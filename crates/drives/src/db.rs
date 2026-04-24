@@ -10,7 +10,7 @@
 
 use std::path::Path;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection, ToSql};
@@ -55,6 +55,11 @@ pub struct DriveStore {
     /// every poll.
     route_count: AtomicI64,
     processed_count: AtomicI64,
+    /// Set whenever routes or tags change. `get_cached_drives_json` rebuilds
+    /// and clears this flag before serving. Using a flag rather than
+    /// rebuilding on every `add_route` call avoids O(n²) work when the
+    /// processor adds hundreds of clips in a batch.
+    drive_cache_dirty: AtomicBool,
 }
 
 impl DriveStore {
@@ -84,6 +89,7 @@ impl DriveStore {
             conn: Mutex::new(conn),
             route_count: AtomicI64::new(0),
             processed_count: AtomicI64::new(0),
+            drive_cache_dirty: AtomicBool::new(true),
         };
 
         store.load_locked(IMPORT_SOURCE_CANDIDATES)?;
@@ -102,6 +108,7 @@ impl DriveStore {
             conn: Mutex::new(conn),
             route_count: AtomicI64::new(0),
             processed_count: AtomicI64::new(0),
+            drive_cache_dirty: AtomicBool::new(false),
         };
         // Still run migrate + backfill so tests exercise the real schema.
         let guard = store.conn.lock().unwrap();
@@ -144,7 +151,23 @@ impl DriveStore {
                     &chrono::Utc::now().to_rfc3339(),
                 )?;
             }
+
+            // Checkpoint the WAL after any import/backfill writes so the
+            // subsequent grouper query runs against the main DB file with
+            // no large WAL to walk through.
+            let _ = mg.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)");
+
+            // Rebuild the drive list cache only when the DB contents differ
+            // from what the cache was built from. On a typical restart where
+            // nothing changed, this skips the expensive grouper run entirely
+            // (two COUNT(*) queries instead of a full 5k-row table scan).
+            if is_drive_cache_valid(&mg)? {
+                info!("[drives] Drive list cache is current; skipping rebuild on startup");
+            } else {
+                rebuild_drive_list_cache(&mg).context("load: build drive cache")?;
+            }
         }
+        self.drive_cache_dirty.store(false, Ordering::Release);
         self.refresh_counts()?;
         Ok(())
     }
@@ -248,6 +271,7 @@ impl DriveStore {
 
         tx.commit()?;
         drop(conn);
+        self.drive_cache_dirty.store(true, Ordering::Release);
         self.refresh_counts()?;
         Ok(())
     }
@@ -355,7 +379,9 @@ impl DriveStore {
             }
         }
         tx.commit()?;
+        let _ = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)");
         drop(conn);
+        self.drive_cache_dirty.store(true, Ordering::Release);
         self.refresh_counts()?;
         Ok(())
     }
@@ -416,6 +442,7 @@ impl DriveStore {
             }
         }
         tx.commit()?;
+        self.drive_cache_dirty.store(true, Ordering::Release);
         Ok(())
     }
 
@@ -497,8 +524,11 @@ impl DriveStore {
     ) -> Result<crate::json_compat::ImportStats> {
         let stats = {
             let mut conn = self.conn.lock().unwrap();
-            crate::json_compat::import_json(&mut conn, path, on_progress)?
+            let s = crate::json_compat::import_json(&mut conn, path, on_progress)?;
+            let _ = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)");
+            s
         };
+        self.drive_cache_dirty.store(true, Ordering::Release);
         self.refresh_counts()?;
         Ok(stats)
     }
@@ -575,6 +605,29 @@ impl DriveStore {
         Ok(())
     }
 
+    /// Return the pre-computed drives list as a JSON string. On a cache hit
+    /// (the common case after startup) this is a single-row meta-table
+    /// lookup — no grouper work, no BLOB decoding, no sorter allocation.
+    ///
+    /// On a cache miss (first request after startup or after routes/tags
+    /// change), builds the cache from route summaries + tags and stores it
+    /// in the `meta` table for subsequent requests.
+    pub fn get_cached_drives_json(&self) -> Result<String> {
+        let conn = self.conn.lock().unwrap();
+
+        if !self.drive_cache_dirty.load(Ordering::Acquire) {
+            if let Some(json) = schema::meta_get(&conn, "drive_list_cache")? {
+                if !json.is_empty() {
+                    return Ok(json);
+                }
+            }
+        }
+
+        rebuild_drive_list_cache(&conn)?;
+        self.drive_cache_dirty.store(false, Ordering::Release);
+        Ok(schema::meta_get(&conn, "drive_list_cache")?.unwrap_or_else(|| "[]".to_string()))
+    }
+
     /// Refresh the cached row counts. Called after every mutation.
     fn refresh_counts(&self) -> Result<()> {
         let conn = self.conn.lock().unwrap();
@@ -602,10 +655,73 @@ fn apply_pragmas(conn: &Connection) -> Result<()> {
         "PRAGMA journal_mode = WAL;
          PRAGMA synchronous = NORMAL;
          PRAGMA foreign_keys = ON;
-         PRAGMA busy_timeout = 5000;
-         PRAGMA temp_store = MEMORY;",
+         PRAGMA busy_timeout = 5000;",
     )?;
     Ok(())
+}
+
+/// Build the grouped drive list and store it as JSON in the `meta` table,
+/// along with the route count and tag row count used to validate the cache
+/// on the next startup.
+fn rebuild_drive_list_cache(conn: &Connection) -> Result<()> {
+    let summaries = select_all_route_summaries(conn)?;
+    let route_count = summaries.len() as i64;
+
+    let mut tags = std::collections::HashMap::<String, Vec<String>>::new();
+    let mut tags_count: i64 = 0;
+    {
+        let mut stmt = conn.prepare("SELECT drive_key, tag FROM drive_tags")?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        for r in rows {
+            let (k, t) = r?;
+            tags.entry(k).or_default().push(t);
+            tags_count += 1;
+        }
+    }
+
+    let drives = crate::grouper::group_summaries_fast(&summaries, &tags);
+    let json = serde_json::to_string(&drives)
+        .map_err(|e| anyhow::anyhow!("drive cache serialize: {}", e))?;
+    schema::meta_set(conn, "drive_list_cache", &json)?;
+    schema::meta_set(conn, "drive_list_cache_route_count", &route_count.to_string())?;
+    schema::meta_set(conn, "drive_list_cache_tags_count", &tags_count.to_string())?;
+    info!(
+        "[drives] Drive list cache rebuilt ({} drives from {} routes)",
+        drives.len(),
+        route_count
+    );
+    Ok(())
+}
+
+/// True when the persisted drive list cache matches the current DB contents.
+/// Compares route count and drive_tags row count stored at cache-build time
+/// against live COUNT(*) values. Two cheap queries per startup skip the
+/// expensive grouper run on restarts where nothing changed.
+fn is_drive_cache_valid(conn: &Connection) -> Result<bool> {
+    let cache = schema::meta_get(conn, "drive_list_cache")?;
+    if cache.map_or(true, |s| s.is_empty()) {
+        return Ok(false);
+    }
+
+    let stored_rc = schema::meta_get(conn, "drive_list_cache_route_count")?
+        .and_then(|s| s.parse::<i64>().ok());
+    let current_rc: i64 =
+        conn.query_row("SELECT COUNT(*) FROM routes", [], |r| r.get(0))?;
+    if stored_rc != Some(current_rc) {
+        return Ok(false);
+    }
+
+    let stored_tc = schema::meta_get(conn, "drive_list_cache_tags_count")?
+        .and_then(|s| s.parse::<i64>().ok());
+    let current_tc: i64 =
+        conn.query_row("SELECT COUNT(*) FROM drive_tags", [], |r| r.get(0))?;
+    if stored_tc != Some(current_tc) {
+        return Ok(false);
+    }
+
+    Ok(true)
 }
 
 /// Insert-or-update a single route row with all v2 aggregate columns.
