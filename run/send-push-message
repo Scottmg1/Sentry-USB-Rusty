@@ -118,14 +118,39 @@ http_code=$(echo "$response" | tail -1)
 body=$(echo "$response" | sed '$d')
 
 if [ "$http_code" -ge 200 ] 2>/dev/null && [ "$http_code" -lt 300 ] 2>/dev/null; then
-  # Log summary if present so the user can tell from /mutable/archiveloop.log
-  # whether the notification went through.
   skipped=$(echo "$body" | sed -n 's/.*"skipped" *: *true.*/true/p')
   if [ "$skipped" = "true" ]; then
     log "Notifications skipped (type disabled by server)"
   else
-    attempted=$(echo "$body" | sed -n 's/.*"attempted" *: *\([0-9]*\).*/\1/p')
-    [ -n "$attempted" ] && log "Notifications attempted: $attempted"
+    # Extract the providers array (e.g. ["mobile_push","discord"]) and
+    # the failed array (e.g. ["discord: timeout"]) from the response JSON
+    # using Python — avoids fragile nested-JSON sed parsing.
+    parse_result=$(python3 - "$body" <<'PYEOF'
+import sys, json
+try:
+    d = json.loads(sys.argv[1])
+    providers = d.get("providers") or []
+    failed    = d.get("failed") or []
+    print("providers=" + ",".join(providers))
+    print("failed_count=" + str(len(failed)))
+    print("failed_list=" + "; ".join(failed))
+except Exception:
+    pass
+PYEOF
+)
+    providers_val=$(echo "$parse_result" | sed -n 's/^providers=//p')
+    failed_count=$(echo "$parse_result" | sed -n 's/^failed_count=//p')
+    failed_list=$(echo "$parse_result" | sed -n 's/^failed_list=//p')
+
+    if [ -n "$providers_val" ]; then
+      log "Notifications sent via: $providers_val"
+    else
+      attempted=$(echo "$body" | sed -n 's/.*"attempted" *: *\([0-9]*\).*/\1/p')
+      [ -n "$attempted" ] && log "Notifications attempted: $attempted"
+    fi
+    if [ -n "$failed_list" ] && [ "${failed_count:-0}" -gt 0 ]; then
+      log "Notification failures: $failed_list"
+    fi
   fi
 else
   log "ERROR: notifications/send — HTTP $http_code — $body"

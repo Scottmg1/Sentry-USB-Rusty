@@ -23,28 +23,27 @@ pub struct DriveState {
 /// True if archiveloop is currently archiving. Mirrors Go `IsArchiving`:
 /// /tmp/archive_status.json present, mtime within 120s, phase == "archiving".
 pub fn is_archiving() -> bool {
+    match read_archive_status() {
+        Some(v) => v.get("phase").and_then(|p| p.as_str()) == Some("archiving"),
+        None => false,
+    }
+}
+
+/// Read and parse /tmp/archive_status.json, returning None if absent, stale, or invalid.
+/// Removes the file if its mtime is older than 120s (same as Go's IsArchiving).
+fn read_archive_status() -> Option<serde_json::Value> {
     const STATUS: &str = "/tmp/archive_status.json";
-    let meta = match std::fs::metadata(STATUS) {
-        Ok(m) => m,
-        Err(_) => return false,
-    };
+    let meta = std::fs::metadata(STATUS).ok()?;
     if let Ok(modified) = meta.modified() {
         if let Ok(age) = std::time::SystemTime::now().duration_since(modified) {
             if age > std::time::Duration::from_secs(120) {
                 let _ = std::fs::remove_file(STATUS);
-                return false;
+                return None;
             }
         }
     }
-    let data = match std::fs::read_to_string(STATUS) {
-        Ok(d) => d,
-        Err(_) => return false,
-    };
-    let v: serde_json::Value = match serde_json::from_str(&data) {
-        Ok(v) => v,
-        Err(_) => return false,
-    };
-    v.get("phase").and_then(|p| p.as_str()) == Some("archiving")
+    let data = std::fs::read_to_string(STATUS).ok()?;
+    serde_json::from_str(&data).ok()
 }
 
 /// Sources envsetup.sh + exports shared PID file so awake_start/awake_stop
@@ -218,7 +217,30 @@ pub async fn processing_status(
     State(state): State<AppState>,
 ) -> (StatusCode, Json<serde_json::Value>) {
     let status = state.drives.processor.get_status().await;
-    (StatusCode::OK, Json(serde_json::to_value(status).unwrap_or_default()))
+    let importing = state.drives.importing.load(Ordering::SeqCst);
+
+    let mut resp = serde_json::json!({
+        "running":   status.running,
+        "importing": importing,
+        "archiving": is_archiving(),
+    });
+
+    if status.total_files > 0 {
+        resp["process_current"] = status.processed_files.into();
+        resp["process_total"]   = status.total_files.into();
+    }
+
+    // Merge archive progress fields (phase, current, total) from archiveloop's
+    // status file so the dashboard progress bar has the data it needs.
+    if let Some(archive) = read_archive_status() {
+        if let Some(obj) = archive.as_object() {
+            for (k, v) in obj {
+                resp[k] = v.clone();
+            }
+        }
+    }
+
+    (StatusCode::OK, Json(resp))
 }
 
 /// POST /api/drives/process — start processing new clips.

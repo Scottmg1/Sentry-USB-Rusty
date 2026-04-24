@@ -455,33 +455,42 @@ async fn proxy_response(resp: reqwest::Response) -> (StatusCode, Json<serde_json
 
 /// POST /api/notifications/test
 ///
-/// Sends a test through every configured notifier via the Rust notify
-/// crate (option A: Rust owns production notification dispatch). This
-/// is a *superset* of Go's behavior — Go's test only hits the mobile
-/// push backend. We additionally exercise Discord/Slack/Pushover/etc.
-/// here so a user who configured a non-mobile channel gets a useful
-/// "all providers OK" or "these ones failed" response from the button.
+/// Sends a test notification to the mobile push backend only.
+/// Mirrors Go's sendTestNotification which exclusively targets the
+/// Sentry Connect relay — other providers are not exercised here.
 pub async fn send_test_notification(State(_s): State<AppState>) -> (StatusCode, Json<serde_json::Value>) {
-    let config = sentryusb_notify::NotifyConfig::from_config();
-    let results = sentryusb_notify::send_to_all(&config, "SentryUSB", "Test notification from SentryUSB").await;
+    let creds = match get_or_create_credentials() {
+        Some(c) => c,
+        None => return crate::json_error(StatusCode::INTERNAL_SERVER_ERROR, "Notification credentials not available"),
+    };
 
-    let attempted = results.len();
-    let failures: Vec<String> = results
-        .into_iter()
-        .filter_map(|(name, r)| r.err().map(|e| format!("{}: {}", name, e)))
-        .collect();
+    let hostname = std::fs::read_to_string("/etc/hostname")
+        .unwrap_or_else(|_| "SentryUSB".to_string());
+    let hostname = hostname.trim();
 
-    if attempted == 0 {
-        return crate::json_error(StatusCode::BAD_REQUEST, "No notification providers are enabled");
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .unwrap_or_default();
+
+    let result = sentryusb_notify::sentry_connect::send(
+        &client,
+        &creds.device_id,
+        &creds.device_secret,
+        "SentryUSB Test",
+        &format!("Test notification from {} — push notifications are working!", hostname),
+    ).await;
+
+    match result {
+        Ok(()) => {
+            info!("[notifications] Test notification sent successfully");
+            (StatusCode::OK, Json(serde_json::json!({"status": "ok"})))
+        }
+        Err(e) => {
+            warn!("[notifications] Test notification failed: {}", e);
+            crate::json_error(StatusCode::BAD_GATEWAY, &e.to_string())
+        }
     }
-    if !failures.is_empty() && failures.len() == attempted {
-        return crate::json_error(StatusCode::INTERNAL_SERVER_ERROR, &failures.join("; "));
-    }
-    (StatusCode::OK, Json(serde_json::json!({
-        "status": "ok",
-        "attempted": attempted,
-        "failed": failures,
-    })))
 }
 
 // -----------------------------------------------------------------------------
@@ -567,6 +576,7 @@ pub async fn send_notification(
         }
     }
     let attempted = results.len();
+    let providers_for_response = providers.clone();
 
     // Record history. Type falls back to "general" when unset — matches
     // bash's `${notification_type:-general}`.
@@ -588,6 +598,7 @@ pub async fn send_notification(
         Json(serde_json::json!({
             "status": "ok",
             "attempted": attempted,
+            "providers": providers_for_response,
             "failed": failures,
         })),
     )
