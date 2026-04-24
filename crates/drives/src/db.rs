@@ -628,6 +628,37 @@ impl DriveStore {
         Ok(schema::meta_get(&conn, "drive_list_cache")?.unwrap_or_else(|| "[]".to_string()))
     }
 
+    /// Return the pre-computed drive stats as a JSON string. `processed_count`
+    /// is stored as 0 in the cache; callers must inject the live value.
+    pub fn get_cached_drive_stats_json(&self) -> Result<String> {
+        let conn = self.conn.lock().unwrap();
+        if !self.drive_cache_dirty.load(Ordering::Acquire) {
+            if let Some(json) = schema::meta_get(&conn, "drive_stats_cache")? {
+                if !json.is_empty() {
+                    return Ok(json);
+                }
+            }
+        }
+        rebuild_drive_list_cache(&conn)?;
+        self.drive_cache_dirty.store(false, Ordering::Release);
+        Ok(schema::meta_get(&conn, "drive_stats_cache")?.unwrap_or_else(|| "{}".to_string()))
+    }
+
+    /// Return the pre-computed FSD analytics as a JSON string.
+    pub fn get_cached_fsd_analytics_json(&self) -> Result<String> {
+        let conn = self.conn.lock().unwrap();
+        if !self.drive_cache_dirty.load(Ordering::Acquire) {
+            if let Some(json) = schema::meta_get(&conn, "fsd_analytics_cache")? {
+                if !json.is_empty() {
+                    return Ok(json);
+                }
+            }
+        }
+        rebuild_drive_list_cache(&conn)?;
+        self.drive_cache_dirty.store(false, Ordering::Release);
+        Ok(schema::meta_get(&conn, "fsd_analytics_cache")?.unwrap_or_else(|| "{}".to_string()))
+    }
+
     /// Refresh the cached row counts. Called after every mutation.
     fn refresh_counts(&self) -> Result<()> {
         let conn = self.conn.lock().unwrap();
@@ -687,6 +718,40 @@ fn rebuild_drive_list_cache(conn: &Connection) -> Result<()> {
     schema::meta_set(conn, "drive_list_cache", &json)?;
     schema::meta_set(conn, "drive_list_cache_route_count", &route_count.to_string())?;
     schema::meta_set(conn, "drive_list_cache_tags_count", &tags_count.to_string())?;
+
+    // Cache drive stats — computed from summaries (no BLOB decoding needed).
+    // processed_count is stored as 0; handlers inject the live atomic value.
+    let stats = crate::grouper::compute_aggregate_stats_from_summaries(&summaries);
+    let r = |v: f64| -> f64 { (v * 100.0).round() / 100.0 };
+    let stats_json = serde_json::to_string(&serde_json::json!({
+        "drives_count":          stats.drives_count,
+        "routes_count":          stats.routes_count,
+        "processed_count":       0,
+        "total_distance_km":     r(stats.total_distance_km),
+        "total_distance_mi":     r(stats.total_distance_mi),
+        "total_duration_ms":     stats.total_duration_ms,
+        "fsd_engaged_ms":        stats.fsd_engaged_ms,
+        "fsd_distance_km":       r(stats.fsd_distance_km),
+        "fsd_distance_mi":       r(stats.fsd_distance_mi),
+        "fsd_percent":           stats.fsd_percent,
+        "fsd_disengagements":    stats.fsd_disengagements,
+        "fsd_accel_pushes":      stats.fsd_accel_pushes,
+        "autosteer_engaged_ms":  stats.autosteer_engaged_ms,
+        "autosteer_distance_km": r(stats.autosteer_distance_km),
+        "autosteer_distance_mi": r(stats.autosteer_distance_mi),
+        "tacc_engaged_ms":       stats.tacc_engaged_ms,
+        "tacc_distance_km":      r(stats.tacc_distance_km),
+        "tacc_distance_mi":      r(stats.tacc_distance_mi),
+        "assisted_percent":      stats.assisted_percent,
+    })).map_err(|e| anyhow::anyhow!("stats cache serialize: {}", e))?;
+    schema::meta_set(conn, "drive_stats_cache", &stats_json)?;
+
+    // Cache FSD analytics — reuses the already-grouped drives list.
+    let fsd = crate::grouper::fsd_analytics_from_drives(&drives);
+    let fsd_json = serde_json::to_string(&fsd)
+        .map_err(|e| anyhow::anyhow!("fsd analytics cache serialize: {}", e))?;
+    schema::meta_set(conn, "fsd_analytics_cache", &fsd_json)?;
+
     info!(
         "[drives] Drive list cache rebuilt ({} drives from {} routes)",
         drives.len(),

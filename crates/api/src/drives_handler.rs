@@ -320,50 +320,40 @@ pub async fn reprocess_all(
 }
 
 /// GET /api/drives/stats — aggregate stats
-/// Manually builds snake_case JSON to match Go API output expected by frontend.
+/// Served from the pre-computed cache; no grouper work or BLOB decoding per request.
+/// `processed_count` is injected live from the atomic counter (it changes on
+/// every processed clip, independent of the route/tags cache invalidation key).
 pub async fn drive_stats(
     State(state): State<AppState>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    let processed_count = state.drives.store.processed_count();
-    match state.drives.store.with_route_summaries(|summaries| {
-        grouper::compute_aggregate_stats_from_summaries(summaries)
-    }) {
-        Ok(stats) => {
-            let r = |v: f64| -> f64 { (v * 100.0).round() / 100.0 };
-            (StatusCode::OK, Json(serde_json::json!({
-                "drives_count": stats.drives_count,
-                "routes_count": stats.routes_count,
-                "processed_count": processed_count,
-                "total_distance_km": r(stats.total_distance_km),
-                "total_distance_mi": r(stats.total_distance_mi),
-                "total_duration_ms": stats.total_duration_ms,
-                "fsd_engaged_ms": stats.fsd_engaged_ms,
-                "fsd_distance_km": r(stats.fsd_distance_km),
-                "fsd_distance_mi": r(stats.fsd_distance_mi),
-                "fsd_percent": stats.fsd_percent,
-                "fsd_disengagements": stats.fsd_disengagements,
-                "fsd_accel_pushes": stats.fsd_accel_pushes,
-                "autosteer_engaged_ms": stats.autosteer_engaged_ms,
-                "autosteer_distance_km": r(stats.autosteer_distance_km),
-                "autosteer_distance_mi": r(stats.autosteer_distance_mi),
-                "tacc_engaged_ms": stats.tacc_engaged_ms,
-                "tacc_distance_km": r(stats.tacc_distance_km),
-                "tacc_distance_mi": r(stats.tacc_distance_mi),
-                "assisted_percent": stats.assisted_percent,
-            })))
-        }
+    match state.drives.store.get_cached_drive_stats_json() {
+        Ok(json) => match serde_json::from_str::<serde_json::Value>(&json) {
+            Ok(mut v) => {
+                v["processed_count"] = state.drives.store.processed_count().into();
+                (StatusCode::OK, Json(v))
+            }
+            Err(e) => crate::json_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("drive stats cache parse: {}", e),
+            ),
+        },
         Err(e) => crate::json_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
     }
 }
 
 /// GET /api/drives/fsd-analytics — FSD analytics
+/// Served from the pre-computed cache; no grouper work or BLOB decoding per request.
 pub async fn fsd_analytics(
     State(state): State<AppState>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    match state.drives.store.with_route_summaries(|summaries| {
-        grouper::fsd_analytics_from_summaries(summaries)
-    }) {
-        Ok(analytics) => (StatusCode::OK, Json(serde_json::to_value(analytics).unwrap_or_default())),
+    match state.drives.store.get_cached_fsd_analytics_json() {
+        Ok(json) => match serde_json::from_str(&json) {
+            Ok(v) => (StatusCode::OK, Json(v)),
+            Err(e) => crate::json_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("fsd analytics cache parse: {}", e),
+            ),
+        },
         Err(e) => crate::json_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
     }
 }

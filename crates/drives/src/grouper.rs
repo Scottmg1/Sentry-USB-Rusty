@@ -139,6 +139,12 @@ pub fn fsd_analytics_from_summaries(summaries: &[RouteSummary]) -> FsdAnalytics 
     build_fsd_analytics(&drives, "week")
 }
 
+/// Build FSD analytics from an already-grouped drive list. Used by the
+/// cache rebuild path so `group_summaries_fast` is not called a second time.
+pub fn fsd_analytics_from_drives(drives: &[DriveSummary]) -> FsdAnalytics {
+    build_fsd_analytics(drives, "week")
+}
+
 /// Resolve a drive id (numeric index or start-time string) to the
 /// summary-path index **and** the file list that makes up that drive.
 /// Used by `single_drive` to scope the full-BLOB decode to just the

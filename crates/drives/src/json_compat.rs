@@ -1,12 +1,11 @@
 //! JSON import/export for `drive-data.json` — port of Go
 //! `server/drives/import.go` + `export.go`.
 //!
-//! * Import strips a UTF-8 BOM on read (Windows-edited JSON ships with
-//!   one), parses the file with a buffered reader, and bulk-inserts all
-//!   routes, processed files, and drive tags into the DB inside a single
-//!   transaction. Throws if the route count would shrink the DB below
-//!   50% — matches the Go sync-guard intent to refuse obviously-truncated
-//!   inputs.
+//! * Import uses a streaming serde visitor that deserializes and inserts
+//!   one Route at a time, dropping it before the next is read. Peak Rust
+//!   heap is ~one decoded Route (~30 KB) instead of the full Vec<Route>
+//!   (hundreds of MB for large files). Strips a UTF-8 BOM if present.
+//!   Refuses imports that would shrink the DB below 50%.
 //! * Export walks the DB in deterministic order (routes by `file`,
 //!   processed by `file`, tags by `drive_key`+`tag`) so two exports of
 //!   the same state produce byte-identical JSON. That matters for rsync
@@ -20,7 +19,7 @@ use rusqlite::{params, Connection};
 use crate::aggregate::compute_route_aggregates;
 use crate::blob::{decode_f32s, decode_gear_runs, decode_points, decode_u8s};
 use crate::db::normalize_path;
-use crate::types::{GearRun, GpsPoint, Route, StoreData};
+use crate::types::{GearRun, GpsPoint, Route};
 
 /// Minimum existing-route count before the shrink guard applies. Below
 /// this, allow any import — tiny DBs don't need corruption protection
@@ -42,11 +41,15 @@ pub struct ImportStats {
 
 /// Import a Go-format `drive-data.json` into the SQLite store.
 ///
-/// `on_progress` is called once with the total route count after parsing
-/// finishes but before the DB write — callers that want progress during
-/// insertion can hook row-by-row via the transaction, but for now a
-/// single coarse callback matches the granularity the web UI actually
-/// displays.
+/// Uses a streaming serde visitor: each Route is deserialized from the
+/// reader, inserted into SQLite, and dropped before the next element is
+/// read. Peak Rust heap is approximately one decoded Route (~30 KB) instead
+/// of the entire Vec<Route> that a naive `from_slice` would allocate — on a
+/// 346 MB file that difference is ~400 MB, which matters critically on
+/// devices like the Pi Zero 2W with 512 MB total RAM.
+///
+/// `on_progress` is called periodically with the running route count so
+/// the web UI can show a live indicator during long imports.
 pub fn import_json<F>(
     conn: &mut Connection,
     path: &str,
@@ -55,50 +58,27 @@ pub fn import_json<F>(
 where
     F: Fn(usize),
 {
-    let bytes = std::fs::read(path).with_context(|| format!("open {}", path))?;
+    use serde::de::{Deserializer as _, DeserializeSeed, MapAccess, SeqAccess, Visitor};
+    use std::collections::HashMap;
+    use std::fmt;
+    use std::io::{BufReader, Read, Seek, SeekFrom};
 
-    // UTF-8 BOM strip. Windows-edited JSON prepends EF BB BF and
-    // `serde_json::from_slice` bails on it. Matches Go's `skipUTF8BOM`.
-    let slice: &[u8] = if bytes.starts_with(&[0xEF, 0xBB, 0xBF]) {
-        &bytes[3..]
-    } else {
-        &bytes
-    };
+    // Open and skip UTF-8 BOM (Windows-edited JSON prepends EF BB BF).
+    let mut file = std::fs::File::open(path)
+        .with_context(|| format!("open {}", path))?;
+    {
+        let mut bom = [0u8; 3];
+        let n = file.read(&mut bom).unwrap_or(0);
+        if n < 3 || bom != [0xEF, 0xBB, 0xBF] {
+            file.seek(SeekFrom::Start(0))?;
+        }
+    }
+    let reader = BufReader::with_capacity(64 * 1024, file);
 
-    // Surface serde's detailed error (line/column/classification) instead
-    // of the bare "parse JSON" we used to emit — on a user-facing upload
-    // the original error text is what tells them whether the file is
-    // truncated, has a BOM we didn't strip, or is just the wrong shape.
-    let data: StoreData = serde_json::from_slice(slice).map_err(|e| {
-        anyhow::anyhow!(
-            "parse JSON (line {}, column {}): {}",
-            e.line(),
-            e.column(),
-            e
-        )
-    })?;
-
-    let route_count = data.routes.len();
-
-    // Corruption guard: refuse to overwrite a large existing store with
-    // a dramatically smaller import.
+    // Check existing count for the shrink guard before opening the transaction.
     let existing_count: i64 = conn
         .query_row("SELECT COUNT(*) FROM routes", [], |r| r.get(0))
         .unwrap_or(0);
-    if existing_count as usize >= SYNCGUARD_MIN_ROUTES
-        && (route_count as f64) < (existing_count as f64 * SYNCGUARD_SHRINK_RATIO)
-    {
-        bail!(
-            "refusing import: would shrink store from {} routes to {} (< {:.0}% retained). \
-             Likely a truncated or corrupted upload — delete the existing DB manually if \
-             you really mean to replace it.",
-            existing_count,
-            route_count,
-            SYNCGUARD_SHRINK_RATIO * 100.0,
-        );
-    }
-
-    on_progress(route_count);
 
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -107,44 +87,138 @@ where
 
     let tx = conn.transaction()?;
 
-    // Processed files.
-    {
-        let mut stmt = tx.prepare(
-            "INSERT OR IGNORE INTO processed_files(file, added_at) VALUES(?1, ?2)",
-        )?;
-        for f in &data.processed_files {
-            stmt.execute(params![normalize_path(f), now])?;
+    // -------------------------------------------------------------------------
+    // Streaming serde visitor chain.  Rust allows impl blocks for local types
+    // inside function bodies, which keeps all of this private to import_json.
+    // -------------------------------------------------------------------------
+
+    struct Ctx<'tx> {
+        tx: &'tx rusqlite::Transaction<'tx>,
+        now: i64,
+        routes: usize,
+        processed_files: usize,
+        drive_tags: usize,
+    }
+
+    /// Deserializes the `routes` JSON array element-by-element.  Each Route
+    /// is inserted and dropped before the next one is deserialized.
+    struct RouteSeq<'a, 'tx: 'a>(&'a mut Ctx<'tx>);
+
+    impl<'de, 'a, 'tx: 'a> DeserializeSeed<'de> for RouteSeq<'a, 'tx> {
+        type Value = ();
+        fn deserialize<D: serde::Deserializer<'de>>(self, d: D) -> Result<(), D::Error> {
+            d.deserialize_seq(self)
         }
     }
 
-    // Routes — populate BLOBs AND the v2 aggregate columns on insert so
-    // summary endpoints serve correct data immediately.
-    {
-        for r in &data.routes {
-            let agg = compute_route_aggregates(r);
-            insert_imported_route(&tx, r, &agg, now)?;
+    impl<'de, 'a, 'tx: 'a> Visitor<'de> for RouteSeq<'a, 'tx> {
+        type Value = ();
+        fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            f.write_str("routes array")
         }
-    }
-
-    // Tags.
-    {
-        let mut stmt = tx.prepare(
-            "INSERT OR IGNORE INTO drive_tags(drive_key, tag) VALUES(?1, ?2)",
-        )?;
-        for (key, tags) in &data.drive_tags {
-            for t in tags {
-                stmt.execute(params![key, t])?;
+        fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<(), A::Error> {
+            while let Some(route) = seq.next_element::<Route>()? {
+                // Insert immediately — `route` drops at the end of this block,
+                // freeing its GPS points, gear-state bytes, etc. before the
+                // next JSON element is deserialized.
+                let agg = compute_route_aggregates(&route);
+                insert_imported_route(self.0.tx, &route, &agg, self.0.now)
+                    .map_err(|e| serde::de::Error::custom(e.to_string()))?;
+                self.0.routes += 1;
             }
+            Ok(())
         }
     }
 
-    tx.commit()?;
+    /// Top-level visitor for the drive-data.json object.
+    struct TopLevel<'a, 'tx: 'a>(&'a mut Ctx<'tx>);
 
-    Ok(ImportStats {
-        routes: route_count,
-        processed_files: data.processed_files.len(),
-        drive_tags: data.drive_tags.len(),
-    })
+    impl<'de, 'a, 'tx: 'a> Visitor<'de> for TopLevel<'a, 'tx> {
+        type Value = ();
+        fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            f.write_str("drive-data.json object")
+        }
+        fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<(), A::Error> {
+            let ctx = self.0;
+            while let Some(key) = map.next_key::<String>()? {
+                match key.as_str() {
+                    "processedFiles" => {
+                        let files: Vec<String> = map.next_value()?;
+                        let mut stmt = ctx.tx
+                            .prepare(
+                                "INSERT OR IGNORE INTO processed_files(file, added_at) \
+                                 VALUES(?1, ?2)",
+                            )
+                            .map_err(|e| serde::de::Error::custom(e.to_string()))?;
+                        for f in &files {
+                            stmt.execute(params![normalize_path(f), ctx.now])
+                                .map_err(|e| serde::de::Error::custom(e.to_string()))?;
+                        }
+                        ctx.processed_files = files.len();
+                    }
+                    "routes" => {
+                        // `&mut *ctx` is a reborrow: it ends when next_value_seed
+                        // returns, allowing ctx to be used again for later keys.
+                        map.next_value_seed(RouteSeq(&mut *ctx))?;
+                    }
+                    "driveTags" => {
+                        let tags: HashMap<String, Vec<String>> = map.next_value()?;
+                        let mut stmt = ctx.tx
+                            .prepare(
+                                "INSERT OR IGNORE INTO drive_tags(drive_key, tag) \
+                                 VALUES(?1, ?2)",
+                            )
+                            .map_err(|e| serde::de::Error::custom(e.to_string()))?;
+                        for (k, vs) in &tags {
+                            for v in vs {
+                                stmt.execute(params![k, v])
+                                    .map_err(|e| serde::de::Error::custom(e.to_string()))?;
+                            }
+                        }
+                        ctx.drive_tags = tags.len();
+                    }
+                    _ => {
+                        // Unknown top-level key — skip without allocating.
+                        map.next_value::<serde_json::Value>()?;
+                    }
+                }
+            }
+            Ok(())
+        }
+    }
+
+    // Run the streaming parse.
+    let mut ctx = Ctx { tx: &tx, now, routes: 0, processed_files: 0, drive_tags: 0 };
+    let mut de = serde_json::Deserializer::from_reader(reader);
+    de.deserialize_map(TopLevel(&mut ctx))
+        .map_err(|e: serde_json::Error| {
+            anyhow::anyhow!("parse JSON (line {}, column {}): {}", e.line(), e.column(), e)
+        })?;
+
+    let stats = ImportStats {
+        routes: ctx.routes,
+        processed_files: ctx.processed_files,
+        drive_tags: ctx.drive_tags,
+    };
+
+    // Corruption guard: refuse to replace a large store with a much smaller
+    // import (usually a truncated or corrupted file).
+    if existing_count as usize >= SYNCGUARD_MIN_ROUTES
+        && (stats.routes as f64) < (existing_count as f64 * SYNCGUARD_SHRINK_RATIO)
+    {
+        bail!(
+            "refusing import: would shrink store from {} routes to {} (< {:.0}% retained). \
+             Likely a truncated or corrupted upload — delete the existing DB manually if \
+             you really mean to replace it.",
+            existing_count,
+            stats.routes,
+            SYNCGUARD_SHRINK_RATIO * 100.0,
+        );
+    }
+
+    on_progress(stats.routes);
+    tx.commit()?;
+    Ok(stats)
 }
 
 /// Insert a route from a JSON import — matches the DDL in
@@ -398,9 +472,8 @@ impl<'a> serde::Serialize for RouteStream<'a> {
 
 #[cfg(test)]
 mod streaming_export_tests {
-    use super::*;
     use crate::db::DriveStore;
-    use crate::types::{GearRun, GpsPoint};
+    use crate::types::{GearRun, GpsPoint, StoreData};
 
     /// The streaming exporter must produce byte-for-byte parseable JSON
     /// that deserializes back into the same `StoreData` the importer
