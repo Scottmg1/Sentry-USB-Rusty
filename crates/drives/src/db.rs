@@ -27,7 +27,7 @@ use crate::syncguard::{self, check_sync_size_guard, read_sync_cache, write_sync_
 use crate::types::{GearRun, GpsPoint, Route, RouteAggregates, RouteSummary, StoreData};
 
 /// Default SQLite DB path on the Pi.
-pub const DEFAULT_DATA_PATH: &str = "/mutable/drive-data.db";
+pub const DEFAULT_DATA_PATH: &str = "/backingfiles/drive-data.db";
 
 /// JSON staging mirror — regenerated on demand by `ExportJSONForSync` so
 /// `post-archive-process.sh` can ship it to the archive server.
