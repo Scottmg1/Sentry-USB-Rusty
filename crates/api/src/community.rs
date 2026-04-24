@@ -184,7 +184,7 @@ pub async fn lock_chime_library(
     headers: HeaderMap,
     Query(params): Query<HashMap<String, String>>,
 ) -> Response {
-    proxy_library("/lockchime/community/library", &params, "chimes", headers).await
+    proxy_library("/lockchime/library", &params, "chimes", headers).await
 }
 
 pub async fn lock_chime_stream(
@@ -195,7 +195,7 @@ pub async fn lock_chime_stream(
         return invalid_code();
     }
     // Streams audio (WAV) — binary passthrough with appropriate cache headers.
-    let url = format!("{}/lockchime/community/stream/{}", COMMUNITY_API, code);
+    let url = format!("{}/lockchime/download/{}", COMMUNITY_API, code);
     let client = match reqwest::Client::builder().timeout(Duration::from_secs(30)).build() {
         Ok(c) => c,
         Err(e) => return bad_gateway(&e.to_string()),
@@ -229,7 +229,7 @@ pub async fn lock_chime_upload(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    let url = format!("{}/lockchime/community/upload", COMMUNITY_API);
+    let url = format!("{}/lockchime/upload", COMMUNITY_API);
     let client = match reqwest::Client::builder().timeout(Duration::from_secs(30)).build() {
         Ok(c) => c,
         Err(e) => return bad_gateway(&e.to_string()),
@@ -267,7 +267,7 @@ pub async fn lock_chime_download(
     }
     proxy_json(
         reqwest::Method::POST,
-        &format!("/lockchime/community/download/{}", code),
+        &format!("/lockchime/download/{}", code),
         Some(b"{}".to_vec()),
         forward_headers(&headers, true),
         Duration::from_secs(30),
@@ -288,7 +288,7 @@ pub async fn lock_chime_admin_validate(
     }
     proxy_json(
         reqwest::Method::POST,
-        "/lockchime/community/admin/validate",
+        "/lockchime/admin/validate",
         None,
         forward_headers(&headers, false),
         Duration::from_secs(15),
@@ -314,7 +314,7 @@ pub async fn lock_chime_admin_edit(
     }
     proxy_json(
         reqwest::Method::PUT,
-        &format!("/lockchime/community/admin/edit/{}", code),
+        &format!("/lockchime/admin/edit/{}", code),
         Some(body.to_vec()),
         forward_headers(&headers, false),
         Duration::from_secs(15),
@@ -339,7 +339,7 @@ pub async fn lock_chime_admin_delete(
     }
     proxy_json(
         reqwest::Method::DELETE,
-        &format!("/lockchime/community/admin/delete/{}", code),
+        &format!("/lockchime/admin/delete/{}", code),
         None,
         forward_headers(&headers, false),
         Duration::from_secs(15),
