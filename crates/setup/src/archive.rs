@@ -241,10 +241,140 @@ pub async fn configure_archive(env: &SetupEnv, emitter: &SetupEmitter) -> Result
 
     ensure_rsync(emitter).await?;
 
+    // Port of run/nfs_archive/verify-and-configure-archive.sh::configure_archive
+    // and its cifs_archive counterpart. The bash flow always wrote an
+    // `/etc/fstab` entry for mount-based archive backends; without it
+    // `connect-archive.sh` (which calls `mount /mnt/archive` from fstab)
+    // fails all 10 retries every archive cycle, and clips never leave
+    // the Pi. `noauto` keeps the mount on-demand so boot doesn't hang
+    // waiting for a NAS that's usually offline except when parked at
+    // home. rsync/rclone paths don't need this — they talk directly.
+    match archive_system {
+        ArchiveSystem::Nfs => configure_nfs_mount(env, emitter).await?,
+        ArchiveSystem::Cifs => configure_cifs_mount(env, emitter).await?,
+        _ => {}
+    }
+
     crate::system::install_archive_service()?;
     let _ = sentryusb_shell::run("systemctl", &["daemon-reload"]).await;
     let _ = sentryusb_shell::run("systemctl", &["enable", "sentryusb-archive.service"]).await;
 
     emitter.progress("Archive configuration complete.");
     Ok(true)
+}
+
+/// Ensure the named package is installed (idempotent, skips if already
+/// there). Used by the on-demand archive-helper installs.
+async fn ensure_pkg(pkg: &str, emitter: &SetupEmitter) -> Result<()> {
+    if sentryusb_shell::run("dpkg", &["-s", pkg]).await.is_ok() {
+        return Ok(());
+    }
+    emitter.progress(&format!("Installing {}...", pkg));
+    sentryusb_shell::run_with_timeout(
+        Duration::from_secs(240),
+        "apt-get",
+        &[
+            "-o", "DPkg::Lock::Timeout=180",
+            "install", "-y", "--no-install-recommends", pkg,
+        ],
+    )
+    .await
+    .with_context(|| format!("failed to install {}", pkg))?;
+    Ok(())
+}
+
+/// Strip any prior entry for `mount_point` with filesystem type `fstype`
+/// from `/etc/fstab` and append `new_line`. Keeps the file's other
+/// entries (root, /boot, /mutable, cam_disk, tmpfs, etc.) intact.
+fn replace_fstab_entry(fstype: &str, mount_point: &str, new_line: &str) -> Result<()> {
+    // Root was remounted read-write at the start of the setup runner,
+    // but belt-and-suspenders re-remount here so a user who invokes the
+    // archive phase standalone doesn't hit an EROFS.
+    let _ = std::process::Command::new("mount")
+        .args(["/", "-o", "remount,rw"])
+        .output();
+
+    let existing = std::fs::read_to_string("/etc/fstab").unwrap_or_default();
+    let mut lines: Vec<String> = existing
+        .lines()
+        .filter(|l| {
+            // Match " nfs " / " cifs " as a whole field and the exact
+            // mount point. Avoids clobbering an unrelated entry that
+            // happens to mention the same substring.
+            let fields: Vec<&str> = l.split_whitespace().collect();
+            !(fields.len() >= 3 && fields[1] == mount_point && fields[2] == fstype)
+        })
+        .map(|s| s.to_string())
+        .collect();
+    lines.push(new_line.to_string());
+    let mut out = lines.join("\n");
+    if !out.ends_with('\n') {
+        out.push('\n');
+    }
+    std::fs::write("/etc/fstab", out).context("write /etc/fstab")?;
+    Ok(())
+}
+
+async fn configure_nfs_mount(env: &SetupEnv, emitter: &SetupEmitter) -> Result<()> {
+    let server = env.get("ARCHIVE_SERVER", "");
+    let share = env.get("SHARE_NAME", "");
+    if server.is_empty() || share.is_empty() {
+        return Ok(());
+    }
+
+    ensure_pkg("nfs-common", emitter).await?;
+    std::fs::create_dir_all("/mnt/archive").context("mkdir /mnt/archive")?;
+
+    // vers=3 + proto=tcp matches the bash flow. Broader NAS compat
+    // (UniFi Drive, Synology DSM 7, TrueNAS) than defaulting to v4.2,
+    // and `nolock` avoids NLM lock-server dependencies we don't need.
+    let line = format!(
+        "{}:{} /mnt/archive nfs rw,noauto,nolock,proto=tcp,vers=3 0 0",
+        server, share
+    );
+    replace_fstab_entry("nfs", "/mnt/archive", &line)?;
+    emitter.progress("Added NFS mount to /etc/fstab");
+    Ok(())
+}
+
+async fn configure_cifs_mount(env: &SetupEnv, emitter: &SetupEmitter) -> Result<()> {
+    let server = env.get("ARCHIVE_SERVER", "");
+    let share = env.get("SHARE_NAME", "");
+    let user = env.get("SHARE_USER", "");
+    let pass = env.get("SHARE_PASSWORD", "");
+    let domain = env.get("SHARE_DOMAIN", "");
+    let vers = env.get("CIFS_VERSION", "3.0");
+    if server.is_empty() || share.is_empty() || user.is_empty() || pass.is_empty() {
+        return Ok(());
+    }
+
+    ensure_pkg("cifs-utils", emitter).await?;
+
+    // Credentials live in a 0600 file referenced by fstab so the
+    // password doesn't leak into the world-readable fstab itself.
+    // Matches `/root/.teslaCamArchiveCredentials` from the bash flow.
+    let creds_path = "/root/.teslaCamArchiveCredentials";
+    let mut creds = format!("username={}\npassword={}\n", user, pass);
+    if !domain.is_empty() {
+        creds.push_str(&format!("domain={}\n", domain));
+    }
+    std::fs::write(creds_path, creds).context("write credentials file")?;
+    // `chmod 600` via shell — std::os::unix::fs::PermissionsExt isn't on
+    // the Windows dev host where we cargo-check, so we keep this off the
+    // std::os::unix path entirely. The setup phase only ever runs on
+    // Linux at execution time, so the shell call is the real code path.
+    let _ = sentryusb_shell::run("chmod", &["600", creds_path]).await;
+
+    std::fs::create_dir_all("/mnt/archive").context("mkdir /mnt/archive")?;
+
+    // Fstab mangles spaces in paths as \040. Preserves share names like
+    // "Tesla Cam" without breaking the field split.
+    let share_escaped = share.replace(' ', "\\040");
+    let line = format!(
+        "//{}/{} /mnt/archive cifs rw,noauto,credentials={},iocharset=utf8,file_mode=0777,dir_mode=0777,vers={} 0 0",
+        server, share_escaped, creds_path, vers
+    );
+    replace_fstab_entry("cifs", "/mnt/archive", &line)?;
+    emitter.progress("Added CIFS mount to /etc/fstab");
+    Ok(())
 }
