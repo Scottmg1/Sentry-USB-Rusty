@@ -24,6 +24,3 @@ sentryusb-drives = { path = "../drives", package = "sentryusb-drives" }
 sentryusb-api = { path = "../api", package = "sentryusb-api" }
 sentryusb-setup = { path = "../setup", package = "sentryusb-setup" }
 sentryusb-gadget = { path = "../usb_gadget", package = "sentryusb-gadget" }
-
-[target.'cfg(target_os = "linux")'.dependencies]
-tikv-jemallocator = "0.6"

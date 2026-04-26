@@ -1,6 +1,8 @@
-#[cfg(target_os = "linux")]
-#[global_allocator]
-static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+// The system allocator is used so the binary works on every Pi kernel
+// regardless of page size (Pi 5 / Bookworm uses 16 KB pages while older
+// Pis use 4 KB pages). A page-size-specific allocator like jemalloc
+// aborts at startup when its compiled-in page size doesn't match the
+// kernel's, which is why we don't use one here.
 
 use std::sync::Arc;
 
