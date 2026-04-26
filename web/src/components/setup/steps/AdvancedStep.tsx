@@ -19,8 +19,11 @@ function Field({ label, field, type = "text", placeholder, data, onChange, hint 
 
 const TIMEZONES = [
   "auto",
-  // US shortcuts
-  "US/Eastern", "US/Central", "US/Mountain", "US/Pacific", "US/Alaska", "US/Hawaii",
+  // US: prefer the canonical IANA names below — newer Pi OS / Debian
+  // releases ship a minimal tzdata that drops the legacy `US/*` aliases,
+  // which would make `timedatectl set-timezone` fail. Our backend
+  // normalizes US/Eastern → America/New_York etc. for older saved
+  // configs, but new installs should pick the canonical name directly.
   // Americas
   "America/Adak", "America/Anchorage", "America/Anguilla", "America/Antigua", "America/Araguaina",
   "America/Argentina/Buenos_Aires", "America/Argentina/Catamarca", "America/Argentina/Cordoba",

@@ -405,7 +405,16 @@ WantedBy=backingfiles.mount
 
 /// Ensure required system packages are installed. Only announces a phase if
 /// one or more packages actually need installing.
+///
+/// We test for the *binary* via `which` rather than the *package* via
+/// `dpkg -s` because Debian splits binaries across packages differently
+/// across releases — e.g. `fdisk` is its own package on bookworm but ships
+/// inside `util-linux` on bullseye, so `dpkg -s fdisk` would falsely report
+/// missing on bullseye and `apt-get install fdisk` would then fail. The
+/// binary check works regardless of which package owns the file.
 pub async fn install_required_packages(emitter: &SetupEmitter) -> Result<bool> {
+    // (binary_to_check, package_to_install_when_missing)
+    //
     // `ntpsec-ntpdig` provides the `ntpdig` binary that
     // `run/archiveloop`'s `set_time()` calls via
     //   `ntpdig -S time.google.com || sntp -S 129.6.15.28`
@@ -415,12 +424,20 @@ pub async fn install_required_packages(emitter: &SetupEmitter) -> Result<bool> {
     // the clock (systemd-timesyncd keeps sync quietly in the background)
     // but it floods the archive log and causes a cold-boot window where
     // clip folder timestamps are wrong until timesyncd catches up.
-    let packages = ["dos2unix", "parted", "fdisk", "curl", "rsync", "jq", "ntpsec-ntpdig"];
-    let mut to_install = Vec::new();
+    let packages: &[(&str, &str)] = &[
+        ("dos2unix", "dos2unix"),
+        ("parted", "parted"),
+        ("fdisk", "fdisk"),
+        ("curl", "curl"),
+        ("rsync", "rsync"),
+        ("jq", "jq"),
+        ("ntpdig", "ntpsec-ntpdig"),
+    ];
+    let mut to_install: Vec<&str> = Vec::new();
 
-    for pkg in &packages {
-        if sentryusb_shell::run("dpkg", &["-s", pkg]).await.is_err() {
-            to_install.push(*pkg);
+    for (binary, package) in packages {
+        if sentryusb_shell::run("which", &[binary]).await.is_err() {
+            to_install.push(*package);
         }
     }
 
