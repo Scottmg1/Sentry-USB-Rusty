@@ -7,7 +7,6 @@ use std::path::Path;
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
-use tracing::info;
 
 use crate::env::SetupEnv;
 use crate::SetupEmitter;
@@ -177,7 +176,7 @@ async fn release_all_images() {
 }
 
 /// Ensure exfat tools are available if needed.
-async fn ensure_exfat_tools(use_exfat: bool) -> Result<bool> {
+async fn ensure_exfat_tools(use_exfat: bool, emitter: &SetupEmitter) -> Result<bool> {
     if !use_exfat {
         return Ok(false);
     }
@@ -188,7 +187,11 @@ async fn ensure_exfat_tools(use_exfat: bool) -> Result<bool> {
     ).await.is_ok();
 
     if !has_kernel {
-        info!("Kernel does not support ExFAT, reverting to FAT32");
+        // Surface to the wizard log — a silent fallback would let the
+        // user think they got an exFAT cam disk when they actually
+        // got FAT32 (and FAT32's 4 GB per-file cap silently truncates
+        // long Tesla clips).
+        emitter.progress("WARNING: kernel does not support ExFAT — falling back to FAT32");
         return Ok(false);
     }
 
@@ -197,7 +200,7 @@ async fn ensure_exfat_tools(use_exfat: bool) -> Result<bool> {
         if sentryusb_shell::run_with_timeout(
             Duration::from_secs(600), "apt-get", &["-y", "install", "exfatprogs"],
         ).await.is_err() {
-            info!("Could not install exfatprogs, reverting to FAT32");
+            emitter.progress("WARNING: could not install exfatprogs — falling back to FAT32");
             return Ok(false);
         }
     }
@@ -241,7 +244,7 @@ pub async fn create_disk_images(env: &SetupEnv, emitter: &SetupEmitter) -> Resul
     emitter.begin_phase("disk_images", "Disk images");
     emitter.progress("Creating disk images...");
 
-    let use_exfat = ensure_exfat_tools(use_exfat_cfg).await?;
+    let use_exfat = ensure_exfat_tools(use_exfat_cfg, emitter).await?;
     ensure_vfat_tools().await?;
 
     // Space check

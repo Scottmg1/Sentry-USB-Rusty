@@ -46,7 +46,18 @@ pub(crate) fn save_prefs(prefs: &serde_json::Map<String, serde_json::Value>) {
     // intermediate zero-length state if the kernel panics mid-write,
     // which on next boot would silently reset every toggle (away-mode
     // notifications, update channel, etc.) to its default.
+    //
+    // On a fresh first install the wizard saves prefs (e.g. the new
+    // community wraps/chimes flags) BEFORE the /mutable partition has
+    // been created and mounted — at that point the parent directory
+    // doesn't exist yet and the write fails with ENOENT, leaving a
+    // noisy warning in journalctl. Pre-create the parent so the write
+    // succeeds onto rootfs as a placeholder; once /mutable is mounted
+    // any subsequent save lands on the persistent partition.
     let data = serde_json::to_string_pretty(prefs).unwrap_or_default();
+    if let Some(parent) = std::path::Path::new(PREFS_FILE).parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
     let tmp = format!("{}.tmp", PREFS_FILE);
     if let Err(e) = std::fs::write(&tmp, &data) {
         tracing::warn!("[preferences] failed to write tmp: {}", e);

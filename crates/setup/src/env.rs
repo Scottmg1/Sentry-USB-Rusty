@@ -96,15 +96,28 @@ impl SetupEnv {
             .map(|p| p.to_string_lossy().to_string())
             .unwrap_or_else(|_| "/boot".to_string());
 
-        let cmdline_path = ["/sentryusb/cmdline.txt"]
-            .iter()
-            .find(|p| Path::new(p).exists())
-            .map(|s| s.to_string());
+        // Look through /sentryusb first (preserves the user's chosen
+        // boot dir), then fall through to the canonical locations so a
+        // broken symlink left over from a prior install doesn't make
+        // every cmdline/config edit silently no-op. Bookworm puts the
+        // boot files under /boot/firmware; older images use /boot.
+        let cmdline_path = [
+            "/sentryusb/cmdline.txt",
+            "/boot/firmware/cmdline.txt",
+            "/boot/cmdline.txt",
+        ]
+        .iter()
+        .find(|p| Path::new(p).exists())
+        .map(|s| s.to_string());
 
-        let piconfig_path = ["/sentryusb/config.txt"]
-            .iter()
-            .find(|p| Path::new(p).exists())
-            .map(|s| s.to_string());
+        let piconfig_path = [
+            "/sentryusb/config.txt",
+            "/boot/firmware/config.txt",
+            "/boot/config.txt",
+        ]
+        .iter()
+        .find(|p| Path::new(p).exists())
+        .map(|s| s.to_string());
 
         // Detect boot disk
         let boot_disk = detect_boot_disk().await.ok();

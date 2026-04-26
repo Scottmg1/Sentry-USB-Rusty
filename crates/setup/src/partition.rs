@@ -86,7 +86,7 @@ pub async fn setup_data_drive(env: &SetupEnv, emitter: &SetupEmitter) -> Result<
 
         // Let udev reprobe the device after xfs_repair so the kernel
         // releases the inode it briefly held during the log replay.
-        let _ = sentryusb_shell::run("udevadm", &["settle", "--timeout=10"]).await;
+        let _ = sentryusb_shell::run("udevadm", &["settle", "--timeout=30"]).await;
     } else {
         emitter.progress(&format!("Unmounting partitions on {}...", data_drive));
         cleanup_mounts().await;
@@ -105,7 +105,7 @@ pub async fn setup_data_drive(env: &SetupEnv, emitter: &SetupEmitter) -> Result<
             "parted", &["-a", "optimal", "-m", data_drive, "mkpart", "primary", "ext4", "2GB", "100%"],
         ).await?;
 
-        let _ = sentryusb_shell::run("udevadm", &["settle", "--timeout=10"]).await;
+        let _ = sentryusb_shell::run("udevadm", &["settle", "--timeout=30"]).await;
 
         emitter.progress(&format!("Formatting mutable partition (ext4) on {}...", p1));
         sentryusb_shell::run("mkfs.ext4", &["-F", "-L", "mutable", &p1]).await
@@ -206,14 +206,14 @@ pub async fn setup_sd_card(env: &SetupEnv, emitter: &SetupEmitter) -> Result<boo
     ).await.context("sfdisk mutable failed")?;
 
     let _ = sentryusb_shell::run("partprobe", &[boot_disk]).await;
-    let _ = sentryusb_shell::run("udevadm", &["settle", "--timeout=10"]).await;
+    let _ = sentryusb_shell::run("udevadm", &["settle", "--timeout=30"]).await;
 
     // Add partitions to kernel if needed
     if !Path::new(&bf_dev).exists() || !Path::new(&mut_dev).exists() {
         let _ = sentryusb_shell::run(
             "partx", &["--add", "--nr", &format!("{}:{}", last_part_num + 1, last_part_num + 2), boot_disk],
         ).await;
-        let _ = sentryusb_shell::run("udevadm", &["settle", "--timeout=10"]).await;
+        let _ = sentryusb_shell::run("udevadm", &["settle", "--timeout=30"]).await;
     }
 
     if !Path::new(&bf_dev).exists() || !Path::new(&mut_dev).exists() {
