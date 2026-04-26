@@ -44,14 +44,36 @@ const PAIRING_EXPIRY: Duration = Duration::from_secs(5 * 60);
 const MAX_ACTIVE_CODES: usize = 3;
 
 /// Default notification backend. Override with `SENTRY_NOTIFICATION_URL`
-/// env var (matches the send-push-message PR #31 patch).
+/// (env var or `sentryusb.conf` entry) — matches Sentry-USB PR #31 / 771bca6.
 const DEFAULT_NOTIFICATION_BASE_URL: &str = "https://notifications.sentry-six.com";
 
 fn notification_base_url() -> String {
-    std::env::var("SENTRY_NOTIFICATION_URL")
-        .unwrap_or_else(|_| DEFAULT_NOTIFICATION_BASE_URL.to_string())
-        .trim_end_matches('/')
-        .to_string()
+    // 1. Env var first — covers dev overrides + any future systemd
+    //    EnvironmentFile= setup.
+    if let Ok(v) = std::env::var("SENTRY_NOTIFICATION_URL") {
+        let trimmed = v.trim().trim_end_matches('/');
+        if !trimmed.is_empty() {
+            return trimmed.to_string();
+        }
+    }
+    // 2. Parse `sentryusb.conf` directly. systemd starts the binary
+    //    without sourcing the config (no shell wrapper), so the env
+    //    var won't be set on a normal install — without this fallback,
+    //    the user's SENTRY_NOTIFICATION_URL is silently ignored and
+    //    every pairing/test/list call hits notifications.sentry-six.com
+    //    regardless of what the conf says. Mirrors Go's configOrDefault
+    //    (server/api/apiconfig.go).
+    let config_path = sentryusb_config::find_config_path();
+    if let Ok((active, _)) = sentryusb_config::parse_file(config_path) {
+        if let Some(v) = active.get("SENTRY_NOTIFICATION_URL") {
+            let trimmed = v.trim().trim_end_matches('/');
+            if !trimmed.is_empty() {
+                return trimmed.to_string();
+            }
+        }
+    }
+    // 3. Hardcoded default.
+    DEFAULT_NOTIFICATION_BASE_URL.to_string()
 }
 
 // -----------------------------------------------------------------------------
