@@ -195,11 +195,19 @@ function sync_user_media_to_cam () {
       rsync -a --delete "/mutable/LicensePlate/" "$CAM_MOUNT/LicensePlate/" >> "$LOG_FILE" 2>&1 \
         || log "Failed to sync LicensePlate to cam drive"
     fi
-    # Sync LockChime.wav to the root of the cam drive so Tesla reads it via USB
-    if [ -f "/mutable/LockChime.wav" ]
+    # Sync LockChime.wav to the root of the cam drive so Tesla reads it via USB.
+    # Active chime is tracked via /mutable/LockChime/.active_name (directory-based library).
+    _active_chime_name=""
+    if [ -f "/mutable/LockChime/.active_name" ]; then
+      _active_chime_name=$(tr -d '\n\r' < "/mutable/LockChime/.active_name")
+    fi
+    if [ -n "$_active_chime_name" ] && [ -f "/mutable/LockChime/$_active_chime_name" ]
     then
-      cp -f "/mutable/LockChime.wav" "$CAM_MOUNT/LockChime.wav" >> "$LOG_FILE" 2>&1 \
-        || log "Failed to sync LockChime.wav to cam drive"
+      if cp -f "/mutable/LockChime/$_active_chime_name" "$CAM_MOUNT/LockChime.wav"; then
+        log "Synced LockChime.wav ($_active_chime_name) to cam drive"
+      else
+        log "Failed to sync LockChime.wav to cam drive"
+      fi
     else
       # No active lock chime — remove from cam drive if present
       rm -f "$CAM_MOUNT/LockChime.wav" 2>/dev/null || true
@@ -297,7 +305,8 @@ function connect_usb_drives_to_host() {
   fi
   sync_disk_media_to_host
   # Randomize lock chime BEFORE sync_user_media_to_cam so the fresh random pick
-  # at /mutable/LockChime.wav gets copied into the cam disk during the sync step.
+  # (recorded in /mutable/LockChime/.active_name) gets copied into the cam disk
+  # during the sync step.
   local port="${SENTRYUSB_PORT:-80}"
   curl -sf -X POST "http://127.0.0.1:${port}/api/lockchime/randomize-on-connect" > /dev/null 2>&1 || true
   sync_user_media_to_cam
