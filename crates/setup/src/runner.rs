@@ -789,12 +789,10 @@ async fn mount_partitions(emitter: &SetupEmitter) -> Result<()> {
             // mount below dies with "Can't open blockdev".
             let _ = sentryusb_shell::run("umount", &[dev.as_str()]).await;
             let _ = sentryusb_shell::run("umount", &["/backingfiles"]).await;
-            let _ = sentryusb_shell::run_with_timeout(
-                Duration::from_secs(60), "xfs_repair", &["-L", &dev],
-            ).await;
+            crate::partition::repair_xfs(&dev, emitter).await;
             // Let udev reprobe so the kernel releases the inode that
             // xfs_repair briefly held during log replay.
-            let _ = sentryusb_shell::run("udevadm", &["settle", "--timeout=10"]).await;
+            let _ = sentryusb_shell::run("udevadm", &["settle", "--timeout=30"]).await;
         }
         sentryusb_shell::run("mount", &["/backingfiles"]).await?;
     }

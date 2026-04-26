@@ -79,10 +79,7 @@ pub async fn setup_data_drive(env: &SetupEnv, emitter: &SetupEmitter) -> Result<
         emitter.progress(&format!("Releasing any active mounts on {}...", data_drive));
         cleanup_mounts().await;
 
-        emitter.progress(&format!("Clearing XFS log on {}...", p2));
-        let _ = sentryusb_shell::run_with_timeout(
-            Duration::from_secs(60), "xfs_repair", &["-L", &p2],
-        ).await;
+        repair_xfs(&p2, emitter).await;
 
         // Let udev reprobe the device after xfs_repair so the kernel
         // releases the inode it briefly held during the log replay.
@@ -285,6 +282,80 @@ async fn cleanup_mounts() {
         let _ = sentryusb_shell::run("umount", &[mount]).await;
     }
     tokio::time::sleep(Duration::from_secs(2)).await;
+}
+
+/// Run `xfs_repair` against an XFS partition before we mount it on a
+/// resume. We can't trust the previous run to have unmounted cleanly
+/// (cttseraser FUSE crash, kernel panic, power loss…), so the FS may
+/// have an uncommitted log entry or genuine metadata damage that
+/// makes `mount` reject it with "Structure needs cleaning."
+///
+/// Strategy: try the safe pass first (no `-L`), fall back to log
+/// zeroing only if a log replay is needed, then run one final pass to
+/// confirm the structure is clean. All output is surfaced to the
+/// wizard log so a stuck install reports something actionable
+/// instead of silently retrying. Errors are non-fatal — the
+/// downstream `mount` call decides whether the FS is usable.
+pub(crate) async fn repair_xfs(dev: &str, emitter: &SetupEmitter) {
+    // 5 min — xfs_repair on a damaged 1 TB SSD with millions of files
+    // can legitimately run for a few minutes. The previous 60s ceiling
+    // was killing repairs mid-flight, leaving the FS half-fixed and
+    // making `mount` fail with "Structure needs cleaning" right
+    // afterward.
+    let timeout = Duration::from_secs(300);
+
+    emitter.progress(&format!("Checking XFS structure on {}...", dev));
+    match sentryusb_shell::run_with_timeout(timeout, "xfs_repair", &[dev]).await {
+        Ok(_) => {
+            emitter.progress(&format!("XFS clean on {}", dev));
+            // One more no-op pass so we know the verify is stable.
+            let _ = sentryusb_shell::run_with_timeout(timeout, "xfs_repair", &[dev]).await;
+            return;
+        }
+        Err(e) => {
+            // Log replay failure surfaces as exit 2 + "needs to replay
+            // a dirty log" on stderr. Other failures (genuine metadata
+            // corruption) generally need `-L` to make any progress
+            // anyway — at worst we drop a few uncommitted writes.
+            let msg = e.to_string();
+            emitter.progress(&format!(
+                "xfs_repair pass on {} reported issues — falling back to log zeroing: {}",
+                dev,
+                truncate_for_log(&msg)
+            ));
+        }
+    }
+
+    emitter.progress(&format!("Clearing XFS log on {} (xfs_repair -L)...", dev));
+    match sentryusb_shell::run_with_timeout(timeout, "xfs_repair", &["-L", dev]).await {
+        Ok(_) => emitter.progress(&format!("XFS log cleared on {}", dev)),
+        Err(e) => emitter.progress(&format!(
+            "xfs_repair -L on {} returned an error (mount may still fail): {}",
+            dev,
+            truncate_for_log(&e.to_string())
+        )),
+    }
+
+    // Verify pass after log zeroing. A clean exit here is what
+    // tells us the subsequent mount has a chance.
+    if let Err(e) = sentryusb_shell::run_with_timeout(timeout, "xfs_repair", &[dev]).await {
+        emitter.progress(&format!(
+            "xfs_repair verify on {} still reports errors — partition may be unrecoverable: {}",
+            dev,
+            truncate_for_log(&e.to_string())
+        ));
+    }
+}
+
+/// Trim long stderr blobs so the wizard log stays readable.
+fn truncate_for_log(s: &str) -> String {
+    const MAX: usize = 400;
+    let s = s.trim();
+    if s.len() <= MAX {
+        s.to_string()
+    } else {
+        format!("{}…", &s[..MAX])
+    }
 }
 
 /// Ensure /etc/fstab has entries for backingfiles and mutable.

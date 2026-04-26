@@ -135,6 +135,29 @@ fn spawn_setup(hub: sentryusb_ws::Hub) {
             }
             Err(e) => {
                 tracing::error!("[setup] Failed: {:#}", e);
+                // Surface the error to the wizard's live log too. Without
+                // this, the failure only lands in journalctl and the
+                // wizard log just stops mid-phase with no explanation —
+                // the user sees "Mounting backingfiles partition..." as
+                // the last line and has no way to know what went wrong.
+                let line = format!("ERROR: setup failed: {:#}", e);
+                let stamped = format!(
+                    "{} : {}",
+                    std::process::Command::new("date")
+                        .output()
+                        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+                        .unwrap_or_else(|_| "???".to_string()),
+                    line,
+                );
+                if let Ok(mut f) = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open("/sentryusb/sentryusb-setup.log")
+                {
+                    use std::io::Write;
+                    let _ = writeln!(f, "{}", stamped);
+                }
+                hub.broadcast("setup_progress", &serde_json::json!({"message": stamped}));
                 hub.broadcast("setup", &serde_json::json!({"status": "error", "error": e.to_string()}));
             }
         }
