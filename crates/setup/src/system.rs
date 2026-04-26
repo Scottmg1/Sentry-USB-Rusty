@@ -452,10 +452,18 @@ pub async fn install_required_packages(emitter: &SetupEmitter) -> Result<bool> {
 /// acting, and keep `/etc/timezone` in sync ourselves so legacy tools
 /// that consult it (apt, logrotate, some cron jobs) agree with systemd.
 pub async fn configure_timezone(env: &SetupEnv, emitter: &SetupEmitter) -> Result<bool> {
-    let tz = match env.config.get("TIME_ZONE") {
+    let raw = match env.config.get("TIME_ZONE") {
         Some(v) if !v.is_empty() => v.clone(),
         _ => return Ok(false),
     };
+
+    // Newer Pi OS / Debian images (bookworm and later) ship only the
+    // canonical IANA tzdata zones and drop the legacy `US/*` and
+    // single-name aliases that older images still carried. Configs
+    // saved with one of those shortcuts then fail timedatectl with
+    // "Invalid or not installed time zone". Map them up front so we
+    // hand timedatectl a name every shipped tzdata version recognizes.
+    let tz = normalize_timezone(&raw);
 
     if current_timezone().as_deref() == Some(tz.as_str()) {
         return Ok(false);
@@ -470,6 +478,71 @@ pub async fn configure_timezone(env: &SetupEnv, emitter: &SetupEmitter) -> Resul
     let _ = std::fs::write("/etc/timezone", format!("{}\n", tz));
 
     Ok(true)
+}
+
+/// Translate legacy tzdata aliases to their canonical IANA names.
+/// Returns the input unchanged if it isn't a known alias.
+fn normalize_timezone(tz: &str) -> String {
+    match tz {
+        // US/* aliases — all dropped from minimal tzdata installs
+        "US/Alaska" => "America/Anchorage",
+        "US/Aleutian" => "America/Adak",
+        "US/Arizona" => "America/Phoenix",
+        "US/Central" => "America/Chicago",
+        "US/East-Indiana" => "America/Indiana/Indianapolis",
+        "US/Eastern" => "America/New_York",
+        "US/Hawaii" => "Pacific/Honolulu",
+        "US/Indiana-Starke" => "America/Indiana/Knox",
+        "US/Michigan" => "America/Detroit",
+        "US/Mountain" => "America/Denver",
+        "US/Pacific" => "America/Los_Angeles",
+        "US/Samoa" => "Pacific/Pago_Pago",
+        // Common single-name legacy zones
+        "GMT" | "UTC" | "Universal" | "Zulu" => "UTC",
+        "Navajo" => "America/Denver",
+        "Cuba" => "America/Havana",
+        "Egypt" => "Africa/Cairo",
+        "Eire" => "Europe/Dublin",
+        "GB" | "GB-Eire" => "Europe/London",
+        "Hongkong" => "Asia/Hong_Kong",
+        "Iceland" => "Atlantic/Reykjavik",
+        "Iran" => "Asia/Tehran",
+        "Israel" => "Asia/Jerusalem",
+        "Jamaica" => "America/Jamaica",
+        "Japan" => "Asia/Tokyo",
+        "Kwajalein" => "Pacific/Kwajalein",
+        "Libya" => "Africa/Tripoli",
+        "Poland" => "Europe/Warsaw",
+        "Portugal" => "Europe/Lisbon",
+        "Singapore" => "Asia/Singapore",
+        "Turkey" => "Europe/Istanbul",
+        other => return other.to_string(),
+    }
+    .to_string()
+}
+
+#[cfg(test)]
+mod timezone_normalize_tests {
+    use super::normalize_timezone;
+
+    #[test]
+    fn maps_us_aliases() {
+        assert_eq!(normalize_timezone("US/Eastern"), "America/New_York");
+        assert_eq!(normalize_timezone("US/Pacific"), "America/Los_Angeles");
+        assert_eq!(normalize_timezone("US/Hawaii"), "Pacific/Honolulu");
+    }
+
+    #[test]
+    fn passes_canonical_through() {
+        assert_eq!(normalize_timezone("America/New_York"), "America/New_York");
+        assert_eq!(normalize_timezone("Europe/Berlin"), "Europe/Berlin");
+    }
+
+    #[test]
+    fn maps_single_name_legacy() {
+        assert_eq!(normalize_timezone("Japan"), "Asia/Tokyo");
+        assert_eq!(normalize_timezone("Eire"), "Europe/Dublin");
+    }
 }
 
 /// Best-effort detection of the system's current timezone. Tries
