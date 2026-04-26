@@ -276,6 +276,13 @@ pub async fn check_for_update(
 
     let mut new_stable_version = String::new();
 
+    // Detect whether the user is currently on a prerelease so we can offer
+    // the latest stable as a downgrade option when no forward upgrade is
+    // available. Mirrors Go's onPrerelease check at update.go:537-538.
+    let on_prerelease = parse_semver(&current)
+        .map(|(_, _, _, pre)| !pre.is_empty())
+        .unwrap_or(false);
+
     if let Some(stable) = latest_stable {
         let stable_available = can_update && is_version_newer(&stable.tag_name, &current);
         result["update_available"] = serde_json::Value::Bool(stable_available);
@@ -290,6 +297,18 @@ pub async fn check_for_update(
         });
         if stable_available {
             new_stable_version = stable.tag_name.clone();
+        }
+
+        // If user is on a prerelease and the latest stable isn't flagged as
+        // a newer version (e.g. prerelease has a higher base version), offer
+        // the stable release as a revert/downgrade option. Mirrors Go's
+        // dbb89a6 (server/api/update.go:556-562).
+        if on_prerelease && can_update && !stable_available {
+            result["revert_stable"] = serde_json::json!({
+                "version": stable.tag_name,
+                "release_url": stable.html_url,
+                "release_notes": stable.body,
+            });
         }
     } else {
         result["update_available"] = serde_json::Value::Bool(false);
@@ -330,6 +349,7 @@ struct ReleaseInfo {
     html_url: String,
     body: String,
     prerelease: bool,
+    draft: bool,
 }
 
 /// Fetch the most recent releases (stable + prerelease) from GitHub.
@@ -377,6 +397,7 @@ async fn fetch_releases() -> Result<Vec<ReleaseInfo>, String> {
             html_url: v.get("html_url").and_then(|s| s.as_str()).unwrap_or("").to_string(),
             body: v.get("body").and_then(|s| s.as_str()).unwrap_or("").to_string(),
             prerelease: v.get("prerelease").and_then(|s| s.as_bool()).unwrap_or(false),
+            draft: v.get("draft").and_then(|s| s.as_bool()).unwrap_or(false),
         })
         .filter(|r| !r.tag_name.is_empty())
         .collect())
@@ -384,11 +405,14 @@ async fn fetch_releases() -> Result<Vec<ReleaseInfo>, String> {
 
 /// Pick the first stable and the first prerelease from the list. Mirrors
 /// Go's `findLatestReleases` — assumes the GitHub API returns releases in
-/// publish-newest-first order.
+/// publish-newest-first order. Draft releases are skipped.
 fn find_latest_releases(releases: &[ReleaseInfo]) -> (Option<&ReleaseInfo>, Option<&ReleaseInfo>) {
     let mut stable: Option<&ReleaseInfo> = None;
     let mut prerelease: Option<&ReleaseInfo> = None;
     for r in releases {
+        if r.draft {
+            continue;
+        }
         if r.prerelease {
             if prerelease.is_none() {
                 prerelease = Some(r);
