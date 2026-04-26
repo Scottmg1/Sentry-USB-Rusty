@@ -783,9 +783,18 @@ async fn mount_partitions(emitter: &SetupEmitter) -> Result<()> {
     if !bf_mounted {
         emitter.progress("Mounting backingfiles partition...");
         if let Ok(dev) = sentryusb_shell::run("findfs", &["LABEL=backingfiles"]).await {
+            let dev = dev.trim().to_string();
+            // Drop any stale auto-mount before xfs_repair — otherwise
+            // the loser still holds /dev/sdaN open exclusively and the
+            // mount below dies with "Can't open blockdev".
+            let _ = sentryusb_shell::run("umount", &[dev.as_str()]).await;
+            let _ = sentryusb_shell::run("umount", &["/backingfiles"]).await;
             let _ = sentryusb_shell::run_with_timeout(
-                Duration::from_secs(60), "xfs_repair", &["-L", dev.trim()],
+                Duration::from_secs(60), "xfs_repair", &["-L", &dev],
             ).await;
+            // Let udev reprobe so the kernel releases the inode that
+            // xfs_repair briefly held during log replay.
+            let _ = sentryusb_shell::run("udevadm", &["settle", "--timeout=10"]).await;
         }
         sentryusb_shell::run("mount", &["/backingfiles"]).await?;
     }

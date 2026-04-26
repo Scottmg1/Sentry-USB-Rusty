@@ -69,10 +69,24 @@ pub async fn setup_data_drive(env: &SetupEnv, emitter: &SetupEmitter) -> Result<
 
     if already_partitioned {
         emitter.progress("Existing backingfiles (xfs) and mutable (ext4) partitions found. Keeping them.");
+
+        // Drop any auto-mount or stale mount holding the device first.
+        // Without this, xfs_repair contends with whatever mounted the
+        // partition (systemd auto-mount, autofs, udisks2, etc.), often
+        // hits the 60s timeout, and then our subsequent `mount` call
+        // fails with "Can't open blockdev" because the loser still
+        // has /dev/sda2 open exclusively.
+        emitter.progress(&format!("Releasing any active mounts on {}...", data_drive));
+        cleanup_mounts().await;
+
         emitter.progress(&format!("Clearing XFS log on {}...", p2));
         let _ = sentryusb_shell::run_with_timeout(
             Duration::from_secs(60), "xfs_repair", &["-L", &p2],
         ).await;
+
+        // Let udev reprobe the device after xfs_repair so the kernel
+        // releases the inode it briefly held during the log replay.
+        let _ = sentryusb_shell::run("udevadm", &["settle", "--timeout=10"]).await;
     } else {
         emitter.progress(&format!("Unmounting partitions on {}...", data_drive));
         cleanup_mounts().await;

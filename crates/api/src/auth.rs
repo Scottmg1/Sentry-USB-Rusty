@@ -268,7 +268,16 @@ pub async fn auth_middleware(
     // SENTRYUSB_SETUP_FINISHED exists, the same endpoints become
     // privileged (otherwise anyone on the LAN could repoint archive
     // URLs, change hostnames, re-run setup, etc. on a provisioned Pi).
-    if path.starts_with("/api/setup/") && !setup_is_finished() {
+    //
+    // The setup-log poll (`/api/logs/setup`) is also exempt during
+    // setup. The wizard polls it once per second to render the live
+    // log; if auth blocks the poll, the log silently freezes mid-flow
+    // (the user sees the spinner but no text after auth gets configured
+    // on the security step). Limited to the literal "setup" log name
+    // — every other `/api/logs/*` path stays auth-gated.
+    if !setup_is_finished()
+        && (path.starts_with("/api/setup/") || path == "/api/logs/setup")
+    {
         return next.run(req).await;
     }
 
