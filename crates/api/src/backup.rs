@@ -25,12 +25,40 @@ const LAST_HASH_FILE: &str = "/mutable/backups/.last_hash";
 const BACKUP_VERSION: u32 = 1;
 
 // Paths matching Go's `createBackupData` (backup.go:72-99).
-const SSH_PRIVATE_KEY: &str = "/root/.ssh/id_rsa";
-const SSH_PUBLIC_KEY: &str = "/root/.ssh/id_rsa.pub";
+//
+// The Rust wizard generates ed25519 keys (smaller, faster, modern) at
+// /root/.ssh/id_ed25519 — the Go-era code generated RSA at
+// /root/.ssh/id_rsa. Backups need to find whichever was generated, AND
+// restores need to write the key back to the path matching its type.
+// Always check ed25519 first since that's what new installs produce;
+// fall back to RSA so restoring an old Go-era backup still works.
+const SSH_ED25519_PRIVATE_KEY: &str = "/root/.ssh/id_ed25519";
+const SSH_ED25519_PUBLIC_KEY: &str = "/root/.ssh/id_ed25519.pub";
+const SSH_RSA_PRIVATE_KEY: &str = "/root/.ssh/id_rsa";
+const SSH_RSA_PUBLIC_KEY: &str = "/root/.ssh/id_rsa.pub";
 const RCLONE_CONFIG: &str = "/root/.config/rclone/rclone.conf";
 const BLE_PRIVATE_KEY: &str = "/root/.ble/key_private.pem";
 const BLE_PUBLIC_KEY: &str = "/root/.ble/key_public.pem";
 const NOTIFICATION_CREDS: &str = "/root/.sentryusb/notification-credentials.json";
+
+/// Read whichever SSH keypair exists on disk. ed25519 wins when both are
+/// present (newer install ran ssh-keygen on top of an old RSA key). Returns
+/// `(private_pem, public_pem)`; either may be empty if no keypair is set up.
+fn read_ssh_keypair() -> (String, String) {
+    if std::path::Path::new(SSH_ED25519_PRIVATE_KEY).exists() {
+        return (
+            read_file_if_exists(SSH_ED25519_PRIVATE_KEY),
+            read_file_if_exists(SSH_ED25519_PUBLIC_KEY),
+        );
+    }
+    if std::path::Path::new(SSH_RSA_PRIVATE_KEY).exists() {
+        return (
+            read_file_if_exists(SSH_RSA_PRIVATE_KEY),
+            read_file_if_exists(SSH_RSA_PUBLIC_KEY),
+        );
+    }
+    (String::new(), String::new())
+}
 
 #[derive(Serialize, Deserialize, Default)]
 struct BackupData {
@@ -103,6 +131,7 @@ async fn build_backup_data_async() -> Result<BackupData, String> {
         .trim()
         .to_string();
     let now = chrono::Utc::now();
+    let (ssh_private_key, ssh_public_key) = read_ssh_keypair();
     Ok(BackupData {
         version: BACKUP_VERSION,
         date: now.format("%Y-%m-%d").to_string(),
@@ -111,8 +140,8 @@ async fn build_backup_data_async() -> Result<BackupData, String> {
         config,
         preferences: prefs_as_strings(),
         drive_data_included: false,
-        ssh_private_key: read_file_if_exists(SSH_PRIVATE_KEY),
-        ssh_public_key: read_file_if_exists(SSH_PUBLIC_KEY),
+        ssh_private_key,
+        ssh_public_key,
         rclone_config: read_file_if_exists(RCLONE_CONFIG),
         ble_private_key: read_file_if_exists(BLE_PRIVATE_KEY),
         ble_public_key: read_file_if_exists(BLE_PUBLIC_KEY),
@@ -497,12 +526,25 @@ pub async fn restore_backup(
                 std::fs::Permissions::from_mode(0o700),
             );
         }
-        match write_with_mode(SSH_PRIVATE_KEY, &backup.ssh_private_key, 0o600) {
-            Ok(()) => info!("[backup] Restored SSH private key"),
+        // Pick the on-disk filename to match the embedded key type so the
+        // restored pubkey lines up with the privkey and `ssh-keygen -y`
+        // works as expected. Backups from the modern Rust wizard contain
+        // ed25519 keys (OPENSSH PRIVATE KEY); Go-era backups contain RSA
+        // (RSA PRIVATE KEY). Fall back to ed25519 for anything else
+        // because that's what new installs default to.
+        let priv_pem = backup.ssh_private_key.trim_start();
+        let is_rsa = priv_pem.starts_with("-----BEGIN RSA PRIVATE KEY-----");
+        let (priv_path, pub_path) = if is_rsa {
+            (SSH_RSA_PRIVATE_KEY, SSH_RSA_PUBLIC_KEY)
+        } else {
+            (SSH_ED25519_PRIVATE_KEY, SSH_ED25519_PUBLIC_KEY)
+        };
+        match write_with_mode(priv_path, &backup.ssh_private_key, 0o600) {
+            Ok(()) => info!("[backup] Restored SSH private key to {}", priv_path),
             Err(e) => warn!("[backup] Failed to restore SSH private key: {}", e),
         }
         if !backup.ssh_public_key.is_empty() {
-            if let Err(e) = write_with_mode(SSH_PUBLIC_KEY, &backup.ssh_public_key, 0o644) {
+            if let Err(e) = write_with_mode(pub_path, &backup.ssh_public_key, 0o644) {
                 warn!("[backup] Failed to restore SSH public key: {}", e);
             }
         }
