@@ -94,15 +94,55 @@ pub async fn gadget_disable(State(_s): State<AppState>) -> (StatusCode, Json<ser
 }
 
 /// POST /api/system/trigger-sync
+///
+/// Force archiveloop to start a sync cycle now, regardless of the
+/// connectivity check's current opinion. archiveloop has two distinct
+/// wait states the loop can be sitting in when the user clicks "Start
+/// Archive":
+///
+///   1. `wait_for_archive_to_be_reachable` — usual case after a fresh
+///      boot or after the car drove away from the home WiFi. Loop
+///      polls archive-is-reachable.sh until it succeeds. Consumes
+///      `/tmp/archive_is_reachable` to fake a positive result and
+///      proceed to the archive step.
+///
+///   2. `wait_for_archive_to_be_unreachable` — idle steady state after
+///      archive completed; loop is waiting for the car to drive away
+///      so the next archive cycle can start fresh. Consumes
+///      `/tmp/archive_is_unreachable` to fake "user drove away" and
+///      proceed back to step 1.
+///
+/// The Go-era `force_sync.sh` only created the unreachable canary,
+/// which is correct for state (2) but a no-op for state (1) — the
+/// exact case a user hits when their NAS is briefly down or the
+/// reachability check is misconfigured. Create the unreachable canary
+/// first (covering state 2), wait a moment for archiveloop to
+/// consume it, then create the reachable canary (covering both: state
+/// 1 directly, or state 2 after archiveloop transitions out via the
+/// first canary). Either way the loop kicks off an archive cycle.
 pub async fn trigger_sync(State(_s): State<AppState>) -> (StatusCode, Json<serde_json::Value>) {
     tokio::spawn(async {
-        let canary = std::path::Path::new("/tmp/archive_is_unreachable");
-        if std::fs::File::create(canary).is_err() {
-            return;
+        let unreachable = std::path::Path::new("/tmp/archive_is_unreachable");
+        let reachable = std::path::Path::new("/tmp/archive_is_reachable");
+        // Step 1: kick a loop sitting in wait_for_unreachable.
+        let _ = std::fs::File::create(unreachable);
+        // Wait up to ~5s for archiveloop to consume it. If it doesn't,
+        // the loop is already past that state (in wait_for_reachable),
+        // and a stale canary left lying around would otherwise fire on
+        // the next idle cycle and cause a phantom force-sync the user
+        // didn't ask for. Clean up either way.
+        for _ in 0..10 {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            if !unreachable.exists() {
+                break;
+            }
         }
-        while canary.exists() {
-            tokio::time::sleep(Duration::from_secs(5)).await;
-        }
+        let _ = std::fs::remove_file(unreachable);
+        // Step 2: kick a loop sitting in wait_for_reachable. archiveloop
+        // consumes this and starts an archive cycle even if the real
+        // network probe is currently failing — exactly what a user
+        // means when they click "Start Archive Now".
+        let _ = std::fs::File::create(reachable);
     });
     crate::json_ok()
 }
