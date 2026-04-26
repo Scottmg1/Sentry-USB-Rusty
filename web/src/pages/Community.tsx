@@ -1,13 +1,16 @@
 import { useState, useRef, useCallback } from "react"
 import { Users, Paintbrush, Volume2, Shield, X, Loader2 } from "lucide-react"
+import { Link } from "react-router-dom"
 import CommunityWraps from "./CommunityWraps"
 import LockChime from "./LockChime"
+import { useCommunityPrefs } from "@/hooks/useCommunityPrefs"
 
 const API_BASE = "/api"
 
 type CommunityView = "wraps" | "chimes"
 
 export default function Community() {
+  const { mode, loading } = useCommunityPrefs()
   const [view, setView] = useState<CommunityView>("wraps")
   const [adminPasscode, setAdminPasscode] = useState<string | null>(null)
   const [showPasscodePrompt, setShowPasscodePrompt] = useState(false)
@@ -35,20 +38,81 @@ export default function Community() {
     }
   }, [adminPasscode])
 
+  if (loading) {
+    return (
+      <div className="flex items-center justify-center py-16">
+        <Loader2 className="h-5 w-5 animate-spin text-slate-500" />
+      </div>
+    )
+  }
+
+  if (mode === "none") {
+    return (
+      <div className="space-y-6">
+        <div className="flex items-center gap-3">
+          <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-slate-500/10">
+            <Users className="h-5 w-5 text-slate-500" />
+          </div>
+          <div>
+            <h1 className="text-xl font-semibold text-slate-100">Community</h1>
+            <p className="text-xs text-slate-500">Disabled</p>
+          </div>
+        </div>
+
+        <div className="glass-card flex flex-col items-start gap-3 p-6">
+          <p className="text-sm text-slate-300">
+            Community features are disabled. Enable Wraps or Lock Chimes from Settings to use this section.
+          </p>
+          <Link
+            to="/settings"
+            className="rounded-lg bg-blue-500 px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-blue-600"
+          >
+            Open Settings
+          </Link>
+        </div>
+      </div>
+    )
+  }
+
+  // Single-feature modes lock the view to the enabled feature.
+  const effectiveView: CommunityView = mode === "wraps-only"
+    ? "wraps"
+    : mode === "chimes-only"
+      ? "chimes"
+      : view
+
+  const headingTitle = mode === "wraps-only"
+    ? "Wraps"
+    : mode === "chimes-only"
+      ? "Lock Chimes"
+      : "Community"
+
+  const headingSubtitle = mode === "wraps-only"
+    ? "Community wraps"
+    : mode === "chimes-only"
+      ? "Lock chime sounds"
+      : "Wraps & Chimes"
+
+  const HeadingIcon = mode === "wraps-only"
+    ? Paintbrush
+    : mode === "chimes-only"
+      ? Volume2
+      : Users
+
   return (
     <div className="space-y-6">
       {/* Header */}
       <div className="flex items-center justify-between">
         <div className="flex items-center gap-3">
           <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-blue-500/20">
-            <Users className="h-5 w-5 text-blue-400" />
+            <HeadingIcon className="h-5 w-5 text-blue-400" />
           </div>
           <div>
             <h1
               className="cursor-default select-none text-xl font-semibold text-slate-100"
               onClick={handleHeadingClick}
-            >Community</h1>
-            <p className="text-xs text-slate-500">Wraps & Chimes</p>
+            >{headingTitle}</h1>
+            <p className="text-xs text-slate-500">{headingSubtitle}</p>
           </div>
         </div>
         {adminPasscode && (
@@ -62,34 +126,36 @@ export default function Community() {
         )}
       </div>
 
-      {/* Toggle Switch */}
-      <div className="flex items-center gap-1 rounded-lg bg-white/[0.03] border border-white/10 p-1 w-fit">
-        <button
-          onClick={() => setView("wraps")}
-          className={`flex items-center gap-2 rounded-md px-4 py-2 text-sm font-medium transition-colors ${
-            view === "wraps"
-              ? "bg-blue-500/15 text-blue-400"
-              : "text-slate-400 hover:text-slate-200"
-          }`}
-        >
-          <Paintbrush className="h-4 w-4" />
-          Wraps
-        </button>
-        <button
-          onClick={() => setView("chimes")}
-          className={`flex items-center gap-2 rounded-md px-4 py-2 text-sm font-medium transition-colors ${
-            view === "chimes"
-              ? "bg-blue-500/15 text-blue-400"
-              : "text-slate-400 hover:text-slate-200"
-          }`}
-        >
-          <Volume2 className="h-4 w-4" />
-          Chimes
-        </button>
-      </div>
+      {/* Toggle Switch — only visible when both features are enabled */}
+      {mode === "both" && (
+        <div className="flex items-center gap-1 rounded-lg bg-white/[0.03] border border-white/10 p-1 w-fit">
+          <button
+            onClick={() => setView("wraps")}
+            className={`flex items-center gap-2 rounded-md px-4 py-2 text-sm font-medium transition-colors ${
+              view === "wraps"
+                ? "bg-blue-500/15 text-blue-400"
+                : "text-slate-400 hover:text-slate-200"
+            }`}
+          >
+            <Paintbrush className="h-4 w-4" />
+            Wraps
+          </button>
+          <button
+            onClick={() => setView("chimes")}
+            className={`flex items-center gap-2 rounded-md px-4 py-2 text-sm font-medium transition-colors ${
+              view === "chimes"
+                ? "bg-blue-500/15 text-blue-400"
+                : "text-slate-400 hover:text-slate-200"
+            }`}
+          >
+            <Volume2 className="h-4 w-4" />
+            Chimes
+          </button>
+        </div>
+      )}
 
       {/* Content */}
-      {view === "wraps"
+      {effectiveView === "wraps"
         ? <CommunityWraps adminPasscode={adminPasscode} onAdminPasscodeChange={setAdminPasscode} />
         : <LockChime adminPasscode={adminPasscode} onAdminPasscodeChange={setAdminPasscode} />
       }
@@ -97,7 +163,7 @@ export default function Community() {
       {/* Shared passcode modal */}
       {showPasscodePrompt && (
         <PasscodeModal
-          view={view}
+          view={effectiveView}
           onSuccess={(passcode) => {
             setAdminPasscode(passcode)
             setShowPasscodePrompt(false)

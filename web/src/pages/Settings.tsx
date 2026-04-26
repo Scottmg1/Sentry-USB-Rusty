@@ -22,6 +22,9 @@ import {
   Clock,
   Bell,
   Save,
+  Users,
+  Paintbrush,
+  Volume2,
 } from "lucide-react"
 import { api } from "@/lib/api"
 import { cn } from "@/lib/utils"
@@ -1446,6 +1449,128 @@ function ConfigBackupSection() {
   )
 }
 
+// ─── Community Features section ────────────────────────────────────────────
+
+function CommunityFeaturesSection({ onOpenWizardForWraps }: { onOpenWizardForWraps: () => void }) {
+  const [wrapsEnabled, setWrapsEnabled] = useState<boolean>(true)
+  const [chimesEnabled, setChimesEnabled] = useState<boolean>(true)
+  const [hasWrapsPartition, setHasWrapsPartition] = useState<boolean>(false)
+  const [loaded, setLoaded] = useState(false)
+
+  function refreshState() {
+    Promise.all([
+      fetch("/api/config/preference?key=community_wraps_enabled").then((r) => r.json()).catch(() => ({ value: null })),
+      fetch("/api/config/preference?key=community_chimes_enabled").then((r) => r.json()).catch(() => ({ value: null })),
+      fetch("/api/setup/config").then((r) => r.ok ? r.json() : null).catch(() => null),
+    ]).then(([wraps, chimes, config]) => {
+      setWrapsEnabled(wraps?.value == null ? true : wraps.value !== "disabled")
+      setChimesEnabled(chimes?.value == null ? true : chimes.value !== "disabled")
+      if (config) {
+        const entry = config.WRAPS_SIZE as { value?: string; active?: boolean } | undefined
+        const raw = entry?.active ? (entry.value ?? "") : ""
+        const num = parseInt(raw.replace(/[^0-9]/g, "") || "0", 10)
+        setHasWrapsPartition(num > 0)
+      } else {
+        setHasWrapsPartition(false)
+      }
+      setLoaded(true)
+    })
+  }
+
+  useEffect(() => {
+    refreshState()
+    function onPrefsChanged() { refreshState() }
+    window.addEventListener("community-prefs-changed", onPrefsChanged)
+    return () => window.removeEventListener("community-prefs-changed", onPrefsChanged)
+  }, [])
+
+  async function setPref(key: "community_wraps_enabled" | "community_chimes_enabled", enabled: boolean) {
+    await fetch("/api/config/preference", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ key, value: enabled ? "enabled" : "disabled" }),
+    }).catch(() => {})
+    window.dispatchEvent(new CustomEvent("community-prefs-changed"))
+  }
+
+  async function handleWrapsToggle(next: boolean) {
+    if (next && !hasWrapsPartition) {
+      // Need to allocate a partition — open the setup wizard pre-set to enable wraps.
+      onOpenWizardForWraps()
+      return
+    }
+    setWrapsEnabled(next)
+    await setPref("community_wraps_enabled", next)
+  }
+
+  async function handleChimesToggle(next: boolean) {
+    setChimesEnabled(next)
+    await setPref("community_chimes_enabled", next)
+  }
+
+  return (
+    <div className="glass-card overflow-hidden">
+      <div className="flex items-center gap-3 border-b border-white/5 px-3 py-2.5">
+        <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-blue-500/20">
+          <Users className="h-4 w-4 text-blue-400" />
+        </div>
+        <div className="min-w-0 flex-1">
+          <p className="text-xs font-semibold text-slate-200">Community Features</p>
+          <p className="text-[10px] text-slate-500">Choose which community features appear in the sidebar</p>
+        </div>
+      </div>
+
+      {/* Wraps toggle */}
+      <div className="px-3 py-2.5">
+        <label className="flex cursor-pointer items-start justify-between gap-3">
+          <div className="flex items-start gap-2">
+            <Paintbrush className="mt-0.5 h-3.5 w-3.5 shrink-0 text-blue-400" />
+            <div>
+              <span className="text-xs font-medium text-slate-200">Wraps &amp; License Plates</span>
+              <span className="block text-[10px] text-slate-500 mt-0.5">
+                {hasWrapsPartition
+                  ? wrapsEnabled
+                    ? "Tab visible. Toggle off to hide without removing your wraps drive."
+                    : "Hidden. Toggle on to show — your wraps drive is preserved."
+                  : "Requires a dedicated drive partition. Toggling on opens the setup wizard."}
+              </span>
+            </div>
+          </div>
+          <input
+            type="checkbox"
+            checked={wrapsEnabled}
+            disabled={!loaded}
+            onChange={(e) => handleWrapsToggle(e.target.checked)}
+            className="toggle-switch mt-0.5"
+          />
+        </label>
+      </div>
+
+      {/* Chimes toggle */}
+      <div className="border-t border-white/5 px-3 py-2.5">
+        <label className="flex cursor-pointer items-start justify-between gap-3">
+          <div className="flex items-start gap-2">
+            <Volume2 className="mt-0.5 h-3.5 w-3.5 shrink-0 text-blue-400" />
+            <div>
+              <span className="text-xs font-medium text-slate-200">Lock Chimes</span>
+              <span className="block text-[10px] text-slate-500 mt-0.5">
+                Custom Tesla lock-chime sounds. No partition required — toggle freely.
+              </span>
+            </div>
+          </div>
+          <input
+            type="checkbox"
+            checked={chimesEnabled}
+            disabled={!loaded}
+            onChange={(e) => handleChimesToggle(e.target.checked)}
+            className="toggle-switch mt-0.5"
+          />
+        </label>
+      </div>
+    </div>
+  )
+}
+
 // ─── Tab definitions ────────────────────────────────────────────────────────
 
 // ─── Main Settings page ────────────────────────────────────────────────────
@@ -1777,6 +1902,28 @@ export default function Settings() {
           <KeepAwakePreference />
           <AwayModeControl />
           <ConfigBackupSection />
+          <CommunityFeaturesSection
+            onOpenWizardForWraps={async () => {
+              try {
+                const res = await fetch("/api/setup/config")
+                if (res.ok) {
+                  const data = await res.json()
+                  const flat: Record<string, string> = {}
+                  for (const [k, v] of Object.entries(data)) {
+                    const entry = v as { value: string; active: boolean }
+                    if (entry.active) flat[k] = entry.value
+                  }
+                  flat._community_wraps_enabled = "true"
+                  setWizardInitialData(flat)
+                } else {
+                  setWizardInitialData({ _community_wraps_enabled: "true" })
+                }
+              } catch {
+                setWizardInitialData({ _community_wraps_enabled: "true" })
+              }
+              setWizardOpen(true)
+            }}
+          />
         </div>
       </div>
 

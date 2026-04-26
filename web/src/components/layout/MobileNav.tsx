@@ -15,6 +15,8 @@ import {
   Timer,
   LogOut,
   Users,
+  Paintbrush,
+  Volume2,
   BellRing,
   Wifi,
 } from "lucide-react"
@@ -24,13 +26,14 @@ import { useKeepAwake } from "@/hooks/useKeepAwake"
 import { useUpdateAvailable } from "@/hooks/useUpdateAvailable"
 import { useConnectionStatus } from "@/hooks/useConnectionStatus"
 import { useAuth } from "@/hooks/useAuth"
+import { useCommunityPrefs } from "@/hooks/useCommunityPrefs"
 
 interface MobileNavProps {
   open: boolean
   onClose: () => void
 }
 
-const navItems = [
+const baseNavItems = [
   { to: "/", icon: LayoutDashboard, label: "Dashboard" },
   { to: "/viewer", icon: Video, label: "Viewer" },
   { to: "/files", icon: FolderOpen, label: "Files" },
@@ -41,6 +44,17 @@ const navItems = [
   { to: "/settings", icon: Settings, label: "Settings" },
 ]
 
+function buildNavItems(mode: ReturnType<typeof useCommunityPrefs>["mode"]) {
+  return baseNavItems
+    .filter((item) => item.to !== "/community" || mode !== "none")
+    .map((item) => {
+      if (item.to !== "/community") return item
+      if (mode === "wraps-only") return { ...item, icon: Paintbrush, label: "Wraps" }
+      if (mode === "chimes-only") return { ...item, icon: Volume2, label: "Lock Chimes" }
+      return item
+    })
+}
+
 export function MobileNav({ open, onClose }: MobileNavProps) {
   const { status: awayModeStatus } = useAwayMode()
   const { status } = useKeepAwake()
@@ -48,7 +62,9 @@ export function MobileNav({ open, onClose }: MobileNavProps) {
   const { available: updateAvailable } = useUpdateAvailable()
   const { state: connState } = useConnectionStatus()
   const { authRequired, logout } = useAuth()
+  const { mode: communityMode } = useCommunityPrefs()
   const [version, setVersion] = useState<string | null>(null)
+  const navItems = buildNavItems(communityMode)
 
   useEffect(() => {
     fetch("/api/system/version")

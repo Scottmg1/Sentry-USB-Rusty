@@ -5,6 +5,7 @@ import { SetupProgress } from "./SetupProgress"
 import { WelcomeStep } from "./steps/WelcomeStep"
 import { NetworkStep } from "./steps/NetworkStep"
 import { StorageStep } from "./steps/StorageStep"
+import { CommunityStep } from "./steps/CommunityStep"
 import { ArchiveStep } from "./steps/ArchiveStep"
 import { KeepAwakeStep } from "./steps/KeepAwakeStep"
 import { NotificationsStep } from "./steps/NotificationsStep"
@@ -107,10 +108,11 @@ function getStepError(stepIdx: number, data: SetupFormData): string | null {
   switch (stepIdx) {
     case 1: return networkError(data)
     case 2: return storageError(data)
-    case 3: return archiveError(data)
-    case 4: return keepAwakeError(data)
-    case 5: return notificationsError(data)
-    case 6: return securityError(data)
+    // case 3 is the Community step — no validation needed (both can be unchecked)
+    case 4: return archiveError(data)
+    case 5: return keepAwakeError(data)
+    case 6: return notificationsError(data)
+    case 7: return securityError(data)
     default: return null
   }
 }
@@ -180,6 +182,7 @@ const steps: StepDef[] = [
   { id: "welcome", title: "Welcome", component: WelcomeStep },
   { id: "network", title: "Network", component: NetworkStep },
   { id: "storage", title: "Storage", component: StorageStep },
+  { id: "community", title: "Community", component: CommunityStep },
   { id: "archive", title: "Archive", component: ArchiveStep },
   { id: "keepawake", title: "Keep Awake", component: KeepAwakeStep },
   { id: "notifications", title: "Notifications", component: NotificationsStep },
@@ -242,6 +245,38 @@ export function SetupWizard({ initialData, onClose }: SetupWizardProps) {
       originalDataRef.current = { ...(originalDataRef.current ?? {}), ...baseline }
       isRestoreFlow.current = true
     }
+  }, [])
+
+  // Hydrate Community Features prefs from the preference store on mount.
+  // initialData (passed by callers) only carries sentryusb.conf keys, so the
+  // pref-store-backed _community_* keys must be loaded separately. Caller-
+  // supplied values in initialData (e.g., from the Settings Wraps toggle)
+  // take precedence and are not overwritten here.
+  useEffect(() => {
+    let cancelled = false
+    Promise.all([
+      fetch("/api/config/preference?key=community_wraps_enabled").then((r) => r.json()).catch(() => null),
+      fetch("/api/config/preference?key=community_chimes_enabled").then((r) => r.json()).catch(() => null),
+    ]).then(([wraps, chimes]) => {
+      if (cancelled) return
+      const updates: Record<string, string> = {}
+      if (wraps && wraps.value !== null && wraps.value !== undefined) {
+        updates._community_wraps_enabled = wraps.value === "disabled" ? "false" : "true"
+      }
+      if (chimes && chimes.value !== null && chimes.value !== undefined) {
+        updates._community_chimes_enabled = chimes.value === "disabled" ? "false" : "true"
+      }
+      if (Object.keys(updates).length === 0) return
+      setFormData((prev) => {
+        const next = { ...prev }
+        for (const [k, v] of Object.entries(updates)) {
+          if (next[k] === undefined) next[k] = v
+        }
+        return next
+      })
+    })
+    return () => { cancelled = true }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
   // Poll setup status while running
@@ -365,7 +400,7 @@ export function SetupWizard({ initialData, onClose }: SetupWizardProps) {
     setSaving(true)
     setSaveError(null)
     try {
-      const sizeFields = new Set(["CAM_SIZE", "MUSIC_SIZE", "LIGHTSHOW_SIZE", "BOOMBOX_SIZE"])
+      const sizeFields = new Set(["CAM_SIZE", "MUSIC_SIZE", "LIGHTSHOW_SIZE", "BOOMBOX_SIZE", "WRAPS_SIZE"])
       const configData = Object.fromEntries(
         Object.entries(dataToSave)
           .filter(([k, v]) => !k.startsWith("_") && v !== "")
@@ -394,6 +429,33 @@ export function SetupWizard({ initialData, onClose }: SetupWizardProps) {
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ key: "backup_location", value: dataToSave._BACKUP_LOCATION }),
         }).catch(() => {}) // best-effort
+      }
+
+      // Save Community Features prefs (Wraps / Lock Chimes opt-in)
+      const communityPrefPuts: Promise<unknown>[] = []
+      if (dataToSave._community_wraps_enabled !== undefined) {
+        communityPrefPuts.push(fetch("/api/config/preference", {
+          method: "PUT",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            key: "community_wraps_enabled",
+            value: dataToSave._community_wraps_enabled === "true" ? "enabled" : "disabled",
+          }),
+        }).catch(() => {}))
+      }
+      if (dataToSave._community_chimes_enabled !== undefined) {
+        communityPrefPuts.push(fetch("/api/config/preference", {
+          method: "PUT",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            key: "community_chimes_enabled",
+            value: dataToSave._community_chimes_enabled === "true" ? "enabled" : "disabled",
+          }),
+        }).catch(() => {}))
+      }
+      if (communityPrefPuts.length > 0) {
+        await Promise.all(communityPrefPuts)
+        window.dispatchEvent(new CustomEvent("community-prefs-changed"))
       }
 
       setPhase("applying")
