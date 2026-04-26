@@ -1198,6 +1198,55 @@ def setup_bluez_restart_detection(bus):
         bus_name='org.freedesktop.DBus')
 
 
+# ============================================================
+# Android BLE pairing agent
+# ============================================================
+# Android's BLE stack triggers a BlueZ pairing request on first connect.
+# Without a registered agent, BlueZ rejects it and the connection times out.
+# iOS uses CoreBluetooth internally and is unaffected.
+# Registering a NoInputNoOutput agent makes BlueZ auto-accept just-works
+# pairing, so Android clients pair silently on first connection.
+
+AGENT_PATH = "/com/sentryusb/PairingAgent"
+
+
+class AutoPairAgent(dbus.service.Object):
+    @dbus.service.method("org.bluez.Agent1", in_signature="o", out_signature="u")
+    def RequestPasskey(self, device):
+        return dbus.UInt32(0)
+
+    @dbus.service.method("org.bluez.Agent1", in_signature="ou", out_signature="")
+    def DisplayPasskey(self, device, passkey):
+        pass
+
+    @dbus.service.method("org.bluez.Agent1", in_signature="ou", out_signature="")
+    def RequestConfirmation(self, device, passkey):
+        pass
+
+    @dbus.service.method("org.bluez.Agent1", in_signature="o", out_signature="")
+    def RequestAuthorization(self, device):
+        pass
+
+    @dbus.service.method("org.bluez.Agent1", in_signature="os", out_signature="")
+    def AuthorizeService(self, device, uuid):
+        pass
+
+    @dbus.service.method("org.bluez.Agent1", in_signature="", out_signature="")
+    def Cancel(self):
+        pass
+
+
+def register_android_pairing_agent(bus):
+    agent = AutoPairAgent(bus, AGENT_PATH)
+    mgr = dbus.Interface(
+        bus.get_object("org.bluez", "/org/bluez"),
+        "org.bluez.AgentManager1")
+    mgr.RegisterAgent(AGENT_PATH, "NoInputNoOutput")
+    mgr.RequestDefaultAgent(AGENT_PATH)
+    log.info("Android pairing agent registered (NoInputNoOutput)")
+    return agent
+
+
 def main():
     maybe_install_dbus_policy()
     global mainloop, API_BASE
@@ -1234,6 +1283,14 @@ def main():
     # Exit (triggering systemd restart) if bluetoothd restarts, which drops
     # our GATT registration and causes iOS to see stale/wrong services.
     setup_bluez_restart_detection(bus)
+
+    # Register a NoInputNoOutput pairing agent so Android devices can pair
+    # silently without a PIN prompt.  iOS uses CoreBluetooth internals and
+    # doesn't need this, but Android's BLE stack requests a pairing confirmation
+    # that BlueZ will reject (timing out the connection) unless an agent is
+    # registered.  NoInputNoOutput tells BlueZ the Pi has no keyboard/display,
+    # causing it to auto-accept the just-works pairing automatically.
+    _pairing_agent = register_android_pairing_agent(bus)
 
     # Power on adapter and set unique BLE name
     adapter_props = dbus.Interface(

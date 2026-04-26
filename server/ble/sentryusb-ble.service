@@ -21,7 +21,6 @@ ExecStartPre=/bin/bash -c 'for i in $(seq 1 30); do busctl status org.bluez >/de
 ExecStart=/usr/bin/python3 /root/bin/sentryusb-ble.py
 Restart=always
 RestartSec=5
-RuntimeMaxSec=86400
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=sentryusb-ble
