@@ -7,9 +7,11 @@ const API_BASE = "/api"
 
 const TESLA_MODELS = [
   "Cybertruck",
+  "Model S",
   "Model 3",
   "Model 3 (2024+) Standard & Premium",
   "Model 3 (2024+) Performance",
+  "Model X",
   "Model Y",
   "Model Y (2025+) Standard",
   "Model Y (2025+) Premium",
@@ -20,7 +22,7 @@ const TESLA_MODELS = [
 const FILTER_MODELS = ["All", ...TESLA_MODELS]
 
 // Maps display names to Godot scene IDs from Tesla Wrap Studio
-// Models without a Godot 3D counterpart (Model S, Model X) are omitted — no 3D preview for those
+// Model S and Model X have no Godot 3D counterpart — uploads for those skip 3D preview generation and fall back to the thumbnail
 const MODEL_TO_GODOT_ID: Record<string, string> = {
   "Cybertruck": "cybertruck",
   "Model 3": "model3",
