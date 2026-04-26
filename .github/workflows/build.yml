@@ -55,15 +55,22 @@ jobs:
             target
           key: ${{ runner.os }}-cargo-${{ matrix.target }}-${{ hashFiles('**/Cargo.lock') }}
 
-      - name: Ensure frontend exists
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: web/package-lock.json
+
+      - name: Build frontend
         run: |
-          if [ -d "crates/sentryusb/static/assets" ]; then
-            echo "Frontend already present"
-          else
-            echo "Using placeholder frontend"
-            mkdir -p crates/sentryusb/static
-            echo '<!DOCTYPE html><html><body>Frontend not bundled</body></html>' > crates/sentryusb/static/index.html
-          fi
+          cd web
+          npm ci
+          npm run build
+          cd ..
+          rm -rf crates/sentryusb/static
+          cp -r web/dist crates/sentryusb/static
+          echo "Frontend rebuilt from current source"
 
       - name: Build release binaries (sentryusb + cttseraser)
         run: |
