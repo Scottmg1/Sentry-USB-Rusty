@@ -118,9 +118,15 @@ pub async fn save_setup_config(
     }
 }
 
-/// Backfill ARCHIVE_SERVER from the per-system variable when the wizard
-/// didn't set it directly (rsync uses RSYNC_SERVER, rclone uses
-/// RCLONE_DRIVE). cifs/nfs already populate ARCHIVE_SERVER themselves.
+/// Backfill ARCHIVE_SERVER from RSYNC_SERVER for rsync setups so the
+/// legacy bash archive scripts (which all read $ARCHIVE_SERVER) get a
+/// real hostname to probe. cifs and nfs already collect ARCHIVE_SERVER
+/// directly in the wizard. rclone is intentionally NOT mirrored: its
+/// per-system key is RCLONE_DRIVE (a remote name like "myremote"), not
+/// a pingable hostname — copying that into ARCHIVE_SERVER would just
+/// substitute one form of "Name or service not known" for another.
+/// rclone instead has its own ARCHIVE_SERVER input (an IP to ping for
+/// liveness), validated separately on the wizard side.
 /// Idempotent: a non-empty incoming ARCHIVE_SERVER wins.
 fn mirror_archive_server(
     mut body: std::collections::HashMap<String, String>,
@@ -136,12 +142,10 @@ fn mirror_archive_server(
     if already_set {
         return body;
     }
-    let source_key = match system {
-        "rsync" => "RSYNC_SERVER",
-        "rclone" => "RCLONE_DRIVE",
-        _ => return body,
-    };
-    if let Some(v) = body.get(source_key).cloned() {
+    if system != "rsync" {
+        return body;
+    }
+    if let Some(v) = body.get("RSYNC_SERVER").cloned() {
         if !v.trim().is_empty() {
             body.insert("ARCHIVE_SERVER".to_string(), v);
         }

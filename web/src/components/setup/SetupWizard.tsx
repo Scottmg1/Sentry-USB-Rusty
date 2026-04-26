@@ -63,6 +63,12 @@ function archiveError(data: SetupFormData): string | null {
   } else if (system === "rclone") {
     if (!data.RCLONE_DRIVE?.trim()) return "Remote Name is required."
     if (!data.RCLONE_PATH?.trim()) return "Remote Path is required."
+    // archiveloop's connectivity probe pings $ARCHIVE_SERVER. For rclone
+    // the remote name (RCLONE_DRIVE) isn't a hostname, so the wizard
+    // collects an explicit IP/hostname here. Without it the loop sits
+    // forever on "Waiting for archive to be reachable..." — same trap
+    // rsync hit before ARCHIVE_SERVER was backfilled server-side.
+    if (!data.ARCHIVE_SERVER?.trim()) return "Archive Server (for connectivity check) is required for rclone."
   } else if (system === "nfs") {
     if (!data.ARCHIVE_SERVER?.trim()) return "NFS Server is required."
     if (!data.SHARE_NAME?.trim()) return "Export Path is required."
