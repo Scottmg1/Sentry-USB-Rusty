@@ -304,6 +304,18 @@ pub(crate) async fn repair_xfs(dev: &str, emitter: &SetupEmitter) {
     // afterward.
     let timeout = Duration::from_secs(300);
 
+    // Drop the kernel's buffer cache for this device before running
+    // xfs_repair. If a previous mount attempt populated the page
+    // cache with broken metadata (a corrupted FS, a half-formatted
+    // partition, or a USB bridge that briefly returned stale bytes),
+    // xfs_repair would otherwise see the *cached* version of the
+    // device, not what's actually on disk. After a fresh mkfs.xfs on
+    // a USB-attached drive (Samsung T7 etc.) without this flush, the
+    // verify pass sees the previous run's corruption and we false-
+    // positive into "partition unrecoverable".
+    let _ = sentryusb_shell::run("blockdev", &["--flushbufs", dev]).await;
+    let _ = sentryusb_shell::run("sync", &[]).await;
+
     emitter.progress(&format!("Checking XFS structure on {}...", dev));
     match sentryusb_shell::run_with_timeout(timeout, "xfs_repair", &[dev]).await {
         Ok(_) => {
@@ -345,6 +357,11 @@ pub(crate) async fn repair_xfs(dev: &str, emitter: &SetupEmitter) {
             truncate_for_log(&e.to_string())
         ));
     }
+
+    // Final flush so the subsequent mount reads xfs_repair's writes
+    // from disk rather than the page cache's pre-repair version.
+    let _ = sentryusb_shell::run("sync", &[]).await;
+    let _ = sentryusb_shell::run("blockdev", &["--flushbufs", dev]).await;
 }
 
 /// Trim long stderr blobs so the wizard log stays readable.
