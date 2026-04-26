@@ -72,11 +72,48 @@ function NasSSHKey() {
     }
   }
 
-  function copyKey() {
+  async function copyKey() {
     if (!pubKey) return
-    navigator.clipboard.writeText(pubKey)
-    setCopied(true)
-    setTimeout(() => setCopied(false), 2000)
+    // The Pi serves over plain HTTP on the LAN. navigator.clipboard is
+    // gated on a "secure context" (https:// or localhost) in every
+    // modern browser, so calling it from http://sentryusb.local
+    // throws or silently rejects — the user clicks the button and
+    // nothing happens. Try the modern API first (works when the user
+    // accesses via localhost from the Pi itself), fall back to the
+    // legacy execCommand path that does work on insecure http://.
+    let ok = false
+    if (navigator.clipboard && window.isSecureContext) {
+      try {
+        await navigator.clipboard.writeText(pubKey)
+        ok = true
+      } catch {
+        // fall through to legacy fallback
+      }
+    }
+    if (!ok) {
+      const ta = document.createElement("textarea")
+      ta.value = pubKey
+      ta.setAttribute("readonly", "")
+      ta.style.position = "fixed"
+      ta.style.top = "0"
+      ta.style.left = "0"
+      ta.style.opacity = "0"
+      document.body.appendChild(ta)
+      ta.focus()
+      ta.select()
+      try {
+        ok = document.execCommand("copy")
+      } catch {
+        ok = false
+      }
+      document.body.removeChild(ta)
+    }
+    if (ok) {
+      setCopied(true)
+      setTimeout(() => setCopied(false), 2000)
+    } else {
+      setError("Copy failed — select the key text manually with your mouse.")
+    }
   }
 
   return (

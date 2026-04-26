@@ -56,6 +56,66 @@ const CONFIG_GROUPS: Record<string, { label: string; keys: string[] }> = {
   },
 }
 
+/** Map legacy lowercase config keys to their current canonical names.
+ *  Mirrors `migrate_legacy_config_keys` in crates/setup/src/env.rs so the
+ *  wizard inputs (which read CAM_SIZE, ARCHIVE_SERVER, etc.) actually
+ *  populate from teslausb-era .conf files that still use camsize,
+ *  archiveserver, etc. Without this, uploading an old config silently
+ *  drops every legacy key into an unread keyspace and the user sees
+ *  blank inputs despite a successful "Imported N keys" toast.
+ *  New-name wins: if both old and new are present, keep the new value.
+ */
+const LEGACY_KEY_MAP: Record<string, string> = {
+  archiveserver: "ARCHIVE_SERVER",
+  camsize: "CAM_SIZE",
+  musicsize: "MUSIC_SIZE",
+  lightshowsize: "LIGHTSHOW_SIZE",
+  boomboxsize: "BOOMBOX_SIZE",
+  wrapssize: "WRAPS_SIZE",
+  sharename: "SHARE_NAME",
+  musicsharename: "MUSIC_SHARE_NAME",
+  shareuser: "SHARE_USER",
+  sharepassword: "SHARE_PASSWORD",
+  sharepath: "SHARE_PATH",
+  tesla_email: "TESLA_EMAIL",
+  tesla_password: "TESLA_PASSWORD",
+  tesla_vin: "TESLA_VIN",
+  timezone: "TIME_ZONE",
+  usb_drive: "DATA_DRIVE",
+  USB_DRIVE: "DATA_DRIVE",
+  archivedelay: "ARCHIVE_DELAY",
+  trigger_file_saved: "TRIGGER_FILE_SAVED",
+  trigger_file_sentry: "TRIGGER_FILE_SENTRY",
+  trigger_file_any: "TRIGGER_FILE_ANY",
+  pushover_enabled: "PUSHOVER_ENABLED",
+  pushover_user_key: "PUSHOVER_USER_KEY",
+  pushover_app_key: "PUSHOVER_APP_KEY",
+  gotify_enabled: "GOTIFY_ENABLED",
+  gotify_domain: "GOTIFY_DOMAIN",
+  gotify_app_token: "GOTIFY_APP_TOKEN",
+  gotify_priority: "GOTIFY_PRIORITY",
+  ifttt_enabled: "IFTTT_ENABLED",
+  ifttt_event_name: "IFTTT_EVENT_NAME",
+  ifttt_key: "IFTTT_KEY",
+  sns_enabled: "SNS_ENABLED",
+  aws_region: "AWS_REGION",
+  aws_access_key_id: "AWS_ACCESS_KEY_ID",
+  aws_secret_key: "AWS_SECRET_ACCESS_KEY",
+  aws_sns_topic_arn: "AWS_SNS_TOPIC_ARN",
+}
+
+function migrateLegacyKeys(parsed: Record<string, string>): Record<string, string> {
+  const out = { ...parsed }
+  for (const [oldKey, newKey] of Object.entries(LEGACY_KEY_MAP)) {
+    if (Object.prototype.hasOwnProperty.call(out, newKey)) continue
+    if (Object.prototype.hasOwnProperty.call(out, oldKey)) {
+      out[newKey] = out[oldKey]
+      delete out[oldKey]
+    }
+  }
+  return out
+}
+
 /** Parse a sentryusb.conf file (export KEY=VALUE lines) */
 function parseConfFile(text: string): Record<string, string> {
   const result: Record<string, string> = {}
@@ -77,7 +137,7 @@ function parseConfFile(text: string): Record<string, string> {
       result[key] = val
     }
   }
-  return result
+  return migrateLegacyKeys(result)
 }
 
 /** Mask sensitive values for display */
