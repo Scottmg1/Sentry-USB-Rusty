@@ -155,6 +155,8 @@ function sync_user_media_to_cam () {
       mkdir -p "$WRAPS_MOUNT/Wraps"
       rsync -a --delete "/mutable/Wraps/" "$WRAPS_MOUNT/Wraps/" >> "$LOG_FILE" 2>&1 \
         || log "Failed to sync Wraps to wraps drive"
+      # Forward-sync propagated deletions to disk; tombstones no longer needed
+      rm -rf /mutable/.wraps_deleted 2>/dev/null || true
       unmount_mount_point "$WRAPS_MOUNT"
       log "Synced Wraps to dedicated wraps drive."
     else
@@ -165,6 +167,8 @@ function sync_user_media_to_cam () {
         mkdir -p "$CAM_MOUNT/Wraps"
         rsync -a --delete "/mutable/Wraps/" "$CAM_MOUNT/Wraps/" >> "$LOG_FILE" 2>&1 \
           || log "Failed to sync Wraps to cam drive"
+        # Forward-sync propagated deletions to disk; tombstones no longer needed
+        rm -rf /mutable/.wraps_deleted 2>/dev/null || true
         unmount_mount_point "$CAM_MOUNT"
       fi
     fi
@@ -181,6 +185,8 @@ function sync_user_media_to_cam () {
         mkdir -p "$CAM_MOUNT/Wraps"
         rsync -a --delete "/mutable/Wraps/" "$CAM_MOUNT/Wraps/" >> "$LOG_FILE" 2>&1 \
           || log "Failed to sync Wraps to cam drive"
+        # Forward-sync propagated deletions to disk; tombstones no longer needed
+        rm -rf /mutable/.wraps_deleted 2>/dev/null || true
       fi
     fi
     if [ -d "/mutable/LicensePlate" ] && [ -n "$(ls -A /mutable/LicensePlate 2>/dev/null)" ]
@@ -217,8 +223,16 @@ function sync_disk_media_to_host () {
       if [ -d "$WRAPS_MOUNT/Wraps" ] && [ -n "$(ls -A "$WRAPS_MOUNT/Wraps" 2>/dev/null)" ]
       then
         mkdir -p /mutable/Wraps
-        rsync -a --ignore-existing "$WRAPS_MOUNT/Wraps/" "/mutable/Wraps/" >> "$LOG_FILE" 2>&1 \
+        # Build exclude list from tombstones to prevent resurrection of deleted wraps
+        _wraps_exclude_file=$(mktemp)
+        if [ -d /mutable/.wraps_deleted ]; then
+          for _tombstone in /mutable/.wraps_deleted/*; do
+            [ -e "$_tombstone" ] && basename "$_tombstone" >> "$_wraps_exclude_file"
+          done
+        fi
+        rsync -a --ignore-existing --exclude-from="$_wraps_exclude_file" "$WRAPS_MOUNT/Wraps/" "/mutable/Wraps/" >> "$LOG_FILE" 2>&1 \
           || log "Failed to reverse-sync Wraps from wraps drive"
+        rm -f "$_wraps_exclude_file"
         log "Reverse-synced Wraps from wraps drive to /mutable/Wraps."
       fi
       unmount_mount_point "$WRAPS_MOUNT"
@@ -234,8 +248,16 @@ function sync_disk_media_to_host () {
       if [ ! -e /backingfiles/wraps_disk.bin ] && [ -d "$CAM_MOUNT/Wraps" ] && [ -n "$(ls -A "$CAM_MOUNT/Wraps" 2>/dev/null)" ]
       then
         mkdir -p /mutable/Wraps
-        rsync -a --ignore-existing "$CAM_MOUNT/Wraps/" "/mutable/Wraps/" >> "$LOG_FILE" 2>&1 \
+        # Build exclude list from tombstones (same as dedicated disk path above)
+        _wraps_exclude_file=$(mktemp)
+        if [ -d /mutable/.wraps_deleted ]; then
+          for _tombstone in /mutable/.wraps_deleted/*; do
+            [ -e "$_tombstone" ] && basename "$_tombstone" >> "$_wraps_exclude_file"
+          done
+        fi
+        rsync -a --ignore-existing --exclude-from="$_wraps_exclude_file" "$CAM_MOUNT/Wraps/" "/mutable/Wraps/" >> "$LOG_FILE" 2>&1 \
           || log "Failed to reverse-sync Wraps from cam drive"
+        rm -f "$_wraps_exclude_file"
         log "Reverse-synced Wraps from cam drive to /mutable/Wraps."
       fi
       if [ -d "$CAM_MOUNT/LicensePlate" ] && [ -n "$(ls -A "$CAM_MOUNT/LicensePlate" 2>/dev/null)" ]

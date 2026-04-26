@@ -258,6 +258,18 @@ pub async fn delete_file(State(_s): State<AppState>, Query(params): Query<Delete
 
     match result {
         Ok(()) => {
+            // Path is rooted at /mutable/Wraps/* — write a zero-byte tombstone so
+            // archiveloop's reverse-sync (--ignore-existing) won't resurrect it
+            // from the wraps disk on the next loop. Tombstones are cleared after
+            // a successful forward-sync.
+            if clean_str.starts_with("/mutable/Wraps/") {
+                let tombstone_dir = std::path::Path::new("/mutable/.wraps_deleted");
+                if std::fs::create_dir_all(tombstone_dir).is_ok() {
+                    if let Some(base) = clean.file_name() {
+                        let _ = std::fs::write(tombstone_dir.join(base), b"");
+                    }
+                }
+            }
             // Clean up snapshot symlinks for SavedClips/SentryClips
             if clean_str.contains("/SavedClips/") || clean_str.contains("/SentryClips/") {
                 let path = clean_str.to_string();
