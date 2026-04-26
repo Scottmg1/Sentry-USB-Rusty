@@ -1,14 +1,20 @@
 //! OTA update: check for updates, run update, version info.
 
+use std::collections::HashMap;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use axum::Json;
-use axum::extract::State;
+use axum::extract::{Query, State};
 use axum::http::StatusCode;
 
 use crate::router::AppState;
 use crate::status::get_sbc_model;
+
+/// Cache file written by `check_for_update`, read by `get_update_status` so
+/// the Settings page can render last-check results on load without forcing
+/// a network round-trip. Path matches Go's `getUpdateStatus`.
+const UPDATE_CHECK_CACHE: &str = "/tmp/sentryusb-update-check.json";
 
 static UPDATE_RUNNING: AtomicBool = AtomicBool::new(false);
 
@@ -223,101 +229,178 @@ fn read_current_version() -> String {
 /// date" regardless of the actual result. This was the root cause of
 /// the user-reported "update never appears" bug even when the backend
 /// correctly found a newer release.
-pub async fn check_for_update(State(_s): State<AppState>) -> (StatusCode, Json<serde_json::Value>) {
-    let url = format!("https://api.github.com/repos/{}/releases/latest", UPDATE_REPO);
+pub async fn check_for_update(
+    State(_s): State<AppState>,
+    Query(params): Query<HashMap<String, String>>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let current = read_current_version();
+    let can_update = !current.is_empty() && current != "dev";
 
-    let client = match reqwest::Client::builder()
+    // Include prereleases if requested via query param OR if the user's
+    // update_channel preference is set to "prerelease". Mirrors Go's
+    // checkForUpdate (server/api/update.go:501-506).
+    let mut include_prerelease = params.get("include_prerelease").map(String::as_str) == Some("true");
+    if !include_prerelease {
+        let prefs = crate::preferences::load_prefs();
+        if prefs.get("update_channel").and_then(|v| v.as_str()) == Some("prerelease") {
+            include_prerelease = true;
+        }
+    }
+
+    let releases = match fetch_releases().await {
+        Ok(rs) => rs,
+        Err(msg) => {
+            // Fire a basic telemetry heartbeat so the support server still sees
+            // the device when GitHub is unreachable, matching Go's defer block.
+            let cur_clone = current.clone();
+            tokio::spawn(async move { send_telemetry(&cur_clone, false, "").await });
+
+            return (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "available": false,
+                    "update_available": false,
+                    "error": msg,
+                })),
+            );
+        }
+    };
+
+    let (latest_stable, latest_prerelease) = find_latest_releases(&releases);
+
+    // current_version + checked_at top-level matches Go's response.
+    let mut result = serde_json::json!({
+        "current_version": current,
+        "checked_at": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+    });
+
+    let mut new_stable_version = String::new();
+
+    if let Some(stable) = latest_stable {
+        let stable_available = can_update && is_version_newer(&stable.tag_name, &current);
+        result["update_available"] = serde_json::Value::Bool(stable_available);
+        result["latest_version"] = serde_json::Value::String(stable.tag_name.clone());
+        result["release_url"] = serde_json::Value::String(stable.html_url.clone());
+        result["release_notes"] = serde_json::Value::String(stable.body.clone());
+        result["stable"] = serde_json::json!({
+            "version": stable.tag_name,
+            "release_url": stable.html_url,
+            "release_notes": stable.body,
+            "available": stable_available,
+        });
+        if stable_available {
+            new_stable_version = stable.tag_name.clone();
+        }
+    } else {
+        result["update_available"] = serde_json::Value::Bool(false);
+    }
+
+    if include_prerelease {
+        if let Some(pre) = latest_prerelease {
+            let pre_available = can_update && is_version_newer(&pre.tag_name, &current);
+            result["prerelease"] = serde_json::json!({
+                "version": pre.tag_name,
+                "release_url": pre.html_url,
+                "release_notes": pre.body,
+                "available": pre_available,
+            });
+        }
+    }
+
+    // Cache the result so the Settings page load can render last-check info
+    // without re-hitting GitHub. Mirrors Go's writeFile at update.go:578.
+    if let Ok(data) = serde_json::to_vec(&result) {
+        let _ = std::fs::write(UPDATE_CHECK_CACHE, data);
+    }
+
+    // Telemetry — only report stable updates, never prereleases.
+    let cur_clone = current.clone();
+    let new_ver_clone = new_stable_version.clone();
+    tokio::spawn(async move {
+        send_telemetry(&cur_clone, !new_ver_clone.is_empty(), &new_ver_clone).await;
+    });
+
+    (StatusCode::OK, Json(result))
+}
+
+/// Minimal release info parsed from a GitHub release object.
+#[derive(Clone)]
+struct ReleaseInfo {
+    tag_name: String,
+    html_url: String,
+    body: String,
+    prerelease: bool,
+}
+
+/// Fetch the most recent releases (stable + prerelease) from GitHub.
+async fn fetch_releases() -> Result<Vec<ReleaseInfo>, String> {
+    let url = format!("https://api.github.com/repos/{}/releases?per_page=20", UPDATE_REPO);
+
+    let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
         .user_agent(concat!("sentryusb-updater/", env!("CARGO_PKG_VERSION")))
         .build()
-    {
-        Ok(c) => c,
-        Err(e) => {
-            return (StatusCode::OK, Json(serde_json::json!({
-                "available": false,
-                "update_available": false,
-                "error": format!("http client init failed: {}", e),
-            })));
-        }
-    };
+        .map_err(|e| format!("http client init failed: {}", e))?;
 
-    let resp = match client.get(&url).send().await {
-        Ok(r) => r,
-        Err(e) => {
-            let msg = if e.is_timeout() {
-                "GitHub API request timed out".to_string()
-            } else if e.is_connect() {
-                format!("could not reach GitHub: {}", e)
-            } else {
-                format!("GitHub API request failed: {}", e)
-            };
-            return (StatusCode::OK, Json(serde_json::json!({
-                "available": false,
-                "update_available": false,
-                "error": msg,
-            })));
+    let resp = client.get(&url).send().await.map_err(|e| {
+        if e.is_timeout() {
+            "GitHub API request timed out".to_string()
+        } else if e.is_connect() {
+            format!("could not reach GitHub: {}", e)
+        } else {
+            format!("GitHub API request failed: {}", e)
         }
-    };
+    })?;
 
     let status = resp.status();
     if !status.is_success() {
-        let err_msg = if status.as_u16() == 403 || status.as_u16() == 429 {
+        return Err(if status.as_u16() == 403 || status.as_u16() == 429 {
             "GitHub API rate limit hit — wait about an hour and try again".to_string()
         } else {
             format!("GitHub API returned HTTP {}", status)
-        };
-        return (StatusCode::OK, Json(serde_json::json!({
-            "available": false,
-            "update_available": false,
-            "error": err_msg,
-        })));
+        });
     }
 
-    let body: serde_json::Value = match resp.json().await {
-        Ok(v) => v,
-        Err(e) => {
-            return (StatusCode::OK, Json(serde_json::json!({
-                "available": false,
-                "update_available": false,
-                "error": format!("GitHub API returned unparseable JSON: {}", e),
-            })));
+    let body: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|e| format!("GitHub API returned unparseable JSON: {}", e))?;
+
+    let arr = body
+        .as_array()
+        .ok_or_else(|| "GitHub API response was not an array".to_string())?;
+
+    Ok(arr
+        .iter()
+        .map(|v| ReleaseInfo {
+            tag_name: v.get("tag_name").and_then(|s| s.as_str()).unwrap_or("").to_string(),
+            html_url: v.get("html_url").and_then(|s| s.as_str()).unwrap_or("").to_string(),
+            body: v.get("body").and_then(|s| s.as_str()).unwrap_or("").to_string(),
+            prerelease: v.get("prerelease").and_then(|s| s.as_bool()).unwrap_or(false),
+        })
+        .filter(|r| !r.tag_name.is_empty())
+        .collect())
+}
+
+/// Pick the first stable and the first prerelease from the list. Mirrors
+/// Go's `findLatestReleases` — assumes the GitHub API returns releases in
+/// publish-newest-first order.
+fn find_latest_releases(releases: &[ReleaseInfo]) -> (Option<&ReleaseInfo>, Option<&ReleaseInfo>) {
+    let mut stable: Option<&ReleaseInfo> = None;
+    let mut prerelease: Option<&ReleaseInfo> = None;
+    for r in releases {
+        if r.prerelease {
+            if prerelease.is_none() {
+                prerelease = Some(r);
+            }
+        } else if stable.is_none() {
+            stable = Some(r);
         }
-    };
-
-    let latest = body.get("tag_name").and_then(|v| v.as_str()).unwrap_or("").to_string();
-    let release_url = body.get("html_url").and_then(|v| v.as_str()).unwrap_or("").to_string();
-    let release_notes = body.get("body").and_then(|v| v.as_str()).unwrap_or("").to_string();
-
-    if latest.is_empty() {
-        return (StatusCode::OK, Json(serde_json::json!({
-            "available": false,
-            "update_available": false,
-            "error": "GitHub API response missing tag_name",
-        })));
+        if stable.is_some() && prerelease.is_some() {
+            break;
+        }
     }
-
-    let current = read_current_version();
-    let available = is_version_newer(&latest, &current);
-
-    // Fire-and-forget telemetry so support server can track install base.
-    let cur_clone = current.clone();
-    let lat_clone = latest.clone();
-    tokio::spawn(async move {
-        send_telemetry(&cur_clone, available, &lat_clone).await;
-    });
-
-    (StatusCode::OK, Json(serde_json::json!({
-        // Legacy field names — keep for any older clients.
-        "available": available,
-        "latest": latest,
-        "current": current,
-        // Field names the current web UI (Settings.tsx) actually reads.
-        "update_available": available,
-        "latest_version": latest,
-        "current_version": current,
-        "release_url": release_url,
-        "release_notes": release_notes,
-    })))
+    (stable, prerelease)
 }
 
 /// POST {fingerprint, current_version, update_available, new_version, arch, model}
@@ -437,9 +520,29 @@ async fn try_send_telemetry(current: &str, update_available: bool, new_version: 
 }
 
 /// GET /api/system/update-status
+///
+/// Returns the cached result of the last `check_for_update` call so the
+/// Settings page can render last-known release info without forcing a
+/// fresh GitHub round-trip on every page load. Mirrors Go's
+/// `getUpdateStatus` (server/api/update.go:594).
+///
+/// Live install progress is delivered via the `update_status` WebSocket
+/// channel (see `run_update`), not this endpoint.
 pub async fn get_update_status(State(_s): State<AppState>) -> (StatusCode, Json<serde_json::Value>) {
-    let running = UPDATE_RUNNING.load(Ordering::Relaxed);
-    (StatusCode::OK, Json(serde_json::json!({
-        "status": if running { "running" } else { "idle" },
-    })))
+    match std::fs::read_to_string(UPDATE_CHECK_CACHE) {
+        Ok(s) => match serde_json::from_str::<serde_json::Value>(&s) {
+            Ok(v) => (StatusCode::OK, Json(v)),
+            Err(_) => (
+                StatusCode::OK,
+                Json(serde_json::json!({"update_available": false})),
+            ),
+        },
+        Err(_) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "update_available": false,
+                "checked_at": "",
+            })),
+        ),
+    }
 }
