@@ -163,6 +163,9 @@ async fn main() {
     let is_busy: Arc<dyn Fn() -> bool + Send + Sync> = Arc::new(move || {
         sentryusb_api::drives_handler::is_archiving() || is_busy_processor.is_running()
     });
+    // Wipe any stale wanted-flag from a crashed prior run so the first
+    // awake_stop after boot isn't deferred forever.
+    sentryusb_api::drives_handler::clear_keep_awake_wanted();
     let keep_awake = sentryusb_api::keep_awake::KeepAwakeManager::new(is_busy);
 
     let app_state = sentryusb_api::router::AppState {

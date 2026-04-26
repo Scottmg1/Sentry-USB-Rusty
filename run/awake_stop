@@ -6,19 +6,63 @@ then
 fi
 
 # ---------------------------------------------------------------------------
+# Handoff guard
+#
+# Skip the entire stop when any other keep-awake owner still wants the car
+# awake. Two signals defer the stop:
+#   1. /tmp/keep_awake_webui_wanted — Rust-side registry (webui / processor /
+#      migration). Owners register on start, release on end; file is created
+#      on the 0→1 transition and removed on the last release.
+#   2. /tmp/archive_status.json — archiveloop writes this while archiving and
+#      clears it when archive_clips finishes. Match Rust's is_archiving()
+#      logic (fresh within 120s) so a crashed-archive stale file is ignored.
+#
+# Skipping is safe because awake_start is idempotent (Case 1/2 re-enable is a
+# car-side no-op when Sentry Mode is already on; Case 3's awake_start kills
+# any existing nudge PID before spawning a new one).
+# ---------------------------------------------------------------------------
+if [ -e "/tmp/keep_awake_webui_wanted" ]; then
+  log "Keep-awake: Rust-side owner (webui/processor/migration) still active — deferring stop for handoff."
+  exit 0
+fi
+if [ -e "/tmp/archive_status.json" ]; then
+  # `find -mmin -2` prints the path iff modified within the last 2 minutes.
+  if [ -n "$(find /tmp/archive_status.json -mmin -2 2>/dev/null)" ]; then
+    log "Keep-awake: archive cycle still in progress — deferring stop for handoff."
+    exit 0
+  fi
+fi
+
+# ---------------------------------------------------------------------------
 # BLE radio restore
 #
 # Restore the GATT daemon (mobile-app Bluetooth) after keep-awake ends.
 # awake_start disables it and creates BLE_LOCK; we restore only when:
-#   1. The lock file exists (we actually disabled it).
-#   2. No other keep-awake nudge loop is still running (overlap safety).
+#   1. The lock file exists (we actually disabled it), OR
+#   2. The lock is missing but sentryusb-ble is currently inactive — covers
+#      the case where the lock got wiped mid-session (e.g. sentryusb-ble.service
+#      restarted and its ExecStartPre removed the lock) but the GATT daemon
+#      is still down. Without this fallback the GATT daemon stays down until
+#      a full Pi reboot.
+#   3. No other keep-awake nudge loop is still running (overlap safety).
 # If another caller still needs the radio, we leave the lock in place and
 # let that caller's awake_stop handle the restore.
 # ---------------------------------------------------------------------------
 BLE_LOCK="/tmp/ble_keep_awake_active"
 
 ble_restore_gatt_daemon() {
-  if [ ! -e "$BLE_LOCK" ]; then
+  local have_lock=0
+  if [ -e "$BLE_LOCK" ]; then
+    have_lock=1
+  fi
+
+  local ble_active=1
+  if ! systemctl is-active --quiet sentryusb-ble 2>/dev/null; then
+    ble_active=0
+  fi
+
+  if [ "$have_lock" = "0" ] && [ "$ble_active" = "1" ]; then
+    # No lock and GATT already running — nothing to restore.
     return
   fi
 
@@ -34,10 +78,25 @@ ble_restore_gatt_daemon() {
     fi
   fi
 
+  # Belt-and-suspenders: also look for a nudge loop by command name in case
+  # the pid file is missing (e.g. lost when /tmp was re-created).
+  if pgrep -fE "ble_nudge|keep_awake_nudge" >/dev/null 2>&1; then
+    log "Tesla BLE: Keep-awake nudge process still running — mobile-app Bluetooth stays disabled."
+    return
+  fi
+
+  # The top-of-script handoff guard already skips awake_stop entirely when
+  # the Rust-side owner flag is set, so we're only reached when the full
+  # priority chain has drained to idle.
+
   rm -f "$BLE_LOCK"
-  log "Tesla BLE: Keep-awake ended. Restoring mobile-app Bluetooth (GATT daemon)..."
+  if [ "$have_lock" = "0" ]; then
+    log "Tesla BLE: Keep-awake lock was lost but GATT daemon is down — restoring mobile-app Bluetooth..."
+  else
+    log "Tesla BLE: Keep-awake ended. Restoring mobile-app Bluetooth (GATT daemon)..."
+  fi
   systemctl start sentryusb-ble 2>/dev/null || true
-  log "Tesla BLE: Mobile-app Bluetooth restored. iOS app can connect via Bluetooth again."
+  log "Tesla BLE: Mobile-app Bluetooth restored. Companion apps can connect via Bluetooth again."
 }
 
 # Returns a label like "Archive", "Drive Processing", "Manual (8m left)"

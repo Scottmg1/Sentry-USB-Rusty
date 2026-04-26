@@ -94,6 +94,10 @@ impl KeepAwakeManager {
 
         if (self.is_busy)() {
             inner.state = KaState::Pending;
+            // Record intent immediately so awake_stop's handoff guard knows
+            // the webui session will need the nudge as soon as the busy
+            // owner releases.
+            crate::drives_handler::register_keep_awake_want("webui");
             keep_awake_log(&format!(
                 "Queued (mode: {}, duration: {}s) — waiting for archive/processing to finish",
                 mode,
@@ -114,6 +118,7 @@ impl KeepAwakeManager {
                 duration.as_secs()
             ));
             info!("[keep-awake] Started (mode: {}, duration: {}s)", mode, duration.as_secs());
+            crate::drives_handler::register_keep_awake_want("webui");
             crate::drives_handler::start_keep_awake_with(
                 &reason_label(&mode),
                 Some(expires_unix),
@@ -148,16 +153,32 @@ impl KeepAwakeManager {
     pub async fn stop(self: &Arc<Self>) {
         let mut inner = self.inner.lock().await;
         let was_active = inner.state == KaState::Active;
+        let was_pending = inner.state == KaState::Pending;
         inner.epoch.fetch_add(1, Ordering::SeqCst);
         inner.stop_notify.notify_waiters();
         inner.state = KaState::Idle;
         inner.expires_at = None;
         inner.started_at = None;
+        drop(inner);
+
+        if was_active || was_pending {
+            crate::drives_handler::release_keep_awake_want("webui");
+        }
 
         if was_active {
-            keep_awake_log("Stopped by user");
-            info!("[keep-awake] Stopped by user");
-            crate::drives_handler::stop_keep_awake_bg();
+            // Don't kill the shared nudge if archive/processor still owns it.
+            // Web-UI clears its own state; the active owner issues its own
+            // awake_stop on completion.
+            if (self.is_busy)() {
+                keep_awake_log(
+                    "Stopped by user — system still busy (archive/processor); leaving nudge to current owner",
+                );
+                info!("[keep-awake] Stop deferred — archive/processor still owns the nudge");
+            } else {
+                keep_awake_log("Stopped by user");
+                info!("[keep-awake] Stopped by user");
+                crate::drives_handler::stop_keep_awake_bg();
+            }
         } else {
             keep_awake_log("Cancelled (was pending)");
             info!("[keep-awake] Cancelled (was pending)");
@@ -260,9 +281,23 @@ impl KeepAwakeManager {
                     inner.expires_at = None;
                     inner.started_at = None;
                     inner.epoch.fetch_add(1, Ordering::SeqCst);
-                    keep_awake_log("Expired, stopping keep-awake");
-                    info!("[keep-awake] Expired");
-                    crate::drives_handler::stop_keep_awake_bg();
+                    drop(inner);
+
+                    crate::drives_handler::release_keep_awake_want("webui");
+
+                    // Don't kill the shared nudge mid-archive/processing.
+                    if (self.is_busy)() {
+                        keep_awake_log(
+                            "Expired — system still busy; leaving nudge to current owner",
+                        );
+                        info!(
+                            "[keep-awake] Expired — archive/processor still owns the nudge"
+                        );
+                    } else {
+                        keep_awake_log("Expired, stopping keep-awake");
+                        info!("[keep-awake] Expired");
+                        crate::drives_handler::stop_keep_awake_bg();
+                    }
                 }
                 return;
             }
