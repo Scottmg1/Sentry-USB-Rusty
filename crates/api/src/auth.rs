@@ -43,7 +43,12 @@ impl AuthState {
 
     /// Whether authentication is required.
     pub fn auth_required(&self) -> bool {
-        !self.inner.username.is_empty()
+        // BOTH must be set. A username with no password is effectively
+        // unusable — there's no credential the user could supply that
+        // would let them log in — but the previous version would still
+        // gate the UI with 401s. That trapped users who tried to
+        // disable auth by blanking just one field.
+        !self.inner.username.is_empty() && !self.inner.password.is_empty()
     }
 
     /// Create a new session token.
