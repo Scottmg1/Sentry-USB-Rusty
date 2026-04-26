@@ -96,11 +96,57 @@ pub async fn save_setup_config(
     // Remount filesystem read-write (root fs may be read-only)
     let _ = sentryusb_shell::run("mount", &["/", "-o", "remount,rw"]).await;
 
+    // The vendored bash archive scripts (run/{cifs,rsync,rclone,nfs}_archive/
+    // archive-is-reachable.sh and friends) all read `$ARCHIVE_SERVER`
+    // and pass it as $1 to the reachability probe. The wizard, though,
+    // collects the per-system server name in a per-system variable
+    // (RSYNC_SERVER for rsync, RCLONE_DRIVE for rclone). Without
+    // mirroring it into ARCHIVE_SERVER, archiveloop hands the bash
+    // script an empty string, the script exits 1 with "Name or service
+    // not known", and the loop is permanently stuck on
+    // "Waiting for archive to be reachable...".
+    //
+    // CIFS and NFS already use ARCHIVE_SERVER directly in the wizard,
+    // so they're fine unchanged. Mirror only when the user-provided
+    // ARCHIVE_SERVER is empty so we don't clobber an explicit value.
+    let body = mirror_archive_server(body);
+
     let config_path = sentryusb_config::find_config_path();
     match sentryusb_config::write_file(config_path, &body) {
         Ok(()) => crate::json_ok(),
         Err(e) => crate::json_error(StatusCode::INTERNAL_SERVER_ERROR, &format!("Failed to write config: {}", e)),
     }
+}
+
+/// Backfill ARCHIVE_SERVER from the per-system variable when the wizard
+/// didn't set it directly (rsync uses RSYNC_SERVER, rclone uses
+/// RCLONE_DRIVE). cifs/nfs already populate ARCHIVE_SERVER themselves.
+/// Idempotent: a non-empty incoming ARCHIVE_SERVER wins.
+fn mirror_archive_server(
+    mut body: std::collections::HashMap<String, String>,
+) -> std::collections::HashMap<String, String> {
+    let system = body
+        .get("ARCHIVE_SYSTEM")
+        .map(|s| s.as_str())
+        .unwrap_or("");
+    let already_set = body
+        .get("ARCHIVE_SERVER")
+        .map(|s| !s.trim().is_empty())
+        .unwrap_or(false);
+    if already_set {
+        return body;
+    }
+    let source_key = match system {
+        "rsync" => "RSYNC_SERVER",
+        "rclone" => "RCLONE_DRIVE",
+        _ => return body,
+    };
+    if let Some(v) = body.get(source_key).cloned() {
+        if !v.trim().is_empty() {
+            body.insert("ARCHIVE_SERVER".to_string(), v);
+        }
+    }
+    body
 }
 
 /// Shared logic: spawn the setup task in the background.
