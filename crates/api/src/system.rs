@@ -257,6 +257,16 @@ pub async fn get_ssh_pubkey(State(_s): State<AppState>) -> (StatusCode, Json<ser
 
 /// POST /api/system/ssh-keygen
 pub async fn generate_ssh_key(State(_s): State<AppState>) -> (StatusCode, Json<serde_json::Value>) {
+    // Production images run with a read-only root, so writing to
+    // /root/.ssh fails (EROFS) without remounting first. remountfs_rw is
+    // the canonical helper; the mount fallback covers dev images where
+    // it isn't installed.
+    let _ = sentryusb_shell::run(
+        "bash",
+        &["-c", "/root/bin/remountfs_rw 2>/dev/null || mount -o remount,rw / 2>/dev/null || true"],
+    )
+    .await;
+
     let key_path = "/root/.ssh/id_ed25519";
     let _ = std::fs::remove_file(key_path);
     let _ = std::fs::remove_file(format!("{}.pub", key_path));
