@@ -13,6 +13,11 @@ use tracing::info;
 use crate::router::AppState;
 
 /// Allowed base paths for file operations (security).
+///
+/// `/var/www/html/fs` is the autofs-mounted, on-demand RW path for the
+/// Music/LightShow/Boombox disk images (see `/root/bin/auto.www`). The UI
+/// hits these paths so accessing them triggers the automount; reading
+/// `/mnt/music` directly would just see an empty `noauto` mountpoint.
 const ALLOWED_BASES: &[&str] = &[
     "/mutable",
     "/mnt/cam",
@@ -24,6 +29,7 @@ const ALLOWED_BASES: &[&str] = &[
     "/mnt/music",
     "/mnt/lightshow",
     "/mnt/boombox",
+    "/var/www/html/fs",
 ];
 
 /// Validate and clean a path, resolving symlinks and checking against allowed bases.
