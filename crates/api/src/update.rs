@@ -70,18 +70,35 @@ pub async fn check_internet(State(_s): State<AppState>) -> (StatusCode, Json<ser
 
 /// POST /api/system/update
 ///
-/// Downloads the latest binary from the Sentry-USB-Rusty GitHub releases and
-/// replaces the running binary.  A service restart is needed to apply.
-pub async fn run_update(State(s): State<AppState>) -> (StatusCode, Json<serde_json::Value>) {
+/// Body (optional): `{"version": "vX.Y.Z"}` — install a specific release.
+/// Empty body / missing version → install whatever `/releases/latest`
+/// currently points to (backward-compatible "install latest" path).
+///
+/// A service restart is needed to apply.
+pub async fn run_update(
+    State(s): State<AppState>,
+    body: String,
+) -> (StatusCode, Json<serde_json::Value>) {
     if UPDATE_RUNNING.swap(true, Ordering::SeqCst) {
         return crate::json_error(StatusCode::CONFLICT, "Update already in progress");
     }
+
+    // Frontend conditionally attaches the body only when targetVersion is set
+    // (Settings.tsx:1597), so an empty string is the "install latest" case.
+    let target_version: Option<String> = if body.trim().is_empty() {
+        None
+    } else {
+        serde_json::from_str::<serde_json::Value>(&body)
+            .ok()
+            .and_then(|v| v.get("version").and_then(|s| s.as_str()).map(String::from))
+            .filter(|s| !s.is_empty())
+    };
 
     let hub = s.hub.clone();
     tokio::spawn(async move {
         hub.broadcast("update_status", &serde_json::json!({"status": "running"}));
 
-        let result = self_update().await;
+        let result = self_update(target_version).await;
 
         UPDATE_RUNNING.store(false, Ordering::SeqCst);
 
@@ -96,7 +113,7 @@ pub async fn run_update(State(s): State<AppState>) -> (StatusCode, Json<serde_js
 
 const UPDATE_REPO: &str = "Scottmg1/Sentry-USB-Rusty";
 
-async fn self_update() -> anyhow::Result<String> {
+async fn self_update(target_version: Option<String>) -> anyhow::Result<String> {
     let arch = sentryusb_shell::run("uname", &["-m"]).await?;
     let suffix = match arch.trim() {
         "aarch64" => "linux-arm64",
@@ -106,10 +123,35 @@ async fn self_update() -> anyhow::Result<String> {
         other => anyhow::bail!("unsupported architecture: {}", other),
     };
 
-    let url = format!(
-        "https://github.com/{}/releases/latest/download/sentryusb-{}",
-        UPDATE_REPO, suffix
-    );
+    // Build the download URL — tag-specific if a target version was requested
+    // (Revert to Stable / Install Pre-release), otherwise the latest release.
+    let url = if let Some(v) = &target_version {
+        format!(
+            "https://github.com/{}/releases/download/{}/sentryusb-{}",
+            UPDATE_REPO, v, suffix
+        )
+    } else {
+        format!(
+            "https://github.com/{}/releases/latest/download/sentryusb-{}",
+            UPDATE_REPO, suffix
+        )
+    };
+
+    // HEAD-check the binary exists before downloading so a typo'd version or
+    // a release that didn't get a binary uploaded surfaces as a clear error
+    // instead of an empty mv'd file.
+    sentryusb_shell::run_with_timeout(
+        std::time::Duration::from_secs(15),
+        "curl",
+        &["-sfI", "--max-time", "10", &url],
+    )
+    .await
+    .map_err(|_| {
+        anyhow::anyhow!(
+            "No release binary found at {}. Publish a release with the binary first.",
+            url
+        )
+    })?;
 
     // Remount root read-write
     let _ = sentryusb_shell::run("mount", &["/", "-o", "remount,rw"]).await;
@@ -123,20 +165,32 @@ async fn self_update() -> anyhow::Result<String> {
     sentryusb_shell::run("chmod", &["+x", tmp]).await?;
     sentryusb_shell::run("mv", &[tmp, "/opt/sentryusb/sentryusb"]).await?;
 
-    // Fetch version tag
-    let tag_cmd = format!(
-        "curl -fsSL --max-time 10 https://api.github.com/repos/{}/releases/latest 2>/dev/null \
-         | grep '\"tag_name\"' | head -1 | sed 's/.*\"tag_name\": *\"\\([^\"]*\\)\".*/\\1/'",
-        UPDATE_REPO
-    );
-    let tag = sentryusb_shell::run("bash", &["-c", &tag_cmd]).await.unwrap_or_default();
-    let tag = tag.trim();
+    // Determine the tag to record. Use the requested target if any (it
+    // matches the binary we just installed); otherwise resolve /latest.
+    let tag = match target_version {
+        Some(v) => v,
+        None => {
+            let tag_cmd = format!(
+                "curl -fsSL --max-time 10 https://api.github.com/repos/{}/releases/latest 2>/dev/null \
+                 | grep '\"tag_name\"' | head -1 | sed 's/.*\"tag_name\": *\"\\([^\"]*\\)\".*/\\1/'",
+                UPDATE_REPO
+            );
+            sentryusb_shell::run("bash", &["-c", &tag_cmd])
+                .await
+                .unwrap_or_default()
+                .trim()
+                .to_string()
+        }
+    };
 
     if !tag.is_empty() {
-        let _ = std::fs::write("/opt/sentryusb/version", tag);
+        let _ = std::fs::write("/opt/sentryusb/version", &tag);
     }
 
-    Ok(format!("Updated to {}.  Restart the service to apply.", if tag.is_empty() { "latest" } else { tag }))
+    Ok(format!(
+        "Updated to {}.  Restart the service to apply.",
+        if tag.is_empty() { "latest".to_string() } else { tag }
+    ))
 }
 
 /// GET /api/system/version
