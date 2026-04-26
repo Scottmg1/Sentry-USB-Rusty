@@ -152,6 +152,27 @@ fi
 cat "$optfile"
 "#;
 
+// ── archiveloop + supporting bash scripts ──────────────────────────────────
+//
+// Pulled in via `include_str!` from the vendored `run/` tree at compile
+// time. Before this, the Rust setup runner only wrote out the small
+// helper scripts above and silently relied on the Go-era pi-gen image
+// having pre-installed `archiveloop`, `archive-clips.sh`, etc. Anyone
+// running `curl | bash install-pi.sh` on a clean Pi OS would end up
+// with a working binary, a perfectly-formatted /root/sentryusb.conf,
+// systemd-archive enabled… and an empty /root/bin/ where the script
+// the service tries to exec is supposed to live. Service crashloops,
+// no archive ever runs.
+
+const ARCHIVELOOP: &str = include_str!("../../../run/archiveloop");
+const POST_ARCHIVE_PROCESS: &str = include_str!("../../../run/post-archive-process.sh");
+const AWAKE_START: &str = include_str!("../../../run/awake_start");
+const AWAKE_STOP: &str = include_str!("../../../run/awake_stop");
+const SEND_LIVE_ACTIVITY: &str = include_str!("../../../run/send-live-activity");
+const SEND_PUSH_MESSAGE: &str = include_str!("../../../run/send-push-message");
+const TEMPERATURE_MONITOR: &str = include_str!("../../../run/temperature_monitor");
+const WAITFORIDLE: &str = include_str!("../../../run/waitforidle");
+
 /// Install all runtime helper scripts to /root/bin/.
 ///
 /// Only announces a phase if at least one script is missing or has changed —
@@ -171,6 +192,20 @@ pub async fn install_runtime_scripts(emitter: &crate::SetupEmitter) -> Result<bo
         ("disable_gadget.sh", DISABLE_GADGET),
         ("auto.sentryusb", AUTO_SENTRYUSB),
         ("auto.www", AUTO_WWW),
+        // Archive flow — these are the universal scripts that don't depend
+        // on which archive system the user picked. The per-system variants
+        // (archive-clips.sh, archive-is-reachable.sh, connect-archive.sh,
+        // disconnect-archive.sh, copy-music.sh, verify-and-configure-
+        // archive.sh) are installed by `archive::install_archive_scripts`
+        // based on ARCHIVE_SYSTEM, since each system has its own copy.
+        ("archiveloop", ARCHIVELOOP),
+        ("post-archive-process.sh", POST_ARCHIVE_PROCESS),
+        ("awake_start", AWAKE_START),
+        ("awake_stop", AWAKE_STOP),
+        ("send-live-activity", SEND_LIVE_ACTIVITY),
+        ("send-push-message", SEND_PUSH_MESSAGE),
+        ("temperature_monitor", TEMPERATURE_MONITOR),
+        ("waitforidle", WAITFORIDLE),
     ];
 
     // Skip the phase entirely if every script is already present and

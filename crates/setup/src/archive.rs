@@ -255,12 +255,126 @@ pub async fn configure_archive(env: &SetupEnv, emitter: &SetupEmitter) -> Result
         _ => {}
     }
 
+    // Drop the per-archive-system bash helpers (archive-clips.sh,
+    // archive-is-reachable.sh, etc.) into /root/bin/. archiveloop reads
+    // these by fixed name regardless of which system is active, so we
+    // pick the right variant based on ARCHIVE_SYSTEM. Without this,
+    // archiveloop hits "command not found" on every cycle and clips
+    // never leave the Pi — the Go-era pi-gen image used to bake these
+    // in at build time, but `curl | bash install-pi.sh` doesn't run
+    // pi-gen, so the responsibility moved to the Rust setup runner.
+    install_archive_scripts(archive_system, emitter)?;
+
     crate::system::install_archive_service()?;
     let _ = sentryusb_shell::run("systemctl", &["daemon-reload"]).await;
     let _ = sentryusb_shell::run("systemctl", &["enable", "sentryusb-archive.service"]).await;
 
     emitter.progress("Archive configuration complete.");
     Ok(true)
+}
+
+// ── Per-archive-system bash helper scripts ────────────────────────────────
+//
+// Each archive backend has its own copies of these helpers under
+// `run/<system>_archive/`. They share filenames; archiveloop calls them by
+// fixed name (e.g. `/root/bin/archive-is-reachable.sh`). At setup time we
+// drop the matching variant into `/root/bin/` based on ARCHIVE_SYSTEM. A
+// follow-up wizard run with a different system swaps the files cleanly
+// because we always write the full set.
+
+const CIFS_ARCHIVE_CLIPS: &str = include_str!("../../../run/cifs_archive/archive-clips.sh");
+const CIFS_ARCHIVE_IS_REACHABLE: &str = include_str!("../../../run/cifs_archive/archive-is-reachable.sh");
+const CIFS_CONNECT_ARCHIVE: &str = include_str!("../../../run/cifs_archive/connect-archive.sh");
+const CIFS_COPY_MUSIC: &str = include_str!("../../../run/cifs_archive/copy-music.sh");
+const CIFS_DISCONNECT_ARCHIVE: &str = include_str!("../../../run/cifs_archive/disconnect-archive.sh");
+const CIFS_VERIFY_CONFIGURE: &str = include_str!("../../../run/cifs_archive/verify-and-configure-archive.sh");
+
+const NFS_ARCHIVE_CLIPS: &str = include_str!("../../../run/nfs_archive/archive-clips.sh");
+const NFS_ARCHIVE_IS_REACHABLE: &str = include_str!("../../../run/nfs_archive/archive-is-reachable.sh");
+const NFS_CONNECT_ARCHIVE: &str = include_str!("../../../run/nfs_archive/connect-archive.sh");
+const NFS_COPY_MUSIC: &str = include_str!("../../../run/nfs_archive/copy-music.sh");
+const NFS_DISCONNECT_ARCHIVE: &str = include_str!("../../../run/nfs_archive/disconnect-archive.sh");
+const NFS_VERIFY_CONFIGURE: &str = include_str!("../../../run/nfs_archive/verify-and-configure-archive.sh");
+
+const RSYNC_ARCHIVE_CLIPS: &str = include_str!("../../../run/rsync_archive/archive-clips.sh");
+const RSYNC_ARCHIVE_IS_REACHABLE: &str = include_str!("../../../run/rsync_archive/archive-is-reachable.sh");
+const RSYNC_CONNECT_ARCHIVE: &str = include_str!("../../../run/rsync_archive/connect-archive.sh");
+const RSYNC_COPY_MUSIC: &str = include_str!("../../../run/rsync_archive/copy-music.sh");
+const RSYNC_DISCONNECT_ARCHIVE: &str = include_str!("../../../run/rsync_archive/disconnect-archive.sh");
+const RSYNC_VERIFY_CONFIGURE: &str = include_str!("../../../run/rsync_archive/verify-and-configure-archive.sh");
+
+const RCLONE_ARCHIVE_CLIPS: &str = include_str!("../../../run/rclone_archive/archive-clips.sh");
+const RCLONE_ARCHIVE_IS_REACHABLE: &str = include_str!("../../../run/rclone_archive/archive-is-reachable.sh");
+const RCLONE_CONNECT_ARCHIVE: &str = include_str!("../../../run/rclone_archive/connect-archive.sh");
+const RCLONE_DISCONNECT_ARCHIVE: &str = include_str!("../../../run/rclone_archive/disconnect-archive.sh");
+const RCLONE_VERIFY_CONFIGURE: &str = include_str!("../../../run/rclone_archive/verify-and-configure-archive.sh");
+
+const NONE_ARCHIVE_CLIPS: &str = include_str!("../../../run/none_archive/archive-clips.sh");
+const NONE_ARCHIVE_IS_REACHABLE: &str = include_str!("../../../run/none_archive/archive-is-reachable.sh");
+const NONE_CONNECT_ARCHIVE: &str = include_str!("../../../run/none_archive/connect-archive.sh");
+const NONE_DISCONNECT_ARCHIVE: &str = include_str!("../../../run/none_archive/disconnect-archive.sh");
+const NONE_VERIFY_CONFIGURE: &str = include_str!("../../../run/none_archive/verify-and-configure-archive.sh");
+
+/// Drop the per-archive-system bash helpers into /root/bin/ with mode 0755.
+/// Idempotent — overwriting existing files is fine, and a stale entry from
+/// a prior run with a different ARCHIVE_SYSTEM gets cleanly replaced.
+fn install_archive_scripts(system: ArchiveSystem, emitter: &SetupEmitter) -> Result<()> {
+    let _ = std::fs::create_dir_all("/root/bin");
+
+    let scripts: &[(&str, &str)] = match system {
+        ArchiveSystem::Cifs => &[
+            ("archive-clips.sh", CIFS_ARCHIVE_CLIPS),
+            ("archive-is-reachable.sh", CIFS_ARCHIVE_IS_REACHABLE),
+            ("connect-archive.sh", CIFS_CONNECT_ARCHIVE),
+            ("copy-music.sh", CIFS_COPY_MUSIC),
+            ("disconnect-archive.sh", CIFS_DISCONNECT_ARCHIVE),
+            ("verify-and-configure-archive.sh", CIFS_VERIFY_CONFIGURE),
+        ],
+        ArchiveSystem::Nfs => &[
+            ("archive-clips.sh", NFS_ARCHIVE_CLIPS),
+            ("archive-is-reachable.sh", NFS_ARCHIVE_IS_REACHABLE),
+            ("connect-archive.sh", NFS_CONNECT_ARCHIVE),
+            ("copy-music.sh", NFS_COPY_MUSIC),
+            ("disconnect-archive.sh", NFS_DISCONNECT_ARCHIVE),
+            ("verify-and-configure-archive.sh", NFS_VERIFY_CONFIGURE),
+        ],
+        ArchiveSystem::Rsync => &[
+            ("archive-clips.sh", RSYNC_ARCHIVE_CLIPS),
+            ("archive-is-reachable.sh", RSYNC_ARCHIVE_IS_REACHABLE),
+            ("connect-archive.sh", RSYNC_CONNECT_ARCHIVE),
+            ("copy-music.sh", RSYNC_COPY_MUSIC),
+            ("disconnect-archive.sh", RSYNC_DISCONNECT_ARCHIVE),
+            ("verify-and-configure-archive.sh", RSYNC_VERIFY_CONFIGURE),
+        ],
+        ArchiveSystem::Rclone => &[
+            ("archive-clips.sh", RCLONE_ARCHIVE_CLIPS),
+            ("archive-is-reachable.sh", RCLONE_ARCHIVE_IS_REACHABLE),
+            ("connect-archive.sh", RCLONE_CONNECT_ARCHIVE),
+            ("disconnect-archive.sh", RCLONE_DISCONNECT_ARCHIVE),
+            ("verify-and-configure-archive.sh", RCLONE_VERIFY_CONFIGURE),
+        ],
+        ArchiveSystem::None => &[
+            ("archive-clips.sh", NONE_ARCHIVE_CLIPS),
+            ("archive-is-reachable.sh", NONE_ARCHIVE_IS_REACHABLE),
+            ("connect-archive.sh", NONE_CONNECT_ARCHIVE),
+            ("disconnect-archive.sh", NONE_DISCONNECT_ARCHIVE),
+            ("verify-and-configure-archive.sh", NONE_VERIFY_CONFIGURE),
+        ],
+    };
+
+    for (name, content) in scripts {
+        let path = format!("/root/bin/{}", name);
+        std::fs::write(&path, *content)
+            .with_context(|| format!("write {}", path))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755));
+        }
+    }
+
+    emitter.progress(&format!("Installed {} archive helper scripts", scripts.len()));
+    Ok(())
 }
 
 /// Ensure the named package is installed (idempotent, skips if already
