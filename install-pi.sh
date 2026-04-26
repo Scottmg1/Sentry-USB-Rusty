@@ -57,14 +57,32 @@ if [ -n "${1:-}" ] && [ -f "${1:-}" ]; then
 else
     info "Downloading latest SentryUSB binary from GitHub..."
 
-    ARCH=$(uname -m)
-    case "$ARCH" in
-        aarch64) SUFFIX="linux-arm64" ;;
-        armv7l)  SUFFIX="linux-armv7" ;;
-        armv6l)  SUFFIX="linux-armv6" ;;
-        x86_64)  SUFFIX="linux-amd64" ;;
-        *)       error_exit "Unsupported architecture: $ARCH" ;;
-    esac
+    # Detect *userspace* architecture, not kernel arch. On Pi OS, a 64-bit
+    # kernel can run with a 32-bit (armhf) userspace, in which case
+    # `uname -m` reports `aarch64` but our aarch64 binary won't load —
+    # the kernel returns ENOENT on exec because the dynamic linker
+    # /lib/ld-linux-aarch64.so.1 isn't installed. Trust dpkg first
+    # (always available on Debian-based Pi OS) and fall back to
+    # `uname -m` only when dpkg isn't there.
+    if command -v dpkg >/dev/null 2>&1; then
+        DPKG_ARCH=$(dpkg --print-architecture)
+        case "$DPKG_ARCH" in
+            arm64)  SUFFIX="linux-arm64" ;;
+            armhf)  SUFFIX="linux-armv7" ;;
+            armel)  SUFFIX="linux-armv6" ;;
+            amd64)  SUFFIX="linux-amd64" ;;
+            *)      error_exit "Unsupported userspace architecture: $DPKG_ARCH" ;;
+        esac
+    else
+        ARCH=$(uname -m)
+        case "$ARCH" in
+            aarch64) SUFFIX="linux-arm64" ;;
+            armv7l)  SUFFIX="linux-armv7" ;;
+            armv6l)  SUFFIX="linux-armv6" ;;
+            x86_64)  SUFFIX="linux-amd64" ;;
+            *)       error_exit "Unsupported architecture: $ARCH" ;;
+        esac
+    fi
 
     DOWNLOAD_URL="https://github.com/${REPO}/releases/latest/download/${BINARY_NAME}-${SUFFIX}"
     TMP="/tmp/${BINARY_NAME}-new"

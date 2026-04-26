@@ -113,15 +113,36 @@ pub async fn run_update(
 
 const UPDATE_REPO: &str = "Scottmg1/Sentry-USB-Rusty";
 
-async fn self_update(target_version: Option<String>) -> anyhow::Result<String> {
+/// Detect the *userspace* architecture (not kernel arch).
+///
+/// On Pi OS a 64-bit kernel can be paired with a 32-bit (armhf) userspace,
+/// in which case `uname -m` reports `aarch64` but the linux-arm64 binary
+/// can't actually load — exec returns ENOENT because the dynamic linker
+/// `/lib/ld-linux-aarch64.so.1` isn't installed. Trust dpkg first
+/// (always available on Debian-based Pi OS) and only fall back to
+/// `uname -m` when dpkg isn't there.
+async fn detect_release_suffix() -> anyhow::Result<&'static str> {
+    if let Ok(out) = sentryusb_shell::run("dpkg", &["--print-architecture"]).await {
+        match out.trim() {
+            "arm64" => return Ok("linux-arm64"),
+            "armhf" => return Ok("linux-armv7"),
+            "armel" => return Ok("linux-armv6"),
+            "amd64" => return Ok("linux-amd64"),
+            other => anyhow::bail!("unsupported userspace architecture: {}", other),
+        }
+    }
     let arch = sentryusb_shell::run("uname", &["-m"]).await?;
-    let suffix = match arch.trim() {
-        "aarch64" => "linux-arm64",
-        "armv7l" => "linux-armv7",
-        "armv6l" => "linux-armv6",
-        "x86_64" => "linux-amd64",
+    match arch.trim() {
+        "aarch64" => Ok("linux-arm64"),
+        "armv7l" => Ok("linux-armv7"),
+        "armv6l" => Ok("linux-armv6"),
+        "x86_64" => Ok("linux-amd64"),
         other => anyhow::bail!("unsupported architecture: {}", other),
-    };
+    }
+}
+
+async fn self_update(target_version: Option<String>) -> anyhow::Result<String> {
+    let suffix = detect_release_suffix().await?;
 
     // Build the download URL — tag-specific if a target version was requested
     // (Revert to Stable / Install Pre-release), otherwise the latest release.
