@@ -89,28 +89,34 @@ pub async fn setup_data_drive(env: &SetupEnv, emitter: &SetupEmitter) -> Result<
         cleanup_mounts().await;
 
         emitter.progress(&format!("WARNING: This will delete EVERYTHING on {}", data_drive));
-        sentryusb_shell::run("wipefs", &["-afq", data_drive]).await
-            .context("wipefs failed")?;
-        sentryusb_shell::run("parted", &[data_drive, "--script", "mktable", "gpt"]).await
+        // Bound every block-device operation. A stalled / wedged USB
+        // bridge can hang `wipefs` or `parted` indefinitely, leaving
+        // the wizard stuck on "Creating partitions..." with no way to
+        // recover. 2 minutes is long enough for any healthy drive
+        // (mkfs.ext4 lazy-init means even multi-TB drives finish in
+        // seconds) and short enough that the user notices a problem.
+        let op_timeout = Duration::from_secs(120);
+        sentryusb_shell::run_with_timeout(op_timeout, "wipefs", &["-afq", data_drive]).await
+            .context("wipefs failed (drive unresponsive?)")?;
+        sentryusb_shell::run_with_timeout(op_timeout, "parted",
+            &[data_drive, "--script", "mktable", "gpt"]).await
             .context("parted mktable failed")?;
 
         emitter.progress("Creating partitions...");
-        sentryusb_shell::run(
-            "parted", &["-a", "optimal", "-m", data_drive, "mkpart", "primary", "ext4", "0%", "2GB"],
-        ).await?;
-        sentryusb_shell::run(
-            "parted", &["-a", "optimal", "-m", data_drive, "mkpart", "primary", "ext4", "2GB", "100%"],
-        ).await?;
+        sentryusb_shell::run_with_timeout(op_timeout, "parted",
+            &["-a", "optimal", "-m", data_drive, "mkpart", "primary", "ext4", "0%", "2GB"]).await?;
+        sentryusb_shell::run_with_timeout(op_timeout, "parted",
+            &["-a", "optimal", "-m", data_drive, "mkpart", "primary", "ext4", "2GB", "100%"]).await?;
 
         let _ = sentryusb_shell::run("udevadm", &["settle", "--timeout=30"]).await;
 
         emitter.progress(&format!("Formatting mutable partition (ext4) on {}...", p1));
-        sentryusb_shell::run("mkfs.ext4", &["-F", "-L", "mutable", &p1]).await
-            .context("mkfs.ext4 failed")?;
+        sentryusb_shell::run_with_timeout(op_timeout, "mkfs.ext4",
+            &["-F", "-L", "mutable", &p1]).await.context("mkfs.ext4 failed")?;
 
         emitter.progress(&format!("Formatting backingfiles partition (xfs) on {}...", p2));
-        sentryusb_shell::run("mkfs.xfs", &["-f", "-m", "reflink=1", "-L", "backingfiles", &p2]).await
-            .context("mkfs.xfs failed")?;
+        sentryusb_shell::run_with_timeout(op_timeout, "mkfs.xfs",
+            &["-f", "-m", "reflink=1", "-L", "backingfiles", &p2]).await.context("mkfs.xfs failed")?;
 
         emitter.progress("Partition formatting complete.");
     }

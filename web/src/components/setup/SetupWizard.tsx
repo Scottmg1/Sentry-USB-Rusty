@@ -35,7 +35,16 @@ function networkError(data: SetupFormData): string | null {
   return null
 }
 
-function storageError(_data: SetupFormData): string | null {
+function storageError(data: SetupFormData): string | null {
+  // CAM_SIZE = 0 silently disables the dashcam drive — which is the entire
+  // point of this device — and downstream phases happily proceed against
+  // an empty cam disk image, leaving the user with a "complete" install
+  // that does nothing. Treat it as a hard error so the user sees the
+  // mistake before kicking off setup.
+  const cam = parseFloat(data.CAM_SIZE ?? "0")
+  if (!Number.isFinite(cam) || cam <= 0) {
+    return "Dashcam drive size must be greater than 0 GB."
+  }
   return null
 }
 
@@ -73,7 +82,14 @@ function keepAwakeError(data: SetupFormData): string | null {
   if (method === "teslafi" && !data.TESLAFI_API_TOKEN?.trim()) return "TeslaFi API Token is required."
   if (method === "tessie" && !data.TESSIE_API_TOKEN?.trim()) return "Tessie API Token is required."
   if (method === "tessie" && !data.TESSIE_VIN?.trim()) return "Vehicle VIN is required for Tessie."
-  if (method === "webhook" && !data.KEEP_AWAKE_WEBHOOK_URL?.trim()) return "Webhook URL is required."
+  if (method === "webhook") {
+    const url = data.KEEP_AWAKE_WEBHOOK_URL?.trim() ?? ""
+    if (!url) return "Webhook URL is required."
+    // Schemeless URLs ("homeassistant.local/api/webhook/foo") get curl-
+    // interpreted as a file path at runtime, then the keep-awake job
+    // silently does nothing. Catch it before the user submits.
+    if (!/^https?:\/\//i.test(url)) return "Webhook URL must start with http:// or https://."
+  }
   if (!data.SENTRY_CASE) return "Sentry Mode behavior must be selected."
   return null
 }
@@ -99,8 +115,16 @@ function notificationsError(data: SetupFormData): string | null {
 }
 
 function securityError(data: SetupFormData): string | null {
-  if (data.WEB_USERNAME?.trim() && !data.WEB_PASSWORD?.trim())
-    return "Web Password is required when a Web Username is set."
+  // Both fields must be set together, or both must be empty (auth disabled).
+  // Filling only one silently breaks login — username-only enables the auth
+  // gate but leaves the user unable to authenticate; password-only is
+  // ignored entirely because the backend keys auth on having a username.
+  // Validate both directions so the user can't escape the Security step
+  // in a half-configured state that locks them out post-setup.
+  const u = data.WEB_USERNAME?.trim() ?? ""
+  const p = data.WEB_PASSWORD?.trim() ?? ""
+  if (u && !p) return "Web Password is required when a Web Username is set."
+  if (p && !u) return "Web Username is required when a Web Password is set."
   return null
 }
 
