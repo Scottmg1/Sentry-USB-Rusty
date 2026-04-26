@@ -53,7 +53,11 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-${{ matrix.target }}-${{ hashFiles('**/Cargo.lock') }}
+          # Invalidate the target cache whenever Cargo.lock OR the inputs
+          # to the embedded frontend change. rust-embed's rerun-if-changed
+          # is unreliable across cache restores, so any change that ends up
+          # in crates/sentryusb/static must force a clean cargo rebuild.
+          key: ${{ runner.os }}-cargo-${{ matrix.target }}-${{ hashFiles('**/Cargo.lock', 'web/src/**', 'web/package-lock.json', 'web/package.json', 'web/index.html', 'web/vite.config.*', 'web/tsconfig*.json') }}
 
       - name: Set up Node.js
         uses: actions/setup-node@v4
@@ -64,13 +68,32 @@ jobs:
 
       - name: Build frontend
         run: |
+          set -e
           cd web
           npm ci
           npm run build
           cd ..
+          # Verify the build actually produced an HTML entry point. If
+          # it didn't, refuse to continue rather than ship a binary with
+          # an empty embedded UI.
+          if [ ! -s "web/dist/index.html" ]; then
+            echo "::error::web/dist/index.html missing or empty after npm run build"
+            exit 1
+          fi
           rm -rf crates/sentryusb/static
           cp -r web/dist crates/sentryusb/static
-          echo "Frontend rebuilt from current source"
+          # Sanity-check the embedded dir before handing off to cargo.
+          if [ ! -s "crates/sentryusb/static/index.html" ] || [ -z "$(ls -A crates/sentryusb/static/assets 2>/dev/null)" ]; then
+            echo "::error::crates/sentryusb/static is empty or missing assets after copy"
+            exit 1
+          fi
+          echo "Frontend rebuilt; embedded $(ls crates/sentryusb/static/assets | wc -l) asset(s)"
+
+      - name: Validate Cargo.lock
+        # cargo fetch resolves the lockfile against Cargo.toml and exits
+        # non-zero if Cargo.lock is genuinely broken. This catches lockfile
+        # corruption before the much slower cargo build step.
+        run: cargo fetch --target ${{ matrix.target }}
 
       - name: Build release binaries (sentryusb + cttseraser)
         run: |
