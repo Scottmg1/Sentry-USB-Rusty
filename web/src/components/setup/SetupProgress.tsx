@@ -237,8 +237,8 @@ export function SetupProgress({ complete, phase = "running" }: SetupProgressProp
 
   return (
     <div className="w-full space-y-5">
-      {/* Current activity heading */}
-      <div className="flex items-center gap-2.5">
+      {/* Current activity heading — centered above the two columns */}
+      <div className="flex items-center justify-center gap-2.5 text-center">
         {isDone ? (
           <div className="flex h-7 w-7 shrink-0 items-center justify-center rounded-full bg-emerald-500/20">
             <Check className="h-3.5 w-3.5 text-emerald-400" />
@@ -246,7 +246,7 @@ export function SetupProgress({ complete, phase = "running" }: SetupProgressProp
         ) : (
           <Loader2 className="h-5 w-5 shrink-0 animate-spin text-blue-400" />
         )}
-        <div className="flex-1 min-w-0">
+        <div className="min-w-0">
           <div className="text-sm font-medium text-slate-200 truncate">
             {headerLabel}
           </div>
@@ -258,48 +258,7 @@ export function SetupProgress({ complete, phase = "running" }: SetupProgressProp
         </div>
       </div>
 
-      {/* Phase list */}
-      {phases.length > 0 && (
-        <div className="rounded-xl border border-white/8 bg-white/[0.02]">
-          <ul className="divide-y divide-white/5">
-            {phases.map((p, i) => {
-              const done = i < activeIdx
-              const active = !isDone && i === activeIdx
-              return (
-                <li
-                  key={p.id}
-                  className="flex items-center gap-3 px-3.5 py-2"
-                >
-                  <span className={cn(
-                    "flex h-5 w-5 shrink-0 items-center justify-center rounded-full",
-                    done
-                      ? "bg-emerald-500/20"
-                      : active
-                        ? "bg-blue-500/20"
-                        : "bg-white/5"
-                  )}>
-                    {done ? (
-                      <Check className="h-3 w-3 text-emerald-400" />
-                    ) : active ? (
-                      <Loader2 className="h-3 w-3 animate-spin text-blue-400" />
-                    ) : (
-                      <span className="h-1 w-1 rounded-full bg-white/20" />
-                    )}
-                  </span>
-                  <span className={cn(
-                    "text-sm",
-                    done ? "text-slate-500" : active ? "text-slate-200" : "text-slate-600"
-                  )}>
-                    {p.label}
-                  </span>
-                </li>
-              )
-            })}
-          </ul>
-        </div>
-      )}
-
-      {/* Stale warning */}
+      {/* Stale warning — full width above both columns */}
       {stale && !isDone && (
         <div className="flex items-start gap-2 rounded-xl border border-yellow-500/20 bg-yellow-500/5 px-3 py-2.5">
           <AlertCircle className="mt-0.5 h-3.5 w-3.5 shrink-0 text-yellow-400" />
@@ -311,44 +270,96 @@ export function SetupProgress({ complete, phase = "running" }: SetupProgressProp
         </div>
       )}
 
-      {/* Setup log */}
-      <div className="overflow-hidden rounded-xl border border-white/8 bg-black/30">
-        <div className="flex items-center gap-2 border-b border-white/5 px-3 py-2">
-          <Terminal className="h-3.5 w-3.5 text-slate-500" />
-          <span className="text-xs font-medium text-slate-500">Setup Log</span>
-          {logLines.length > 0 && (
-            <span className="ml-auto text-[10px] tabular-nums text-slate-600">
-              {logLines.length} lines
-            </span>
-          )}
-        </div>
-        <div
-          ref={scrollRef}
-          className="max-h-56 overflow-y-auto p-3 font-mono text-[11px] leading-relaxed"
-        >
-          {logLines.length === 0 ? (
-            <div className="flex items-center gap-2 text-slate-600">
-              <Loader2 className="h-3 w-3 animate-spin" />
-              Waiting for setup log...
+      {/* Two-column layout on lg+, stacked on mobile. The phase list and the
+          setup log scroll independently so neither overflows the viewport
+          when there are 20+ phases / hundreds of log lines. */}
+      <div className="grid grid-cols-1 gap-5 lg:grid-cols-2 lg:items-start">
+        {/* Phase list — left column */}
+        {phases.length > 0 && (
+          <div className="overflow-hidden rounded-xl border border-white/8 bg-white/[0.02]">
+            <div className="border-b border-white/5 px-3.5 py-2 text-xs font-medium text-slate-500">
+              Phases
+              <span className="ml-2 text-[10px] tabular-nums text-slate-600">
+                {phases.length}
+              </span>
             </div>
-          ) : (
-            visibleLines.map((parsed, i) => {
-              const colors = levelColors[parsed.level]
-              return (
-                <div key={i} className="whitespace-pre-wrap break-all">
-                  {parsed.time && (
-                    <span className="text-slate-600 select-none">{parsed.time}  </span>
-                  )}
-                  {parsed.tag && (
-                    <span className={cn("font-semibold", colors.tag)}>
-                      [{parsed.tag}]{"  "}
+            <ul className="max-h-[28rem] divide-y divide-white/5 overflow-y-auto lg:max-h-[34rem]">
+              {phases.map((p, i) => {
+                const done = i < activeIdx
+                const active = !isDone && i === activeIdx
+                return (
+                  <li
+                    key={p.id}
+                    className="flex items-center gap-3 px-3.5 py-2"
+                  >
+                    <span className={cn(
+                      "flex h-5 w-5 shrink-0 items-center justify-center rounded-full",
+                      done
+                        ? "bg-emerald-500/20"
+                        : active
+                          ? "bg-blue-500/20"
+                          : "bg-white/5"
+                    )}>
+                      {done ? (
+                        <Check className="h-3 w-3 text-emerald-400" />
+                      ) : active ? (
+                        <Loader2 className="h-3 w-3 animate-spin text-blue-400" />
+                      ) : (
+                        <span className="h-1 w-1 rounded-full bg-white/20" />
+                      )}
                     </span>
-                  )}
-                  <span className={colors.text}>{parsed.message}</span>
-                </div>
-              )
-            })
-          )}
+                    <span className={cn(
+                      "text-sm",
+                      done ? "text-slate-500" : active ? "text-slate-200" : "text-slate-600"
+                    )}>
+                      {p.label}
+                    </span>
+                  </li>
+                )
+              })}
+            </ul>
+          </div>
+        )}
+
+        {/* Setup log — right column */}
+        <div className="overflow-hidden rounded-xl border border-white/8 bg-black/30">
+          <div className="flex items-center gap-2 border-b border-white/5 px-3 py-2">
+            <Terminal className="h-3.5 w-3.5 text-slate-500" />
+            <span className="text-xs font-medium text-slate-500">Setup Log</span>
+            {logLines.length > 0 && (
+              <span className="ml-auto text-[10px] tabular-nums text-slate-600">
+                {logLines.length} lines
+              </span>
+            )}
+          </div>
+          <div
+            ref={scrollRef}
+            className="max-h-[28rem] overflow-y-auto p-3 font-mono text-[11px] leading-relaxed lg:max-h-[34rem]"
+          >
+            {logLines.length === 0 ? (
+              <div className="flex items-center gap-2 text-slate-600">
+                <Loader2 className="h-3 w-3 animate-spin" />
+                Waiting for setup log...
+              </div>
+            ) : (
+              visibleLines.map((parsed, i) => {
+                const colors = levelColors[parsed.level]
+                return (
+                  <div key={i} className="whitespace-pre-wrap break-all">
+                    {parsed.time && (
+                      <span className="text-slate-600 select-none">{parsed.time}  </span>
+                    )}
+                    {parsed.tag && (
+                      <span className={cn("font-semibold", colors.tag)}>
+                        [{parsed.tag}]{"  "}
+                      </span>
+                    )}
+                    <span className={colors.text}>{parsed.message}</span>
+                  </div>
+                )
+              })
+            )}
+          </div>
         </div>
       </div>
     </div>

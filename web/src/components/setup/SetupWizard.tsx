@@ -606,7 +606,7 @@ export function SetupWizard({ initialData, onClose }: SetupWizardProps) {
     const isInProgress = phase === "applying" || phase === "running" || phase === "rebooting" || phase === "finalizing"
     return (
       <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm">
-        <div className="glass-card flex w-full max-w-2xl flex-col gap-6 p-8">
+        <div className="glass-card flex w-full max-w-2xl flex-col gap-6 p-8 lg:max-w-5xl">
           {isInProgress ? (
             <>
               <div className="text-center">
