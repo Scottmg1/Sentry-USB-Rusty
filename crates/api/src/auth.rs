@@ -249,11 +249,15 @@ pub async fn auth_middleware(
     }
 
     // Always-exempt: login, logout, session check, and the status
-    // endpoint that the frontend uses to decide whether to show the
-    // login screen in the first place. These must work without a
-    // session cookie even after the device is fully set up.
+    // endpoints that the frontend uses to decide whether to show the
+    // login screen / wizard in the first place. These must work
+    // without a session cookie even after the device is fully set up
+    // — without `/api/setup/status` in this list, the SPA's initial
+    // routing call gets 401, can't tell setup is finished, and falls
+    // through to rendering the SetupWizard on every page load.
     const EXEMPT_ALWAYS: &[&str] = &[
         "/api/status",
+        "/api/setup/status",
         "/api/auth/login",
         "/api/auth/logout",
         "/api/auth/check",
