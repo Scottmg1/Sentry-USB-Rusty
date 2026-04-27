@@ -39,6 +39,7 @@ pub const LEGACY_JSON_PATH: &str = "/root/drive-data.json";
 
 /// Archive-side JSON copy for CIFS/NFS mounts.
 pub const ARCHIVE_DATA_PATH: &str = "/mnt/archive/drive-data.json";
+const DRIVE_LIST_CACHE_ALGO_VERSION: &str = "2";
 
 /// Ordered list of paths the one-shot importer checks on first boot.
 /// The first that exists wins.
@@ -727,8 +728,10 @@ fn apply_pragmas(conn: &Connection) -> Result<()> {
 /// along with the route count and tag row count used to validate the cache
 /// on the next startup.
 fn rebuild_drive_list_cache(conn: &Connection) -> Result<()> {
-    let summaries = select_all_route_summaries(conn)?;
-    let route_count = summaries.len() as i64;
+    // Accuracy-first cache build: use the full route grouper path so drive
+    // boundaries/count match Sentry-Drive exactly.
+    let routes = select_all_routes(conn)?;
+    let route_count = routes.len() as i64;
 
     let mut tags = std::collections::HashMap::<String, Vec<String>>::new();
     let mut tags_count: i64 = 0;
@@ -744,37 +747,71 @@ fn rebuild_drive_list_cache(conn: &Connection) -> Result<()> {
         }
     }
 
-    let drives = crate::grouper::group_summaries_fast(&summaries, &tags);
+    let drives = crate::grouper::group_summaries(&routes, &tags);
     let json = serde_json::to_string(&drives)
         .map_err(|e| anyhow::anyhow!("drive cache serialize: {}", e))?;
     schema::meta_set(conn, "drive_list_cache", &json)?;
     schema::meta_set(conn, "drive_list_cache_route_count", &route_count.to_string())?;
     schema::meta_set(conn, "drive_list_cache_tags_count", &tags_count.to_string())?;
+    schema::meta_set(conn, "drive_list_cache_algo", DRIVE_LIST_CACHE_ALGO_VERSION)?;
 
-    // Cache drive stats — computed from summaries (no BLOB decoding needed).
-    // processed_count is stored as 0; handlers inject the live atomic value.
-    let stats = crate::grouper::compute_aggregate_stats_from_summaries(&summaries);
+    // Cache drive stats from grouped drives so `/api/drives` and
+    // `/api/drives/stats` are consistent on drive count and mileage.
+    // Totals include all drives; FSD-specific analytics are SEI-only.
     let r = |v: f64| -> f64 { (v * 100.0).round() / 100.0 };
+    let drives_count = drives.len() as i64;
+    let total_distance_km: f64 = drives.iter().map(|d| d.distance_km).sum();
+    let total_distance_mi: f64 = drives.iter().map(|d| d.distance_mi).sum();
+    let total_duration_ms: i64 = drives.iter().map(|d| d.duration_ms).sum();
+
+    let sei_drives: Vec<_> = drives
+        .iter()
+        .filter(|d| d.source.as_deref() != Some("tessie"))
+        .collect();
+    let sei_total_km: f64 = sei_drives.iter().map(|d| d.distance_km).sum();
+    let fsd_distance_km: f64 = sei_drives.iter().map(|d| d.fsd_distance_km).sum();
+    let fsd_distance_mi: f64 = sei_drives.iter().map(|d| d.fsd_distance_mi).sum();
+    let autosteer_distance_km: f64 = sei_drives.iter().map(|d| d.autosteer_distance_km).sum();
+    let autosteer_distance_mi: f64 = sei_drives.iter().map(|d| d.autosteer_distance_mi).sum();
+    let tacc_distance_km: f64 = sei_drives.iter().map(|d| d.tacc_distance_km).sum();
+    let tacc_distance_mi: f64 = sei_drives.iter().map(|d| d.tacc_distance_mi).sum();
+    let fsd_engaged_ms: i64 = sei_drives.iter().map(|d| d.fsd_engaged_ms).sum();
+    let autosteer_engaged_ms: i64 = sei_drives.iter().map(|d| d.autosteer_engaged_ms).sum();
+    let tacc_engaged_ms: i64 = sei_drives.iter().map(|d| d.tacc_engaged_ms).sum();
+    let fsd_disengagements: i32 = sei_drives.iter().map(|d| d.fsd_disengagements).sum();
+    let fsd_accel_pushes: i32 = sei_drives.iter().map(|d| d.fsd_accel_pushes).sum();
+    let fsd_percent = if sei_total_km > 0.0 {
+        (fsd_distance_km / sei_total_km * 100.0 * 10.0).round() / 10.0
+    } else {
+        0.0
+    };
+    let assisted_percent = if sei_total_km > 0.0 {
+        ((fsd_distance_km + autosteer_distance_km + tacc_distance_km) / sei_total_km * 100.0 * 10.0)
+            .round()
+            / 10.0
+    } else {
+        0.0
+    };
     let stats_json = serde_json::to_string(&serde_json::json!({
-        "drives_count":          stats.drives_count,
-        "routes_count":          stats.routes_count,
+        "drives_count":          drives_count,
+        "routes_count":          route_count,
         "processed_count":       0,
-        "total_distance_km":     r(stats.total_distance_km),
-        "total_distance_mi":     r(stats.total_distance_mi),
-        "total_duration_ms":     stats.total_duration_ms,
-        "fsd_engaged_ms":        stats.fsd_engaged_ms,
-        "fsd_distance_km":       r(stats.fsd_distance_km),
-        "fsd_distance_mi":       r(stats.fsd_distance_mi),
-        "fsd_percent":           stats.fsd_percent,
-        "fsd_disengagements":    stats.fsd_disengagements,
-        "fsd_accel_pushes":      stats.fsd_accel_pushes,
-        "autosteer_engaged_ms":  stats.autosteer_engaged_ms,
-        "autosteer_distance_km": r(stats.autosteer_distance_km),
-        "autosteer_distance_mi": r(stats.autosteer_distance_mi),
-        "tacc_engaged_ms":       stats.tacc_engaged_ms,
-        "tacc_distance_km":      r(stats.tacc_distance_km),
-        "tacc_distance_mi":      r(stats.tacc_distance_mi),
-        "assisted_percent":      stats.assisted_percent,
+        "total_distance_km":     r(total_distance_km),
+        "total_distance_mi":     r(total_distance_mi),
+        "total_duration_ms":     total_duration_ms,
+        "fsd_engaged_ms":        fsd_engaged_ms,
+        "fsd_distance_km":       r(fsd_distance_km),
+        "fsd_distance_mi":       r(fsd_distance_mi),
+        "fsd_percent":           fsd_percent,
+        "fsd_disengagements":    fsd_disengagements,
+        "fsd_accel_pushes":      fsd_accel_pushes,
+        "autosteer_engaged_ms":  autosteer_engaged_ms,
+        "autosteer_distance_km": r(autosteer_distance_km),
+        "autosteer_distance_mi": r(autosteer_distance_mi),
+        "tacc_engaged_ms":       tacc_engaged_ms,
+        "tacc_distance_km":      r(tacc_distance_km),
+        "tacc_distance_mi":      r(tacc_distance_mi),
+        "assisted_percent":      assisted_percent,
     })).map_err(|e| anyhow::anyhow!("stats cache serialize: {}", e))?;
     schema::meta_set(conn, "drive_stats_cache", &stats_json)?;
 
@@ -815,6 +852,11 @@ fn is_drive_cache_valid(conn: &Connection) -> Result<bool> {
     let current_tc: i64 =
         conn.query_row("SELECT COUNT(*) FROM drive_tags", [], |r| r.get(0))?;
     if stored_tc != Some(current_tc) {
+        return Ok(false);
+    }
+
+    let algo = schema::meta_get(conn, "drive_list_cache_algo")?;
+    if algo.as_deref() != Some(DRIVE_LIST_CACHE_ALGO_VERSION) {
         return Ok(false);
     }
 
