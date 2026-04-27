@@ -257,3 +257,10 @@ code, pre, .font-mono {
 .leaflet-pane {
   background: transparent;
 }
+
+/* Import progress bar pulse */
+@keyframes importPulse {
+  0% { width: 15%; opacity: 0.7; }
+  50% { width: 65%; opacity: 1; }
+  100% { width: 15%; opacity: 0.7; }
+}

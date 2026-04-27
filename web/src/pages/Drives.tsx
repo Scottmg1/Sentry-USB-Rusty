@@ -1,14 +1,15 @@
-import { useCallback, useEffect, useRef, useState } from "react"
+import { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import { Link } from "react-router-dom"
 import L from "leaflet"
 import "leaflet/dist/leaflet.css"
 import {
   MapPin, Navigation, Clock, Gauge, Play, Pause,
   Download, Upload, Loader2, ChevronLeft, Search, List, X,
-  Tag, Plus, Layers, RefreshCw, AlertTriangle,
+  Tag, Plus, Layers, RefreshCw, AlertTriangle, Trash2,
   Eye, EyeOff, Zap, ChevronRight,
 } from "lucide-react"
 import { cn } from "@/lib/utils"
+import { wsClient } from "@/lib/ws"
 
 // ── Types ──────────────────────────────────────────────────────────
 
@@ -44,6 +45,9 @@ interface DriveSummary {
   taccDistanceKm: number
   taccDistanceMi: number
   assistedPercent: number
+  source?: string
+  externalSignature?: string
+  tessieAutopilotPercent?: number
 }
 
 interface FSDEventPoint {
@@ -99,17 +103,23 @@ function formatDuration(ms: number) {
   return h > 0 ? `${h}h ${m}m` : `${m} min`
 }
 
-/** Returns the label for the dominant assisted-driving mode in a drive */
-function assistedModeLabel(d: { fsdPercent: number; autosteerPercent: number; taccPercent: number }): string {
-  if (d.fsdPercent >= d.autosteerPercent && d.fsdPercent >= d.taccPercent && d.fsdPercent > 0) return "FSD"
-  if (d.autosteerPercent >= d.fsdPercent && d.autosteerPercent >= d.taccPercent && d.autosteerPercent > 0) return "Autopilot"
-  if (d.taccPercent > 0) return "TACC"
-  return ""
-}
-
-/** Returns total assisted percent (FSD + Autopilot + TACC) */
-function totalAssistedPercent(d: { fsdPercent: number; autosteerPercent: number; taccPercent: number; assistedPercent: number }): number {
-  return d.assistedPercent || 0
+/**
+ * Badge display for assisted driving — matches Sentry-Drive's `assistedBadge`.
+ * Single mode → that mode's specific percent and label.
+ * Multiple modes → combined assistedPercent with "Assisted" label.
+ */
+function assistedBadge(d: { fsdPercent: number; autosteerPercent: number; taccPercent: number; assistedPercent: number }): { label: string; pct: number } | null {
+  const fsd = d.fsdPercent ?? 0
+  const ap = d.autosteerPercent ?? 0
+  const tacc = d.taccPercent ?? 0
+  const assisted = d.assistedPercent ?? 0
+  if (!assisted) return null
+  const modeCount = (fsd > 0 ? 1 : 0) + (ap > 0 ? 1 : 0) + (tacc > 0 ? 1 : 0)
+  if (modeCount > 1) return { label: "Assisted", pct: assisted }
+  if (fsd) return { label: "FSD", pct: fsd }
+  if (ap) return { label: "Autopilot", pct: ap }
+  if (tacc) return { label: "TACC", pct: tacc }
+  return null
 }
 
 function formatTime(iso: string) {
@@ -132,6 +142,14 @@ function haversine(lat1: number, lon1: number, lat2: number, lon2: number) {
   const dLon = toRad(lon2 - lon1)
   const a = Math.sin(dLat / 2) ** 2 + Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLon / 2) ** 2
   return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a))
+}
+
+/** FSD score color — matches Sentry-Drive's fsdScoreColor */
+function fsdScoreColor(pct: number): string {
+  if (pct >= 90) return "#22c55e"
+  if (pct >= 60) return "#3b82f6"
+  if (pct >= 30) return "#f59e0b"
+  return "#94a3b8"
 }
 
 type MapStyle = "dark" | "streets" | "google" | "satellite"
@@ -167,6 +185,7 @@ export default function Drives() {
   const mapRef = useRef<HTMLDivElement>(null)
   const mapInstance = useRef<L.Map | null>(null)
   const selectionLayers = useRef<L.Layer[]>([])
+  const overviewLayers = useRef<L.Polyline[]>([])
   const arrowMarker = useRef<L.Marker | null>(null)
   const tileLayerRef = useRef<L.TileLayer | null>(null)
 
@@ -218,6 +237,10 @@ export default function Drives() {
   const [showFSDMarkers, setShowFSDMarkers] = useState(true)
   const [importing, setImporting] = useState(false)
   const [importMsg, setImportMsg] = useState("")
+  const [importRoutes, setImportRoutes] = useState(0)
+  const [importPhase, setImportPhase] = useState<"idle" | "starting" | "progress" | "complete" | "error">("idle")
+  const [showDeleteConfirm, setShowDeleteConfirm] = useState(false)
+  const [deleting, setDeleting] = useState(false)
   const fsdEventLayers = useRef<L.Layer[]>([])
 
   // ── Init map ──
@@ -235,6 +258,8 @@ export default function Drives() {
     return () => {
       selectionLayers.current.forEach((l) => { l.off(); map.removeLayer(l) })
       selectionLayers.current = []
+      overviewLayers.current.forEach((l) => map.removeLayer(l))
+      overviewLayers.current = []
       fsdEventLayers.current = []
       map.remove()
       mapInstance.current = null
@@ -260,18 +285,21 @@ export default function Drives() {
   const loadDrives = useCallback(async () => {
     setLoading(true)
     try {
-      const [drivesRes, statsRes, tagsRes] = await Promise.all([
+      const [drivesRes, statsRes, tagsRes, routesRes] = await Promise.all([
         fetch("/api/drives"),
         fetch("/api/drives/stats"),
         fetch("/api/drives/tags"),
+        fetch("/api/drives/routes"),
       ])
       const drivesData: DriveSummary[] = await drivesRes.json()
       const statsData: DriveStats = await statsRes.json()
       const tagsData: string[] = await tagsRes.json()
+      const routesData: { id: number; points: [number, number][] }[] = routesRes.ok ? await routesRes.json() : []
       drivesData.sort((a, b) => new Date(b.startTime).getTime() - new Date(a.startTime).getTime())
       setDrives(drivesData)
       setStats(statsData)
       setAllTags(tagsData ?? [])
+      renderOverviewRoutes(routesData)
     } catch {
       // API may not be available in dev
     } finally {
@@ -280,6 +308,26 @@ export default function Drives() {
   }, [])
 
   useEffect(() => { loadDrives() }, [loadDrives])
+
+  function renderOverviewRoutes(routes: { id: number; points: [number, number][] }[]) {
+    const map = mapInstance.current
+    if (!map) return
+    overviewLayers.current.forEach((l) => map.removeLayer(l))
+    overviewLayers.current = []
+    const bounds: L.LatLng[] = []
+    for (const r of routes) {
+      if (!r.points || r.points.length < 2) continue
+      const latlngs = r.points.map((p) => [p[0], p[1]] as L.LatLngExpression)
+      const line = L.polyline(latlngs, { color: "#3b82f6", weight: 2.5, opacity: 0.7, smoothFactor: 1.5 })
+      ;(line as any)._driveId = r.id
+      line.addTo(map)
+      overviewLayers.current.push(line)
+      for (const p of r.points) bounds.push(L.latLng(p[0], p[1]))
+    }
+    if (bounds.length > 0) {
+      map.fitBounds(L.latLngBounds(bounds), { padding: [40, 40], maxZoom: 12 })
+    }
+  }
 
   function clearSelection() {
     const map = mapInstance.current
@@ -335,6 +383,15 @@ export default function Drives() {
       setSelectedDrive(data)
 
       clearSelection()
+
+      // Dim overview routes: hide the selected drive's overview, fade others
+      for (const layer of overviewLayers.current) {
+        if ((layer as any)._driveId === id) {
+          map.removeLayer(layer)
+        } else {
+          layer.setStyle({ color: "#555566", opacity: 0.4 })
+        }
+      }
 
       const pts = data.points
       if (!pts || pts.length < 2) return
@@ -434,7 +491,21 @@ export default function Drives() {
     clearSelection()
     const map = mapInstance.current
     if (!map) return
-    map.setView([39.8, -98.6], 5)
+    // Restore overview routes
+    const bounds: L.LatLng[] = []
+    for (const layer of overviewLayers.current) {
+      if (!map.hasLayer(layer)) layer.addTo(map)
+      layer.setStyle({ color: "#3b82f6", opacity: 0.7 })
+      layer.getLatLngs().flat().forEach((ll) => {
+        const pt = ll as L.LatLng
+        bounds.push(pt)
+      })
+    }
+    if (bounds.length > 0) {
+      map.fitBounds(L.latLngBounds(bounds), { padding: [40, 40], maxZoom: 12 })
+    } else {
+      map.setView([39.8, -98.6], 5)
+    }
     requestAnimationFrame(() => map.invalidateSize())
   }
 
@@ -499,6 +570,27 @@ export default function Drives() {
     return () => clearInterval(iv)
   }, [])
 
+  // ── Import progress via WebSocket ──
+  useEffect(() => {
+    const unsub = wsClient.subscribe("drive_import", (data: unknown) => {
+      const d = data as { phase?: string; routes?: number; error?: string }
+      if (d.phase === "starting") {
+        setImportPhase("starting")
+        setImportRoutes(0)
+      } else if (d.phase === "progress") {
+        setImportPhase("progress")
+        if (typeof d.routes === "number") setImportRoutes(d.routes)
+      } else if (d.phase === "complete") {
+        setImportPhase("complete")
+        if (typeof d.routes === "number") setImportRoutes(d.routes)
+        setTimeout(() => setImportPhase("idle"), 3000)
+      } else if (d.phase === "error") {
+        setImportPhase("error")
+      }
+    })
+    return unsub
+  }, [])
+
   // ── Process ──
   async function triggerProcess(mode: "new" | "reprocess" = "new") {
     setProcessing(true)
@@ -542,6 +634,8 @@ export default function Drives() {
   async function handleUpload(file: File) {
     setImporting(true)
     setImportMsg("")
+    setImportPhase("idle")
+    setImportRoutes(0)
     try {
       const res = await fetch("/api/drives/data/upload", {
         method: "POST",
@@ -561,6 +655,26 @@ export default function Drives() {
     } finally {
       setImporting(false)
       setTimeout(() => setImportMsg(""), 5000)
+    }
+  }
+
+  async function handleDeleteAll() {
+    setDeleting(true)
+    try {
+      const res = await fetch("/api/drives/data", { method: "DELETE" })
+      if (res.ok) {
+        setShowDeleteConfirm(false)
+        setDrives([])
+        setSelectedDrive(null)
+        loadDrives()
+      } else {
+        const err = await res.json().catch(() => null)
+        alert(err?.error || `Delete failed (${res.status})`)
+      }
+    } catch (err) {
+      alert(`Delete failed — ${err instanceof Error ? err.message : "could not reach server"}`)
+    } finally {
+      setDeleting(false)
     }
   }
 
@@ -628,6 +742,7 @@ export default function Drives() {
       { count: 0, distKm: 0, distMi: 0, durMs: 0 }
     )
     : null
+  const tessieCount = useMemo(() => drives.filter(d => d.source === "tessie").length, [drives])
   const displayCount = filteredStats ? filteredStats.count : stats?.drives_count ?? 0
   const totalDist = filteredStats
     ? (metric ? filteredStats.distKm.toFixed(1) : filteredStats.distMi.toFixed(1))
@@ -648,6 +763,15 @@ export default function Drives() {
               <span>Drives: <span className="font-semibold text-blue-400">{displayCount}</span>{isFiltered && <span className="text-slate-600">/{stats.drives_count}</span>}</span>
               <span>Total: <span className="font-semibold text-blue-400">{totalDist} {distUnit}</span></span>
               <span>Time: <span className="font-semibold text-blue-400">{totalDur}</span></span>
+              {stats.fsd_engaged_ms > 0 && (
+                <span>FSD Score: <span className="font-semibold" style={{ color: fsdScoreColor(stats.fsd_percent) }}>{stats.fsd_percent}%</span></span>
+              )}
+              {stats.autosteer_engaged_ms > 0 && (
+                <span>Autopilot: <span className="font-semibold text-blue-400">{stats.autosteer_distance_km > 0 ? Math.round(stats.autosteer_distance_km / stats.total_distance_km * 100) : 0}%</span></span>
+              )}
+              {tessieCount > 0 && (
+                <span className="text-amber-500/70" title="FSD analytics are dashcam-only">({tessieCount} Tessie)</span>
+              )}
             </div>
           )}
         </div>
@@ -716,10 +840,69 @@ export default function Drives() {
             {importing ? <Loader2 className="h-3 w-3 animate-spin" /> : <Upload className="h-3 w-3" />} {importing ? "Importing…" : "Import"}
           </button>
           <input ref={fileInputRef} type="file" accept=".json" className="hidden" onChange={(e) => { const f = e.target.files?.[0]; if (f) handleUpload(f) }} />
+          {/* Delete All */}
+          <button
+            onClick={() => setShowDeleteConfirm(true)}
+            disabled={processing || importing || deleting}
+            className="flex items-center gap-1.5 rounded-lg border border-red-500/20 bg-red-500/10 px-3 py-1.5 text-xs font-medium text-red-400 transition-colors hover:bg-red-500/20 disabled:opacity-50 disabled:pointer-events-none"
+          >
+            <Trash2 className="h-3 w-3" /> Delete All
+          </button>
         </div>
       </div>
 
+      {/* Delete confirmation modal */}
+      {showDeleteConfirm && (
+        <div className="fixed inset-0 z-[2000] flex items-center justify-center bg-black/60 backdrop-blur-sm">
+          <div className="w-full max-w-sm rounded-xl border border-white/10 bg-slate-950 p-6 shadow-2xl">
+            <h3 className="text-sm font-semibold text-slate-100">Delete All Drives?</h3>
+            <p className="mt-2 text-xs leading-relaxed text-slate-400">
+              This will permanently remove all routes, processed file records, and drive tags from the database. You cannot undo this action.
+            </p>
+            <p className="mt-2 text-xs text-slate-500">
+              Tip: Export your data first if you want to keep a backup.
+            </p>
+            <div className="mt-5 flex items-center justify-end gap-2">
+              <button
+                onClick={() => setShowDeleteConfirm(false)}
+                disabled={deleting}
+                className="rounded-lg border border-white/10 bg-white/5 px-4 py-1.5 text-xs font-medium text-slate-300 transition-colors hover:bg-white/10 disabled:opacity-50"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={handleDeleteAll}
+                disabled={deleting}
+                className="flex items-center gap-1.5 rounded-lg bg-red-600 px-4 py-1.5 text-xs font-medium text-white transition-colors hover:bg-red-500 disabled:opacity-50"
+              >
+                {deleting ? <Loader2 className="h-3 w-3 animate-spin" /> : <Trash2 className="h-3 w-3" />}
+                {deleting ? "Deleting…" : "Delete Everything"}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
       {processMsg && <p className="text-xs text-amber-400">{processMsg}</p>}
+      {importing && importPhase !== "idle" && (
+        <div className="flex items-center gap-3">
+          <div className="relative h-2 flex-1 overflow-hidden rounded-full bg-white/5">
+            <div
+              className={cn(
+                "absolute inset-y-0 left-0 rounded-full transition-all duration-300",
+                importPhase === "complete" ? "bg-emerald-500 w-full" : "bg-blue-500"
+              )}
+              style={importPhase !== "complete" ? { animation: "importPulse 1.5s ease-in-out infinite" } : undefined}
+            />
+          </div>
+          <span className="shrink-0 text-xs tabular-nums text-slate-400">
+            {importPhase === "starting" && "Preparing import…"}
+            {importPhase === "progress" && `${importRoutes.toLocaleString()} routes imported…`}
+            {importPhase === "complete" && `${importRoutes.toLocaleString()} routes imported`}
+            {importPhase === "error" && "Import error"}
+          </span>
+        </div>
+      )}
       {importMsg && <p className={cn("text-xs", importMsg.startsWith("Imported") ? "text-emerald-400" : "text-red-400")}>{importMsg}</p>}
 
       {/* Main content: sidebar + map */}
@@ -797,21 +980,24 @@ export default function Drives() {
                           <p className="text-sm font-medium text-slate-200">
                             {formatTime(d.startTime)} — {formatTime(d.endTime)}
                           </p>
-                          {totalAssistedPercent(d) > 0 && (
+                          {d.source === "tessie" && (
+                            <span className="ml-1 shrink-0 rounded-full bg-amber-500/15 px-1.5 py-0.5 text-[10px] font-bold text-amber-400">Tessie</span>
+                          )}
+                          {(() => { const b = assistedBadge(d); return b ? (
                             <span className={cn(
                               "ml-1 shrink-0 rounded-full px-1.5 py-0.5 text-[10px] font-bold",
                               d.fsdPercent >= 95 ? "bg-emerald-500/15 text-emerald-400" : d.fsdPercent >= 50 ? "bg-blue-500/15 text-blue-400" : "bg-slate-700 text-slate-400"
                             )}>
-                              {totalAssistedPercent(d)}% {assistedModeLabel(d) || "Assisted"}
+                              {b.pct}% {b.label}
                             </span>
-                          )}
+                          ) : null })()}
                         </div>
                         <div className="mt-1 flex gap-x-3 text-[11px] text-slate-500">
                           <span>{dist(d)}</span>
                           <span>{formatDuration(d.durationMs)}</span>
                           <span>{avgSpd(d)}</span>
                         </div>
-                        {d.fsdDisengagements > 0 && (
+                        {d.source !== "tessie" && d.fsdDisengagements > 0 && (
                           <div className="mt-0.5 text-[11px] text-red-400/70">{d.fsdDisengagements} disengagement{d.fsdDisengagements !== 1 ? "s" : ""}</div>
                         )}
                         <div className="mt-1.5 flex flex-wrap items-center gap-1">
@@ -943,21 +1129,24 @@ export default function Drives() {
                         <p className="text-sm font-medium text-slate-200">
                           {formatTime(d.startTime)} — {formatTime(d.endTime)}
                         </p>
-                        {totalAssistedPercent(d) > 0 && (
+                        {d.source === "tessie" && (
+                          <span className="ml-1 shrink-0 rounded-full bg-amber-500/15 px-1.5 py-0.5 text-[10px] font-bold text-amber-400">Tessie</span>
+                        )}
+                        {(() => { const b = assistedBadge(d); return b ? (
                           <span className={cn(
                             "ml-1 shrink-0 rounded-full px-1.5 py-0.5 text-[10px] font-bold",
                             d.fsdPercent >= 95 ? "bg-emerald-500/15 text-emerald-400" : d.fsdPercent >= 50 ? "bg-blue-500/15 text-blue-400" : "bg-slate-700 text-slate-400"
                           )}>
-                            {totalAssistedPercent(d)}% {assistedModeLabel(d) || "Assisted"}
+                            {b.pct}% {b.label}
                           </span>
-                        )}
+                        ) : null })()}
                       </div>
                       <div className="mt-1 flex gap-x-3 text-[11px] text-slate-500">
                         <span>{dist(d)}</span>
                         <span>{formatDuration(d.durationMs)}</span>
                         <span>{avgSpd(d)}</span>
                       </div>
-                      {d.fsdDisengagements > 0 && (
+                      {d.source !== "tessie" && d.fsdDisengagements > 0 && (
                         <div className="mt-0.5 text-[11px] text-red-400/70">{d.fsdDisengagements} disengagement{d.fsdDisengagements !== 1 ? "s" : ""}</div>
                       )}
                       <div className="mt-1.5 flex flex-wrap items-center gap-1">
@@ -1141,7 +1330,7 @@ export default function Drives() {
               </div>
 
               {/* Assisted driving stats row */}
-              {totalAssistedPercent(selectedDrive) > 0 && (
+              {(selectedDrive.assistedPercent ?? 0) > 0 && (
                 <div className="mb-2 flex flex-wrap items-center gap-x-5 gap-y-1 rounded-lg border border-emerald-500/10 bg-emerald-500/5 px-3 py-1.5">
                   {selectedDrive.fsdPercent > 0 && (
                     <div className="flex items-center gap-1.5 text-[11px]">

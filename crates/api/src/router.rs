@@ -139,6 +139,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/drives/status", get(crate::drives_handler::processing_status))
         .route("/api/drives/data/download", get(crate::drives_handler::download_data))
         .route("/api/drives/data/upload", post(crate::drives_handler::upload_data))
+        .route("/api/drives/data", axum::routing::delete(crate::drives_handler::delete_all_drives))
         .route("/api/drives/data/export-for-sync", post(crate::drives_handler::export_for_sync))
         .route("/api/drives/stats", get(crate::drives_handler::drive_stats))
         .route("/api/drives/fsd-analytics", get(crate::drives_handler::fsd_analytics))

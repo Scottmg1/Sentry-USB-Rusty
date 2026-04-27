@@ -93,6 +93,9 @@ mod tests {
             raw_park_count: 1,
             raw_frame_count: 100,
             gear_runs: vec![],
+            source: None,
+            external_signature: None,
+            tessie_autopilot_percent: None,
         }
     }
 

@@ -238,6 +238,9 @@ mod tests {
             raw_park_count: 0,
             raw_frame_count: 0,
             gear_runs: vec![],
+            source: None,
+            external_signature: None,
+            tessie_autopilot_percent: None,
         }
     }
 
@@ -299,6 +302,9 @@ mod tests {
             raw_park_count: 0,
             raw_frame_count: 61,
             gear_runs: vec![GearRun { gear: 4, frames: 61 }],
+            source: None,
+            external_signature: None,
+            tessie_autopilot_percent: None,
         };
         let agg = compute_route_aggregates(&r);
         assert_eq!(agg.fsd_disengagements, 1);
@@ -314,7 +320,6 @@ mod tests {
             let lat = 37.7749 + (i as f64) * 0.00001;
             points.push([lat, -122.4194]);
             ap.push(if (1..20).contains(&i) { AUTOPILOT_FSD } else { AUTOPILOT_OFF });
-            // Park within 2s of disengage (frame 20 disengages, frame 21 parks).
             gears.push(if i >= 20 && i < 25 { GEAR_PARK } else { 4 });
         }
         let r = Route {
@@ -328,6 +333,9 @@ mod tests {
             raw_park_count: 1,
             raw_frame_count: 61,
             gear_runs: vec![],
+            source: None,
+            external_signature: None,
+            tessie_autopilot_percent: None,
         };
         let agg = compute_route_aggregates(&r);
         assert_eq!(agg.fsd_disengagements, 0);

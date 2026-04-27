@@ -290,13 +290,58 @@ fn group_clips(routes: &[Route]) -> Vec<Vec<TimedRoute>> {
         time_groups.push(current);
     }
 
-    // Second pass: split each time group further by gear state (Park transitions)
+    // Second pass: split each time group further by gear state (Park transitions),
+    // then by external signature (prevents Tessie drives from merging).
     let mut groups = Vec::new();
     for tg in time_groups {
-        let mut splits = split_by_gear_state(tg);
-        groups.append(&mut splits);
+        for gear_group in split_by_gear_state(tg) {
+            for sig_group in split_by_external_signature(gear_group) {
+                groups.push(sig_group);
+            }
+        }
     }
     groups
+}
+
+// ---------------------------------------------------------------------------
+// Internal: external-signature splitting (Tessie drives)
+// ---------------------------------------------------------------------------
+
+/// Split a group by `external_signature`. Clips without a signature (native
+/// SEI) stay as one group. Clips with different signatures become separate
+/// groups. This prevents Tessie-imported drives from merging with each other
+/// — the grouper's time-gap / park-gap heuristics can't reliably tell two
+/// back-to-back Tessie drives apart, but the signature is unambiguous.
+///
+/// Port of Sentry-Drive's `splitByExternalSignature`.
+fn split_by_external_signature(group: Vec<TimedRoute>) -> Vec<Vec<TimedRoute>> {
+    if group.len() <= 1 {
+        return vec![group];
+    }
+    let has_any = group.iter().any(|c| c.route.external_signature.is_some());
+    if !has_any {
+        return vec![group];
+    }
+
+    let mut buckets: std::collections::HashMap<String, Vec<TimedRoute>> =
+        std::collections::HashMap::new();
+    let mut no_sig: Vec<TimedRoute> = Vec::new();
+
+    for clip in group {
+        match &clip.route.external_signature {
+            Some(sig) => buckets.entry(sig.clone()).or_default().push(clip),
+            None => no_sig.push(clip),
+        }
+    }
+
+    let mut result = Vec::new();
+    if !no_sig.is_empty() {
+        result.push(no_sig);
+    }
+    for bucket in buckets.into_values() {
+        result.push(bucket);
+    }
+    result
 }
 
 // ---------------------------------------------------------------------------
@@ -480,6 +525,9 @@ fn split_clip_at_park_gaps(clip: &TimedRoute) -> Vec<ClipSegment> {
                     raw_park_count: 0,
                     raw_frame_count: 0,
                     gear_runs: Vec::new(),
+                    source: clip.route.source.clone(),
+                    external_signature: clip.route.external_signature.clone(),
+                    tessie_autopilot_percent: clip.route.tessie_autopilot_percent,
                 },
                 timestamp: clip.timestamp + offset,
             },
@@ -822,6 +870,9 @@ fn build_summary(
         tacc_distance_km: round2(tacc_dist_m / 1000.0),
         tacc_distance_mi: round2(tacc_dist_m / 1609.344),
         assisted_percent,
+        source: first_clip.route.source.clone(),
+        external_signature: first_clip.route.external_signature.clone(),
+        tessie_autopilot_percent: first_clip.route.tessie_autopilot_percent,
     }
 }
 
@@ -1227,6 +1278,9 @@ fn build_drive_stats(
         tacc_distance_km: round2(tacc_distance_m / 1000.0),
         tacc_distance_mi: round2(tacc_distance_m / 1609.344),
         assisted_percent,
+        source: first_clip.route.source.clone(),
+        external_signature: first_clip.route.external_signature.clone(),
+        tessie_autopilot_percent: first_clip.route.tessie_autopilot_percent,
     }
 }
 
@@ -1360,8 +1414,11 @@ fn compute_aggregate_stats_from_routes(routes: &[Route]) -> AggregateStats {
         }
     }
 
-    // Per-route distance and autopilot stats
+    // Per-route distance and autopilot stats.
+    // Totals include ALL routes; FSD analytics are SEI-only (Tessie excluded)
+    // to match Sentry-Drive's aggregate stats approach.
     let mut total_distance_m: f64 = 0.0;
+    let mut sei_distance_m: f64 = 0.0;
     let mut total_fsd_dist_m: f64 = 0.0;
     let mut total_autosteer_dist_m: f64 = 0.0;
     let mut total_tacc_dist_m: f64 = 0.0;
@@ -1373,9 +1430,10 @@ fn compute_aggregate_stats_from_routes(routes: &[Route]) -> AggregateStats {
             continue;
         }
 
+        let route_is_tessie = is_tessie(&r.source);
         let clip_duration_ms: f64 = 60000.0;
         let clip_start_ms = ti.ts.and_utc().timestamp_millis() as f64;
-        let has_ap = r.autopilot_states.len() == n;
+        let has_ap = !route_is_tessie && r.autopilot_states.len() == n;
         let has_gears = r.gear_states.len() == n;
         let has_accel = r.accel_positions.len() == n;
         let has_sei_speeds = r.speeds.len() == n && r.speeds.iter().any(|&sp| sp > 0.0);
@@ -1390,7 +1448,6 @@ fn compute_aggregate_stats_from_routes(routes: &[Route]) -> AggregateStats {
                 r.points[i][1],
             );
 
-            // Skip GPS teleportation artifacts
             if !has_sei_speeds {
                 let dt_sec = (clip_duration_ms / (n - 1) as f64) / 1000.0;
                 if dt_sec > 0.0 && d / dt_sec > 70.0 {
@@ -1399,6 +1456,9 @@ fn compute_aggregate_stats_from_routes(routes: &[Route]) -> AggregateStats {
             }
 
             total_distance_m += d;
+            if !route_is_tessie {
+                sei_distance_m += d;
+            }
             let dt_ms = clip_duration_ms / (n - 1) as f64;
 
             if has_ap {
@@ -1421,7 +1481,6 @@ fn compute_aggregate_stats_from_routes(routes: &[Route]) -> AggregateStats {
                     _ => {}
                 }
 
-                // FSD disengagement: FSD -> non-FSD
                 if prev_ap == AUTOPILOT_FSD && cur_ap != AUTOPILOT_FSD {
                     let mut skip_disengage = false;
                     if has_gears {
@@ -1445,7 +1504,6 @@ fn compute_aggregate_stats_from_routes(routes: &[Route]) -> AggregateStats {
                     in_accel_press = false;
                 }
 
-                // FSD accel push detection
                 if cur_ap == AUTOPILOT_FSD && has_accel {
                     let mut accel_pct = r.accel_positions[i] as f64;
                     if accel_pct <= 1.0 {
@@ -1473,11 +1531,12 @@ fn compute_aggregate_stats_from_routes(routes: &[Route]) -> AggregateStats {
     s.tacc_distance_km = total_tacc_dist_m / 1000.0;
     s.tacc_distance_mi = total_tacc_dist_m / 1609.344;
 
-    if s.total_distance_km > 0.0 {
-        s.fsd_percent = round1(s.fsd_distance_km / s.total_distance_km * 100.0);
+    let sei_total_km = sei_distance_m / 1000.0;
+    if sei_total_km > 0.0 {
+        s.fsd_percent = round1(s.fsd_distance_km / sei_total_km * 100.0);
         let total_assisted_km =
             s.fsd_distance_km + s.autosteer_distance_km + s.tacc_distance_km;
-        s.assisted_percent = round1(total_assisted_km / s.total_distance_km * 100.0);
+        s.assisted_percent = round1(total_assisted_km / sei_total_km * 100.0);
     }
 
     s
@@ -1569,10 +1628,15 @@ fn build_fsd_analytics(summaries: &[DriveSummary], period: &str) -> FsdAnalytics
         .map(|d| d.format("%Y-%m-%d").to_string())
         .unwrap_or_default();
 
-    // Filter drives in period
+    // Filter drives in period. Tessie drives are excluded from FSD analytics
+    // entirely — their autopilot data is inferred, not from dashcam SEI
+    // telemetry, so mixing them would dilute the score.
     let period_drives: Vec<&DriveSummary> = summaries
         .iter()
         .filter(|d| {
+            if is_tessie(&d.source) {
+                return false;
+            }
             if let Some(ps) = period_start {
                 if let Ok(dt) =
                     NaiveDateTime::parse_from_str(&d.start_time, "%Y-%m-%dT%H:%M:%S")
@@ -1782,6 +1846,13 @@ fn build_fsd_analytics(summaries: &[DriveSummary], period: &str) -> FsdAnalytics
 // Utility functions
 // ---------------------------------------------------------------------------
 
+/// Returns true when a source tag indicates a Tessie-imported drive.
+/// FSD analytics exclude Tessie because its per-point autopilot inference
+/// is fuzzier than dashcam SEI telemetry — mixing them dilutes the score.
+fn is_tessie(source: &Option<String>) -> bool {
+    source.as_deref() == Some("tessie")
+}
+
 /// Haversine distance in meters between two GPS coordinates.
 fn haversine_m(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
     const R: f64 = 6_371_000.0;
@@ -1966,6 +2037,9 @@ impl Route {
             raw_park_count: 0,
             raw_frame_count: 0,
             gear_runs: Vec::new(),
+            source: None,
+            external_signature: None,
+            tessie_autopilot_percent: None,
         }
     }
 }
@@ -2026,13 +2100,49 @@ fn group_summary_clips<'a>(summaries: &'a [RouteSummary]) -> Vec<Vec<TimedSummar
         time_groups.push(current);
     }
 
-    // Gear-state split.
+    // Gear-state split, then external-signature split.
     let mut groups = Vec::new();
     for tg in time_groups {
-        let mut splits = split_summary_by_gear_state(tg);
-        groups.append(&mut splits);
+        for gear_group in split_summary_by_gear_state(tg) {
+            for sig_group in split_summary_by_external_signature(gear_group) {
+                groups.push(sig_group);
+            }
+        }
     }
     groups
+}
+
+/// Summary-side equivalent of `split_by_external_signature`.
+fn split_summary_by_external_signature<'a>(
+    group: Vec<TimedSummary<'a>>,
+) -> Vec<Vec<TimedSummary<'a>>> {
+    if group.len() <= 1 {
+        return vec![group];
+    }
+    let has_any = group.iter().any(|c| c.summary.external_signature.is_some());
+    if !has_any {
+        return vec![group];
+    }
+
+    let mut buckets: std::collections::HashMap<&str, Vec<TimedSummary<'a>>> =
+        std::collections::HashMap::new();
+    let mut no_sig: Vec<TimedSummary<'a>> = Vec::new();
+
+    for clip in group {
+        match &clip.summary.external_signature {
+            Some(sig) => buckets.entry(sig.as_str()).or_default().push(clip),
+            None => no_sig.push(clip),
+        }
+    }
+
+    let mut result = Vec::new();
+    if !no_sig.is_empty() {
+        result.push(no_sig);
+    }
+    for bucket in buckets.into_values() {
+        result.push(bucket);
+    }
+    result
 }
 
 /// Summary-side equivalent of `split_by_gear_state`. Since we can't chop
@@ -2240,6 +2350,9 @@ fn build_summary_from_aggregates(
         tacc_distance_km: round2(tacc_dist_m / 1000.0),
         tacc_distance_mi: round2(tacc_dist_m / 1609.344),
         assisted_percent,
+        source: first_clip.summary.source.clone(),
+        external_signature: first_clip.summary.external_signature.clone(),
+        tessie_autopilot_percent: None,
     }
 }
 
@@ -2266,13 +2379,22 @@ fn compute_aggregate_stats_summary_impl(summaries: &[RouteSummary]) -> Aggregate
     }
     s.total_duration_ms = total_duration_ms;
 
+    // Totals include ALL routes (Tessie + SEI) — ground-truth mileage.
+    // FSD analytics use SEI-only data because Tessie's per-point autopilot
+    // inference is fuzzier than dashcam SEI telemetry; mixing them dilutes
+    // the score. Matches Sentry-Drive's `renderDriveStats` approach.
     let mut total_m: f64 = 0.0;
+    let mut sei_total_m: f64 = 0.0;
     let mut fsd_m: f64 = 0.0;
     let mut autosteer_m: f64 = 0.0;
     let mut tacc_m: f64 = 0.0;
     for sum in summaries {
         let a = &sum.aggregates;
         total_m += a.distance_m;
+        if is_tessie(&sum.source) {
+            continue;
+        }
+        sei_total_m += a.distance_m;
         fsd_m += a.fsd_distance_m;
         autosteer_m += a.autosteer_distance_m;
         tacc_m += a.tacc_distance_m;
@@ -2291,11 +2413,12 @@ fn compute_aggregate_stats_summary_impl(summaries: &[RouteSummary]) -> Aggregate
     s.tacc_distance_km = tacc_m / 1000.0;
     s.tacc_distance_mi = tacc_m / 1609.344;
 
-    if s.total_distance_km > 0.0 {
-        s.fsd_percent = round1(s.fsd_distance_km / s.total_distance_km * 100.0);
+    let sei_total_km = sei_total_m / 1000.0;
+    if sei_total_km > 0.0 {
+        s.fsd_percent = round1(s.fsd_distance_km / sei_total_km * 100.0);
         let total_assisted_km =
             s.fsd_distance_km + s.autosteer_distance_km + s.tacc_distance_km;
-        s.assisted_percent = round1(total_assisted_km / s.total_distance_km * 100.0);
+        s.assisted_percent = round1(total_assisted_km / sei_total_km * 100.0);
     }
     s
 }
@@ -2372,23 +2495,30 @@ mod tests {
         assert!(groups.is_empty());
     }
 
-    #[test]
-    fn test_group_clips_single() {
-        let routes = vec![Route {
-            file: "/cam/2025-01-15_12-30-45-front.mp4".to_string(),
+    fn test_route(file: &str, points: Vec<[f64; 2]>) -> Route {
+        Route {
+            file: file.to_string(),
             date: "2025-01-15".to_string(),
-            points: vec![[37.0, -122.0]],
+            points,
             gear_states: vec![1],
             autopilot_states: vec![0],
             speeds: vec![10.0],
             accel_positions: vec![0.0],
             raw_park_count: 0,
             raw_frame_count: 10,
-            gear_runs: vec![GearRun {
-                gear: 1,
-                frames: 10,
-            }],
-        }];
+            gear_runs: vec![GearRun { gear: 1, frames: 10 }],
+            source: None,
+            external_signature: None,
+            tessie_autopilot_percent: None,
+        }
+    }
+
+    #[test]
+    fn test_group_clips_single() {
+        let routes = vec![test_route(
+            "/cam/2025-01-15_12-30-45-front.mp4",
+            vec![[37.0, -122.0]],
+        )];
         let groups = group_clips(&routes);
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].len(), 1);
@@ -2397,36 +2527,8 @@ mod tests {
     #[test]
     fn test_group_clips_time_gap_split() {
         let routes = vec![
-            Route {
-                file: "/cam/2025-01-15_12-00-00-front.mp4".to_string(),
-                date: "2025-01-15".to_string(),
-                points: vec![[37.0, -122.0]],
-                gear_states: vec![1],
-                autopilot_states: vec![0],
-                speeds: vec![10.0],
-                accel_positions: vec![0.0],
-                raw_park_count: 0,
-                raw_frame_count: 10,
-                gear_runs: vec![GearRun {
-                    gear: 1,
-                    frames: 10,
-                }],
-            },
-            Route {
-                file: "/cam/2025-01-15_13-00-00-front.mp4".to_string(),
-                date: "2025-01-15".to_string(),
-                points: vec![[37.1, -122.1]],
-                gear_states: vec![1],
-                autopilot_states: vec![0],
-                speeds: vec![10.0],
-                accel_positions: vec![0.0],
-                raw_park_count: 0,
-                raw_frame_count: 10,
-                gear_runs: vec![GearRun {
-                    gear: 1,
-                    frames: 10,
-                }],
-            },
+            test_route("/cam/2025-01-15_12-00-00-front.mp4", vec![[37.0, -122.0]]),
+            test_route("/cam/2025-01-15_13-00-00-front.mp4", vec![[37.1, -122.1]]),
         ];
         let groups = group_clips(&routes);
         // 1 hour gap > 5 min => 2 groups

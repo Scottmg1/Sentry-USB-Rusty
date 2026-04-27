@@ -110,6 +110,17 @@ pub struct Route {
     pub raw_frame_count: u32,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub gear_runs: Vec<GearRun>,
+    /// Provenance: "sei" (native dashcam) or "tessie" (imported from Tessie).
+    /// Absent / null defaults to "sei" for backwards compatibility.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    /// Stable identifier for a Tessie-imported drive — keeps drives from
+    /// merging with each other when time/gear heuristics can't tell them apart.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external_signature: Option<String>,
+    /// Tessie-reported autopilot percentage for this drive.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tessie_autopilot_percent: Option<f64>,
 }
 
 fn u32_is_zero(n: &u32) -> bool { *n == 0 }
@@ -168,6 +179,13 @@ pub struct Drive {
     pub tacc_distance_mi: f64,
     // Assisted aggregate
     pub assisted_percent: f64,
+    // Provenance
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external_signature: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tessie_autopilot_percent: Option<f64>,
 }
 
 /// Lightweight drive summary (no full point arrays) for list views.
@@ -210,6 +228,13 @@ pub struct DriveSummary {
     pub tacc_distance_mi: f64,
     // Assisted aggregate
     pub assisted_percent: f64,
+    // Provenance
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external_signature: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tessie_autopilot_percent: Option<f64>,
 }
 
 /// Aggregate statistics across all drives.
@@ -370,6 +395,10 @@ pub struct RouteSummary {
     pub raw_frame_count: u32,
     pub gear_runs: Vec<GearRun>,
     pub aggregates: RouteAggregates,
+    /// Provenance carried through for grouping: "sei" or "tessie".
+    pub source: Option<String>,
+    /// Tessie external signature for `splitByExternalSignature` grouping.
+    pub external_signature: Option<String>,
 }
 
 /// Archive-side JSON structure that Sentry Studio reads from the archive
@@ -433,6 +462,9 @@ mod tests {
             raw_park_count: 0,
             raw_frame_count: 0,
             gear_runs: vec![],
+            source: None,
+            external_signature: None,
+            tessie_autopilot_percent: None,
         };
         let s = serde_json::to_string(&r).unwrap();
         assert!(s.contains(r#""gearStates":"AAEAAA==""#), "serialized: {}", s);

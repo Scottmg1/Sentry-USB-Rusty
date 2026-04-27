@@ -241,6 +241,9 @@ fn backfill_one_batch(conn: &mut Connection) -> Result<i64> {
             raw_park_count: r.raw_park_count,
             raw_frame_count: r.raw_frame_count,
             gear_runs,
+            source: None,
+            external_signature: None,
+            tessie_autopilot_percent: None,
         };
         let agg = compute_route_aggregates(&route);
         decoded.push((r.file.clone(), agg));

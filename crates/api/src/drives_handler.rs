@@ -646,13 +646,8 @@ pub async fn upload_data(
     }
 
     // Emit `drive_import` WebSocket events so the web UI can show a
-    // progress state during what may be a multi-minute restore. Matches
-    // Go's per-phase broadcasts in server/api/drives.go:557-609 —
-    // starting → progress → complete/error. Our progress fires once
-    // with the total route count (the JSON decoder materializes the
-    // whole StoreData before we see routes). The phases still give the
-    // frontend enough signal to swap the "uploading" UI for an
-    // "importing 5243 routes" UI instead of a stale spinner.
+    // live progress bar during what may be a multi-minute restore.
+    // Phases: starting → progress (every 50 routes) → complete/error.
     let hub = state.hub.clone();
     hub.broadcast("drive_import", &serde_json::json!({"phase": "starting"}));
 
@@ -710,6 +705,37 @@ pub async fn upload_data(
             );
             crate::json_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string())
         }
+    }
+}
+
+/// DELETE /api/drives/data — wipe all drive data (routes, processed_files, tags).
+pub async fn delete_all_drives(
+    State(state): State<AppState>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    if state.drives.processor.is_running() {
+        return crate::json_error(
+            StatusCode::CONFLICT,
+            "processing in progress — please wait until it finishes",
+        );
+    }
+    if state.drives.importing.load(Ordering::SeqCst) {
+        return crate::json_error(
+            StatusCode::CONFLICT,
+            "drive data import in progress — please wait until it finishes",
+        );
+    }
+    if is_archiving() {
+        return crate::json_error(
+            StatusCode::CONFLICT,
+            "archive is currently running — please wait until it finishes",
+        );
+    }
+    match state.drives.store.clear_all_drives() {
+        Ok(()) => (
+            StatusCode::OK,
+            Json(serde_json::json!({"deleted": true})),
+        ),
+        Err(e) => crate::json_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
     }
 }
 

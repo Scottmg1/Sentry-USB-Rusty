@@ -98,6 +98,7 @@ where
         routes: usize,
         processed_files: usize,
         drive_tags: usize,
+        on_progress: &'tx dyn Fn(usize),
     }
 
     /// Deserializes the `routes` JSON array element-by-element.  Each Route
@@ -118,13 +119,13 @@ where
         }
         fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<(), A::Error> {
             while let Some(route) = seq.next_element::<Route>()? {
-                // Insert immediately — `route` drops at the end of this block,
-                // freeing its GPS points, gear-state bytes, etc. before the
-                // next JSON element is deserialized.
                 let agg = compute_route_aggregates(&route);
                 insert_imported_route(self.0.tx, &route, &agg, self.0.now)
                     .map_err(|e| serde::de::Error::custom(e.to_string()))?;
                 self.0.routes += 1;
+                if self.0.routes % 50 == 0 {
+                    (self.0.on_progress)(self.0.routes);
+                }
             }
             Ok(())
         }
@@ -188,7 +189,7 @@ where
     }
 
     // Run the streaming parse.
-    let mut ctx = Ctx { tx: &tx, now, routes: 0, processed_files: 0, drive_tags: 0 };
+    let mut ctx = Ctx { tx: &tx, now, routes: 0, processed_files: 0, drive_tags: 0, on_progress: &on_progress };
     let mut de = serde_json::Deserializer::from_reader(reader);
     de.deserialize_map(TopLevel(&mut ctx))
         .map_err(|e: serde_json::Error| {
@@ -250,7 +251,8 @@ fn insert_imported_route(
             fsd_engaged_ms, autosteer_engaged_ms, tacc_engaged_ms,
             fsd_distance_m, autosteer_distance_m, tacc_distance_m, assisted_distance_m,
             fsd_disengagements, fsd_accel_pushes,
-            start_lat, start_lon, end_lat, end_lon)
+            start_lat, start_lon, end_lat, end_lon,
+            source, external_signature, tessie_autopilot_percent)
          VALUES(
             ?1, ?2, ?3, ?4, ?5,
             NULL, NULL, ?6, ?7, ?8,
@@ -259,7 +261,8 @@ fn insert_imported_route(
             ?20, ?21, ?22,
             ?23, ?24, ?25, ?26,
             ?27, ?28,
-            ?29, ?30, ?31, ?32)",
+            ?29, ?30, ?31, ?32,
+            ?33, ?34, ?35)",
         params![
             norm, r.date, r.points.len() as i64, r.raw_park_count as i64, r.raw_frame_count as i64,
             a.distance_m, first_lat, first_lon,
@@ -269,6 +272,7 @@ fn insert_imported_route(
             a.fsd_distance_m, a.autosteer_distance_m, a.tacc_distance_m, a.assisted_distance_m,
             a.fsd_disengagements, a.fsd_accel_pushes,
             a.start_lat, a.start_lng, a.end_lat, a.end_lng,
+            r.source, r.external_signature, r.tessie_autopilot_percent,
         ],
     )?;
     Ok(())
@@ -364,7 +368,8 @@ impl<'a> serde::Serialize for RouteStream<'a> {
             .prepare(
                 "SELECT file, date_dir, raw_park_count, raw_frame_count,
                         points_blob, gear_states_blob, ap_states_blob,
-                        speeds_blob, accel_blob, gear_runs_blob
+                        speeds_blob, accel_blob, gear_runs_blob,
+                        source, external_signature, tessie_autopilot_percent
                  FROM routes
                  ORDER BY file",
             )
@@ -434,6 +439,18 @@ impl<'a> serde::Serialize for RouteStream<'a> {
                 *self.error.borrow_mut() = Some(e);
                 S::Error::custom("col gear_runs_blob")
             })?;
+            let source: Option<String> = row.get(10).map_err(|e| {
+                *self.error.borrow_mut() = Some(e);
+                S::Error::custom("col source")
+            })?;
+            let external_signature: Option<String> = row.get(11).map_err(|e| {
+                *self.error.borrow_mut() = Some(e);
+                S::Error::custom("col external_signature")
+            })?;
+            let tessie_autopilot_percent: Option<f64> = row.get(12).map_err(|e| {
+                *self.error.borrow_mut() = Some(e);
+                S::Error::custom("col tessie_autopilot_percent")
+            })?;
 
             let points: Vec<GpsPoint> = decode_points(pb.as_deref())
                 .map_err(|e| S::Error::custom(format!("decode points {}: {}", file, e)))?
@@ -461,6 +478,9 @@ impl<'a> serde::Serialize for RouteStream<'a> {
                 raw_park_count,
                 raw_frame_count,
                 gear_runs,
+                source,
+                external_signature,
+                tessie_autopilot_percent,
             };
             seq.serialize_element(&route)?;
             // `route` drops here — its ~10 KB of decoded BLOBs goes back

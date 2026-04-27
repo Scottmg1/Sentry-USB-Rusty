@@ -15,7 +15,7 @@ use rusqlite::{params, Connection, OptionalExtension};
 
 /// Schema version this binary writes. Stored in the `meta` table and
 /// checked on every open so future upgrades can run targeted migrations.
-pub const CURRENT_SCHEMA_VERSION: i32 = 3;
+pub const CURRENT_SCHEMA_VERSION: i32 = 4;
 
 /// v1 DDL. Each statement is idempotent (`IF NOT EXISTS`) so `migrate()`
 /// is safe on every startup. Column shapes and names match Go exactly —
@@ -106,6 +106,15 @@ const V3_CLOUD_PENDING_INDEX: &str =
     "CREATE INDEX IF NOT EXISTS idx_routes_cloud_pending \
      ON routes(cloud_uploaded_at) WHERE cloud_uploaded_at IS NULL";
 
+/// v4 Tessie provenance columns. Preserves `source`, `externalSignature`,
+/// and `tessieAutopilotPercent` through SQLite on import/export so a
+/// round-trip with Sentry-Drive's `drive-data.json` is lossless.
+pub const V4_ROUTE_TESSIE_COLUMNS: &[(&str, &str)] = &[
+    ("source", "TEXT"),
+    ("external_signature", "TEXT"),
+    ("tessie_autopilot_percent", "REAL"),
+];
+
 /// Bring the DB up to `CURRENT_SCHEMA_VERSION`. Safe on every open —
 /// idempotent by construction.
 pub fn migrate(conn: &Connection) -> Result<()> {
@@ -121,6 +130,7 @@ pub fn migrate(conn: &Connection) -> Result<()> {
     for (name, typ) in V2_ROUTE_AGGREGATE_COLUMNS
         .iter()
         .chain(V3_ROUTE_CLOUD_COLUMNS.iter())
+        .chain(V4_ROUTE_TESSIE_COLUMNS.iter())
     {
         if existing.contains(*name) {
             continue;
@@ -228,7 +238,7 @@ mod tests {
         migrate(&conn).unwrap();
         assert_eq!(
             meta_get(&conn, "schema_version").unwrap().as_deref(),
-            Some("3"),
+            Some("4"),
         );
         assert!(meta_get(&conn, "created_at").unwrap().is_some());
     }
@@ -256,17 +266,18 @@ mod tests {
         for (name, _) in V2_ROUTE_AGGREGATE_COLUMNS
             .iter()
             .chain(V3_ROUTE_CLOUD_COLUMNS.iter())
+            .chain(V4_ROUTE_TESSIE_COLUMNS.iter())
         {
             assert!(existing.contains(*name), "column {} missing after migrate", name);
         }
         assert_eq!(
             meta_get(&conn, "schema_version").unwrap().as_deref(),
-            Some("3")
+            Some("4")
         );
     }
 
     #[test]
-    fn migrate_from_v2_adds_only_v3_columns() {
+    fn migrate_from_v2_adds_v3_and_v4_columns() {
         let conn = open();
         // Simulate a v2 DB: v1 DDL + v2 columns + schema_version = 2.
         for stmt in V1_SCHEMA {
@@ -281,12 +292,43 @@ mod tests {
         migrate(&conn).unwrap();
 
         let existing = list_route_columns(&conn).unwrap();
-        for (name, _) in V3_ROUTE_CLOUD_COLUMNS {
-            assert!(existing.contains(*name), "v3 column {} missing", name);
+        for (name, _) in V3_ROUTE_CLOUD_COLUMNS
+            .iter()
+            .chain(V4_ROUTE_TESSIE_COLUMNS.iter())
+        {
+            assert!(existing.contains(*name), "column {} missing", name);
         }
         assert_eq!(
             meta_get(&conn, "schema_version").unwrap().as_deref(),
-            Some("3")
+            Some("4")
+        );
+    }
+
+    #[test]
+    fn migrate_from_v3_adds_v4_tessie_columns() {
+        let conn = open();
+        // Simulate a v3 DB.
+        for stmt in V1_SCHEMA {
+            conn.execute(stmt, []).unwrap();
+        }
+        for (name, typ) in V2_ROUTE_AGGREGATE_COLUMNS
+            .iter()
+            .chain(V3_ROUTE_CLOUD_COLUMNS.iter())
+        {
+            let sql = format!("ALTER TABLE routes ADD COLUMN {} {}", name, typ);
+            conn.execute(&sql, []).unwrap();
+        }
+        meta_set(&conn, "schema_version", "3").unwrap();
+
+        migrate(&conn).unwrap();
+
+        let existing = list_route_columns(&conn).unwrap();
+        for (name, _) in V4_ROUTE_TESSIE_COLUMNS {
+            assert!(existing.contains(*name), "v4 column {} missing", name);
+        }
+        assert_eq!(
+            meta_get(&conn, "schema_version").unwrap().as_deref(),
+            Some("4")
         );
     }
 
@@ -319,11 +361,11 @@ mod tests {
 
     #[test]
     fn stored_less_than_handles_corrupted_values() {
-        assert!(stored_less_than("", 3));
-        assert!(stored_less_than("garbage", 3));
-        assert!(stored_less_than("1", 3));
-        assert!(stored_less_than("2", 3));
-        assert!(!stored_less_than("3", 3));
-        assert!(!stored_less_than("99", 3));
+        assert!(stored_less_than("", 4));
+        assert!(stored_less_than("garbage", 4));
+        assert!(stored_less_than("1", 4));
+        assert!(stored_less_than("3", 4));
+        assert!(!stored_less_than("4", 4));
+        assert!(!stored_less_than("99", 4));
     }
 }

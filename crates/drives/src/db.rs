@@ -277,6 +277,9 @@ impl DriveStore {
                 raw_park_count,
                 raw_frame_count,
                 gear_runs: gear_runs.to_vec(),
+                source: None,
+                external_signature: None,
+                tessie_autopilot_percent: None,
             };
             let agg = compute_route_aggregates(&route);
             insert_or_update_route(&tx, &norm, &route, &agg, now)?;
@@ -505,6 +508,22 @@ impl DriveStore {
         let conn = self.conn.lock().unwrap();
         conn.execute("DELETE FROM processed_files", [])?;
         drop(conn);
+        self.refresh_counts()?;
+        Ok(())
+    }
+
+    /// Wipe routes, processed_files, and drive_tags — clean slate.
+    pub fn clear_all_drives(&self) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        for stmt in &[
+            "DELETE FROM routes",
+            "DELETE FROM processed_files",
+            "DELETE FROM drive_tags",
+        ] {
+            conn.execute(stmt, [])?;
+        }
+        drop(conn);
+        self.drive_cache_dirty.store(true, Ordering::Release);
         self.refresh_counts()?;
         Ok(())
     }
@@ -823,7 +842,6 @@ fn insert_or_update_route(
 
     let point_count = r.points.len() as i64;
 
-    // 34 parameters — matches Go's INSERT ... VALUES() positional binding.
     let p: Vec<Box<dyn ToSql>> = vec![
         Box::new(norm_file.to_string()),
         Box::new(r.date.clone()),
@@ -857,6 +875,9 @@ fn insert_or_update_route(
         Box::new(a.start_lng),
         Box::new(a.end_lat),
         Box::new(a.end_lng),
+        Box::new(r.source.clone()),
+        Box::new(r.external_signature.clone()),
+        Box::new(r.tessie_autopilot_percent),
     ];
     let refs: Vec<&dyn ToSql> = p.iter().map(|b| &**b as &dyn ToSql).collect();
 
@@ -870,7 +891,8 @@ fn insert_or_update_route(
             fsd_engaged_ms, autosteer_engaged_ms, tacc_engaged_ms,
             fsd_distance_m, autosteer_distance_m, tacc_distance_m, assisted_distance_m,
             fsd_disengagements, fsd_accel_pushes,
-            start_lat, start_lon, end_lat, end_lon)
+            start_lat, start_lon, end_lat, end_lon,
+            source, external_signature, tessie_autopilot_percent)
          VALUES(
             ?1, ?2, ?3, ?4, ?5,
             NULL, NULL, ?6, ?7, ?8,
@@ -879,7 +901,8 @@ fn insert_or_update_route(
             ?20, ?21, ?22,
             ?23, ?24, ?25, ?26,
             ?27, ?28,
-            ?29, ?30, ?31, ?32)
+            ?29, ?30, ?31, ?32,
+            ?33, ?34, ?35)
          ON CONFLICT(file) DO UPDATE SET
             date_dir            = excluded.date_dir,
             point_count         = excluded.point_count,
@@ -911,7 +934,10 @@ fn insert_or_update_route(
             start_lat           = excluded.start_lat,
             start_lon           = excluded.start_lon,
             end_lat             = excluded.end_lat,
-            end_lon             = excluded.end_lon",
+            end_lon             = excluded.end_lon,
+            source              = excluded.source,
+            external_signature  = excluded.external_signature,
+            tessie_autopilot_percent = excluded.tessie_autopilot_percent",
         refs.as_slice(),
     )?;
     Ok(())
@@ -922,7 +948,8 @@ fn select_all_routes(conn: &Connection) -> Result<Vec<Route>> {
     let mut stmt = conn.prepare(
         "SELECT file, date_dir, raw_park_count, raw_frame_count,
                 points_blob, gear_states_blob, ap_states_blob,
-                speeds_blob, accel_blob, gear_runs_blob
+                speeds_blob, accel_blob, gear_runs_blob,
+                source, external_signature, tessie_autopilot_percent
          FROM routes
          ORDER BY file",
     )?;
@@ -933,23 +960,23 @@ fn select_all_routes(conn: &Connection) -> Result<Vec<Route>> {
         let sb: Option<Vec<u8>> = row.get(7)?;
         let acb: Option<Vec<u8>> = row.get(8)?;
         let rb: Option<Vec<u8>> = row.get(9)?;
+        let source: Option<String> = row.get(10)?;
+        let external_signature: Option<String> = row.get(11)?;
+        let tessie_autopilot_percent: Option<f64> = row.get(12)?;
         Ok((
             row.get::<_, String>(0)?,
             row.get::<_, String>(1)?,
             row.get::<_, i64>(2)? as u32,
             row.get::<_, i64>(3)? as u32,
-            pb,
-            gb,
-            ab,
-            sb,
-            acb,
-            rb,
+            pb, gb, ab, sb, acb, rb,
+            source, external_signature, tessie_autopilot_percent,
         ))
     })?;
 
     let mut out = Vec::new();
     for r in rows {
-        let (file, date, raw_park_count, raw_frame_count, pb, gb, ab, sb, acb, rb) = r?;
+        let (file, date, raw_park_count, raw_frame_count, pb, gb, ab, sb, acb, rb,
+             source, external_signature, tessie_autopilot_percent) = r?;
         let points = decode_points(pb.as_deref())
             .with_context(|| format!("decode points {}", file))?
             .unwrap_or_default();
@@ -965,16 +992,9 @@ fn select_all_routes(conn: &Connection) -> Result<Vec<Route>> {
             .with_context(|| format!("decode gear_runs {}", file))?
             .unwrap_or_default();
         out.push(Route {
-            file,
-            date,
-            points,
-            gear_states,
-            autopilot_states,
-            speeds,
-            accel_positions,
-            raw_park_count,
-            raw_frame_count,
-            gear_runs,
+            file, date, points, gear_states, autopilot_states,
+            speeds, accel_positions, raw_park_count, raw_frame_count, gear_runs,
+            source, external_signature, tessie_autopilot_percent,
         });
     }
     Ok(out)
@@ -992,7 +1012,8 @@ fn select_routes_by_files(conn: &Connection, files: &[&str]) -> Result<Vec<Route
     let sql = format!(
         "SELECT file, date_dir, raw_park_count, raw_frame_count,
                 points_blob, gear_states_blob, ap_states_blob,
-                speeds_blob, accel_blob, gear_runs_blob
+                speeds_blob, accel_blob, gear_runs_blob,
+                source, external_signature, tessie_autopilot_percent
          FROM routes
          WHERE file IN ({})
          ORDER BY file",
@@ -1012,18 +1033,23 @@ fn select_routes_by_files(conn: &Connection, files: &[&str]) -> Result<Vec<Route
         let sb: Option<Vec<u8>> = row.get(7)?;
         let acb: Option<Vec<u8>> = row.get(8)?;
         let rb: Option<Vec<u8>> = row.get(9)?;
+        let source: Option<String> = row.get(10)?;
+        let external_signature: Option<String> = row.get(11)?;
+        let tessie_autopilot_percent: Option<f64> = row.get(12)?;
         Ok((
             row.get::<_, String>(0)?,
             row.get::<_, String>(1)?,
             row.get::<_, i64>(2)? as u32,
             row.get::<_, i64>(3)? as u32,
             pb, gb, ab, sb, acb, rb,
+            source, external_signature, tessie_autopilot_percent,
         ))
     })?;
 
     let mut out = Vec::with_capacity(files.len());
     for r in rows {
-        let (file, date, raw_park_count, raw_frame_count, pb, gb, ab, sb, acb, rb) = r?;
+        let (file, date, raw_park_count, raw_frame_count, pb, gb, ab, sb, acb, rb,
+             source, external_signature, tessie_autopilot_percent) = r?;
         let points = decode_points(pb.as_deref())
             .with_context(|| format!("decode points {}", file))?
             .unwrap_or_default();
@@ -1041,6 +1067,7 @@ fn select_routes_by_files(conn: &Connection, files: &[&str]) -> Result<Vec<Route
         out.push(Route {
             file, date, points, gear_states, autopilot_states,
             speeds, accel_positions, raw_park_count, raw_frame_count, gear_runs,
+            source, external_signature, tessie_autopilot_percent,
         });
     }
     Ok(out)
@@ -1055,7 +1082,8 @@ fn select_all_route_summaries(conn: &Connection) -> Result<Vec<RouteSummary>> {
                 tacc_engaged_ms, fsd_distance_m, autosteer_distance_m,
                 tacc_distance_m, assisted_distance_m,
                 fsd_disengagements, fsd_accel_pushes,
-                start_lat, start_lon, end_lat, end_lon
+                start_lat, start_lon, end_lat, end_lon,
+                source, external_signature
          FROM routes
          ORDER BY file",
     )?;
@@ -1085,6 +1113,8 @@ fn select_all_route_summaries(conn: &Connection) -> Result<Vec<RouteSummary>> {
             row.get::<_, Option<f64>>(20)?,
             row.get::<_, Option<f64>>(21)?,
             row.get::<_, Option<f64>>(22)?,
+            row.get::<_, Option<String>>(23)?,
+            row.get::<_, Option<String>>(24)?,
         ))
     })?;
 
@@ -1114,6 +1144,8 @@ fn select_all_route_summaries(conn: &Connection) -> Result<Vec<RouteSummary>> {
             start_lon,
             end_lat,
             end_lon,
+            source,
+            external_signature,
         ) = r?;
 
         let gear_runs = decode_gear_runs(rb.as_deref())
@@ -1146,6 +1178,8 @@ fn select_all_route_summaries(conn: &Connection) -> Result<Vec<RouteSummary>> {
                 end_lat,
                 end_lng: end_lon,
             },
+            source,
+            external_signature,
         });
     }
     Ok(out)
