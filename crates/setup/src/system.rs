@@ -133,27 +133,50 @@ pub async fn configure_ssh(emitter: &SetupEmitter) -> Result<bool> {
     }
 
     let content = std::fs::read_to_string(sshd_config)?;
+    // Don't disable password auth automatically. Locking the user out
+    // of SSH on a fresh install — when they may not have copied a
+    // public key into the wizard yet — is hostile. Pi OS already
+    // defaults to PermitRootLogin=prohibit-password (root only via
+    // key); we re-assert that, leave the user's normal-account
+    // password auth alone, and let them harden further from Settings
+    // if they want to.
     let settings = [
         ("PermitRootLogin", "prohibit-password"),
-        ("PasswordAuthentication", "no"),
-        ("ChallengeResponseAuthentication", "no"),
         ("UsePAM", "yes"),
     ];
 
+    // Earlier setup runs wrote `PasswordAuthentication no` and
+    // `ChallengeResponseAuthentication no`, which locked out anyone
+    // who hadn't placed a public key in their authorized_keys before
+    // running the wizard. If those exact lines are still present from
+    // a prior install, drop them so the OS default (password auth on)
+    // is restored on the next sshd reload. We only touch lines that
+    // exactly match what the previous setup wrote — anything the user
+    // edited by hand stays untouched.
+    let aggressive_lines = ["PasswordAuthentication no", "ChallengeResponseAuthentication no"];
+    let needs_cleanup = content.lines().any(|l| aggressive_lines.contains(&l.trim_start()));
+
     // Quick idempotency check — if every setting already has an active line
-    // with the desired value, there's nothing to do.
+    // with the desired value, AND no leftover aggressive lines need
+    // removing, there's nothing to do.
     let all_set = settings.iter().all(|(k, v)| {
         let expected = format!("{} {}", k, v);
         content.lines().any(|l| l.trim_start() == expected)
     });
-    if all_set {
+    if all_set && !needs_cleanup {
         return Ok(false);
     }
 
     emitter.begin_phase("ssh", "SSH hardening");
     emitter.progress("Hardening SSH...");
 
-    let mut lines: Vec<String> = content.lines().map(String::from).collect();
+    // Drop any leftover aggressive lines first.
+    let mut lines: Vec<String> = content
+        .lines()
+        .filter(|l| !aggressive_lines.contains(&l.trim_start()))
+        .map(String::from)
+        .collect();
+
     for (key, value) in &settings {
         let directive = format!("{} {}", key, value);
         let found = lines.iter_mut().any(|line| {
