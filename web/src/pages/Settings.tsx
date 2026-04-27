@@ -1602,29 +1602,61 @@ function CloudPairingSection() {
   const [error, setError] = useState<string | null>(null)
   const [confirmUnpair, setConfirmUnpair] = useState(false)
 
-  // Poll /api/cloud/status. Faster cadence while pairing is in flight so
-  // the UI tracks handshaking → polling → complete in near-real-time.
+  // Status is driven by:
+  //   1. An initial fetch on mount.
+  //   2. WebSocket events `cloud_status_changed` (paired ↔ unpaired) and
+  //      `cloud_upload` (per-sweep deltas) that trigger a re-fetch.
+  //   3. A faster (~1 s) poll while pairing is in flight — the daemon
+  //      currently only broadcasts on terminal transitions, not on every
+  //      handshaking/polling step, so we keep this for live progress.
+  //   4. A slow (30 s) safety-net poll the rest of the time so a missed
+  //      WS event (reconnect, page-load race) self-heals.
   useEffect(() => {
     let mounted = true
     let timer: ReturnType<typeof setTimeout> | null = null
-    async function poll() {
+
+    async function refetch() {
       try {
         const res = await fetch("/api/cloud/status")
         if (!res.ok) throw new Error(`HTTP ${res.status}`)
         const data: CloudStatus = await res.json()
         if (!mounted) return
         setStatus(data)
-        const fast =
-          data.pairingState === "handshaking" || data.pairingState === "polling"
-        timer = setTimeout(poll, fast ? 1000 : 5000)
+        scheduleNext(data)
       } catch {
-        if (mounted) timer = setTimeout(poll, 5000)
+        if (mounted) {
+          if (timer) clearTimeout(timer)
+          timer = setTimeout(refetch, 5000)
+        }
       }
     }
-    poll()
+
+    function scheduleNext(data: CloudStatus | null) {
+      if (timer) clearTimeout(timer)
+      const fast =
+        data?.pairingState === "handshaking" ||
+        data?.pairingState === "polling"
+      // 1 s while handshaking/polling, 30 s otherwise. WS events fill the
+      // gap for everything that fires through the hub.
+      timer = setTimeout(refetch, fast ? 1000 : 30000)
+    }
+
+    refetch()
+
+    // WS bridges. Both events trigger a fresh status fetch (cheap; the
+    // payload also includes counters we want regardless).
+    const unsubStatus = wsClient.subscribe("cloud_status_changed", () => {
+      if (mounted) refetch()
+    })
+    const unsubUpload = wsClient.subscribe("cloud_upload", () => {
+      if (mounted) refetch()
+    })
+
     return () => {
       mounted = false
       if (timer) clearTimeout(timer)
+      unsubStatus()
+      unsubUpload()
     }
   }, [])
 

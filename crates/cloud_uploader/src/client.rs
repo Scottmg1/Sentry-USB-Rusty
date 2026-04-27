@@ -25,8 +25,18 @@ pub enum CloudError {
     #[error("cloud rejected with HTTP {status}: {body}")]
     Http { status: u16, body: String },
 
-    #[error("auth rejected (401/403); pi credentials wiped")]
+    /// 401, or 403 with an `error: "revoked"` body. The Pi has been
+    /// removed from `/settings → Devices` and its bearer token is dead.
+    /// Caller wipes credentials and transitions to unpaired.
+    #[error("auth rejected; pi credentials should be wiped")]
     AuthRejected,
+
+    /// 403 with an `error: "user_suspended"` body. The account is
+    /// suspended but the Pi pairing is still valid. Caller surfaces
+    /// this as an error state without unpairing — uploads resume
+    /// automatically once the suspension is lifted.
+    #[error("user suspended; uploads paused until reinstated")]
+    UserSuspended,
 
     #[error("pi key stale; rekey required before upload retry")]
     PiKeyStale,
@@ -143,10 +153,29 @@ impl CloudClient {
         let body_text = resp.text().await.unwrap_or_default();
         let body_json: Option<Value> = serde_json::from_str(&body_text).ok();
 
-        // 401/403: Pi has been revoked (or never authenticated). Caller
-        // wipes credentials and surfaces "remote revoke" to the UI.
-        if status.as_u16() == 401 || status.as_u16() == 403 {
+        // 401: token is invalid or unknown. Always wipe — there's no
+        // valid bearer state to recover.
+        if status.as_u16() == 401 {
             return Err(CloudError::AuthRejected);
+        }
+        // 403: split on the typed body. `revoked` is true revocation
+        // (wipe). `user_suspended` is recoverable (don't wipe). Any
+        // other 403 falls through to the generic Http variant so the
+        // caller can decide.
+        if status.as_u16() == 403 {
+            let err_field = body_json
+                .as_ref()
+                .and_then(|v| v.get("error"))
+                .and_then(|e| e.as_str());
+            match err_field {
+                Some("user_suspended") => return Err(CloudError::UserSuspended),
+                Some("revoked") | None => return Err(CloudError::AuthRejected),
+                Some(_other) => {
+                    // Unknown 403 reason — treat as revocation rather
+                    // than risk a tight loop.
+                    return Err(CloudError::AuthRejected);
+                }
+            }
         }
         // 409 with `pi_key_stale` is the rekey trigger.
         if status.as_u16() == 409

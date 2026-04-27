@@ -105,6 +105,26 @@ pub fn mark_uploaded(store: &DriveStore, file: &str, ts_unix: i64) -> Result<()>
     })
 }
 
+/// Sentinel value stamped on routes that are permanently rejected by the
+/// cloud (`rejected_too_large`). Negative — distinct from any real unix
+/// timestamp — so the `select_pending` `IS NULL` filter naturally skips
+/// these without needing a separate column or another index.
+pub const PERMANENT_SKIP_SENTINEL: i64 = -1;
+
+/// Mark a route as permanently un-uploadable. Called when the server
+/// returns `rejected_too_large` for a route — the size will not change
+/// across retries, so re-attempting every sweep wastes encrypt cycles
+/// and rate-limit budget.
+pub fn mark_permanent_skip(store: &DriveStore, file: &str) -> Result<()> {
+    store.with_locked_conn(|conn| -> Result<_> {
+        conn.execute(
+            "UPDATE routes SET cloud_uploaded_at = ?1 WHERE file = ?2",
+            params![PERMANENT_SKIP_SENTINEL, file],
+        )?;
+        Ok(())
+    })
+}
+
 /// Count of rows with `cloud_uploaded_at IS NULL`. Cheap thanks to the
 /// partial index. Used by `/api/cloud/status`.
 pub fn pending_count(store: &DriveStore) -> i64 {

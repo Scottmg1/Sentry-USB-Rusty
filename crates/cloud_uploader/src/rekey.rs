@@ -73,8 +73,23 @@ pub async fn poll_and_apply(state: Arc<CloudStateInner>) -> Result<bool> {
             // next upload's 409 trigger the next round.
             return Ok(false);
         }
-        401 | 403 => {
-            // Pi has been revoked. Wipe credentials and surface to UI.
+        401 => {
+            // Token unknown — wipe.
+            state.handle_remote_revoke().await;
+            return Err(anyhow!("auth rejected during rekey poll"));
+        }
+        403 => {
+            // Differentiate user_suspended from true revocation. Read
+            // the body for the typed error field.
+            let body_text = resp.text().await.unwrap_or_default();
+            let err_field = serde_json::from_str::<serde_json::Value>(&body_text)
+                .ok()
+                .and_then(|v| v.get("error").and_then(|e| e.as_str()).map(|s| s.to_string()));
+            if err_field.as_deref() == Some("user_suspended") {
+                *state.last_upload_error.lock().await =
+                    Some("user_suspended".to_string());
+                return Err(anyhow!("user_suspended during rekey poll"));
+            }
             state.handle_remote_revoke().await;
             return Err(anyhow!("auth rejected during rekey poll"));
         }

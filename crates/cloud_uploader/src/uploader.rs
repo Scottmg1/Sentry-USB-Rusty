@@ -132,11 +132,40 @@ async fn sweep_once(state: Arc<CloudStateInner>) -> Result<u32> {
             .map_err(|e| anyhow!("upload POST: {}", e))?;
         let status = resp.status();
 
-        // Auth rejection → wipe credentials, abort sweep.
-        if status.as_u16() == 401 || status.as_u16() == 403 {
-            warn!("cloud upload: auth rejected ({}), wiping credentials", status);
+        // 401: token invalid → wipe.
+        // 403 user_suspended: keep credentials, surface error state.
+        // 403 revoked / other: wipe.
+        if status.as_u16() == 401 {
+            warn!("cloud upload: 401, wiping credentials");
             state.handle_remote_revoke().await;
             return Err(anyhow!("auth rejected; pi unpaired"));
+        }
+        if status.as_u16() == 403 {
+            let body_text = resp.text().await.unwrap_or_default();
+            let err_field = serde_json::from_str::<serde_json::Value>(&body_text)
+                .ok()
+                .and_then(|v| v.get("error").and_then(|e| e.as_str()).map(|s| s.to_string()));
+            match err_field.as_deref() {
+                Some("user_suspended") => {
+                    warn!("cloud upload: user_suspended; pausing without unpair");
+                    *state.last_upload_error.lock().await =
+                        Some("user_suspended".to_string());
+                    state.hub.broadcast(
+                        "cloud_upload",
+                        &serde_json::json!({
+                            "uploaded": 0,
+                            "pending": db_ext::pending_count(&state.store),
+                            "error": "user_suspended",
+                        }),
+                    );
+                    return Err(anyhow!("user_suspended; uploads paused"));
+                }
+                _ => {
+                    warn!("cloud upload: 403 ({:?}), wiping credentials", err_field);
+                    state.handle_remote_revoke().await;
+                    return Err(anyhow!("auth rejected; pi unpaired"));
+                }
+            }
         }
         // Stale generation → run rekey then retry the same batch.
         if status.as_u16() == 409 {
@@ -210,12 +239,18 @@ async fn sweep_once(state: Arc<CloudStateInner>) -> Result<u32> {
                     storage_full_seen = true;
                 }
                 "rejected_too_large" => {
-                    // Permanent — log once, leave NULL so it surfaces in
-                    // /api/cloud/queue but we don't keep retrying every
-                    // sweep. (A future operator UI could offer a
-                    // "discard" button.)
+                    // Permanent rejection — the route's encrypted size
+                    // exceeds the server's 256 KiB cap and won't shrink
+                    // on retry. Stamp `cloud_uploaded_at = -1` (sentinel
+                    // in db_ext) so future sweeps naturally skip it via
+                    // the existing `IS NULL` filter; pendingRouteCount
+                    // also drops it. Operator can still find these by
+                    // querying `cloud_uploaded_at = -1`.
                     if let Some(f) = source_file {
-                        warn!("cloud upload: rejected_too_large for {}", f);
+                        warn!("cloud upload: rejected_too_large for {} (permanent skip)", f);
+                        if let Err(e) = db_ext::mark_permanent_skip(&state.store, f) {
+                            warn!("mark_permanent_skip failed for {}: {}", f, e);
+                        }
                     }
                 }
                 "rejected_stale_generation" => {
