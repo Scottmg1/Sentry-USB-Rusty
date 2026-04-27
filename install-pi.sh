@@ -32,6 +32,23 @@ if [[ $EUID -ne 0 ]]; then
     error_exit "This script must be run as root. Try: sudo -i"
 fi
 
+# Backward-compat: the Go install.sh accepted `norootshrink` as its
+# first arg to skip the root-partition shrink step (used when an
+# external USB/NVMe data drive supplies the storage). In the Rust
+# port the shrink moved into the binary's setup wizard — it's
+# automatically skipped when DATA_DRIVE is set on the Storage step
+# (or in /root/sentryusb.conf). Recognize the legacy arg here so it
+# doesn't silently look like a "local binary path" lookup, and
+# clear it so it doesn't get treated as one.
+case "${1:-}" in
+    norootshrink|no-root-shrink|NOROOTSHRINK|norrotshrink)
+        info "Note: '$1' was a Go-era install arg; in the Rust port,"
+        info "  pick your external drive on the wizard's Storage step"
+        info "  (sets DATA_DRIVE) to skip root-partition shrinking."
+        shift || true
+        ;;
+esac
+
 # ── Step 1: /sentryusb Symlink ─────────────────────────────────────
 
 info "Setting up /sentryusb symlink..."
