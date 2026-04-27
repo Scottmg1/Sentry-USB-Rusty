@@ -34,6 +34,7 @@ export interface PiStatus {
   wifi_ip: string
   ether_ip: string
   ether_speed: string
+  fan_speed: string
 }
 
 export interface DriveStats {

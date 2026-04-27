@@ -29,6 +29,7 @@ struct PiStatus {
     ether_speed: String,
     device_suffix: String,
     sbc_model: String,
+    fan_speed: String,
 }
 
 pub async fn get_status(
@@ -51,6 +52,7 @@ pub async fn get_status(
         ether_speed: String::new(),
         device_suffix: String::new(),
         sbc_model: String::new(),
+        fan_speed: String::new(),
     };
 
     // Device suffix from machine-id
@@ -68,6 +70,9 @@ pub async fn get_status(
     if let Ok(data) = std::fs::read_to_string("/sys/class/thermal/thermal_zone0/temp") {
         s.cpu_temp = data.trim().to_string();
     }
+
+    // Fan speed (Raspberry Pi cooling fan RPM from hwmon device)
+    s.fan_speed = read_fan_speed();
 
     // Uptime
     if let Ok(data) = std::fs::read_to_string("/proc/uptime") {
@@ -393,6 +398,20 @@ fn walkdir(dir: &std::path::Path) -> std::io::Result<Vec<String>> {
         }
     }
     Ok(result)
+}
+
+fn read_fan_speed() -> String {
+    let base = std::path::Path::new("/sys/devices/platform/cooling_fan/hwmon");
+    let Ok(entries) = std::fs::read_dir(base) else {
+        return String::new();
+    };
+    for entry in entries.flatten() {
+        let candidate = entry.path().join("fan1_input");
+        if let Ok(data) = std::fs::read_to_string(&candidate) {
+            return data.trim().to_string();
+        }
+    }
+    String::new()
 }
 
 fn find_net_device(pattern: &str) -> String {
