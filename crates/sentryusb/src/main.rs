@@ -184,7 +184,7 @@ async fn main() {
         store.clone(),
         hub.clone(),
         cloud_notify,
-    );
+    ).await;
 
     let app_state = sentryusb_api::router::AppState {
         hub: hub.clone(),

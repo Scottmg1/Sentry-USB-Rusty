@@ -46,14 +46,14 @@ impl CloudUploader {
     /// Spawn the background tasks. `on_complete` is the same `Notify` clone
     /// passed to `Processor::new(...)`; the processor calls
     /// `notify.notify_one()` after `do_process` finishes, waking our sweep.
-    pub fn spawn(store: Arc<DriveStore>, hub: Hub, on_complete: Arc<Notify>) -> Arc<Self> {
-        Self::spawn_with_options(store, hub, on_complete, SpawnOptions::default())
+    pub async fn spawn(store: Arc<DriveStore>, hub: Hub, on_complete: Arc<Notify>) -> Arc<Self> {
+        Self::spawn_with_options(store, hub, on_complete, SpawnOptions::default()).await
     }
 
     /// Test/dev entry point that lets callers override the cloud base URL
     /// and credentials path. Production calls `spawn(...)` which uses the
     /// `DEFAULT_*` constants.
-    pub fn spawn_with_options(
+    pub async fn spawn_with_options(
         store: Arc<DriveStore>,
         hub: Hub,
         on_complete: Arc<Notify>,
@@ -70,7 +70,7 @@ impl CloudUploader {
 
         // Boot path: try to load an existing credentials file. If present,
         // we transition to Paired and the uploader sweep can run.
-        me.inner.bootstrap_load_credentials();
+        me.inner.bootstrap_load_credentials().await;
 
         // Spawn the upload-sweep loop. Owns its own clone of the state.
         let inner_for_sweep = inner.clone();

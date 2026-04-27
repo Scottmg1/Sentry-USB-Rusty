@@ -116,10 +116,10 @@ impl CloudStateInner {
     /// On boot, attempt to read `cloud-credentials.json`. Sets the paired
     /// state if successful; otherwise stays unpaired and the user has to
     /// run pairing.
-    pub fn bootstrap_load_credentials(&self) {
+    pub async fn bootstrap_load_credentials(&self) {
         match sentryusb_cloud_crypto::credentials::load(&self.credentials_path) {
             Ok(creds) => {
-                let mut guard = self.creds.blocking_lock();
+                let mut guard = self.creds.lock().await;
                 *guard = Some(creds);
             }
             Err(_) => {
