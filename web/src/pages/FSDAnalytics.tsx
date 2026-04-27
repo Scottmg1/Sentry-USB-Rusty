@@ -62,7 +62,11 @@ export default function FSDAnalytics() {
     )
   }
 
-  if (!data) {
+  // Treat a cache-miss / empty-DB response (`{}` from the backend) as
+  // "no data yet" so we render the empty state instead of crashing on
+  // the first `data.fsd_grade.length` access. The cache returns `"{}"`
+  // until the processor has run at least once.
+  if (!data || !data.fsd_grade) {
     return (
       <div className="flex h-full items-center justify-center p-6">
         <p className="text-slate-500">No FSD data available yet. Drive with FSD to see analytics.</p>
@@ -74,7 +78,10 @@ export default function FSDAnalytics() {
 
   // For "all" period: group by month, with drill-down into daily view
   const MONTH_NAMES = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
-  const daily = data.daily || []
+  // Backend may omit `daily` on cache-miss; coerce to [] so the .reduce /
+  // .map calls below don't throw, and skip any malformed day rows whose
+  // date string is missing (used as the YYYY-MM bucket key).
+  const daily = (data.daily || []).filter((d) => typeof d.date === "string" && d.date.length >= 7)
 
   // Monthly buckets: { key: "YYYY-MM", days: FSDDayStats[] }
   const monthlyMap = new Map<string, typeof daily>()
@@ -99,10 +106,11 @@ export default function FSDAnalytics() {
     chartTitle = "Monthly FSD Usage"
     barData = monthKeys.map((key) => {
       const days = monthlyMap.get(key)!
-      const avg = days.reduce((s, d) => s + d.fsdPercent, 0) / days.length
-      const totalDisengagements = days.reduce((s, d) => s + d.disengagements, 0)
+      const avg = days.reduce((s, d) => s + (d.fsdPercent ?? 0), 0) / Math.max(days.length, 1)
+      const totalDisengagements = days.reduce((s, d) => s + (d.disengagements ?? 0), 0)
       const [y, m] = key.split("-")
-      const label = `${MONTH_NAMES[parseInt(m) - 1]} '${y.slice(2)}`
+      const monthIdx = parseInt(m) - 1
+      const label = `${MONTH_NAMES[monthIdx] ?? ""} '${(y ?? "").slice(2)}`
       return {
         label,
         value: Math.round(avg),
@@ -117,29 +125,43 @@ export default function FSDAnalytics() {
     const [y, m] = selectedMonth!.split("-")
     chartTitle = `${MONTH_NAMES[parseInt(m) - 1]} ${y}`
     barData = days.map((day) => {
-      const [, , d] = day.date.split("-")
+      const parts = (day.date ?? "").split("-")
+      const d = parts[2] ?? ""
+      const pct = day.fsdPercent ?? 0
+      const dis = day.disengagements ?? 0
       return {
-        label: `${day.dayName} ${parseInt(d)}`,
-        value: Math.round(day.fsdPercent),
-        color: day.fsdPercent >= 90 ? "#34d399" : day.fsdPercent >= 60 ? "#60a5fa" : "#fbbf24",
-        subLabel: day.disengagements > 0 ? `${day.disengagements}` : undefined,
+        label: `${day.dayName ?? ""} ${parseInt(d) || ""}`.trim(),
+        value: Math.round(pct),
+        color: pct >= 90 ? "#34d399" : pct >= 60 ? "#60a5fa" : "#fbbf24",
+        subLabel: dis > 0 ? `${dis}` : undefined,
       }
     })
   } else {
     // Day / Week / All with only 1 month
     chartTitle = "Daily FSD Usage"
-    barData = daily.map((day) => ({
-      label: day.dayName,
-      value: Math.round(day.fsdPercent),
-      color: day.fsdPercent >= 90 ? "#34d399" : day.fsdPercent >= 60 ? "#60a5fa" : "#fbbf24",
-      subLabel: day.disengagements > 0 ? `${day.disengagements}` : undefined,
-    }))
+    barData = daily.map((day) => {
+      const pct = day.fsdPercent ?? 0
+      const dis = day.disengagements ?? 0
+      return {
+        label: day.dayName ?? "",
+        value: Math.round(pct),
+        color: pct >= 90 ? "#34d399" : pct >= 60 ? "#60a5fa" : "#fbbf24",
+        subLabel: dis > 0 ? `${dis}` : undefined,
+      }
+    })
   }
 
-  const fsdDist = metric ? data.fsd_distance_km : data.fsd_distance_mi
-  const totalDist = metric ? data.total_distance_km : data.total_distance_mi
+  // Coerce missing numerics to 0 — partial JSON would otherwise crash
+  // `.toFixed` further down. Cache returns `{}` until first processor run.
+  const fsdDist = (metric ? data.fsd_distance_km : data.fsd_distance_mi) ?? 0
+  const totalDist = (metric ? data.total_distance_km : data.total_distance_mi) ?? 0
   const distUnit = metric ? "km" : "mi"
   const distPct = totalDist > 0 ? (fsdDist / totalDist) * 100 : 0
+  const avgDis = data.avg_disengagements_per_drive ?? 0
+  const avgAccel = data.avg_accel_pushes_per_drive ?? 0
+  const fsdPct = data.fsd_percent ?? 0
+  const todayPct = data.today_percent ?? 0
+  const bestDayPct = data.best_day_percent ?? 0
 
   return (
     <div className="space-y-4 p-4 sm:p-6">
@@ -175,10 +197,10 @@ export default function FSDAnalytics() {
       {/* Grade Hero */}
       <div className={cn("rounded-xl border p-5 backdrop-blur-sm", grade.bgClass)}>
         <div className="flex flex-col items-center gap-5 sm:flex-row">
-          <RadialProgress value={data.fsd_percent} size={140} strokeWidth={10} color={grade.ringColor}>
+          <RadialProgress value={fsdPct} size={140} strokeWidth={10} color={grade.ringColor}>
             <div className="text-center px-3">
               <p className={cn("font-bold leading-tight", grade.color, data.fsd_grade.length > 5 ? "text-sm" : "text-2xl")}>{data.fsd_grade}</p>
-              <p className="text-xs text-slate-400">{Math.round(data.fsd_percent)}%</p>
+              <p className="text-xs text-slate-400">{Math.round(fsdPct)}%</p>
             </div>
           </RadialProgress>
           <div className="flex flex-1 flex-col gap-3 text-center sm:text-left">
@@ -189,13 +211,13 @@ export default function FSDAnalytics() {
               </div>
               <div>
                 <p className="text-xs text-slate-500">Sessions</p>
-                <p className="text-lg font-semibold text-slate-100">{data.fsd_sessions}</p>
+                <p className="text-lg font-semibold text-slate-100">{data.fsd_sessions ?? 0}</p>
               </div>
               <div>
                 <p className="text-xs text-slate-500">Streak</p>
                 <p className="text-lg font-semibold text-slate-100">
-                  {data.streak_days > 0 && <Flame className="mr-1 inline h-4 w-4 text-orange-400" />}
-                  {data.streak_days}d
+                  {(data.streak_days ?? 0) > 0 && <Flame className="mr-1 inline h-4 w-4 text-orange-400" />}
+                  {data.streak_days ?? 0}d
                 </p>
               </div>
             </div>
@@ -208,28 +230,28 @@ export default function FSDAnalytics() {
         <StatCard
           icon={Zap}
           label="Today"
-          value={`${Math.round(data.today_percent)}%`}
-          color={data.today_percent >= 90 ? "emerald" : data.today_percent >= 60 ? "blue" : "amber"}
+          value={`${Math.round(todayPct)}%`}
+          color={todayPct >= 90 ? "emerald" : todayPct >= 60 ? "blue" : "amber"}
         />
         <StatCard
           icon={TrendingUp}
           label={period === "day" ? "Day" : period === "week" ? "Week" : "All Time"}
-          value={`${Math.round(data.fsd_percent)}%`}
-          color={data.fsd_percent >= 90 ? "emerald" : data.fsd_percent >= 60 ? "blue" : "amber"}
+          value={`${Math.round(fsdPct)}%`}
+          color={fsdPct >= 90 ? "emerald" : fsdPct >= 60 ? "blue" : "amber"}
         />
         <StatCard
           icon={Calendar}
           label="Best Day"
-          value={`${Math.round(data.best_day_percent)}%`}
+          value={`${Math.round(bestDayPct)}%`}
           sub={data.best_day ? new Date(data.best_day + "T00:00:00").toLocaleDateString([], { month: "short", day: "numeric" }) : "—"}
           color="emerald"
         />
         <StatCard
           icon={AlertTriangle}
           label="Avg. Disengagements"
-          value={data.avg_disengagements_per_drive.toFixed(1)}
+          value={avgDis.toFixed(1)}
           sub="per drive"
-          color={data.avg_disengagements_per_drive <= 1 ? "emerald" : data.avg_disengagements_per_drive <= 3 ? "amber" : "red"}
+          color={avgDis <= 1 ? "emerald" : avgDis <= 3 ? "amber" : "red"}
         />
       </div>
 
@@ -291,19 +313,19 @@ export default function FSDAnalytics() {
           <div className="space-y-2">
             <div className="flex items-center justify-between">
               <span className="text-xs text-slate-400">Disengagements</span>
-              <span className="text-sm font-semibold text-red-400">{data.disengagements}</span>
+              <span className="text-sm font-semibold text-red-400">{data.disengagements ?? 0}</span>
             </div>
             <div className="flex items-center justify-between">
               <span className="text-xs text-slate-400">Accelerator Pushes</span>
-              <span className="text-sm font-semibold text-amber-400">{data.accel_pushes}</span>
+              <span className="text-sm font-semibold text-amber-400">{data.accel_pushes ?? 0}</span>
             </div>
             <div className="flex items-center justify-between">
               <span className="text-xs text-slate-400">Average per Drive</span>
-              <span className="text-sm font-semibold text-slate-300">{data.avg_disengagements_per_drive.toFixed(1)}</span>
+              <span className="text-sm font-semibold text-slate-300">{avgDis.toFixed(1)}</span>
             </div>
             <div className="flex items-center justify-between">
               <span className="text-xs text-slate-400">Average Accelerator Pushes per Drive</span>
-              <span className="text-sm font-semibold text-slate-300">{data.avg_accel_pushes_per_drive.toFixed(1)}</span>
+              <span className="text-sm font-semibold text-slate-300">{avgAccel.toFixed(1)}</span>
             </div>
           </div>
         </div>

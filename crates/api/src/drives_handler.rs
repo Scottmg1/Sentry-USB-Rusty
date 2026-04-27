@@ -431,20 +431,72 @@ pub async fn drive_stats(
     }
 }
 
-/// GET /api/drives/fsd-analytics — FSD analytics
-/// Served from the pre-computed cache; no grouper work or BLOB decoding per request.
+/// GET /api/drives/fsd-analytics?period=day|week|all — FSD analytics.
+///
+/// `period=week` (and missing/invalid) is served from the pre-computed
+/// meta cache (no grouper work, no BLOB decoding) — this is what the
+/// FSD page hits on first paint. `period=day` and `period=all` recompute
+/// against the live route_summaries since the cache is week-shaped only.
+///
+/// Earlier the handler ignored the query entirely and always returned
+/// the week cache, so the Day / Week / All Time toggle on the FSD page
+/// silently no-op'd. Combined with a frontend bug that crashed when
+/// `fsd_grade` was undefined, hitting the FSD button on a fresh-DB Pi
+/// produced an unhandled `Cannot read properties of undefined (reading
+/// 'length')` from the toggle's first click.
 pub async fn fsd_analytics(
     State(state): State<AppState>,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    match state.drives.store.get_cached_fsd_analytics_json() {
-        Ok(json) => match serde_json::from_str(&json) {
+    let period = params
+        .get("period")
+        .map(|s| s.as_str())
+        .unwrap_or("week");
+    let period = match period {
+        "day" | "week" | "all" => period,
+        _ => "week",
+    };
+
+    if period == "week" {
+        return match state.drives.store.get_cached_fsd_analytics_json() {
+            Ok(json) => match serde_json::from_str::<serde_json::Value>(&json) {
+                Ok(v) => (StatusCode::OK, Json(v)),
+                Err(e) => crate::json_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    &format!("fsd analytics cache parse: {}", e),
+                ),
+            },
+            Err(e) => crate::json_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+        };
+    }
+
+    // Day / All — recompute against current route summaries. This is
+    // O(routes), not O(routes * BLOB-size), because we go through the
+    // BLOB-free `with_route_summaries` path.
+    let store = state.drives.store.clone();
+    let period_owned = period.to_string();
+    let result = tokio::task::spawn_blocking(move || {
+        store.with_route_summaries(|summaries| {
+            sentryusb_drives::grouper::fsd_analytics_from_summaries_for_period(
+                summaries,
+                &period_owned,
+            )
+        })
+    })
+    .await;
+    match result {
+        Ok(Ok(analytics)) => match serde_json::to_value(&analytics) {
             Ok(v) => (StatusCode::OK, Json(v)),
             Err(e) => crate::json_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                &format!("fsd analytics cache parse: {}", e),
+                &format!("fsd analytics serialize: {}", e),
             ),
         },
-        Err(e) => crate::json_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+        Ok(Err(e)) => crate::json_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+        Err(e) => crate::json_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("fsd analytics task: {}", e),
+        ),
     }
 }
 

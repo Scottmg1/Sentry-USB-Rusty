@@ -134,9 +134,21 @@ pub fn compute_aggregate_stats_from_summaries(
 /// BLOB-free analogue of [`fsd_analytics`]. Builds the DriveSummary list
 /// via `group_summaries_fast` and runs the existing analytics aggregator.
 pub fn fsd_analytics_from_summaries(summaries: &[RouteSummary]) -> FsdAnalytics {
+    fsd_analytics_from_summaries_for_period(summaries, "week")
+}
+
+/// BLOB-free analogue of [`fsd_analytics`] with explicit period
+/// ("day" / "week" / "all"). Used by `GET /api/drives/fsd-analytics`
+/// when the query string asks for something other than the cached
+/// week view, so the Day / Week / All Time toggle on the FSD page
+/// returns actually-different data.
+pub fn fsd_analytics_from_summaries_for_period(
+    summaries: &[RouteSummary],
+    period: &str,
+) -> FsdAnalytics {
     let empty_tags = HashMap::new();
     let drives = group_summaries_fast(summaries, &empty_tags);
-    build_fsd_analytics(&drives, "week")
+    build_fsd_analytics(&drives, period)
 }
 
 /// Build FSD analytics from an already-grouped drive list. Used by the
