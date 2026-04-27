@@ -27,6 +27,18 @@ use crate::state::{now_ms, CloudStateInner};
 /// server-side Zod schema (max 32).
 const BATCH_LIMIT: i64 = 32;
 
+/// Server's per-route blob ceiling (256 KiB binary → ~384 KiB base64).
+/// Routes whose encrypted blob exceeds this are permanently rejected by
+/// the server (`rejected_too_large`), so we skip them client-side to
+/// avoid wasting bandwidth and rate-limit budget.
+const MAX_ROUTE_BLOB_B64_LEN: usize = 384 * 1024;
+
+/// Soft ceiling on the serialized JSON body we're willing to POST. The
+/// server's Fastify bodyLimit on this endpoint is 16 MiB; stay well
+/// under to leave headroom for JSON framing and to tolerate slight
+/// estimation drift.
+const MAX_BATCH_BODY_BYTES: usize = 14 * 1024 * 1024;
+
 /// 10-minute periodic safety-net.
 const SAFETY_TIMER: Duration = Duration::from_secs(600);
 
@@ -98,7 +110,10 @@ async fn sweep_once(state: Arc<CloudStateInner>) -> Result<u32> {
         }
 
         // Encrypt each row + cache route_id back to the DB if uncached.
+        // Track cumulative batch size so we don't blow past the server's
+        // 16 MiB bodyLimit.
         let mut wire_routes: Vec<UploadRoute> = Vec::with_capacity(pending.len());
+        let mut estimated_body_bytes: usize = 64; // JSON envelope overhead
         for p in &pending {
             let encrypted = encrypt::encrypt_route(
                 &p.route,
@@ -114,11 +129,47 @@ async fn sweep_once(state: Arc<CloudStateInner>) -> Result<u32> {
                     warn!("cache_route_id failed for {}: {}", p.file, e);
                 }
             }
+
+            // Skip routes whose encrypted blob exceeds the server's
+            // per-route cap — they'd be `rejected_too_large` anyway.
+            if encrypted.route_blob_b64.len() > MAX_ROUTE_BLOB_B64_LEN {
+                warn!(
+                    "cloud upload: skipping {} (blob {} bytes > {} limit)",
+                    p.file,
+                    encrypted.route_blob_b64.len(),
+                    MAX_ROUTE_BLOB_B64_LEN,
+                );
+                if let Err(e) = db_ext::mark_permanent_skip(&state.store, &p.file) {
+                    warn!("mark_permanent_skip failed for {}: {}", p.file, e);
+                }
+                continue;
+            }
+
+            let route_json_size = encrypted.route_blob_b64.len()
+                + encrypted.wrapped_route_key_b64.len()
+                + encrypted.route_id.len()
+                + 96; // JSON keys + quotes + braces
+            if !wire_routes.is_empty()
+                && estimated_body_bytes + route_json_size > MAX_BATCH_BODY_BYTES
+            {
+                debug!(
+                    "cloud upload: capping batch at {} routes (est {} bytes)",
+                    wire_routes.len(),
+                    estimated_body_bytes,
+                );
+                break;
+            }
+            estimated_body_bytes += route_json_size;
+
             wire_routes.push(UploadRoute {
                 route_id: encrypted.route_id,
                 route_blob: encrypted.route_blob_b64,
                 wrapped_route_key: encrypted.wrapped_route_key_b64,
             });
+        }
+
+        if wire_routes.is_empty() {
+            break;
         }
 
         // POST the batch.
