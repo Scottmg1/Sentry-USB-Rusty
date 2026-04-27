@@ -108,11 +108,19 @@ export default function Viewer() {
   const [segmentDurations, setSegmentDurations] = useState<number[]>([])
   const [metric, setMetric] = useState(false)
 
-  // Load unit preference
+  // Load unit from setup config (DRIVE_MAP_UNIT set in wizard)
   useEffect(() => {
-    fetch("/api/config/preference?key=units")
+    fetch("/api/setup/config")
       .then((r) => r.json())
-      .then((d) => { if (d.value === "metric") setMetric(true) })
+      .then((cfg) => {
+        const entry = cfg.DRIVE_MAP_UNIT
+        if (entry) {
+          const val = typeof entry === "object"
+            ? (entry.active ? entry.value : null)
+            : entry
+          if (val !== null) setMetric(val === "km")
+        }
+      })
       .catch(() => {})
   }, [])
 
