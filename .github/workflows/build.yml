@@ -11,7 +11,13 @@ env:
 jobs:
   build:
     name: Build ${{ matrix.name }}
-    runs-on: ubuntu-latest
+    # Pin to 22.04 (glibc 2.35). `ubuntu-latest` now points at 24.04
+    # (glibc 2.39) and Pi OS Bookworm only ships glibc 2.36 — anything
+    # built on 24.04 fails on every Pi with:
+    #   /lib/.../libc.so.6: version `GLIBC_2.39' not found
+    # When 22.04 is eventually retired by GitHub, switch to a
+    # cargo-zigbuild or container-based build for explicit ABI control.
+    runs-on: ubuntu-22.04
     strategy:
       matrix:
         include:
@@ -119,7 +125,7 @@ jobs:
 
   test:
     name: Test
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
@@ -134,7 +140,7 @@ jobs:
     name: Create Release
     needs: [build, test]
     if: startsWith(github.ref, 'refs/tags/v')
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     permissions:
       contents: write
     steps:
