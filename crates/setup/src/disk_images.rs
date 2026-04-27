@@ -30,7 +30,7 @@ const DRIVE_SPECS: &[DriveSpec] = &[
 ];
 
 /// Parse a human-readable size like "30G", "4G", "100M" into KB.
-fn dehumanize(s: &str) -> Result<u64> {
+pub(crate) fn dehumanize(s: &str) -> Result<u64> {
     let s = s.trim().to_uppercase()
         .replace("GB", "G")
         .replace("MB", "M")

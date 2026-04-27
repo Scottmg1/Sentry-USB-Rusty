@@ -404,7 +404,7 @@ export function AdvancedStep({ data, onChange }: StepProps) {
         </div>
         <div className="grid gap-3 sm:grid-cols-2">
           <Field label="Increase Root Size" field="INCREASE_ROOT_SIZE" placeholder="e.g. 500M or 2G"
-            data={data} onChange={onChange} hint="Extra space for packages. Only works during initial setup." />
+            data={data} onChange={onChange} hint="Extra space for packages — must include suffix M or G. Applied during the root-shrink phase only; once shrink completes, changing this requires a reflash." />
           <Field label="Additional Packages" field="INSTALL_USER_REQUESTED_PACKAGES" placeholder="iftop mosh sysstat"
             data={data} onChange={onChange} hint="Space-separated list of apt packages" />
           <Field label="CPU Governor" field="CPU_GOVERNOR" placeholder="conservative"

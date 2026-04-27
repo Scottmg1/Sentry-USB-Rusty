@@ -528,9 +528,31 @@ async fn check_root_shrink(env: &SetupEnv, emitter: &SetupEmitter) -> Result<boo
         "bash", &["-c", "df --output=used -k / | tail -1 | tr -d ' '"],
     ).await?;
     let used_kb: u64 = used_output.trim().parse().unwrap_or(0);
-    let target_gb = ((used_kb / 1024 / 1024) + 2).max(6);
 
-    emitter.progress(&format!("Shrinking root filesystem to {}GB to free space for setup...", target_gb));
+    // Honor INCREASE_ROOT_SIZE from sentryusb.conf / wizard advanced step.
+    // The wizard exposed this field but the shrink path was ignoring it,
+    // so users who asked for headroom (e.g. for extra apt packages) ended
+    // up with a root partition trimmed to the bare minimum. Round the
+    // requested bytes up to whole GB so we never give them less than they
+    // asked for.
+    let extra_gb: u64 = env
+        .config
+        .get("INCREASE_ROOT_SIZE")
+        .filter(|s| !s.trim().is_empty())
+        .and_then(|s| crate::disk_images::dehumanize(s).ok())
+        .map(|kb_in_gb_units| (kb_in_gb_units + (1024 * 1024 - 1)) / (1024 * 1024))
+        .unwrap_or(0);
+
+    let target_gb = ((used_kb / 1024 / 1024) + 2 + extra_gb).max(6);
+
+    if extra_gb > 0 {
+        emitter.progress(&format!(
+            "Shrinking root filesystem to {}GB (used + 2GB headroom + {}GB INCREASE_ROOT_SIZE) to free space for setup...",
+            target_gb, extra_gb
+        ));
+    } else {
+        emitter.progress(&format!("Shrinking root filesystem to {}GB to free space for setup...", target_gb));
+    }
 
     let _ = std::fs::write(resize_marker, "");
 
