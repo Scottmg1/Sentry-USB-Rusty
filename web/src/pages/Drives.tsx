@@ -322,6 +322,7 @@ export default function Drives() {
       const line = L.polyline(latlngs, { color, weight: 2.5, opacity: 0.7, smoothFactor: 1.5 })
       ;(line as any)._driveId = r.id
       ;(line as any)._source = r.source
+      line.on("click", () => { void selectDrive(r.id) })
       line.addTo(map)
       overviewLayers.current.push(line)
       for (const p of r.points) bounds.push(L.latLng(p[0], p[1]))
