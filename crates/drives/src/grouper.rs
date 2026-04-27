@@ -631,56 +631,23 @@ fn build_summary(
 
     let mut start_point: Option<GpsPoint> = None;
     let mut end_point: Option<GpsPoint> = None;
+    let mut prev_end_point: Option<GpsPoint> = None;
 
-    // First pass: compute median location from valid points across all clips
-    let mut valid_lats: Vec<f64> = Vec::new();
-    let mut valid_lngs: Vec<f64> = Vec::new();
-    for clip in clips {
-        for p in &clip.route.points {
-            if !(p[0].abs() < 1.0 && p[1].abs() < 1.0) {
-                valid_lats.push(p[0]);
-                valid_lngs.push(p[1]);
-            }
-        }
-    }
-
-    let (med_lat, med_lng, has_median) = compute_median_location(&valid_lats, &valid_lngs);
-    drop(valid_lats);
-    drop(valid_lngs);
-
-    // Second pass: compute stats, filtering outliers per-clip
+    // Compute stats from raw merged clip points (matches Sentry-Drive behavior).
     for clip in clips {
         let n = clip.route.points.len();
         if n == 0 {
             continue;
         }
-
-        // Build validity mask for this clip's points
-        let mut valid = build_validity_mask(&clip.route.points, has_median, med_lat, med_lng);
-
-        // Neighbor-jump filter
-        apply_neighbor_jump_filter(&clip.route.points, &mut valid);
-
-        // Track start/end points
         if start_point.is_none() {
-            for i in 0..n {
-                if valid[i] {
-                    start_point = Some([clip.route.points[i][0], clip.route.points[i][1]]);
-                    break;
-                }
-            }
+            start_point = Some([clip.route.points[0][0], clip.route.points[0][1]]);
         }
-        for i in (0..n).rev() {
-            if valid[i] {
-                end_point = Some([clip.route.points[i][0], clip.route.points[i][1]]);
-                break;
-            }
-        }
+        end_point = Some([clip.route.points[n - 1][0], clip.route.points[n - 1][1]]);
+        point_count += n;
 
-        for i in 0..n {
-            if valid[i] {
-                point_count += 1;
-            }
+        // Count boundary distance between clips (prev clip end -> current start).
+        if let Some(prev) = prev_end_point {
+            total_dist_m += haversine_m(prev[0], prev[1], clip.route.points[0][0], clip.route.points[0][1]);
         }
 
         let clip_duration_ms: f64 = 60000.0;
@@ -697,24 +664,12 @@ fn build_summary(
         let mut pending_disengage_idx: usize = 0;
 
         for i in 1..n {
-            if !valid[i] || !valid[i - 1] {
-                continue;
-            }
-
             let d = haversine_m(
                 clip.route.points[i - 1][0],
                 clip.route.points[i - 1][1],
                 clip.route.points[i][0],
                 clip.route.points[i][1],
             );
-
-            // Skip GPS teleportation artifacts
-            if !has_sei_speeds {
-                let dt_sec = (clip_duration_ms / (n - 1) as f64) / 1000.0;
-                if dt_sec > 0.0 && d / dt_sec > 70.0 {
-                    continue;
-                }
-            }
 
             total_dist_m += d;
             let dt_ms = clip_duration_ms / (n - 1) as f64;
@@ -824,6 +779,8 @@ fn build_summary(
                 fsd_disengagements += 1;
             }
         }
+
+        prev_end_point = Some([clip.route.points[n - 1][0], clip.route.points[n - 1][1]]);
     }
 
     let avg_speed_mps = if speed_count > 0 {
