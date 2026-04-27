@@ -60,6 +60,10 @@ pub async fn setup_data_drive(env: &SetupEnv, emitter: &SetupEmitter) -> Result<
     let fstab = std::fs::read_to_string("/etc/fstab").unwrap_or_default();
     let fstab_complete = fstab.contains("LABEL=backingfiles") && fstab.contains("LABEL=mutable");
 
+    // True idempotency only: partitions exist with correct labels/fstypes
+    // AND fstab already references them. This is the resume-after-reboot
+    // case (or a clean re-run that needs no work). Anything else means
+    // the drive is in an unknown state and we wipe it cleanly.
     if already_partitioned && fstab_complete {
         return Ok(false);
     }
@@ -67,68 +71,64 @@ pub async fn setup_data_drive(env: &SetupEnv, emitter: &SetupEmitter) -> Result<
     emitter.begin_phase("partitions", "Disk partitioning");
     emitter.progress(&format!("DATA_DRIVE is set to {}", data_drive));
 
+    // No "keep existing" branch — if we got here, either there are no
+    // partitions yet, OR there are partitions but they don't match the
+    // expected configuration (missing fstab entries, leftover state from
+    // a previous install). Either way the right answer is wipe + fresh
+    // mkfs, so the user lands on a known-good drive every time setup
+    // runs to completion. The wizard's destructive-change detection
+    // ([SetupWizard.tsx:140]) already warned the user before they hit
+    // Save, so we're not erasing anything they didn't sign off on.
     if already_partitioned {
-        emitter.progress("Existing backingfiles (xfs) and mutable (ext4) partitions found. Keeping them.");
-
-        // Drop any auto-mount or stale mount holding the device first.
-        // Without this, xfs_repair contends with whatever mounted the
-        // partition (systemd auto-mount, autofs, udisks2, etc.), often
-        // hits the 60s timeout, and then our subsequent `mount` call
-        // fails with "Can't open blockdev" because the loser still
-        // has /dev/sda2 open exclusively.
-        emitter.progress(&format!("Releasing any active mounts on {}...", data_drive));
-        cleanup_mounts().await;
-
-        repair_xfs(&p2, emitter).await;
-
-        // Let udev reprobe the device after xfs_repair so the kernel
-        // releases the inode it briefly held during the log replay.
-        let _ = sentryusb_shell::run("udevadm", &["settle", "--timeout=30"]).await;
-    } else {
-        emitter.progress(&format!("Unmounting partitions on {}...", data_drive));
-        cleanup_mounts().await;
-
-        // Comprehensive teardown: covers the auto-mounters and loop
-        // devices that `cleanup_mounts` (well-known paths only) misses.
-        // Without this, parted writes the new GPT but the kernel
-        // refuses to switch to it because something on the system
-        // (commonly udisks2 having auto-mounted the prior install's
-        // partition at /media/pi/<label>) still has a partition open.
-        emitter.progress(&format!("Releasing kernel-side holders on {}...", data_drive));
-        release_data_drive(data_drive, emitter).await;
-
-        emitter.progress(&format!("WARNING: This will delete EVERYTHING on {}", data_drive));
-        // Bound every block-device operation. A stalled / wedged USB
-        // bridge can hang `wipefs` or `parted` indefinitely, leaving
-        // the wizard stuck on "Creating partitions..." with no way to
-        // recover. 2 minutes is long enough for any healthy drive
-        // (mkfs.ext4 lazy-init means even multi-TB drives finish in
-        // seconds) and short enough that the user notices a problem.
-        let op_timeout = Duration::from_secs(120);
-        sentryusb_shell::run_with_timeout(op_timeout, "wipefs", &["-afq", data_drive]).await
-            .context("wipefs failed (drive unresponsive?)")?;
-        sentryusb_shell::run_with_timeout(op_timeout, "parted",
-            &[data_drive, "--script", "mktable", "gpt"]).await
-            .context("parted mktable failed")?;
-
-        emitter.progress("Creating partitions...");
-        sentryusb_shell::run_with_timeout(op_timeout, "parted",
-            &["-a", "optimal", "-m", data_drive, "mkpart", "primary", "ext4", "0%", "2GB"]).await?;
-        sentryusb_shell::run_with_timeout(op_timeout, "parted",
-            &["-a", "optimal", "-m", data_drive, "mkpart", "primary", "ext4", "2GB", "100%"]).await?;
-
-        let _ = sentryusb_shell::run("udevadm", &["settle", "--timeout=30"]).await;
-
-        emitter.progress(&format!("Formatting mutable partition (ext4) on {}...", p1));
-        sentryusb_shell::run_with_timeout(op_timeout, "mkfs.ext4",
-            &["-F", "-L", "mutable", &p1]).await.context("mkfs.ext4 failed")?;
-
-        emitter.progress(&format!("Formatting backingfiles partition (xfs) on {}...", p2));
-        sentryusb_shell::run_with_timeout(op_timeout, "mkfs.xfs",
-            &["-f", "-m", "reflink=1", "-L", "backingfiles", &p2]).await.context("mkfs.xfs failed")?;
-
-        emitter.progress("Partition formatting complete.");
+        emitter.progress(&format!(
+            "Existing partitions on {} look stale (fstab incomplete) — wiping for a clean install",
+            data_drive
+        ));
     }
+
+    emitter.progress(&format!("Unmounting partitions on {}...", data_drive));
+    cleanup_mounts().await;
+
+    // Comprehensive teardown: covers the auto-mounters and loop devices
+    // that cleanup_mounts (well-known paths only) misses. Without this,
+    // parted writes the new GPT but the kernel refuses to switch to it
+    // because something on the system (commonly udisks2 having
+    // auto-mounted the prior install's partition at /media/pi/<label>)
+    // still has a partition open.
+    emitter.progress(&format!("Releasing kernel-side holders on {}...", data_drive));
+    release_data_drive(data_drive, emitter).await;
+
+    emitter.progress(&format!("WARNING: This will delete EVERYTHING on {}", data_drive));
+    // Bound every block-device operation. A stalled / wedged USB
+    // bridge can hang wipefs or parted indefinitely, leaving the
+    // wizard stuck on "Creating partitions..." with no way to recover.
+    // 2 minutes is long enough for any healthy drive (mkfs.ext4
+    // lazy-init means even multi-TB drives finish in seconds) and
+    // short enough that the user notices a problem.
+    let op_timeout = Duration::from_secs(120);
+    sentryusb_shell::run_with_timeout(op_timeout, "wipefs", &["-afq", data_drive]).await
+        .context("wipefs failed (drive unresponsive?)")?;
+    sentryusb_shell::run_with_timeout(op_timeout, "parted",
+        &[data_drive, "--script", "mktable", "gpt"]).await
+        .context("parted mktable failed")?;
+
+    emitter.progress("Creating partitions...");
+    sentryusb_shell::run_with_timeout(op_timeout, "parted",
+        &["-a", "optimal", "-m", data_drive, "mkpart", "primary", "ext4", "0%", "2GB"]).await?;
+    sentryusb_shell::run_with_timeout(op_timeout, "parted",
+        &["-a", "optimal", "-m", data_drive, "mkpart", "primary", "ext4", "2GB", "100%"]).await?;
+
+    let _ = sentryusb_shell::run("udevadm", &["settle", "--timeout=30"]).await;
+
+    emitter.progress(&format!("Formatting mutable partition (ext4) on {}...", p1));
+    sentryusb_shell::run_with_timeout(op_timeout, "mkfs.ext4",
+        &["-F", "-L", "mutable", &p1]).await.context("mkfs.ext4 failed")?;
+
+    emitter.progress(&format!("Formatting backingfiles partition (xfs) on {}...", p2));
+    sentryusb_shell::run_with_timeout(op_timeout, "mkfs.xfs",
+        &["-f", "-m", "reflink=1", "-L", "backingfiles", &p2]).await.context("mkfs.xfs failed")?;
+
+    emitter.progress("Partition formatting complete.");
 
     update_fstab().await?;
     Ok(true)
