@@ -114,3 +114,39 @@ pub async fn upload_now(State(state): State<AppState>) -> impl IntoResponse {
     state.cloud.uploader.nudge();
     (StatusCode::ACCEPTED, Json(json!({ "ok": true })))
 }
+
+#[derive(Deserialize, Default)]
+pub struct QueueQuery {
+    /// Cap on rows returned. Server-side ceiling at 200 to avoid
+    /// dragging large lists through SQLite + JSON serialization. Defaults
+    /// to 100; the UI can ask for less.
+    pub limit: Option<i64>,
+}
+
+/// `GET /api/cloud/queue?limit=N` — list pending-upload routes oldest-first.
+/// Returns `{ entries: [{ file, date, startTs, estimatedSizeBytes,
+/// updatedAt }], pending: <total count incl. beyond limit> }`.
+pub async fn get_queue(
+    State(state): State<AppState>,
+    axum::extract::Query(q): axum::extract::Query<QueueQuery>,
+) -> impl IntoResponse {
+    let limit = q.limit.unwrap_or(100).clamp(1, 200);
+    match state.cloud.uploader.pending_queue(limit) {
+        Ok(entries) => {
+            // Total pending count comes from the same index this query
+            // hits, so it's cheap; saves the UI a second round trip.
+            let pending = state.cloud.uploader.status().await.pending_route_count;
+            Json(json!({
+                "entries": entries,
+                "pending": pending,
+                "limit": limit,
+            }))
+            .into_response()
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": e.to_string() })),
+        )
+            .into_response(),
+    }
+}

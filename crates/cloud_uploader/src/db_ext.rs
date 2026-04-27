@@ -138,3 +138,54 @@ pub fn pending_count(store: &DriveStore) -> i64 {
             .unwrap_or(0)
         })
 }
+
+/// One pending-queue row for `/api/cloud/queue`. Cheap to build —
+/// `points_blob` is NOT materialized; we only need the size estimate
+/// from the route's stored columns.
+#[derive(serde::Serialize, Debug)]
+pub struct QueueEntry {
+    pub file: String,
+    pub date: String,
+    pub start_ts: Option<i64>,
+    /// Approximation of the encrypted upload size based on
+    /// `length(points_blob)` + a small fixed overhead. The real
+    /// size is only known after `encrypt::encrypt_route`, but this is
+    /// close enough for a "what's queued + how big" UI panel.
+    pub estimated_size_bytes: i64,
+    /// Wall-clock unix seconds when the row was last updated locally
+    /// (i.e., when processing finished and the route was inserted).
+    pub updated_at: i64,
+}
+
+/// List up to `limit` pending routes for the UI. Sorted oldest-first
+/// (same order the uploader will pick them up).
+pub fn pending_queue(store: &DriveStore, limit: i64) -> Result<Vec<QueueEntry>> {
+    store.with_locked_conn(|conn| -> Result<_> {
+        let mut stmt = conn.prepare(
+            "SELECT file, date_dir, start_ts, \
+                    coalesce(length(points_blob), 0) + \
+                    coalesce(length(gear_states_blob), 0) + \
+                    coalesce(length(ap_states_blob), 0) + \
+                    coalesce(length(speeds_blob), 0) + \
+                    coalesce(length(accel_blob), 0) + 256 AS est_bytes, \
+                    updated_at \
+             FROM routes \
+             WHERE cloud_uploaded_at IS NULL \
+             ORDER BY start_ts ASC, file ASC LIMIT ?1",
+        )?;
+        let iter = stmt.query_map(params![limit], |row| {
+            Ok(QueueEntry {
+                file: row.get(0)?,
+                date: row.get(1)?,
+                start_ts: row.get(2)?,
+                estimated_size_bytes: row.get(3)?,
+                updated_at: row.get(4)?,
+            })
+        })?;
+        let mut out = Vec::new();
+        for r in iter {
+            out.push(r?);
+        }
+        Ok(out)
+    })
+}

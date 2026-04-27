@@ -113,6 +113,12 @@ impl CloudUploader {
     pub fn nudge(&self) {
         self.inner.notify.notify_one();
     }
+
+    /// List the next `limit` pending routes for `/api/cloud/queue`. Cheap
+    /// — uses the partial index `idx_routes_cloud_pending`.
+    pub fn pending_queue(&self, limit: i64) -> anyhow::Result<Vec<db_ext::QueueEntry>> {
+        db_ext::pending_queue(&self.inner.store, limit)
+    }
 }
 
 /// Optional overrides for `spawn_with_options`.

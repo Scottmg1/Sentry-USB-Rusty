@@ -172,6 +172,7 @@ pub fn build_router(state: AppState) -> Router {
         // uploads are automatic at the tail of the archive lifecycle —
         // the `upload-now` endpoint is dev/debug.
         .route("/api/cloud/status", get(crate::cloud::get_status))
+        .route("/api/cloud/queue", get(crate::cloud::get_queue))
         .route("/api/cloud/pair/begin", post(crate::cloud::pair_begin))
         .route("/api/cloud/pair/cancel", post(crate::cloud::pair_cancel))
         .route("/api/cloud/unpair", post(crate::cloud::unpair))
