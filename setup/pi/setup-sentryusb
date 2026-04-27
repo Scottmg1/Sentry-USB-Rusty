@@ -475,8 +475,7 @@ function update_sentryusb_service () {
   cat > /etc/systemd/system/sentryusb.service << 'EOF'
 [Unit]
 Description=SentryUSB Web Server
-After=network-online.target
-Wants=network-online.target
+After=network.target
 Conflicts=nginx.service
 
 [Service]
@@ -495,6 +494,54 @@ EOF
   systemctl daemon-reload
   systemctl enable sentryusb 2>/dev/null || true
   setup_progress "sentryusb.service updated."
+}
+
+function disable_unused_services () {
+  setup_progress "Disabling unused systemd services to improve boot time..."
+
+  # cloud-init is a cloud VM provisioning tool — does nothing useful on a Pi.
+  # Mask (not just disable) so dependency pulls from other units can't resurrect them.
+  for svc in cloud-init-main cloud-init cloud-init-local cloud-init-network cloud-final; do
+    if ! systemctl is-masked "${svc}.service" &>/dev/null; then
+      systemctl mask "${svc}.service" 2>/dev/null || true
+      setup_progress "  masked ${svc}.service"
+    fi
+  done
+
+  # systemd-binfmt registers kernel binary-format handlers (Java .jar, Wine, etc.)
+  # A dedicated SentryUSB device has no use for this — mask it to keep it off
+  # the boot critical chain where it adds ~600ms.
+  if ! systemctl is-masked systemd-binfmt.service &>/dev/null; then
+    systemctl mask systemd-binfmt.service 2>/dev/null || true
+    setup_progress "  masked systemd-binfmt.service"
+  fi
+
+  # rpi-eeprom-update checks for Pi firmware updates — important, but running it
+  # on every boot adds ~850ms for no benefit. Replace with a weekly systemd timer.
+  if [ -f /lib/systemd/system/rpi-eeprom-update.service ]; then
+    if ! systemctl is-masked rpi-eeprom-update.service &>/dev/null; then
+      systemctl mask rpi-eeprom-update.service 2>/dev/null || true
+      setup_progress "  masked rpi-eeprom-update.service (replaced by weekly timer)"
+    fi
+    if [ ! -f /etc/systemd/system/rpi-eeprom-update.timer ]; then
+      cat > /etc/systemd/system/rpi-eeprom-update.timer << 'EOF'
+[Unit]
+Description=Check for Raspberry Pi EEPROM updates weekly
+
+[Timer]
+OnCalendar=weekly
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+      systemctl daemon-reload
+      systemctl enable rpi-eeprom-update.timer 2>/dev/null || true
+      setup_progress "  installed weekly rpi-eeprom-update.timer"
+    fi
+  fi
+
+  setup_progress "Done disabling unused services."
 }
 
 function install_avahi_service () {
@@ -1677,6 +1724,7 @@ get_common_scripts
 install_ble_daemon
 update_sentryusb_binary
 update_sentryusb_service
+disable_unused_services
 install_avahi_service
 
 pushd ~
