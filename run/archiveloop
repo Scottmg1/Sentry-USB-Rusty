@@ -1004,6 +1004,83 @@ function has_cam_disk () {
   [ -f /backingfiles/cam_disk.bin ]
 }
 
+function cloud_upload_step () {
+  # Cloud upload as a real archiveloop stage. Runs after post-archive-process,
+  # inside the awake_start/awake_stop window so the car (and therefore Pi
+  # power) stays alive for the duration. Polls the local API until pending
+  # hits 0 or we hit a hard cap / stall. Failures (WiFi loss, API blip,
+  # cloud-side error) are logged but never abort archiveloop — next cycle
+  # resumes from whatever's still pending.
+  local port="${SENTRYUSB_PORT:-80}"
+  local api="http://127.0.0.1:${port}"
+
+  local status_json
+  if ! status_json=$(curl -sf -m 5 "$api/api/cloud/status" 2>/dev/null); then
+    log "Cloud upload: API unreachable, skipping"
+    return 0
+  fi
+  if ! echo "$status_json" | grep -q '"paired":true'; then
+    log "Cloud upload: Pi not paired, skipping"
+    return 0
+  fi
+
+  local pending
+  pending=$(echo "$status_json" | grep -o '"pendingRouteCount":[0-9]*' | cut -d: -f2)
+  pending=${pending:-0}
+  if [ "$pending" -eq 0 ]; then
+    log "Cloud upload: nothing to upload (0 pending)"
+    return 0
+  fi
+
+  log "Cloud upload: starting upload of $pending route(s)..."
+
+  # Kick the sweep. Fire-and-forget — actual progress is observed via /status.
+  curl -sf -m 5 -X POST "$api/api/cloud/upload-now" -d '' > /dev/null 2>&1 || true
+
+  # Hard cap = 30 min total. Stall detection = no decrease in pending for
+  # 2 min ⇒ give up (cloud is rejecting, WiFi is dead, etc — next cycle retries).
+  local deadline=$(( $(date +%s) + 1800 ))
+  local last_pending=$pending
+  local stalled_for=0
+  local last_logged=$pending
+
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    sleep 10
+    if ! status_json=$(curl -sf -m 5 "$api/api/cloud/status" 2>/dev/null); then
+      log "Cloud upload: status check failed (WiFi/API issue); retrying"
+      continue
+    fi
+    pending=$(echo "$status_json" | grep -o '"pendingRouteCount":[0-9]*' | cut -d: -f2)
+    pending=${pending:-0}
+
+    if [ "$pending" -eq 0 ]; then
+      log "Cloud upload: complete (all routes uploaded)"
+      return 0
+    fi
+
+    if [ "$pending" -ge "$last_pending" ]; then
+      stalled_for=$((stalled_for + 10))
+      if [ "$stalled_for" -ge 120 ]; then
+        local last_err
+        last_err=$(echo "$status_json" | grep -o '"lastUploadError":"[^"]*"' | cut -d: -f2- | tr -d '"')
+        log "Cloud upload: stalled at $pending pending for 2 min (lastError=${last_err:-none}); will retry next cycle"
+        return 0
+      fi
+    else
+      stalled_for=0
+      last_pending=$pending
+      # Log progress at most every ~25 routes to avoid spam.
+      if [ $(( last_logged - pending )) -ge 25 ]; then
+        log "Cloud upload: progress — $pending route(s) remaining"
+        last_logged=$pending
+      fi
+    fi
+  done
+
+  log "Cloud upload: hit 30 min cap with $pending pending; will retry next cycle"
+  return 0
+}
+
 function archive_clips () {
   log "Archiving..."
 
@@ -1048,6 +1125,7 @@ function archive_clips () {
   # recording immediately instead of waiting for processing to finish.
   connect_usb_drives_to_host
   /root/bin/post-archive-process.sh || log "ERROR: post-archive-process.sh failed (exit $?)"
+  cloud_upload_step
   /root/bin/send-live-activity end complete || true
   if ! archive_is_reachable; then
     log "Archive became unreachable during drive processing, user likely drove away"
