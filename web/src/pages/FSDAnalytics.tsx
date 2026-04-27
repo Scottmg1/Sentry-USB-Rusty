@@ -41,7 +41,17 @@ export default function FSDAnalytics() {
   useEffect(() => {
     setLoading(true)
     api.getFSDAnalytics(period === "all" ? "all" : period)
-      .then(setData)
+      .then(async (resp) => {
+        // If week/day cache returns empty object, fall back to All Time so
+        // users still see existing FSD history instead of a false empty state.
+        if (period !== "all" && (!resp || !(resp as any).fsd_grade)) {
+          const all = await api.getFSDAnalytics("all")
+          setData(all)
+          setPeriod("all")
+          return
+        }
+        setData(resp)
+      })
       .catch(() => setData(null))
       .finally(() => setLoading(false))
   }, [period])

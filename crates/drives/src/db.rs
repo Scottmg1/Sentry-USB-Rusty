@@ -682,7 +682,9 @@ impl DriveStore {
         let conn = self.conn.lock().unwrap();
         if !self.drive_cache_dirty.load(Ordering::Acquire) {
             if let Some(json) = schema::meta_get(&conn, "fsd_analytics_cache")? {
-                if !json.is_empty() {
+                // Treat "{}" as a cache miss: older builds could persist an
+                // empty-object placeholder which then masks real data forever.
+                if !json.is_empty() && json.trim() != "{}" {
                     return Ok(json);
                 }
             }
