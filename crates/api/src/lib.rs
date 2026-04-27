@@ -21,6 +21,7 @@ pub mod preferences;
 pub mod memory;
 pub mod logs;
 pub mod devices;
+pub mod cloud;
 
 pub use auth::{AuthState, init_auth};
 pub use router::build_router;

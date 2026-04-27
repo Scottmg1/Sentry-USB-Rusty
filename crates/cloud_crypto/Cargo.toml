@@ -1,0 +1,32 @@
+[package]
+name = "sentryusb-cloud-crypto"
+version = "0.1.0"
+edition = "2024"
+
+# Pure protocol primitives for the SentryCloud zero-knowledge encryption
+# protocol (see SentryCloud/ENCRYPTION.md). No I/O, no async, no reqwest.
+# Trivially unit-testable against byte vectors lifted from
+# web/src/lib/encryption/format.js.
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+chrono = { workspace = true }
+
+# AEAD (AES-256-GCM), HKDF-SHA-256, SHA-256, ephemeral X25519, RNG. Per
+# ENCRYPTION.md §4 + goal #7 — already pulled in by crates/api and crates/notify.
+ring = "0.17"
+
+# Long-term X25519 keypair (rekey, ENCRYPTION.md §16). ring::agreement does
+# not expose long-term private keys; a small dalek dep is the trade. See
+# the project plan's "Known protocol gap" section.
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+
+base64 = "0.22"
+hex = "0.4"
+
+[dev-dependencies]
+serde_json = { workspace = true }

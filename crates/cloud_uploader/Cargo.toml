@@ -1,0 +1,31 @@
+[package]
+name = "sentryusb-cloud-uploader"
+version = "0.1.0"
+edition = "2024"
+
+# Daemon glue for the SentryCloud zero-knowledge upload pipeline.
+# Owns the upload sweep, the rekey trigger, the pairing client, the
+# cloud HTTP client, and the wake/notify channel from the existing
+# Processor. Pure protocol primitives live in `cloud-crypto`.
+
+[dependencies]
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+chrono = { workspace = true }
+
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+base64 = "0.22"
+rusqlite = { version = "0.32", features = ["bundled"] }
+# Ring is used inside encrypt.rs for the per-route 32-byte randomness.
+ring = "0.17"
+
+sentryusb-cloud-crypto = { path = "../cloud_crypto", package = "sentryusb-cloud-crypto" }
+sentryusb-drives = { path = "../drives", package = "sentryusb-drives" }
+sentryusb-ws = { path = "../ws", package = "sentryusb-ws" }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }

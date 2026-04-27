@@ -147,10 +147,17 @@ async fn main() {
     // No manual step needed here — the import marker in the meta table
     // ensures it only runs once across the lifetime of the DB.
 
+    // Cloud-uploader wake channel. Threaded into Processor so do_process
+    // calls notify_one() at the tail of every successful run; the cloud
+    // sweep loop is the only subscriber. See ENCRYPTION.md + project plan
+    // for the archive-lifecycle hook design.
+    let cloud_notify = Arc::new(tokio::sync::Notify::new());
+
     // Drive processor
-    let processor = Arc::new(sentryusb_drives::processor::Processor::new(
+    let processor = Arc::new(sentryusb_drives::processor::Processor::with_on_complete(
         store.clone(),
         hub.clone(),
+        Some(cloud_notify.clone()),
     ));
 
     let drive_state = sentryusb_api::drives_handler::DriveState {
@@ -170,11 +177,23 @@ async fn main() {
     sentryusb_api::drives_handler::clear_keep_awake_wanted();
     let keep_awake = sentryusb_api::keep_awake::KeepAwakeManager::new(is_busy);
 
+    // SentryCloud upload pipeline. Background tasks pull pending routes
+    // from the local DB, encrypt under the per-Pi key, and POST to
+    // sentryusb.com/api/pi/routes whenever the Notify above fires.
+    let cloud_uploader = sentryusb_cloud_uploader::CloudUploader::spawn(
+        store.clone(),
+        hub.clone(),
+        cloud_notify,
+    );
+
     let app_state = sentryusb_api::router::AppState {
         hub: hub.clone(),
         auth: auth.clone(),
         drives: drive_state,
         keep_awake,
+        cloud: sentryusb_api::cloud::CloudHandlerState {
+            uploader: cloud_uploader,
+        },
     };
 
     // Resume setup if it was interrupted by a reboot (e.g. dwc2 overlay, root shrink)

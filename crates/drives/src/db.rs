@@ -123,6 +123,19 @@ impl DriveStore {
         &self.path
     }
 
+    /// Escape hatch for crates that need targeted SQL access without
+    /// extending the public DriveStore API. Used by the cloud-uploader
+    /// crate to read pending-upload rows and stamp `cloud_uploaded_at`
+    /// without polluting this crate with cloud-specific methods.
+    ///
+    /// Holds the same connection mutex everything else uses, so callers
+    /// share WAL serialization with `add_route` / `save` / etc. Keep the
+    /// closure short — long-running work blocks all other DB I/O.
+    pub fn with_locked_conn<R>(&self, f: impl FnOnce(&Connection) -> R) -> R {
+        let guard = self.conn.lock().unwrap();
+        f(&guard)
+    }
+
     /// Re-load (re-migrate + re-import). Safe to call multiple times.
     pub fn load(&self) -> Result<()> {
         self.load_locked(IMPORT_SOURCE_CANDIDATES)

@@ -15,7 +15,7 @@ use rusqlite::{params, Connection, OptionalExtension};
 
 /// Schema version this binary writes. Stored in the `meta` table and
 /// checked on every open so future upgrades can run targeted migrations.
-pub const CURRENT_SCHEMA_VERSION: i32 = 2;
+pub const CURRENT_SCHEMA_VERSION: i32 = 3;
 
 /// v1 DDL. Each statement is idempotent (`IF NOT EXISTS`) so `migrate()`
 /// is safe on every startup. Column shapes and names match Go exactly —
@@ -86,6 +86,26 @@ pub const V2_ROUTE_AGGREGATE_COLUMNS: &[(&str, &str)] = &[
     ("end_lon", "REAL"),
 ];
 
+/// v3 cloud-uploader bookkeeping. `cloud_uploaded_at` (unix seconds) is
+/// NULL until the cloud-uploader successfully posts the route to
+/// `POST /api/pi/routes` and the server returns `stored | duplicate`.
+/// `cloud_route_id` is the lowercase 64-hex SHA-256 of the route's `file`
+/// path, cached so we never re-derive (locks in stability if the path
+/// normalization ever changes). Both nullable; backfill is unnecessary
+/// since pre-v3 rows simply haven't been considered for upload yet.
+pub const V3_ROUTE_CLOUD_COLUMNS: &[(&str, &str)] = &[
+    ("cloud_uploaded_at", "INTEGER"),
+    ("cloud_route_id", "TEXT"),
+];
+
+/// Partial index on `cloud_uploaded_at IS NULL` rows only — keeps the
+/// steady-state size near zero (uploaded rows aren't indexed). Drives the
+/// uploader's `SELECT file FROM routes WHERE cloud_uploaded_at IS NULL`
+/// hot path.
+const V3_CLOUD_PENDING_INDEX: &str =
+    "CREATE INDEX IF NOT EXISTS idx_routes_cloud_pending \
+     ON routes(cloud_uploaded_at) WHERE cloud_uploaded_at IS NULL";
+
 /// Bring the DB up to `CURRENT_SCHEMA_VERSION`. Safe on every open —
 /// idempotent by construction.
 pub fn migrate(conn: &Connection) -> Result<()> {
@@ -94,11 +114,14 @@ pub fn migrate(conn: &Connection) -> Result<()> {
             .with_context(|| format!("migrate: applying DDL {:?}", truncate(stmt, 60)))?;
     }
 
-    // v2 upgrade: add aggregate columns to existing v1 routes tables.
-    // Check column presence rather than parsing schema_version to stay
-    // robust against DBs restored from future-version backups.
+    // v2/v3 upgrade: add columns to existing routes tables. Check column
+    // presence rather than parsing schema_version to stay robust against
+    // DBs restored from future-version backups.
     let existing = list_route_columns(conn)?;
-    for (name, typ) in V2_ROUTE_AGGREGATE_COLUMNS {
+    for (name, typ) in V2_ROUTE_AGGREGATE_COLUMNS
+        .iter()
+        .chain(V3_ROUTE_CLOUD_COLUMNS.iter())
+    {
         if existing.contains(*name) {
             continue;
         }
@@ -106,6 +129,10 @@ pub fn migrate(conn: &Connection) -> Result<()> {
         conn.execute(&sql, [])
             .with_context(|| format!("migrate: adding routes.{}", name))?;
     }
+
+    // v3 partial index. Idempotent.
+    conn.execute(V3_CLOUD_PENDING_INDEX, [])
+        .context("migrate: creating idx_routes_cloud_pending")?;
 
     // schema_version handling:
     //   * first-ever migrate: seed to CURRENT_SCHEMA_VERSION.
@@ -201,7 +228,7 @@ mod tests {
         migrate(&conn).unwrap();
         assert_eq!(
             meta_get(&conn, "schema_version").unwrap().as_deref(),
-            Some("2"),
+            Some("3"),
         );
         assert!(meta_get(&conn, "created_at").unwrap().is_some());
     }
@@ -217,22 +244,64 @@ mod tests {
     }
 
     #[test]
-    fn migrate_from_v1_adds_aggregate_columns() {
+    fn migrate_from_v1_adds_all_later_columns() {
         let conn = open();
-        // Simulate a v1 DB: apply v1 DDL only, no v2 columns, schema_version = 1.
+        // Simulate a v1 DB: apply v1 DDL only, schema_version = 1.
         for stmt in V1_SCHEMA {
             conn.execute(stmt, []).unwrap();
         }
         meta_set(&conn, "schema_version", "1").unwrap();
         migrate(&conn).unwrap();
         let existing = list_route_columns(&conn).unwrap();
-        for (name, _) in V2_ROUTE_AGGREGATE_COLUMNS {
-            assert!(existing.contains(*name), "v2 column {} missing after migrate", name);
+        for (name, _) in V2_ROUTE_AGGREGATE_COLUMNS
+            .iter()
+            .chain(V3_ROUTE_CLOUD_COLUMNS.iter())
+        {
+            assert!(existing.contains(*name), "column {} missing after migrate", name);
         }
         assert_eq!(
             meta_get(&conn, "schema_version").unwrap().as_deref(),
-            Some("2")
+            Some("3")
         );
+    }
+
+    #[test]
+    fn migrate_from_v2_adds_only_v3_columns() {
+        let conn = open();
+        // Simulate a v2 DB: v1 DDL + v2 columns + schema_version = 2.
+        for stmt in V1_SCHEMA {
+            conn.execute(stmt, []).unwrap();
+        }
+        for (name, typ) in V2_ROUTE_AGGREGATE_COLUMNS {
+            let sql = format!("ALTER TABLE routes ADD COLUMN {} {}", name, typ);
+            conn.execute(&sql, []).unwrap();
+        }
+        meta_set(&conn, "schema_version", "2").unwrap();
+
+        migrate(&conn).unwrap();
+
+        let existing = list_route_columns(&conn).unwrap();
+        for (name, _) in V3_ROUTE_CLOUD_COLUMNS {
+            assert!(existing.contains(*name), "v3 column {} missing", name);
+        }
+        assert_eq!(
+            meta_get(&conn, "schema_version").unwrap().as_deref(),
+            Some("3")
+        );
+    }
+
+    #[test]
+    fn v3_partial_index_exists_after_migrate() {
+        let conn = open();
+        migrate(&conn).unwrap();
+        let exists: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE type='index' AND name='idx_routes_cloud_pending'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(exists, 1, "v3 partial index must be created by migrate()");
     }
 
     #[test]
@@ -250,10 +319,11 @@ mod tests {
 
     #[test]
     fn stored_less_than_handles_corrupted_values() {
-        assert!(stored_less_than("", 2));
-        assert!(stored_less_than("garbage", 2));
-        assert!(stored_less_than("1", 2));
-        assert!(!stored_less_than("2", 2));
-        assert!(!stored_less_than("99", 2));
+        assert!(stored_less_than("", 3));
+        assert!(stored_less_than("garbage", 3));
+        assert!(stored_less_than("1", 3));
+        assert!(stored_less_than("2", 3));
+        assert!(!stored_less_than("3", 3));
+        assert!(!stored_less_than("99", 3));
     }
 }

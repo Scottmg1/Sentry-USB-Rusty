@@ -11,6 +11,8 @@ members = [
     "crates/usb_gadget",
     "crates/setup",
     "crates/cttseraser",
+    "crates/cloud_crypto",
+    "crates/cloud_uploader",
 ]
 
 [workspace.dependencies]

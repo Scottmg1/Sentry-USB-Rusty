@@ -39,6 +39,11 @@ pub struct Processor {
     running: AtomicBool,
     status: Mutex<ProcessingStatus>,
     clip_dir: String,
+    /// Optional: woken with `notify_one()` whenever `do_process` finishes.
+    /// The cloud-uploader subscribes to this so it can run a sweep at the
+    /// tail of the archive lifecycle without polling. None on call sites
+    /// that don't want a wake (e.g. tests).
+    on_complete: Option<Arc<tokio::sync::Notify>>,
 }
 
 impl Processor {
@@ -46,6 +51,18 @@ impl Processor {
     pub const DEFAULT_CLIP_DIR: &str = "/mutable/TeslaCam";
 
     pub fn new(store: Arc<DriveStore>, hub: sentryusb_ws::Hub) -> Self {
+        Self::with_on_complete(store, hub, None)
+    }
+
+    /// Same as `new`, but with a `Notify` wake-channel attached. The
+    /// processor calls `notify.notify_one()` after every successful
+    /// `do_process` (whether triggered automatically or via manual
+    /// reprocess). Designed to feed the cloud-uploader's sweep loop.
+    pub fn with_on_complete(
+        store: Arc<DriveStore>,
+        hub: sentryusb_ws::Hub,
+        on_complete: Option<Arc<tokio::sync::Notify>>,
+    ) -> Self {
         Processor {
             store,
             hub,
@@ -57,6 +74,7 @@ impl Processor {
                 current_file: None,
             }),
             clip_dir: Self::DEFAULT_CLIP_DIR.to_string(),
+            on_complete,
         }
     }
 
@@ -232,6 +250,12 @@ impl Processor {
             "processing complete: {} files processed, {} routes found, {} with GPS, {} errors",
             total, routes_found, files_with_gps, error_count
         );
+
+        // Wake the cloud-uploader if it's listening. Cheap; idempotent
+        // (notify_one with no waiter is a no-op).
+        if let Some(n) = &self.on_complete {
+            n.notify_one();
+        }
         Ok(())
     }
 

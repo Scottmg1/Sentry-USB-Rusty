@@ -4,6 +4,7 @@ use axum::Router;
 use std::sync::Arc;
 
 use crate::auth::AuthState;
+use crate::cloud::CloudHandlerState;
 use crate::drives_handler::DriveState;
 use crate::keep_awake::KeepAwakeManager;
 
@@ -14,6 +15,7 @@ pub struct AppState {
     pub auth: AuthState,
     pub drives: DriveState,
     pub keep_awake: Arc<KeepAwakeManager>,
+    pub cloud: CloudHandlerState,
 }
 
 /// Build the complete Axum router with all API routes.
@@ -165,7 +167,15 @@ pub fn build_router(state: AppState) -> Router {
         // WebSocket
         .route("/api/ws", get(ws_handler))
         // Memory HTML page
-        .route("/memory", get(crate::memory::memory_page));
+        .route("/memory", get(crate::memory::memory_page))
+        // SentryCloud upload pipeline (paired-Pi cloud sync). Production
+        // uploads are automatic at the tail of the archive lifecycle —
+        // the `upload-now` endpoint is dev/debug.
+        .route("/api/cloud/status", get(crate::cloud::get_status))
+        .route("/api/cloud/pair/begin", post(crate::cloud::pair_begin))
+        .route("/api/cloud/pair/cancel", post(crate::cloud::pair_cancel))
+        .route("/api/cloud/unpair", post(crate::cloud::unpair))
+        .route("/api/cloud/upload-now", post(crate::cloud::upload_now));
 
     api.with_state(state)
 }
