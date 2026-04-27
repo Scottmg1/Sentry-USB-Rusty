@@ -127,8 +127,16 @@ pub async fn configure_tesla_ble(env: &SetupEnv, emitter: &SetupEmitter) -> Resu
         }
     };
 
-    let binaries_present = std::path::Path::new("/usr/local/bin/tesla-control").exists()
-        && std::path::Path::new("/usr/local/bin/tesla-keygen").exists();
+    // Match the Go-era install layout: the canonical path is /root/bin/
+    // (which the vendored awake_start script hardcodes at line 153 and
+    // 363), and we additionally symlink into /usr/local/bin/ so PATH
+    // lookups also succeed. Without /root/bin/tesla-control, every
+    // keep-awake call in archiveloop fails with
+    //   /root/bin/awake_start: line 153: /root/bin/tesla-control:
+    //   No such file or directory
+    // even though the binary exists at /usr/local/bin/.
+    let binaries_present = std::path::Path::new("/root/bin/tesla-control").exists()
+        && std::path::Path::new("/root/bin/tesla-keygen").exists();
     let keys_present = std::path::Path::new("/root/.ble/key_private.pem").exists();
 
     if binaries_present && keys_present {
@@ -179,13 +187,22 @@ pub async fn configure_tesla_ble(env: &SetupEnv, emitter: &SetupEmitter) -> Resu
             )],
         ).await.context("failed to download Tesla BLE binaries")?;
 
+        let _ = std::fs::create_dir_all("/root/bin");
         for binary in &["tesla-control", "tesla-keygen"] {
             let src = format!("/tmp/blebin/{}", binary);
-            let dst = format!("/usr/local/bin/{}", binary);
+            let dst = format!("/root/bin/{}", binary);
+            let path_link = format!("/usr/local/bin/{}", binary);
             if std::path::Path::new(&src).exists() {
                 std::fs::copy(&src, &dst)?;
                 sentryusb_shell::run("chmod", &["+x", &dst]).await?;
-                emitter.progress(&format!("Installed {}", dst));
+                // Mirror to /usr/local/bin/ via symlink so PATH-based
+                // callers (the wizard's pairing test, manual ssh sessions)
+                // still work. Remove a stale file or stale symlink first
+                // so re-runs leave us with a clean link.
+                let _ = std::fs::remove_file(&path_link);
+                #[cfg(unix)]
+                let _ = std::os::unix::fs::symlink(&dst, &path_link);
+                emitter.progress(&format!("Installed {} (symlinked to {})", dst, path_link));
             }
         }
         let _ = std::fs::remove_dir_all("/tmp/blebin");

@@ -38,12 +38,26 @@ function do_music_sync {
 
   connectionmonitor $$ &
 
-  if ! rsync -rum --no-human-readable --exclude=.fseventsd/*** --exclude=*.DS_Store --exclude=.metadata_never_index \
+  # Capture rsync's exit BEFORE any conditional inverts it. With
+  # `if ! rsync ; then log "...$?"; fi`, $? inside the then block
+  # referred to the inverted condition (always 0), so every failure
+  # was logged as "rsync failed with error 0" — uselessly opaque.
+  # `set -e` is on (line 1), so disable it for this one command.
+  set +e
+  rsync -rum --no-human-readable --exclude=.fseventsd/*** --exclude=*.DS_Store --exclude=.metadata_never_index \
                 --exclude="System Volume Information/***" \
                 --delete --modify-window=2 --info=stats2 \
                 "$RSYNC_USER@$RSYNC_SERVER:$MUSIC_SHARE_NAME/" "$DST" &> "$LOG"
+  RSYNC_EXIT=$?
+  set -e
+  if [ "$RSYNC_EXIT" -ne 0 ]
   then
-    log "rsync failed with error $?"
+    log "rsync failed with error $RSYNC_EXIT (see $LOG for stderr)"
+    # Surface the last few lines of stderr so the archiveloop log is
+    # actionable without needing to ssh in for /tmp/rsyncmusiclog.txt.
+    tail -n 5 "$LOG" 2>/dev/null | while IFS= read -r _line; do
+      log "  rsync: $_line"
+    done
   fi
 
   # Stop the connection monitor.
