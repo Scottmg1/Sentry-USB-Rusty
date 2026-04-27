@@ -70,6 +70,75 @@ fn validate_archive_config(env: &SetupEnv, system: ArchiveSystem) -> Result<()> 
     Ok(())
 }
 
+/// Pre-populate root's known_hosts with the rsync server's SSH host key
+/// so the non-interactive archiveloop SSH-via-rsync calls succeed. Without
+/// this, the very first sync fails with "Host key verification failed."
+/// because OpenSSH refuses to add unknown hosts in batch mode, and the
+/// user has no way to accept it interactively (the call runs as root
+/// inside a systemd service, not in their shell). Idempotent: ssh-keyscan
+/// returns the same line on every run; we deduplicate against the
+/// existing known_hosts before appending.
+async fn trust_rsync_host_key(env: &SetupEnv, emitter: &SetupEmitter) -> Result<()> {
+    let server = match env.config.get("RSYNC_SERVER") {
+        Some(s) if !s.trim().is_empty() => s.trim().to_string(),
+        _ => return Ok(()),
+    };
+
+    let _ = std::fs::create_dir_all("/root/.ssh");
+    let known_hosts_path = "/root/.ssh/known_hosts";
+    let existing = std::fs::read_to_string(known_hosts_path).unwrap_or_default();
+
+    emitter.progress(&format!("Trusting SSH host key for {}...", server));
+    let scan = match sentryusb_shell::run_with_timeout(
+        Duration::from_secs(15),
+        "ssh-keyscan", &["-H", "-T", "5", &server],
+    ).await {
+        Ok(s) => s,
+        Err(e) => {
+            // Don't fail the whole setup if the server is currently
+            // unreachable — the archive cycle will report a clearer
+            // error later, and the user can re-run setup once the
+            // server is online.
+            emitter.progress(&format!(
+                "ssh-keyscan {} failed: {}. Music sync may need a manual ssh-keyscan later.",
+                server, e
+            ));
+            return Ok(());
+        }
+    };
+
+    let mut new_lines: Vec<&str> = Vec::new();
+    for line in scan.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if !existing.lines().any(|e| e.trim() == line) {
+            new_lines.push(line);
+        }
+    }
+
+    if new_lines.is_empty() {
+        return Ok(());
+    }
+
+    let mut updated = existing;
+    if !updated.is_empty() && !updated.ends_with('\n') {
+        updated.push('\n');
+    }
+    for l in &new_lines {
+        updated.push_str(l);
+        updated.push('\n');
+    }
+    std::fs::write(known_hosts_path, updated)?;
+    let _ = sentryusb_shell::run("chmod", &["600", known_hosts_path]).await;
+    emitter.progress(&format!(
+        "Added {} host key entry/entries for {} to /root/.ssh/known_hosts",
+        new_lines.len(), server
+    ));
+    Ok(())
+}
+
 /// Ensure rsync is installed. Silent when already present.
 async fn ensure_rsync(emitter: &SetupEmitter) -> Result<()> {
     if sentryusb_shell::run("which", &["rsync"]).await.is_ok() {
@@ -269,6 +338,7 @@ pub async fn configure_archive(env: &SetupEnv, emitter: &SetupEmitter) -> Result
     match archive_system {
         ArchiveSystem::Nfs => configure_nfs_mount(env, emitter).await?,
         ArchiveSystem::Cifs => configure_cifs_mount(env, emitter).await?,
+        ArchiveSystem::Rsync => trust_rsync_host_key(env, emitter).await?,
         _ => {}
     }
 
