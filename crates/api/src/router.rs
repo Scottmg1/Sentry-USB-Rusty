@@ -140,6 +140,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/drives/data/export-for-sync", post(crate::drives_handler::export_for_sync))
         .route("/api/drives/stats", get(crate::drives_handler::drive_stats))
         .route("/api/drives/fsd-analytics", get(crate::drives_handler::fsd_analytics))
+        .route("/api/drives/migration-status", get(crate::drives_handler::migration_status))
         .route("/api/drives/{id}/tags", put(crate::drives_handler::set_drive_tags))
         .route("/api/drives/{id}", get(crate::drives_handler::single_drive))
         // Keep-awake

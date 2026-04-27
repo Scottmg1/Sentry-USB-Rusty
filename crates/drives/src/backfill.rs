@@ -11,6 +11,8 @@
 //! run stopped. The `summary_backfilled_at` marker written by the caller
 //! is observability-only — NOT the primary exit condition.
 
+use std::sync::atomic::Ordering;
+
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection};
 
@@ -27,6 +29,70 @@ const BACKFILL_BATCH_SIZE: i64 = 200;
 #[derive(Debug, Default, Clone, Copy)]
 pub struct BackfillStats {
     pub updated: i64,
+}
+
+// ── Process-wide migration progress tracker ────────────────────────────
+//
+// Lets the API expose `GET /api/drives/migration-status` so the iOS / web
+// app can show "Migrating drive data..." UI during a first-boot-after-
+// upgrade backfill instead of a stale spinner. Mirrors Go's
+// `dh.store.MigrationStatus()` shape (server/api/drives.go:151+).
+//
+// Global atomics (one DriveStore per process) make this trivially safe
+// to read concurrently without holding the SQLite mutex.
+
+use std::sync::atomic::{AtomicBool, AtomicI64};
+use std::sync::OnceLock;
+use std::sync::Mutex;
+
+static MIGRATION_ACTIVE: AtomicBool = AtomicBool::new(false);
+static MIGRATION_DONE: AtomicI64 = AtomicI64::new(0);
+static MIGRATION_TOTAL: AtomicI64 = AtomicI64::new(0);
+static MIGRATION_DISK_FULL: AtomicBool = AtomicBool::new(false);
+static MIGRATION_ERROR: OnceLock<Mutex<String>> = OnceLock::new();
+
+fn err_slot() -> &'static Mutex<String> {
+    MIGRATION_ERROR.get_or_init(|| Mutex::new(String::new()))
+}
+
+/// Snapshot of migration state — what the API surfaces in
+/// `GET /api/drives/migration-status`.
+#[derive(Debug, Clone)]
+pub struct MigrationStatus {
+    pub active: bool,
+    pub done: i64,
+    pub total: i64,
+    pub error: String,
+    pub disk_full: bool,
+}
+
+/// Read the current migration state. Safe to call from any thread.
+pub fn migration_status() -> MigrationStatus {
+    MigrationStatus {
+        active: MIGRATION_ACTIVE.load(Ordering::Acquire),
+        done: MIGRATION_DONE.load(Ordering::Relaxed),
+        total: MIGRATION_TOTAL.load(Ordering::Relaxed),
+        error: err_slot().lock().map(|g| g.clone()).unwrap_or_default(),
+        disk_full: MIGRATION_DISK_FULL.load(Ordering::Relaxed),
+    }
+}
+
+fn migration_begin(total: i64) {
+    MIGRATION_DONE.store(0, Ordering::Relaxed);
+    MIGRATION_TOTAL.store(total, Ordering::Relaxed);
+    MIGRATION_DISK_FULL.store(false, Ordering::Relaxed);
+    if let Ok(mut g) = err_slot().lock() { g.clear(); }
+    MIGRATION_ACTIVE.store(true, Ordering::Release);
+}
+
+fn migration_finish_ok() {
+    MIGRATION_ACTIVE.store(false, Ordering::Release);
+}
+
+fn migration_finish_err(msg: &str, disk_full: bool) {
+    if let Ok(mut g) = err_slot().lock() { *g = msg.to_string(); }
+    MIGRATION_DISK_FULL.store(disk_full, Ordering::Relaxed);
+    MIGRATION_ACTIVE.store(false, Ordering::Release);
 }
 
 /// Run the backfill to completion. `on_progress` is called with
@@ -55,15 +121,41 @@ where
         return Ok(stats);
     }
 
-    loop {
-        let updated = backfill_one_batch(conn).context("backfill batch")?;
-        if updated == 0 {
-            break;
+    // Publish "active" + total to the process-wide tracker so the API
+    // endpoint can surface progress to the UI without holding the SQLite
+    // mutex on every poll.
+    migration_begin(total);
+
+    let result: Result<()> = (|| {
+        loop {
+            let updated = backfill_one_batch(conn).context("backfill batch")?;
+            if updated == 0 {
+                break;
+            }
+            stats.updated += updated;
+            MIGRATION_DONE.store(stats.updated, Ordering::Relaxed);
+            on_progress(stats.updated, total);
         }
-        stats.updated += updated;
-        on_progress(stats.updated, total);
+        Ok(())
+    })();
+
+    match result {
+        Ok(()) => {
+            migration_finish_ok();
+            Ok(stats)
+        }
+        Err(e) => {
+            // Heuristic: rusqlite error messages for "database or disk
+            // is full" / "disk I/O error" mark the disk_full flag so the
+            // UI can prompt the user to free space rather than retry.
+            let msg = e.to_string();
+            let disk_full = msg.to_lowercase().contains("disk is full")
+                || msg.to_lowercase().contains("disk i/o error")
+                || msg.to_lowercase().contains("no space left");
+            migration_finish_err(&msg, disk_full);
+            Err(e)
+        }
     }
-    Ok(stats)
 }
 
 /// Select up to `BACKFILL_BATCH_SIZE` NULL-aggregate rows, decode their

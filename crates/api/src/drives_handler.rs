@@ -285,6 +285,52 @@ pub async fn processing_status(
     (StatusCode::OK, Json(resp))
 }
 
+/// GET /api/drives/migration-status — surface the v1→v2 aggregate
+/// backfill state so the iOS / web app can render a "Migrating drive
+/// data..." banner during a first-boot-after-upgrade. Safe to poll at
+/// 2-3s cadence; reads three atomics + a small mutex-guarded string,
+/// no SQLite contention. Mirrors Go `dh.migrationStatus`
+/// (server/api/drives.go:151+).
+///
+/// Response shape:
+///
+/// ```json
+/// {
+///   "active": true,
+///   "done": 1234,
+///   "total": 5500,
+///   "pct": 22.4,
+///   "error": "",
+///   "disk_full": false
+/// }
+/// ```
+///
+/// `active=false` + `error=""` + `done==total` ⇒ migration finished.
+/// `active=false` + `error!=""` ⇒ failed/paused; `disk_full=true` means
+/// "free space then reboot".
+pub async fn migration_status(
+    State(_state): State<AppState>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let s = sentryusb_drives::migration_status();
+    let pct = if s.total > 0 {
+        let raw = 100.0 * (s.done as f64) / (s.total as f64);
+        if raw > 100.0 { 100.0 } else { raw }
+    } else {
+        0.0
+    };
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "active": s.active,
+            "done": s.done,
+            "total": s.total,
+            "pct": pct,
+            "error": s.error,
+            "disk_full": s.disk_full,
+        })),
+    )
+}
+
 /// POST /api/drives/process — start processing new clips.
 ///
 /// Query: `post_archive=1` — allow running during archiveloop's post-archive

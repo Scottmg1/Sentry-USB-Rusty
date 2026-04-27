@@ -10,6 +10,7 @@ pub mod schema;
 pub mod syncguard;
 pub mod types;
 
+pub use backfill::{migration_status, MigrationStatus};
 pub use db::DriveStore;
 pub use types::*;
 
