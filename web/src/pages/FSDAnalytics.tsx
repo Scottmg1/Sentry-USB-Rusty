@@ -9,6 +9,55 @@ import BarChart from "@/components/charts/BarChart"
 
 type Period = "day" | "week" | "all"
 
+function normalizeFsdAnalytics(raw: any): FSDAnalyticsData | null {
+  if (!raw || typeof raw !== "object") return null
+  const daily = Array.isArray(raw.daily)
+    ? raw.daily.map((d: any) => ({
+      date: d?.date ?? "",
+      dayName: d?.dayName ?? d?.day_name ?? "",
+      disengagements: d?.disengagements ?? 0,
+      accelPushes: d?.accelPushes ?? d?.accel_pushes ?? 0,
+      fsdPercent: d?.fsdPercent ?? d?.fsd_percent ?? 0,
+      drives: d?.drives ?? 0,
+      fsdDistanceKm: d?.fsdDistanceKm ?? d?.fsd_distance_km ?? 0,
+      fsdDistanceMi: d?.fsdDistanceMi ?? d?.fsd_distance_mi ?? 0,
+      totalDurationMs: d?.totalDurationMs ?? d?.total_duration_ms ?? 0,
+      fsdEngagedMs: d?.fsdEngagedMs ?? d?.fsd_engaged_ms ?? 0,
+    }))
+    : []
+
+  return {
+    period: raw.period ?? "",
+    period_start: raw.period_start ?? raw.periodStart ?? "",
+    total_drives: raw.total_drives ?? raw.totalDrives ?? 0,
+    fsd_sessions: raw.fsd_sessions ?? raw.fsdSessions ?? 0,
+    fsd_percent: raw.fsd_percent ?? raw.fsdPercent ?? 0,
+    today_percent: raw.today_percent ?? raw.todayPercent ?? 0,
+    best_day: raw.best_day ?? raw.bestDay ?? "",
+    best_day_percent: raw.best_day_percent ?? raw.bestDayPercent ?? 0,
+    fsd_engaged_ms: raw.fsd_engaged_ms ?? raw.fsdEngagedMs ?? 0,
+    fsd_distance_km: raw.fsd_distance_km ?? raw.fsdDistanceKm ?? 0,
+    fsd_distance_mi: raw.fsd_distance_mi ?? raw.fsdDistanceMi ?? 0,
+    total_distance_km: raw.total_distance_km ?? raw.totalDistanceKm ?? 0,
+    total_distance_mi: raw.total_distance_mi ?? raw.totalDistanceMi ?? 0,
+    disengagements: raw.disengagements ?? 0,
+    accel_pushes: raw.accel_pushes ?? raw.accelPushes ?? 0,
+    daily,
+    fsd_grade: raw.fsd_grade ?? raw.fsdGrade ?? "",
+    streak_days: raw.streak_days ?? raw.streakDays ?? 0,
+    fsd_time_formatted: raw.fsd_time_formatted ?? raw.fsdTimeFormatted ?? "0m",
+    avg_disengagements_per_drive: raw.avg_disengagements_per_drive ?? raw.avgDisengagementsPerDrive ?? 0,
+    avg_accel_pushes_per_drive: raw.avg_accel_pushes_per_drive ?? raw.avgAccelPushesPerDrive ?? 0,
+    autosteer_engaged_ms: raw.autosteer_engaged_ms ?? raw.autosteerEngagedMs ?? 0,
+    autosteer_distance_km: raw.autosteer_distance_km ?? raw.autosteerDistanceKm ?? 0,
+    autosteer_distance_mi: raw.autosteer_distance_mi ?? raw.autosteerDistanceMi ?? 0,
+    tacc_engaged_ms: raw.tacc_engaged_ms ?? raw.taccEngagedMs ?? 0,
+    tacc_distance_km: raw.tacc_distance_km ?? raw.taccDistanceKm ?? 0,
+    tacc_distance_mi: raw.tacc_distance_mi ?? raw.taccDistanceMi ?? 0,
+    assisted_percent: raw.assisted_percent ?? raw.assistedPercent ?? 0,
+  }
+}
+
 const gradeConfig: Record<string, { color: string; bgClass: string; ringColor: string }> = {
   Great: { color: "text-emerald-400", bgClass: "border-emerald-500/20 bg-emerald-500/5", ringColor: "#34d399" },
   Good: { color: "text-blue-400", bgClass: "border-blue-500/20 bg-blue-500/5", ringColor: "#60a5fa" },
@@ -42,15 +91,16 @@ export default function FSDAnalytics() {
     setLoading(true)
     api.getFSDAnalytics(period === "all" ? "all" : period)
       .then(async (resp) => {
+        const normalized = normalizeFsdAnalytics(resp)
         // If week/day cache returns empty object, fall back to All Time so
         // users still see existing FSD history instead of a false empty state.
-        if (period !== "all" && (!resp || !(resp as any).fsd_grade)) {
-          const all = await api.getFSDAnalytics("all")
+        if (period !== "all" && (!normalized || !normalized.fsd_grade)) {
+          const all = normalizeFsdAnalytics(await api.getFSDAnalytics("all"))
           setData(all)
           setPeriod("all")
           return
         }
-        setData(resp)
+        setData(normalized)
       })
       .catch(() => setData(null))
       .finally(() => setLoading(false))
