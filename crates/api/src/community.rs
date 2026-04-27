@@ -257,6 +257,16 @@ pub async fn lock_chime_upload(
     r
 }
 
+/// POST /api/lockchime/community/download/{code} — fetch a community
+/// chime from the support server (`GET /lockchime/download/{code}`,
+/// note the upstream method is GET even though the local entry-point
+/// is POST), validate it as a 5s-or-less mono 44.1k WAV under 1MB,
+/// save it to /mutable/LockChime, and return JSON success.
+///
+/// Earlier ports of this just JSON-proxied the upstream call with a
+/// POST body — the support server returned 404 because it only
+/// accepts GET, and even if it had succeeded the bytes would have
+/// been forwarded to the browser instead of saved on the Pi.
 pub async fn lock_chime_download(
     State(_s): State<AppState>,
     Path(code): Path<String>,
@@ -265,14 +275,124 @@ pub async fn lock_chime_download(
     if !valid_code(&code) {
         return invalid_code();
     }
-    proxy_json(
-        reqwest::Method::POST,
-        &format!("/lockchime/download/{}", code),
-        Some(b"{}".to_vec()),
-        forward_headers(&headers, true),
-        Duration::from_secs(30),
-    )
-    .await
+
+    let url = format!("{}/lockchime/download/{}", COMMUNITY_API, code);
+    let client = match reqwest::Client::builder().timeout(Duration::from_secs(30)).build() {
+        Ok(c) => c,
+        Err(e) => return bad_gateway(&e.to_string()),
+    };
+    let resp = match client
+        .get(&url)
+        .headers(forward_headers(&headers, true))
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => return bad_gateway(&format!("Community lock chime service unreachable: {}", e)),
+    };
+
+    let status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+    if !status.is_success() {
+        // Forward upstream error JSON verbatim.
+        let bytes = resp.bytes().await.unwrap_or_default();
+        let mut r = Response::new(axum::body::Body::from(bytes));
+        *r.status_mut() = status;
+        r.headers_mut()
+            .insert("content-type", "application/json".parse().unwrap());
+        return r;
+    }
+
+    let sound_name = resp
+        .headers()
+        .get("x-sound-name")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or(&code)
+        .to_string();
+    let raw_bytes = match resp.bytes().await {
+        Ok(b) => b,
+        Err(e) => return bad_gateway(&format!("Failed to download sound: {}", e)),
+    };
+
+    if raw_bytes.len() > crate::lock_chime::LOCK_CHIME_MAX_BYTES {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "Downloaded sound exceeds 1 MB size limit"})),
+        )
+            .into_response();
+    }
+
+    let normalized = match crate::lock_chime::ensure_mono_wav(&raw_bytes) {
+        Ok(d) => d,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": format!("Downloaded file is not a valid WAV: {}", e)})),
+            )
+                .into_response();
+        }
+    };
+    let duration = match crate::lock_chime::parse_wav_duration(&normalized) {
+        Ok(d) => d,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": format!("Downloaded file is not a valid WAV: {}", e)})),
+            )
+                .into_response();
+        }
+    };
+    if duration > crate::lock_chime::LOCK_CHIME_MAX_SECONDS {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": format!("Sound is {:.1} seconds — must be {:.0} seconds or less",
+                    duration, crate::lock_chime::LOCK_CHIME_MAX_SECONDS)
+            })),
+        )
+            .into_response();
+    }
+
+    let mut base_name = crate::lock_chime::sanitize_lock_chime_name(&sound_name);
+    // Avoid collision with the active /mutable/LockChime.wav target.
+    let stem_lower = std::path::Path::new(&base_name)
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_lowercase())
+        .unwrap_or_default();
+    if stem_lower == "lockchime" {
+        base_name = format!("{}.wav", code);
+    }
+
+    let _ = std::fs::create_dir_all(crate::lock_chime::LOCK_CHIME_DIR);
+    let (dest_path, final_name) = match crate::lock_chime::deduplicate_filename(
+        crate::lock_chime::LOCK_CHIME_DIR, &base_name,
+    ) {
+        Some(t) => t,
+        None => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "Too many duplicate filenames"})),
+            )
+                .into_response();
+        }
+    };
+
+    if let Err(e) = std::fs::write(&dest_path, &normalized) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("Failed to save sound: {}", e)})),
+        )
+            .into_response();
+    }
+    // Default umask of 0022 gives 0644 on the freshly-written file,
+    // which is what we want for chime files anyway.
+
+    Json(serde_json::json!({
+        "success": true,
+        "filename": final_name,
+        "path": dest_path.to_string_lossy(),
+        "size": normalized.len(),
+    }))
+    .into_response()
 }
 
 pub async fn lock_chime_admin_validate(
@@ -420,6 +540,14 @@ pub async fn wraps_upload(
     r
 }
 
+/// POST /api/wraps/download/{code} — fetch a community wrap PNG from
+/// the support server and save it under /mutable/Wraps. Same shape as
+/// `lock_chime_download`: the upstream call is a GET (the local
+/// entry-point is POST to enable simple form posts), and the bytes
+/// are saved on the Pi rather than streamed back to the browser.
+///
+/// Without this fix every "Download to Pi" click returned 404 because
+/// the upstream server only accepts GET on /wraps/download/{code}.
 pub async fn wraps_download(
     State(_s): State<AppState>,
     Path(code): Path<String>,
@@ -428,14 +556,97 @@ pub async fn wraps_download(
     if !valid_code(&code) {
         return invalid_code();
     }
-    proxy_json(
-        reqwest::Method::POST,
-        &format!("/wraps/download/{}", code),
-        Some(b"{}".to_vec()),
-        forward_headers(&headers, true),
-        Duration::from_secs(30),
-    )
-    .await
+
+    const WRAPS_DIR: &str = "/mutable/Wraps";
+    const WRAPS_MAX_BYTES: usize = 20 * 1024 * 1024;
+
+    let url = format!("{}/wraps/download/{}", COMMUNITY_API, code);
+    let client = match reqwest::Client::builder().timeout(Duration::from_secs(30)).build() {
+        Ok(c) => c,
+        Err(e) => return bad_gateway(&e.to_string()),
+    };
+    let resp = match client
+        .get(&url)
+        .headers(forward_headers(&headers, true))
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => return bad_gateway(&format!("Community wraps service unreachable: {}", e)),
+    };
+
+    let status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+    if !status.is_success() {
+        let bytes = resp.bytes().await.unwrap_or_default();
+        let mut r = Response::new(axum::body::Body::from(bytes));
+        *r.status_mut() = status;
+        r.headers_mut()
+            .insert("content-type", "application/json".parse().unwrap());
+        return r;
+    }
+
+    let wrap_name_header = resp
+        .headers()
+        .get("x-wrap-name")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    let raw_bytes = match resp.bytes().await {
+        Ok(b) => b,
+        Err(e) => return bad_gateway(&format!("Failed to download wrap: {}", e)),
+    };
+    if raw_bytes.len() > WRAPS_MAX_BYTES {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "Downloaded wrap exceeds 20 MB size limit"})),
+        )
+            .into_response();
+    }
+
+    // Sanitize filename: keep alphanumeric, spaces, dot, underscore, dash.
+    // Anything else gets stripped. Force .png suffix.
+    let raw_name = if wrap_name_header.is_empty() {
+        code.clone()
+    } else {
+        wrap_name_header
+    };
+    let safe_re = regex::Regex::new(r"[^a-zA-Z0-9 \-_.]").unwrap();
+    let mut wrap_name = safe_re.replace_all(&raw_name, "").trim().to_string();
+    if wrap_name.is_empty() || wrap_name == ".png" {
+        wrap_name = "wrap".to_string();
+    }
+    if !wrap_name.to_lowercase().ends_with(".png") {
+        wrap_name.push_str(".png");
+    }
+
+    let _ = std::fs::create_dir_all(WRAPS_DIR);
+    let (dest_path, final_name) =
+        match crate::lock_chime::deduplicate_filename(WRAPS_DIR, &wrap_name) {
+            Some(t) => t,
+            None => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"error": "Too many duplicate filenames"})),
+                )
+                    .into_response();
+            }
+        };
+
+    if let Err(e) = std::fs::write(&dest_path, &raw_bytes) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("Failed to save wrap: {}", e)})),
+        )
+            .into_response();
+    }
+
+    Json(serde_json::json!({
+        "success": true,
+        "filename": final_name,
+        "path": dest_path.to_string_lossy(),
+        "size": raw_bytes.len(),
+    }))
+    .into_response()
 }
 
 pub async fn wraps_admin_validate(

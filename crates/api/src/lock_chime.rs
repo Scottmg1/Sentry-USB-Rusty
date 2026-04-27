@@ -18,10 +18,10 @@ use crate::router::AppState;
 // Constants
 // ---------------------------------------------------------------------------
 
-const LOCK_CHIME_DIR: &str = "/mutable/LockChime";
+pub(crate) const LOCK_CHIME_DIR: &str = "/mutable/LockChime";
 const LOCK_CHIME_TARGET: &str = "/mutable/LockChime.wav";
-const LOCK_CHIME_MAX_BYTES: usize = 1 * 1024 * 1024;
-const LOCK_CHIME_MAX_SECONDS: f64 = 5.0;
+pub(crate) const LOCK_CHIME_MAX_BYTES: usize = 1 * 1024 * 1024;
+pub(crate) const LOCK_CHIME_MAX_SECONDS: f64 = 5.0;
 const LOCK_CHIME_CONFIG_FILE: &str = "/mutable/LockChime/.random_config.json";
 const LOCK_CHIME_ACTIVE_FILE: &str = "/mutable/LockChime/.active_name";
 const CAM_DISK_IMAGE: &str = "/backingfiles/cam_disk.bin";
@@ -61,7 +61,7 @@ fn is_valid_lock_chime_file(name: &str) -> bool {
     re.is_match(name)
 }
 
-fn sanitize_lock_chime_name(name: &str) -> String {
+pub(crate) fn sanitize_lock_chime_name(name: &str) -> String {
     let re = regex::Regex::new(r"[^a-zA-Z0-9 _.\-]").unwrap();
     let mut result = re.replace_all(name, "").trim().to_string();
     if result.is_empty() {
@@ -285,7 +285,7 @@ async fn clear_lock_chime_from_cam_disk() -> Result<(), String> {
 // WAV processing
 // ---------------------------------------------------------------------------
 
-fn parse_wav_duration(data: &[u8]) -> Result<f64, String> {
+pub(crate) fn parse_wav_duration(data: &[u8]) -> Result<f64, String> {
     if data.len() < 44 {
         return Err("file too small to be a valid WAV".into());
     }
@@ -401,7 +401,7 @@ fn parse_wav_info(data: &[u8]) -> Result<WavInfo, String> {
 
 /// Validates a WAV is PCM 16-bit, resamples to 44.1kHz if needed, and converts
 /// stereo/multi-channel to mono. Returns the (possibly modified) WAV data.
-fn ensure_mono_wav(data: &[u8]) -> Result<Vec<u8>, String> {
+pub(crate) fn ensure_mono_wav(data: &[u8]) -> Result<Vec<u8>, String> {
     let info = parse_wav_info(data)?;
 
     if info.audio_format != 1 {
@@ -868,7 +868,7 @@ async fn lock_chime_scheduler_loop() {
 // Deduplicate filename helper
 // ---------------------------------------------------------------------------
 
-fn deduplicate_filename(dir: &str, base_name: &str) -> Option<(PathBuf, String)> {
+pub(crate) fn deduplicate_filename(dir: &str, base_name: &str) -> Option<(PathBuf, String)> {
     let dest_path = PathBuf::from(dir).join(base_name);
     if !dest_path.exists() {
         return Some((dest_path, base_name.to_string()));
