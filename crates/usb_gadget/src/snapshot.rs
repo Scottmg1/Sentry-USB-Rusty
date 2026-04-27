@@ -24,7 +24,7 @@
 //!   `[drive-map] RecentClips directory not found at /mutable/TeslaCam/RecentClips, skipping`
 //! every cycle and the iOS app sees an empty timeline.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::Duration;
 
 use anyhow::{bail, Result};
