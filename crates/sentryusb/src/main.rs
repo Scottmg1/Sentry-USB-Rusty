@@ -280,16 +280,31 @@ async fn run_gadget(action: GadgetAction) -> i32 {
 
 async fn run_snapshot(action: SnapshotAction) -> i32 {
     match action {
-        SnapshotAction::Make { .. } => match sentryusb_gadget::snapshot::make_snapshot().await {
-            Ok(name) => {
-                println!("{}", name);
-                0
+        SnapshotAction::Make { args } => {
+            // archiveloop calls `make_snapshot.sh nofsck` after a reboot
+            // to skip the redundant fsck pass; treat anything else
+            // (including bare "fsck" or no arg) as fsck-on. The bash
+            // wrapper forwards `"$@"` so the first arg is what landed.
+            let skip_fsck = args.iter().any(|a| a.eq_ignore_ascii_case("nofsck"));
+            match sentryusb_gadget::snapshot::make_snapshot(skip_fsck).await {
+                Ok(Some(name)) => {
+                    println!("{}", name);
+                    0
+                }
+                Ok(None) => {
+                    // Snapshot was identical to the previous one and
+                    // discarded. Print nothing — callers that capture
+                    // stdout will see an empty string and know to
+                    // skip; archiveloop's only consumer of this output
+                    // is informational logging.
+                    0
+                }
+                Err(e) => {
+                    eprintln!("snapshot make: {}", e);
+                    1
+                }
             }
-            Err(e) => {
-                eprintln!("snapshot make: {}", e);
-                1
-            }
-        },
+        }
         SnapshotAction::Release { name } => {
             match sentryusb_gadget::snapshot::release_snapshot(&name).await {
                 Ok(()) => 0,

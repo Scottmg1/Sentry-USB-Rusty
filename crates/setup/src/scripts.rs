@@ -39,8 +39,10 @@ mount -t "$fstype" -o "$opts,$moreopts" "$source" "$mountpoint"
 "#;
 
 const MAKE_SNAPSHOT: &str = r#"#!/bin/bash -eu
-# Thin wrapper — real logic is in the Rust binary.
-# Kept for backward compatibility with scripts that call this.
+# Thin wrapper around `sentryusb snapshot make` — kept because
+# archiveloop and external scripts call this path by filename.
+# Forwards "$@" so `make_snapshot.sh nofsck` reaches the Rust binary
+# which actually handles the flag (skips the loop-mount + fsck pass).
 sentryusb snapshot make "$@"
 "#;
 
