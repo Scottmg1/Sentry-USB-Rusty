@@ -23,6 +23,7 @@ import { useUpdateAvailable } from "@/hooks/useUpdateAvailable"
 import type { PiStatus, DriveStats, StorageBreakdown } from "@/lib/api"
 import { wsClient } from "@/lib/ws"
 import { formatUptime, formatBytes, formatTemp } from "@/lib/utils"
+import CloudPairingSection from "@/components/CloudPairingSection"
 
 function getTempColor(milliC: number): "emerald" | "amber" | "red" {
   if (milliC < 55000) return "emerald"
@@ -303,6 +304,8 @@ export default function Dashboard() {
           </div>
         </div>
       )}
+
+      <CloudPairingSection />
 
       {/* Row 1: Status tiles */}
       <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3">

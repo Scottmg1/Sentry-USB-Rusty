@@ -1,9 +1,4 @@
-//! Internal state and the public `CloudStatus` snapshot.
-//!
-//! State is held behind a `tokio::sync::Mutex` so the async background
-//! tasks (sweep, pairing) and the local API handlers can all touch it
-//! without busy-waiting. The mutex guard never crosses an `await` that
-//! does network I/O — we explicitly drop it before any HTTP call.
+
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
@@ -18,7 +13,6 @@ use sentryusb_cloud_crypto::credentials::CloudCredentialsV1;
 use sentryusb_drives::DriveStore;
 use sentryusb_ws::Hub;
 
-/// Pairing-machine state for `/api/cloud/pair/status`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PairingState {
@@ -29,8 +23,6 @@ pub enum PairingState {
     Error,
 }
 
-/// Snapshot returned by `GET /api/cloud/status`. Constructed on demand —
-/// don't cache; counters move during the construction.
 #[derive(Debug, Clone, Serialize)]
 pub struct CloudStatus {
     pub paired: bool,
@@ -47,8 +39,6 @@ pub struct CloudStatus {
     pub pairing_error: Option<String>,
 }
 
-/// The mutex-protected slice of state. Held in `Arc<CloudStateInner>` so
-/// every background task and API handler shares a single source of truth.
 pub struct CloudStateInner {
     pub store: Arc<DriveStore>,
     pub hub: Hub,
@@ -56,25 +46,16 @@ pub struct CloudStateInner {
     pub cloud_base_url: String,
     pub credentials_path: String,
 
-    /// Loaded credentials when paired. None when unpaired.
     pub creds: Mutex<Option<CloudCredentialsV1>>,
 
-    /// Pairing UI state.
     pub pairing: Mutex<PairingProgress>,
 
-    /// Cancellation flag set by `/api/cloud/pair/cancel`. The pairing
-    /// task polls this between awaitable boundaries.
     pub pairing_cancel: Mutex<Option<Arc<Notify>>>,
 
-    /// Last successful sweep wall-clock time (millis since UNIX epoch).
     pub last_upload_at_ms: AtomicI64,
 
-    /// Last sweep error string (interned via Mutex<String>).
     pub last_upload_error: Mutex<Option<String>>,
 
-    /// Total routes successfully uploaded since process start. Display
-    /// hint only — the source of truth is `cloud_uploaded_at IS NOT NULL`
-    /// in the local DB.
     pub total_uploaded: AtomicU64,
 }
 
@@ -113,9 +94,6 @@ impl CloudStateInner {
         }
     }
 
-    /// On boot, attempt to read `cloud-credentials.json`. Sets the paired
-    /// state if successful; otherwise stays unpaired and the user has to
-    /// run pairing.
     pub async fn bootstrap_load_credentials(&self) {
         match sentryusb_cloud_crypto::credentials::load(&self.credentials_path) {
             Ok(creds) => {
@@ -123,13 +101,11 @@ impl CloudStateInner {
                 *guard = Some(creds);
             }
             Err(_) => {
-                // File missing or unparseable. Stay unpaired silently —
-                // a fresh install hits this on every boot.
+
             }
         }
     }
 
-    /// Cheap-snapshot status assembly.
     pub async fn snapshot_status(&self) -> CloudStatus {
         let creds_guard = self.creds.lock().await;
         let pairing_guard = self.pairing.lock().await;
@@ -203,7 +179,7 @@ impl CloudStateInner {
     pub async fn unpair(&self) -> anyhow::Result<()> {
         let mut creds_guard = self.creds.lock().await;
         if creds_guard.is_some() {
-            // Best-effort: secure-delete the file.
+
             if let Err(e) =
                 sentryusb_cloud_crypto::credentials::secure_delete(&self.credentials_path)
             {
@@ -213,7 +189,6 @@ impl CloudStateInner {
         *creds_guard = None;
         drop(creds_guard);
 
-        // Reset cached counters / errors.
         self.last_upload_at_ms.store(0, Ordering::Relaxed);
         *self.last_upload_error.lock().await = None;
         self.total_uploaded.store(0, Ordering::Relaxed);
@@ -225,7 +200,6 @@ impl CloudStateInner {
         Ok(())
     }
 
-    /// Replace credentials atomically (used by pairing-success and rekey).
     pub async fn set_credentials(&self, new_creds: CloudCredentialsV1) -> anyhow::Result<()> {
         sentryusb_cloud_crypto::credentials::save_atomic(&self.credentials_path, &new_creds)?;
         let mut guard = self.creds.lock().await;
@@ -237,11 +211,6 @@ impl CloudStateInner {
         Ok(())
     }
 
-    /// Wipe credentials in response to a 401/403 from the cloud — the Pi
-    /// has been revoked from the user's `/settings → Devices`. Same end
-    /// state as user-initiated unpair, but emits a different ws event so
-    /// the UI can distinguish "you clicked unpair" from "the cloud said
-    /// goodbye."
     pub async fn handle_remote_revoke(&self) {
         let mut guard = self.creds.lock().await;
         if guard.is_none() {
@@ -265,7 +234,6 @@ impl CloudStateInner {
     }
 }
 
-/// Helper: now() in millis since UNIX epoch.
 pub fn now_ms() -> i64 {
     SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)

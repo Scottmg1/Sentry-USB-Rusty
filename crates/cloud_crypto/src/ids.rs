@@ -1,32 +1,21 @@
-//! Identifier helpers — routeId derivation and Pi-local wrap key.
+
 
 use ring::digest;
 
 use crate::errors::CredentialsError;
 use crate::kdf;
 
-/// Default location of the SBC serial-number export on Linux.
 pub const SERIAL_PATH: &str = "/sys/firmware/devicetree/base/serial-number";
 
-/// HKDF salt for the Pi-local wrap key. Note the case difference vs.
-/// the per-Pi-key salt — matches ENCRYPTION.md §5 exactly.
 pub const PI_LOCAL_WRAP_SALT: &[u8] = b"SENTRYCLOUD_DEK_WRAP_v1";
 
-/// HKDF info for the Pi-local wrap key.
 pub const PI_LOCAL_WRAP_INFO: &[u8] = b"pi-key-at-rest";
 
-/// `routeId = lowercase_hex(sha256(file_path))`. `file_path` is the
-/// route's source clip path as already stored in `routes.file` (the
-/// relative-to-clip-dir POSIX form). 64 hex chars, stable across reflashes.
 pub fn route_id_from_path(file_path: &str) -> String {
     let h = digest::digest(&digest::SHA256, file_path.as_bytes());
     hex::encode(h.as_ref())
 }
 
-/// Read the SBC serial-number file and return the raw bytes (whitespace
-/// trimmed). The Pi devicetree exports the value with a trailing NUL on
-/// some kernels; trim NUL + ASCII whitespace so we get a stable input
-/// to HKDF regardless of trailer.
 pub fn read_serial_number(path: &str) -> Result<Vec<u8>, CredentialsError> {
     let raw = std::fs::read(path).map_err(|_| CredentialsError::SerialMissing {
         path: path.to_string(),
@@ -42,20 +31,12 @@ pub fn read_serial_number(path: &str) -> Result<Vec<u8>, CredentialsError> {
     Ok(trimmed)
 }
 
-/// Derive the 32-byte Pi-local wrap key from the SBC serial number.
-/// `localKey = HKDF-SHA-256(serialNumber, salt="SENTRYCLOUD_DEK_WRAP_v1",
-/// info="pi-key-at-rest")`.
 pub fn derive_pi_local_wrap_key(serial: &[u8]) -> Result<[u8; 32], CredentialsError> {
     Ok(kdf::derive_32(serial, PI_LOCAL_WRAP_SALT, PI_LOCAL_WRAP_INFO)?)
 }
 
-/// HKDF salt for the per-Pi key (ENCRYPTION.md §5).
 pub const PI_KEY_SALT: &[u8] = b"sentrycloud-pi-key-v1";
 
-/// Derive the per-Pi key: `piKey = HKDF(masterDek, salt, info=piId)`.
-/// **Browser-side derivation only on the Pi side** — but the Pi receives
-/// the unwrapped result via the pairing transit envelope, so this helper
-/// is in `cloud-crypto` for parity / testing rather than direct Pi use.
 pub fn derive_pi_key(master_dek: &[u8; 32], pi_id: &str) -> Result<[u8; 32], CredentialsError> {
     Ok(kdf::derive_32(master_dek, PI_KEY_SALT, pi_id.as_bytes())?)
 }
@@ -64,7 +45,6 @@ pub fn derive_pi_key(master_dek: &[u8; 32], pi_id: &str) -> Result<[u8; 32], Cre
 mod tests {
     use super::*;
 
-    /// SHA-256 of empty string → known constant.
     #[test]
     fn route_id_empty_path() {
         let id = route_id_from_path("");

@@ -1,5 +1,4 @@
-//! Error types. Messages NEVER include plaintext, key bytes, or AAD bytes —
-//! a logged error must not leak the secret it failed to protect.
+
 
 use thiserror::Error;
 
@@ -14,9 +13,6 @@ pub enum CryptoError {
     #[error("AEAD seal failed")]
     SealFailed,
 
-    /// Authentication tag verification failed. Could be: corrupted ciphertext,
-    /// wrong key, wrong AAD, or replay across contexts. We do not distinguish
-    /// — that distinction would itself be an oracle.
     #[error("AEAD open failed (auth tag verification)")]
     OpenFailed,
 

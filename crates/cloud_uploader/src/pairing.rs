@@ -1,17 +1,4 @@
-//! Pi-side three-party pairing flow (ENCRYPTION.md §8).
-//!
-//! Drives the sequence:
-//!   1. Pi generates `(piEphPriv, piEphPub)` ephemeral X25519.
-//!   2. Pi generates `(piLongTermPriv, piLongTermPub)` long-term X25519
-//!      for future rekey. The pubkey is sent to cloud at handshake.
-//!   3. Pi POSTs `/api/pi/pair/handshake { code, piEphPub, piPubKey,
-//!      piMetadata }`. Cloud relays to the user's browser via SSE.
-//!   4. Browser computes `wrappedPiKeyForPi`, finalizes.
-//!   5. Pi polls `/api/pi/pair/poll` (header `X-Pairing-Code`) until
-//!      cloud returns the wrapped envelope + `piAuthToken` + `piId`.
-//!   6. Pi decrypts `wrappedPiKeyForPi` with the ECDH-derived KEK.
-//!   7. Pi wraps the per-Pi key + long-term privkey under the SBC-serial
-//!      local wrap key and writes `cloud-credentials.json` atomically.
+
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -29,22 +16,15 @@ use sentryusb_cloud_crypto::{aad, aead, credentials, ids, kdf, x25519};
 use crate::client::CloudClient;
 use crate::state::{CloudStateInner, PairingProgress, PairingState};
 
-/// HKDF salt for the pairing transit KEK (matches ENCRYPTION.md §8 + the
-/// browser's pairing worker — must agree byte-for-byte).
 const HKDF_SALT_PAIR: &[u8] = b"sentrycloud-pair-v1";
 
-/// HKDF info prefix; concatenated with `userId || piId` per ENCRYPTION.md §8.
 const HKDF_INFO_PAIR_PREFIX: &[u8] = b"pair-kek";
 
-/// Poll cadence and total budget. The browser is on the human side of the
-/// flow — give it time. If the user dawdles past the budget, the pairing
-/// code itself expires server-side at 10 min anyway.
 const POLL_INTERVAL: Duration = Duration::from_millis(1500);
 const POLL_TIMEOUT: Duration = Duration::from_secs(60 * 11);
 
-/// Run the entire pairing flow, owning the state mutations along the way.
 pub async fn run(state: Arc<CloudStateInner>, code: String) -> Result<()> {
-    // Refuse if already paired.
+
     {
         let creds = state.creds.lock().await;
         if creds.is_some() {
@@ -52,7 +32,6 @@ pub async fn run(state: Arc<CloudStateInner>, code: String) -> Result<()> {
         }
     }
 
-    // Cancellation channel for /api/cloud/pair/cancel.
     let cancel = Arc::new(Notify::new());
     {
         let mut g = state.pairing_cancel.lock().await;
@@ -61,20 +40,16 @@ pub async fn run(state: Arc<CloudStateInner>, code: String) -> Result<()> {
 
     set_state(&state, PairingState::Handshaking, None).await;
 
-    // Step 1: ephemeral keypair. Used for the one-time ECDH at the end.
     let pi_eph = x25519::EphemeralPrivate::generate()
         .map_err(|e| anyhow!("ephemeral keypair: {}", e))?;
     let pi_eph_pub = pi_eph
         .public_bytes()
         .map_err(|e| anyhow!("ephemeral pubkey: {}", e))?;
 
-    // Step 2: long-term keypair. Sent to cloud at handshake; private half
-    // gets wrapped under the local key after pairing succeeds.
     let pi_long_term = x25519::LongTermPrivate::generate()
         .map_err(|e| anyhow!("long-term keypair: {}", e))?;
     let pi_long_term_pub = pi_long_term.public_bytes();
 
-    // Step 3: handshake POST.
     let metadata = pi_metadata();
     let body = HandshakeBody {
         code: code.clone(),
@@ -92,12 +67,11 @@ pub async fn run(state: Arc<CloudStateInner>, code: String) -> Result<()> {
     })?;
     drop(resp);
 
-    // Step 4-5: poll for the browser's finalize.
     set_state(&state, PairingState::Polling, None).await;
     let started = std::time::Instant::now();
     let mut poll_resp: Option<PollResponse> = None;
     while started.elapsed() < POLL_TIMEOUT {
-        // Honor cancel.
+
         if was_cancelled(&state).await {
             return Err(anyhow!("pairing cancelled"));
         }
@@ -113,7 +87,7 @@ pub async fn run(state: Arc<CloudStateInner>, code: String) -> Result<()> {
                 break;
             }
             202 => {
-                // Browser hasn't finalized yet. Sleep and retry.
+
                 tokio::select! {
                     _ = tokio::time::sleep(POLL_INTERVAL) => {},
                     _ = cancel.notified() => return Err(anyhow!("pairing cancelled")),
@@ -126,7 +100,6 @@ pub async fn run(state: Arc<CloudStateInner>, code: String) -> Result<()> {
     }
     let poll_resp = poll_resp.ok_or_else(|| anyhow!("pairing timed out waiting for browser"))?;
 
-    // Step 6: decrypt the wrapped per-Pi key.
     let browser_eph_pub = decode_b64_32(&poll_resp.browser_eph_pub)
         .ok_or_else(|| anyhow!("bad browserEphPub"))?;
     let wrapped_pi_key = B64
@@ -150,10 +123,9 @@ pub async fn run(state: Arc<CloudStateInner>, code: String) -> Result<()> {
         .try_into()
         .map_err(|_| anyhow!("pi_key wrong length"))?;
 
-    // Step 7: derive local wrap key + persist credentials.
     let serial = ids::read_serial_number(ids::SERIAL_PATH)
         .or_else(|_| {
-            // Dev fallback: tests + local development on non-Pi hardware.
+
             std::env::var("SENTRYCLOUD_DEV_SERIAL")
                 .map(|s| s.into_bytes())
                 .map_err(|_| anyhow!("SBC serial-number missing and SENTRYCLOUD_DEV_SERIAL unset"))
@@ -179,8 +151,6 @@ pub async fn run(state: Arc<CloudStateInner>, code: String) -> Result<()> {
         .await
         .context("set credentials")?;
 
-    // Boot a one-shot upload sweep (kick the Notify) so any routes that
-    // already exist on disk start landing in the cloud immediately.
     state.notify.notify_one();
 
     set_state(&state, PairingState::Complete, None).await;
@@ -233,8 +203,6 @@ fn decode_b64_32(s: &str) -> Option<[u8; 32]> {
     bytes.try_into().ok()
 }
 
-/// HKDF info for the pairing KEK. Matches the browser's
-/// `info="pair-kek" || userId || piId` byte construction.
 fn pair_kek_info(user_id: &str, pi_id: &str) -> Vec<u8> {
     let mut out = Vec::with_capacity(HKDF_INFO_PAIR_PREFIX.len() + user_id.len() + pi_id.len());
     out.extend_from_slice(HKDF_INFO_PAIR_PREFIX);
@@ -243,9 +211,7 @@ fn pair_kek_info(user_id: &str, pi_id: &str) -> Vec<u8> {
     out
 }
 
-/// Pi metadata sent at pairing. Bounded < 4 KiB per server validation.
-/// Truncated MAC (last 4 hex chars) so we don't fingerprint the device.
-fn pi_metadata() -> serde_json::Value {
+pub fn pi_metadata() -> serde_json::Value {
     let hostname = std::env::var("HOSTNAME")
         .ok()
         .or_else(|| {
@@ -263,7 +229,10 @@ fn pi_metadata() -> serde_json::Value {
         .map(|s| s.trim().to_string())
         .unwrap_or_default();
 
-    let sentryusb_version = env!("CARGO_PKG_VERSION").to_string();
+    let sentryusb_version = std::fs::read_to_string("/opt/sentryusb/version")
+        .or_else(|_| std::fs::read_to_string("/root/.sentryusb_version"))
+        .map(|s| s.trim().to_string())
+        .unwrap_or_else(|_| env!("CARGO_PKG_VERSION").to_string());
 
     let model = std::fs::read_to_string("/sys/firmware/devicetree/base/model")
         .ok()
@@ -281,8 +250,6 @@ fn pi_metadata() -> serde_json::Value {
     })
 }
 
-/// Read the last 4 hex chars (lowercase) of the first wired MAC. Best-
-/// effort; returns None on dev hosts. Trims the colon separators.
 fn read_first_mac_tail() -> Option<String> {
     let entries = std::fs::read_dir("/sys/class/net").ok()?;
     for entry in entries.flatten() {

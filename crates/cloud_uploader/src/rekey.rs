@@ -1,19 +1,4 @@
-//! Pi-side rekey: consume the browser-stashed envelope after a master-DEK
-//! rotation (ENCRYPTION.md §16). Triggered by the upload client when it
-//! sees a 409 `pi_key_stale` response — not a periodic timer.
-//!
-//! Flow:
-//!   1. GET `/api/pi/rekey/poll` (bearer-authed). Cloud returns 200 with
-//!      `{ browserEphPub, wrappedNewPiKey, newGeneration }` when the
-//!      browser has stashed an envelope; 202 if rotation in progress
-//!      but not yet stashed; 204 if Pi is already current.
-//!   2. ECDH(piLongTermPriv, browserEphPub) → shared.
-//!   3. HKDF(shared, salt="sentrycloud-rekey-v1",
-//!         info="rekey-kek" || userId || piId || newGeneration_be) → kek.
-//!   4. AES-GCM-decrypt wrappedNewPiKey under kek with `aadRekey` AAD.
-//!   5. Re-derive localKey from SBC serial; rewrap the new piKey under
-//!      it; atomically replace the credentials file with the new
-//!      `wrappedPiKeyLocal` + bumped `dekRotationGeneration`.
+
 
 use std::sync::Arc;
 
@@ -29,15 +14,9 @@ use crate::client::CloudClient;
 use crate::credentials_store::UnlockedCreds;
 use crate::state::CloudStateInner;
 
-/// HKDF info for the rekey KEK. `newGeneration` is appended as a 4-byte
-/// big-endian uint — same encoding as the AAD trailer.
 const HKDF_INFO_REKEY_PREFIX: &[u8] = b"rekey-kek";
 const HKDF_SALT_REKEY: &[u8] = b"sentrycloud-rekey-v1";
 
-/// Run one rekey-poll cycle. Returns:
-///   - `Ok(true)` if a fresh envelope was applied and credentials were rotated.
-///   - `Ok(false)` if there was nothing to apply (204 / 202 from cloud).
-///   - `Err(...)` on transport / decrypt / persistence failure.
 pub async fn poll_and_apply(state: Arc<CloudStateInner>) -> Result<bool> {
     let creds_snapshot = {
         let g = state.creds.lock().await;
@@ -47,10 +26,8 @@ pub async fn poll_and_apply(state: Arc<CloudStateInner>) -> Result<bool> {
         }
     };
 
-    // Unlock so we can ECDH with the long-term privkey.
     let unlocked = unlock_or_err(&creds_snapshot)?;
 
-    // Bearer-auth GET.
     let client =
         CloudClient::new(&creds_snapshot.cloud_base_url).with_bearer(&unlocked.pi_auth_token);
     let resp = client
@@ -61,26 +38,24 @@ pub async fn poll_and_apply(state: Arc<CloudStateInner>) -> Result<bool> {
 
     match status.as_u16() {
         204 => {
-            // Pi is already on the user's current generation.
+
             return Ok(false);
         }
         202 => {
-            // Rotation in progress, browser hasn't stashed yet.
+
             return Ok(false);
         }
         409 => {
-            // Stash drained by another poll; treat as no-op and let the
-            // next upload's 409 trigger the next round.
+
             return Ok(false);
         }
         401 => {
-            // Token unknown — wipe.
+
             state.handle_remote_revoke().await;
             return Err(anyhow!("auth rejected during rekey poll"));
         }
         403 => {
-            // Differentiate user_suspended from true revocation. Read
-            // the body for the typed error field.
+
             let body_text = resp.text().await.unwrap_or_default();
             let err_field = serde_json::from_str::<serde_json::Value>(&body_text)
                 .ok()
@@ -93,7 +68,7 @@ pub async fn poll_and_apply(state: Arc<CloudStateInner>) -> Result<bool> {
             state.handle_remote_revoke().await;
             return Err(anyhow!("auth rejected during rekey poll"));
         }
-        200 => {} // continue
+        200 => {}
         s => return Err(anyhow!("rekey poll: unexpected HTTP {}", s)),
     }
 
@@ -105,7 +80,6 @@ pub async fn poll_and_apply(state: Arc<CloudStateInner>) -> Result<bool> {
         .decode(&parsed.wrapped_new_pi_key)
         .map_err(|_| anyhow!("bad wrappedNewPiKey base64"))?;
 
-    // ECDH with the LONG-TERM privkey.
     let shared = unlocked.long_term_priv.compute_shared(&browser_eph_pub);
 
     let info = rekey_kek_info(
@@ -128,7 +102,6 @@ pub async fn poll_and_apply(state: Arc<CloudStateInner>) -> Result<bool> {
         .try_into()
         .map_err(|_| anyhow!("new pi key wrong length"))?;
 
-    // Re-derive localKey from serial and rewrap.
     let serial = ids::read_serial_number(ids::SERIAL_PATH)
         .or_else(|_| {
             std::env::var("SENTRYCLOUD_DEV_SERIAL")
@@ -144,8 +117,6 @@ pub async fn poll_and_apply(state: Arc<CloudStateInner>) -> Result<bool> {
     )
     .map_err(|e| anyhow!("rewrap pi key: {}", e))?;
 
-    // Atomically write the updated credentials file. Long-term keypair
-    // stays the same — only the per-Pi key wrap and the generation bump.
     let mut updated = creds_snapshot.clone();
     updated.wrapped_pi_key_local = new_wrapped_b64;
     updated.dek_rotation_generation = parsed.new_generation;
@@ -160,7 +131,7 @@ pub async fn poll_and_apply(state: Arc<CloudStateInner>) -> Result<bool> {
 
 fn unlock_or_err(c: &credentials::CloudCredentialsV1) -> Result<UnlockedCreds> {
     UnlockedCreds::unlock(c).or_else(|_| {
-        // Dev fallback: tests on non-Pi hardware expose SENTRYCLOUD_DEV_SERIAL.
+
         let serial = std::env::var("SENTRYCLOUD_DEV_SERIAL")
             .map(|s| s.into_bytes())
             .map_err(|_| anyhow!("unlock failed and SENTRYCLOUD_DEV_SERIAL unset"))?;

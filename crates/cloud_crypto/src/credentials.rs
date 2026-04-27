@@ -1,11 +1,4 @@
-//! `cloud-credentials.json` — the only state the Pi persists about its
-//! cloud pairing. v1 schema, mode 0600 file in a 0700 parent directory.
-//!
-//! Atomic writes via write-temp + fsync + rename, mirroring the pattern
-//! in `crates/config/src/lib.rs`. The Pi-local wrap key is re-derived
-//! from the SBC serial number on every cold start; never persisted.
-//!
-//! See ENCRYPTION.md §9 + §16 for the rationale on every field.
+
 
 use std::fs::{self, OpenOptions};
 use std::io::Write;
@@ -21,30 +14,24 @@ use crate::blob::WRAPPED_KEY_BLOB_LEN;
 use crate::errors::CredentialsError;
 use crate::{aad, x25519};
 
-/// Default location on the Pi.
 pub const DEFAULT_PATH: &str = "/root/.sentryusb/cloud-credentials.json";
 
-/// File mode for the credentials file (Unix only).
 #[cfg(unix)]
 const FILE_MODE: u32 = 0o600;
 
-/// Parent-directory mode for /root/.sentryusb (Unix only).
 #[cfg(unix)]
 const DIR_MODE: u32 = 0o700;
 
-/// Wrapped long-term X25519 keypair sub-object on disk.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LongTermX25519OnDisk {
-    /// Raw 32-byte public key, base64-encoded (standard, not URL-safe).
+
     #[serde(rename = "publicKey")]
     pub public_key: String,
-    /// Wrapped 32-byte privkey seed in the universal blob format
-    /// `[ver|nonce|tag|ct=32]` (61 bytes total), base64-encoded.
+
     #[serde(rename = "wrappedPrivateKey")]
     pub wrapped_private_key: String,
 }
 
-/// On-disk shape, v1.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CloudCredentialsV1 {
     pub version: u32,
@@ -52,29 +39,25 @@ pub struct CloudCredentialsV1 {
     pub user_id: String,
     #[serde(rename = "piId")]
     pub pi_id: String,
-    /// Bearer token plaintext (32 raw bytes), base64-encoded. The cloud
-    /// only persists `sha256(piAuthToken)`.
+
     #[serde(rename = "piAuthToken")]
     pub pi_auth_token: String,
-    /// Wrapped per-Pi key in universal blob format (61 bytes), base64-encoded.
+
     #[serde(rename = "wrappedPiKeyLocal")]
     pub wrapped_pi_key_local: String,
-    /// Long-term keypair: pubkey is sent to cloud at pairing for rekey
-    /// ECDH (ENCRYPTION.md §16); privkey seed lives wrapped here.
+
     #[serde(rename = "longTermX25519")]
     pub long_term_x25519: LongTermX25519OnDisk,
     #[serde(rename = "cloudBaseUrl")]
     pub cloud_base_url: String,
-    /// RFC 3339 timestamp captured at pairing.
+
     #[serde(rename = "pairedAt")]
     pub paired_at: DateTime<Utc>,
-    /// Mirrors the cloud's `pi_devices.dekRotationGeneration`. Bumped
-    /// only after a successful rekey-stash unwrap.
+
     #[serde(rename = "dekRotationGeneration", default)]
     pub dek_rotation_generation: u32,
 }
 
-/// Read + parse the credentials file from `path`.
 pub fn load(path: &str) -> Result<CloudCredentialsV1, CredentialsError> {
     let contents = fs::read_to_string(path)?;
     let creds: CloudCredentialsV1 = serde_json::from_str(&contents)?;
@@ -84,10 +67,6 @@ pub fn load(path: &str) -> Result<CloudCredentialsV1, CredentialsError> {
     Ok(creds)
 }
 
-/// Atomically write `creds` to `path`. Creates the parent directory with
-/// `0o700` if it doesn't already exist; sets the file mode to `0o600`
-/// before the rename. On Windows, mode bits are not enforced (used in
-/// dev/test only — production runs on Linux Pis).
 pub fn save_atomic(path: &str, creds: &CloudCredentialsV1) -> Result<(), CredentialsError> {
     let final_path = PathBuf::from(path);
     if let Some(parent) = final_path.parent() {
@@ -110,16 +89,10 @@ pub fn save_atomic(path: &str, creds: &CloudCredentialsV1) -> Result<(), Credent
         f.sync_all()?;
     }
 
-    // Rename is atomic on the same filesystem (POSIX); on Windows, replaces.
     fs::rename(&tmp_path, &final_path)?;
     Ok(())
 }
 
-/// Overwrite-then-unlink: best-effort secure delete for the credentials
-/// file. Used when the Pi unpairs or detects revocation. Single overwrite
-/// pass with random bytes — SD-card flash translation layers make
-/// guaranteed zeroize impossible from userland; this is a speed bump
-/// against casual recovery, not a wall.
 pub fn secure_delete(path: &str) -> Result<(), CredentialsError> {
     let final_path = PathBuf::from(path);
     if !final_path.exists() {
@@ -169,9 +142,6 @@ fn with_tmp_suffix(p: &Path) -> PathBuf {
     PathBuf::from(s)
 }
 
-// ----- Wrap / unwrap helpers ---------------------------------------------
-
-/// Wrap the per-Pi key under the local wrap key for at-rest storage.
 pub fn wrap_pi_key_local(
     local_wrap_key: &[u8; 32],
     pi_key: &[u8; 32],
@@ -184,7 +154,6 @@ pub fn wrap_pi_key_local(
     Ok(B64.encode(&blob))
 }
 
-/// Unwrap the per-Pi key from on-disk form.
 pub fn unwrap_pi_key_local(
     local_wrap_key: &[u8; 32],
     wrapped_b64: &str,
@@ -204,7 +173,6 @@ pub fn unwrap_pi_key_local(
         }))
 }
 
-/// Wrap the long-term X25519 privkey seed (Amendment 1 AAD).
 pub fn wrap_long_term_privkey(
     local_wrap_key: &[u8; 32],
     seed: &[u8; 32],
@@ -217,7 +185,6 @@ pub fn wrap_long_term_privkey(
     Ok(B64.encode(&blob))
 }
 
-/// Unwrap the long-term X25519 privkey seed.
 pub fn unwrap_long_term_privkey(
     local_wrap_key: &[u8; 32],
     wrapped_b64: &str,
@@ -237,11 +204,6 @@ pub fn unwrap_long_term_privkey(
         }))
 }
 
-// ----- Construction helper for the pairing client ------------------------
-
-/// Build a fresh credentials struct ready to save. The wrapping is done
-/// here so the caller doesn't have to thread `local_wrap_key` through
-/// multiple call sites.
 #[allow(clippy::too_many_arguments)]
 pub fn build_v1(
     user_id: String,
@@ -300,8 +262,6 @@ mod tests {
         assert!(err.is_err());
     }
 
-    /// The two wraps under the same local key MUST NOT be swappable.
-    /// This is the whole reason for Amendment 1 (`pi_local_x25519` AAD).
     #[test]
     fn pi_key_and_long_term_wraps_are_not_swappable() {
         let lk = fixed_local_key();
@@ -312,7 +272,6 @@ mod tests {
         let wrapped_pi_key = wrap_pi_key_local(&lk, &pi_key, pi_id).unwrap();
         let wrapped_lt = wrap_long_term_privkey(&lk, &lt_seed, pi_id).unwrap();
 
-        // Each unwrap MUST reject the other's ciphertext.
         assert!(
             unwrap_pi_key_local(&lk, &wrapped_lt, pi_id).is_err(),
             "long-term ciphertext must not unwrap as pi key"
@@ -348,12 +307,10 @@ mod tests {
         assert_eq!(parsed.pi_id, "pi-cuid");
         assert_eq!(parsed.version, 1);
 
-        // Unwrap the per-Pi key and confirm we recover the original.
         let recovered_pi_key =
             unwrap_pi_key_local(&lk, &parsed.wrapped_pi_key_local, &parsed.pi_id).unwrap();
         assert_eq!(recovered_pi_key, pi_key);
 
-        // Same for the long-term seed.
         let recovered_seed = unwrap_long_term_privkey(
             &lk,
             &parsed.long_term_x25519.wrapped_private_key,
@@ -391,7 +348,6 @@ mod tests {
         assert_eq!(loaded.pi_id, "p");
         assert_eq!(loaded.dek_rotation_generation, 7);
 
-        // Cleanup.
         let _ = std::fs::remove_file(p_str);
         let _ = std::fs::remove_dir(&dir);
     }

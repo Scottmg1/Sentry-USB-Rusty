@@ -1,12 +1,4 @@
-//! AES-256-GCM seal / open with associated data.
-//!
-//! Wraps `ring::aead`. Returns/accepts the universal `[ver|nonce|tag|ct]`
-//! blob layout from `crate::blob`.
-//!
-//! `seal` generates a fresh 12-byte random nonce per call (NIST 96-bit).
-//! Reusing a nonce under the same key would be catastrophic (key recovery
-//! attack), so this helper is the ONLY supported encryption surface — there
-//! is no "encrypt with my own nonce" escape hatch.
+
 
 use ring::aead::{Aad, LessSafeKey, Nonce, UnboundKey, AES_256_GCM, NONCE_LEN as RING_NONCE_LEN};
 use ring::rand::{SecureRandom, SystemRandom};
@@ -14,7 +6,6 @@ use ring::rand::{SecureRandom, SystemRandom};
 use crate::blob::{self, KEY_LEN, NONCE_LEN, TAG_LEN};
 use crate::errors::CryptoError;
 
-/// AES-256 key wrapper. Construct with [`Key::from_bytes`].
 pub struct Key(LessSafeKey);
 
 impl Key {
@@ -29,11 +20,8 @@ impl Key {
     }
 }
 
-// Compile-time sanity: ring's nonce length matches our NONCE_LEN.
 const _: () = assert!(RING_NONCE_LEN == NONCE_LEN);
 
-/// Seal `plaintext` under `key` with `aad`. Returns the full packed blob
-/// `[ver|nonce|tag|ct]`.
 pub fn seal(key: &Key, aad: &[u8], plaintext: &[u8]) -> Result<Vec<u8>, CryptoError> {
     let mut nonce_bytes = [0u8; NONCE_LEN];
     SystemRandom::new()
@@ -42,9 +30,6 @@ pub fn seal(key: &Key, aad: &[u8], plaintext: &[u8]) -> Result<Vec<u8>, CryptoEr
     seal_with_nonce(key, &nonce_bytes, aad, plaintext)
 }
 
-/// Seal with a caller-provided nonce. Crate-private — use [`seal`] from
-/// outside. Exists only so the test suite can verify against fixed-nonce
-/// vectors; the random-nonce path is the production one.
 pub(crate) fn seal_with_nonce(
     key: &Key,
     nonce_bytes: &[u8; NONCE_LEN],
@@ -53,7 +38,6 @@ pub(crate) fn seal_with_nonce(
 ) -> Result<Vec<u8>, CryptoError> {
     let nonce = Nonce::assume_unique_for_key(*nonce_bytes);
 
-    // ring's seal_in_place_separate_tag wants in/out=plaintext, returns tag.
     let mut in_out = plaintext.to_vec();
     let tag = key
         .0
@@ -68,14 +52,9 @@ pub(crate) fn seal_with_nonce(
     Ok(blob::pack(nonce_bytes, &tag_bytes, &in_out))
 }
 
-/// Open the packed blob under `key` with `aad`. Returns the recovered
-/// plaintext. Errors uniformly on every failure mode (bad version, bad
-/// length, wrong key, wrong AAD, corrupted ciphertext) — the distinction
-/// would be a side-channel.
 pub fn open(key: &Key, aad: &[u8], packed: &[u8]) -> Result<Vec<u8>, CryptoError> {
     let parts = blob::unpack(packed)?;
 
-    // ring wants ciphertext+tag concatenated in-place. Build that buffer.
     let mut combined = Vec::with_capacity(parts.ciphertext.len() + parts.tag.len());
     combined.extend_from_slice(parts.ciphertext);
     combined.extend_from_slice(parts.tag);
@@ -134,7 +113,7 @@ mod tests {
     fn open_rejects_corrupted_ciphertext() {
         let key = fixed_key();
         let mut packed = seal(&key, b"aad", b"plaintext").unwrap();
-        // Flip a bit in the ciphertext region (after ver + nonce + tag).
+
         let pos = 1 + NONCE_LEN + TAG_LEN;
         packed[pos] ^= 0x01;
         let err = open(&key, b"aad", &packed).unwrap_err();

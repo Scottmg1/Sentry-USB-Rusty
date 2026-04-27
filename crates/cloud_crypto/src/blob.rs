@@ -1,44 +1,27 @@
-//! Universal AES-256-GCM blob layout used by every encrypted blob in the
-//! SentryCloud protocol. Matches the browser's `web/src/lib/encryption/format.js`
-//! and the server's `lib/serverCrypto.js` byte-for-byte.
-//!
-//! ```text
-//! [ version : u8 ][ nonce : 12 B ][ tag : 16 B ][ ciphertext : n B ]
-//! ```
+
 
 use crate::errors::CryptoError;
 
-/// Wire-format version byte. Bumping requires server + browser + Pi all
-/// learning the new version; see ENCRYPTION.md §4.
 pub const VERSION: u8 = 0x01;
 
-/// AES-GCM 96-bit nonce length.
 pub const NONCE_LEN: usize = 12;
 
-/// AES-GCM 128-bit auth tag length.
 pub const TAG_LEN: usize = 16;
 
-/// AES-256 key length.
 pub const KEY_LEN: usize = 32;
 
-/// HKDF salt length used at signup.
 pub const SALT_LEN: usize = 16;
 
-/// Total length of a wrapped 32-byte key envelope: ver(1) + nonce(12) +
-/// tag(16) + ct(32) = 61 B.
 pub const WRAPPED_KEY_BLOB_LEN: usize = 1 + NONCE_LEN + TAG_LEN + KEY_LEN;
 
-/// Minimum length of any blob (version + nonce + tag, with empty ciphertext).
 pub const MIN_BLOB_LEN: usize = 1 + NONCE_LEN + TAG_LEN;
 
-/// Borrowed view of an unpacked blob. Returned by [`unpack`].
 pub struct BlobParts<'a> {
     pub nonce: &'a [u8],
     pub tag: &'a [u8],
     pub ciphertext: &'a [u8],
 }
 
-/// Pack `[version | nonce | tag | ciphertext]` into a single buffer.
 pub fn pack(nonce: &[u8; NONCE_LEN], tag: &[u8; TAG_LEN], ciphertext: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(MIN_BLOB_LEN + ciphertext.len());
     out.push(VERSION);
@@ -48,8 +31,6 @@ pub fn pack(nonce: &[u8; NONCE_LEN], tag: &[u8; TAG_LEN], ciphertext: &[u8]) -> 
     out
 }
 
-/// Borrow-and-validate the layout of a packed blob. Errors on under-length
-/// input or unknown version byte.
 pub fn unpack(buf: &[u8]) -> Result<BlobParts<'_>, CryptoError> {
     if buf.len() < MIN_BLOB_LEN {
         return Err(CryptoError::BlobTooShort(buf.len(), MIN_BLOB_LEN));
