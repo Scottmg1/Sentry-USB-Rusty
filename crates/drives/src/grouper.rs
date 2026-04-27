@@ -2243,6 +2243,45 @@ fn split_summary_by_gear_state_legacy<'a>(
     result
 }
 
+/// Compute drive distance from summary clips using:
+/// 1) per-clip aggregate distance, plus
+/// 2) boundary gaps between consecutive clips (prev end -> next start).
+///
+/// The gap term matches Sentry-Drive's merged-point walk behavior and is
+/// especially important for sparse Tessie clips.
+fn distance_from_summary_clips(clips: &[TimedSummary]) -> f64 {
+    fn is_null_island_pair(lat: f64, lng: f64) -> bool {
+        lat.abs() < 1.0 && lng.abs() < 1.0
+    }
+
+    let mut total_dist_m = 0.0;
+    let mut prev_end: Option<(f64, f64)> = None;
+
+    for clip in clips {
+        let a = &clip.summary.aggregates;
+        total_dist_m += a.distance_m;
+
+        if let (Some((prev_lat, prev_lng)), Some(cur_lat), Some(cur_lng)) =
+            (prev_end, a.start_lat, a.start_lng)
+        {
+            if !is_null_island_pair(prev_lat, prev_lng) && !is_null_island_pair(cur_lat, cur_lng)
+            {
+                total_dist_m += haversine_m(prev_lat, prev_lng, cur_lat, cur_lng);
+            }
+        }
+
+        prev_end = if let (Some(lat), Some(lng)) = (a.end_lat, a.end_lng) {
+            Some((lat, lng))
+        } else if let (Some(lat), Some(lng)) = (a.start_lat, a.start_lng) {
+            Some((lat, lng))
+        } else {
+            prev_end
+        };
+    }
+
+    total_dist_m
+}
+
 /// Build a single `DriveSummary` by summing the per-clip
 /// `RouteAggregates` columns. No point arrays touched.
 fn build_summary_from_aggregates(
@@ -2256,7 +2295,7 @@ fn build_summary_from_aggregates(
     let end_time = last_clip.timestamp + chrono::Duration::minutes(1);
     let duration_ms = (end_time - start_time).num_milliseconds();
 
-    let mut total_dist_m: f64 = 0.0;
+    let total_dist_m: f64 = distance_from_summary_clips(clips);
     let mut max_speed_mps: f64 = 0.0;
     let mut speed_sum: f64 = 0.0;
     let mut speed_count: i64 = 0;
@@ -2276,7 +2315,6 @@ fn build_summary_from_aggregates(
 
     for clip in clips {
         let a = &clip.summary.aggregates;
-        total_dist_m += a.distance_m;
         if a.max_speed_mps > max_speed_mps {
             max_speed_mps = a.max_speed_mps;
         }
@@ -2387,16 +2425,25 @@ fn compute_aggregate_stats_summary_impl(summaries: &[RouteSummary]) -> Aggregate
     // the score. Matches Sentry-Drive's `renderDriveStats` approach.
     let mut total_m: f64 = 0.0;
     let mut sei_total_m: f64 = 0.0;
+    for grp in &groups {
+        if grp.is_empty() {
+            continue;
+        }
+        let d = distance_from_summary_clips(grp);
+        total_m += d;
+        if !is_tessie(&grp[0].summary.source) {
+            sei_total_m += d;
+        }
+    }
+
     let mut fsd_m: f64 = 0.0;
     let mut autosteer_m: f64 = 0.0;
     let mut tacc_m: f64 = 0.0;
     for sum in summaries {
         let a = &sum.aggregates;
-        total_m += a.distance_m;
         if is_tessie(&sum.source) {
             continue;
         }
-        sei_total_m += a.distance_m;
         fsd_m += a.fsd_distance_m;
         autosteer_m += a.autosteer_distance_m;
         tacc_m += a.tacc_distance_m;
@@ -2535,6 +2582,58 @@ mod tests {
         let groups = group_clips(&routes);
         // 1 hour gap > 5 min => 2 groups
         assert_eq!(groups.len(), 2);
+    }
+
+    #[test]
+    fn test_distance_from_summary_clips_includes_inter_clip_gap() {
+        let mut a1 = RouteAggregates::default();
+        a1.distance_m = 100.0;
+        a1.start_lat = Some(37.0000);
+        a1.start_lng = Some(-122.0000);
+        a1.end_lat = Some(37.0009);
+        a1.end_lng = Some(-122.0000);
+
+        let mut a2 = RouteAggregates::default();
+        a2.distance_m = 200.0;
+        a2.start_lat = Some(37.0020);
+        a2.start_lng = Some(-122.0000);
+        a2.end_lat = Some(37.0030);
+        a2.end_lng = Some(-122.0000);
+
+        let s1 = RouteSummary {
+            file: "/cam/2025-01-15_12-00-00-front.mp4".to_string(),
+            date: "2025-01-15".to_string(),
+            raw_park_count: 0,
+            raw_frame_count: 0,
+            gear_runs: Vec::new(),
+            aggregates: a1,
+            source: None,
+            external_signature: None,
+        };
+        let s2 = RouteSummary {
+            file: "/cam/2025-01-15_12-01-00-front.mp4".to_string(),
+            date: "2025-01-15".to_string(),
+            raw_park_count: 0,
+            raw_frame_count: 0,
+            gear_runs: Vec::new(),
+            aggregates: a2,
+            source: None,
+            external_signature: None,
+        };
+
+        let ts = chrono::NaiveDateTime::parse_from_str("2025-01-15T12:00:00", "%Y-%m-%dT%H:%M:%S")
+            .unwrap();
+        let clips = vec![
+            TimedSummary { summary: &s1, timestamp: ts },
+            TimedSummary { summary: &s2, timestamp: ts + chrono::Duration::minutes(1) },
+        ];
+
+        let d = distance_from_summary_clips(&clips);
+        let gap = haversine_m(37.0009, -122.0000, 37.0020, -122.0000);
+        assert!(
+            (d - (300.0 + gap)).abs() < 0.1,
+            "distance should include inter-clip gap"
+        );
     }
 
     #[test]
