@@ -4,8 +4,34 @@
   --color-glass: rgba(255, 255, 255, 0.04);
   --color-glass-border: rgba(255, 255, 255, 0.08);
   --color-glass-hover: rgba(255, 255, 255, 0.07);
-  --color-accent: #3B82F6;
-  --color-accent-hover: #60A5FA;
+  --color-accent: oklch(0.82 0.18 150);
+  --color-accent-hover: oklch(0.87 0.16 150);
+
+  /* ── SentryCloud palette: remap blue → green accent ────────────── */
+  --color-blue-50: oklch(0.97 0.04 150);
+  --color-blue-100: oklch(0.94 0.08 150);
+  --color-blue-200: oklch(0.90 0.12 150);
+  --color-blue-300: oklch(0.86 0.15 150);
+  --color-blue-400: oklch(0.82 0.18 150);
+  --color-blue-500: oklch(0.72 0.17 150);
+  --color-blue-600: oklch(0.62 0.16 150);
+  --color-blue-700: oklch(0.52 0.14 150);
+  --color-blue-800: oklch(0.42 0.12 150);
+  --color-blue-900: oklch(0.32 0.08 150);
+  --color-blue-950: oklch(0.22 0.06 150);
+
+  /* ── SentryCloud backgrounds: darken slate scale ───────────────── */
+  --color-slate-950: #07090c;
+  --color-slate-900: #0b0e13;
+  --color-slate-800: #10141b;
+  --color-slate-700: #161b24;
+  --color-slate-600: #7a8294;
+  --color-slate-500: #8a93a3;
+  --color-slate-400: #8a93a3;
+  --color-slate-300: #b8bfcf;
+  --color-slate-200: #d4d9e3;
+  --color-slate-100: #e6e9ef;
+  --color-slate-50: #f0f2f5;
 }
 
 html, body, #root {
@@ -14,12 +40,15 @@ html, body, #root {
 }
 
 body {
-  font-family: "DM Sans", system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  font-family: "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+  font-feature-settings: 'ss01', 'cv11';
+  -webkit-font-smoothing: antialiased;
 }
 
-/* Headings use Sora */
+/* Headings use Inter (matching SentryCloud) */
 h1, h2, h3, h4, h5, h6 {
-  font-family: "Sora", "DM Sans", system-ui, sans-serif;
+  font-family: "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+  font-weight: 600;
   letter-spacing: -0.02em;
 }
 
@@ -30,26 +59,26 @@ code, pre, .font-mono {
 
 /* ── Glassmorphism card utility ─────────────────────────────────── */
 .glass-card {
-  background: linear-gradient(135deg, rgba(255, 255, 255, 0.05) 0%, rgba(255, 255, 255, 0.02) 100%);
+  background: linear-gradient(180deg, #10141b 0%, #0b0e13 100%);
   backdrop-filter: blur(16px);
   -webkit-backdrop-filter: blur(16px);
-  border: 1px solid rgba(255, 255, 255, 0.08);
+  border: 1px solid #1e242f;
   border-radius: 14px;
-  box-shadow: 0 2px 16px rgba(0, 0, 0, 0.12), inset 0 1px 0 rgba(255, 255, 255, 0.04);
+  box-shadow: 0 2px 16px rgba(0, 0, 0, 0.18), inset 0 1px 0 rgba(255, 255, 255, 0.03);
 }
 
 .glass-card-hover:hover {
-  background: linear-gradient(135deg, rgba(255, 255, 255, 0.08) 0%, rgba(255, 255, 255, 0.04) 100%);
-  border-color: rgba(255, 255, 255, 0.14);
-  box-shadow: 0 4px 24px rgba(0, 0, 0, 0.18), inset 0 1px 0 rgba(255, 255, 255, 0.06);
+  background: linear-gradient(180deg, #161b24 0%, #10141b 100%);
+  border-color: #2a3140;
+  box-shadow: 0 4px 24px rgba(0, 0, 0, 0.25), inset 0 1px 0 rgba(255, 255, 255, 0.04);
 }
 
 /* Glass sidebar */
 .glass-sidebar {
-  background: rgba(10, 16, 30, 0.85);
+  background: rgba(7, 9, 12, 0.92);
   backdrop-filter: blur(20px);
   -webkit-backdrop-filter: blur(20px);
-  border-right: 1px solid rgba(255, 255, 255, 0.05);
+  border-right: 1px solid #1e242f;
 }
 
 /* ── Toggle switch ─────────────────────────────────────────────── */
@@ -80,17 +109,17 @@ code, pre, .font-mono {
 }
 
 .toggle-switch:checked {
-  background: rgba(59, 130, 246, 0.5);
+  background: oklch(0.82 0.18 150 / 0.35);
 }
 
 .toggle-switch:checked::after {
   transform: translateX(18px);
-  background: #60A5FA;
-  box-shadow: 0 0 8px rgba(96, 165, 250, 0.4), 0 1px 4px rgba(0, 0, 0, 0.3);
+  background: oklch(0.82 0.18 150);
+  box-shadow: 0 0 8px oklch(0.82 0.18 150 / 0.4), 0 1px 4px rgba(0, 0, 0, 0.3);
 }
 
 .toggle-switch:focus-visible {
-  outline: 2px solid rgba(59, 130, 246, 0.5);
+  outline: 2px solid oklch(0.82 0.18 150 / 0.5);
   outline-offset: 2px;
 }
 
@@ -99,9 +128,9 @@ code, pre, .font-mono {
   display: flex;
   gap: 2px;
   padding: 3px;
-  background: rgba(255, 255, 255, 0.03);
+  background: #0b0e13;
   border-radius: 12px;
-  border: 1px solid rgba(255, 255, 255, 0.06);
+  border: 1px solid #1e242f;
 }
 
 .tab-item {
@@ -110,8 +139,8 @@ code, pre, .font-mono {
   border-radius: 9px;
   font-size: 13px;
   font-weight: 500;
-  font-family: "Sora", "DM Sans", system-ui, sans-serif;
-  color: rgba(148, 163, 184, 0.7);
+  font-family: "Inter", -apple-system, system-ui, sans-serif;
+  color: #7a8294;
   text-align: center;
   cursor: pointer;
   transition: all 0.2s ease;
@@ -120,24 +149,24 @@ code, pre, .font-mono {
 }
 
 .tab-item:hover {
-  color: rgba(226, 232, 240, 0.8);
-  background: rgba(255, 255, 255, 0.04);
+  color: #b8bfcf;
+  background: #10141b;
 }
 
 .tab-item.active {
-  color: #e2e8f0;
-  background: rgba(255, 255, 255, 0.08);
-  box-shadow: 0 1px 8px rgba(0, 0, 0, 0.15), inset 0 1px 0 rgba(255, 255, 255, 0.06);
+  color: #e6e9ef;
+  background: #161b24;
+  box-shadow: 0 1px 8px rgba(0, 0, 0, 0.2), inset 0 1px 0 rgba(255, 255, 255, 0.04);
 }
 
 /* ── Section label ──────────────────────────────────────────────── */
 .section-label {
-  font-family: "Sora", "DM Sans", system-ui, sans-serif;
+  font-family: "Inter", -apple-system, system-ui, sans-serif;
   font-size: 11px;
   font-weight: 600;
   letter-spacing: 0.08em;
   text-transform: uppercase;
-  color: rgba(148, 163, 184, 0.5);
+  color: #7a8294;
 }
 
 /* ── Progress bar animation ────────────────────────────────────── */
@@ -185,7 +214,7 @@ code, pre, .font-mono {
 
 /* Prevent white flash on map tiles that haven't loaded yet */
 .leaflet-container {
-  background: #1a1a2e;
+  background: #07090c;
 }
 
 /* Remove default white background from div-icon wrappers */
@@ -196,56 +225,56 @@ code, pre, .font-mono {
 
 /* Dark tooltip styling */
 .leaflet-tooltip {
-  background-color: rgba(15, 23, 42, 0.95);
-  border: 1px solid rgba(255, 255, 255, 0.15);
-  color: #e2e8f0;
+  background-color: rgba(11, 14, 19, 0.95);
+  border: 1px solid #2a3140;
+  color: #e6e9ef;
   box-shadow: 0 4px 12px rgba(0, 0, 0, 0.5);
 }
 
 .leaflet-tooltip-top:before {
-  border-top-color: rgba(15, 23, 42, 0.95);
+  border-top-color: rgba(11, 14, 19, 0.95);
 }
 .leaflet-tooltip-bottom:before {
-  border-bottom-color: rgba(15, 23, 42, 0.95);
+  border-bottom-color: rgba(11, 14, 19, 0.95);
 }
 .leaflet-tooltip-left:before {
-  border-left-color: rgba(15, 23, 42, 0.95);
+  border-left-color: rgba(11, 14, 19, 0.95);
 }
 .leaflet-tooltip-right:before {
-  border-right-color: rgba(15, 23, 42, 0.95);
+  border-right-color: rgba(11, 14, 19, 0.95);
 }
 
 /* Dark popup styling */
 .leaflet-popup-content-wrapper {
-  background: rgba(15, 23, 42, 0.95);
-  color: #e2e8f0;
-  border: 1px solid rgba(255, 255, 255, 0.15);
+  background: rgba(11, 14, 19, 0.95);
+  color: #e6e9ef;
+  border: 1px solid #2a3140;
   box-shadow: 0 4px 12px rgba(0, 0, 0, 0.5);
 }
 
 .leaflet-popup-tip {
-  background: rgba(15, 23, 42, 0.95);
+  background: rgba(11, 14, 19, 0.95);
 }
 
 /* Dark zoom controls */
 .leaflet-control-zoom a {
-  background-color: rgba(15, 23, 42, 0.9) !important;
-  color: #e2e8f0 !important;
-  border-color: rgba(255, 255, 255, 0.1) !important;
+  background-color: rgba(11, 14, 19, 0.9) !important;
+  color: #e6e9ef !important;
+  border-color: #1e242f !important;
 }
 
 .leaflet-control-zoom a:hover {
-  background-color: rgba(30, 41, 59, 0.95) !important;
+  background-color: rgba(16, 20, 27, 0.95) !important;
 }
 
 /* Dark attribution */
 .leaflet-control-attribution {
-  background: rgba(15, 23, 42, 0.7) !important;
-  color: rgba(148, 163, 184, 0.6) !important;
+  background: rgba(7, 9, 12, 0.7) !important;
+  color: #7a8294 !important;
 }
 
 .leaflet-control-attribution a {
-  color: rgba(148, 163, 184, 0.6) !important;
+  color: #7a8294 !important;
 }
 
 /* Prevent white tile placeholders during loading */

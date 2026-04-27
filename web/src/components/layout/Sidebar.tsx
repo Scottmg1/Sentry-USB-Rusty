@@ -88,7 +88,7 @@ export function Sidebar({ collapsed, onToggle }: SidebarProps) {
         </div>
         {!collapsed && (
           <div>
-            <span className="text-lg font-semibold tracking-tight text-slate-100" style={{ fontFamily: '"Sora", "DM Sans", system-ui, sans-serif' }}>
+            <span className="text-lg font-semibold tracking-tight text-slate-100" style={{ fontFamily: '"Inter", -apple-system, system-ui, sans-serif' }}>
               Sentry USB
             </span>
             {version && (
