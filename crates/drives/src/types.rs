@@ -317,6 +317,8 @@ pub struct FsdAnalytics {
 pub struct RouteOverview {
     pub id: i32,
     pub points: Vec<GpsPoint>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
 }
 
 /// Extracted GPS data from a single MP4 file.

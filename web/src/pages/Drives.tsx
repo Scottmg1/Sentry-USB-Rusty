@@ -294,7 +294,7 @@ export default function Drives() {
       const drivesData: DriveSummary[] = await drivesRes.json()
       const statsData: DriveStats = await statsRes.json()
       const tagsData: string[] = await tagsRes.json()
-      const routesData: { id: number; points: [number, number][] }[] = routesRes.ok ? await routesRes.json() : []
+      const routesData: { id: number; points: [number, number][]; source?: string }[] = routesRes.ok ? await routesRes.json() : []
       drivesData.sort((a, b) => new Date(b.startTime).getTime() - new Date(a.startTime).getTime())
       setDrives(drivesData)
       setStats(statsData)
@@ -309,7 +309,7 @@ export default function Drives() {
 
   useEffect(() => { loadDrives() }, [loadDrives])
 
-  function renderOverviewRoutes(routes: { id: number; points: [number, number][] }[]) {
+  function renderOverviewRoutes(routes: { id: number; points: [number, number][]; source?: string }[]) {
     const map = mapInstance.current
     if (!map) return
     overviewLayers.current.forEach((l) => map.removeLayer(l))
@@ -318,8 +318,10 @@ export default function Drives() {
     for (const r of routes) {
       if (!r.points || r.points.length < 2) continue
       const latlngs = r.points.map((p) => [p[0], p[1]] as L.LatLngExpression)
-      const line = L.polyline(latlngs, { color: "#3b82f6", weight: 2.5, opacity: 0.7, smoothFactor: 1.5 })
+      const color = r.source === "tessie" ? "#a855f7" : "#3b82f6"
+      const line = L.polyline(latlngs, { color, weight: 2.5, opacity: 0.7, smoothFactor: 1.5 })
       ;(line as any)._driveId = r.id
+      ;(line as any)._source = r.source
       line.addTo(map)
       overviewLayers.current.push(line)
       for (const p of r.points) bounds.push(L.latLng(p[0], p[1]))
@@ -384,13 +386,9 @@ export default function Drives() {
 
       clearSelection()
 
-      // Dim overview routes: hide the selected drive's overview, fade others
+      // Hide all overview routes while viewing a single drive (Pi RAM)
       for (const layer of overviewLayers.current) {
-        if ((layer as any)._driveId === id) {
-          map.removeLayer(layer)
-        } else {
-          layer.setStyle({ color: "#555566", opacity: 0.4 })
-        }
+        map.removeLayer(layer)
       }
 
       const pts = data.points
@@ -491,11 +489,12 @@ export default function Drives() {
     clearSelection()
     const map = mapInstance.current
     if (!map) return
-    // Restore overview routes
+    // Restore overview routes (each layer keeps its original color via _source)
     const bounds: L.LatLng[] = []
     for (const layer of overviewLayers.current) {
       if (!map.hasLayer(layer)) layer.addTo(map)
-      layer.setStyle({ color: "#3b82f6", opacity: 0.7 })
+      const origColor = (layer as any)._source === "tessie" ? "#a855f7" : "#3b82f6"
+      layer.setStyle({ color: origColor, opacity: 0.7 })
       layer.getLatLngs().flat().forEach((ll) => {
         const pt = ll as L.LatLng
         bounds.push(pt)

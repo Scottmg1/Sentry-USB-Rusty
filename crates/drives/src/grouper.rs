@@ -1352,9 +1352,11 @@ fn group_routes_overview(routes: &[Route], max_points_per_drive: usize) -> Vec<R
             pts.truncate(write);
         }
 
+        let source = clips.first().and_then(|c| c.route.source.clone());
         result.push(RouteOverview {
             id: idx as i32,
             points: downsample(&pts, max_points_per_drive),
+            source,
         });
     }
 
