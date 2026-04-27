@@ -88,6 +88,15 @@ pub async fn setup_data_drive(env: &SetupEnv, emitter: &SetupEmitter) -> Result<
         emitter.progress(&format!("Unmounting partitions on {}...", data_drive));
         cleanup_mounts().await;
 
+        // Comprehensive teardown: covers the auto-mounters and loop
+        // devices that `cleanup_mounts` (well-known paths only) misses.
+        // Without this, parted writes the new GPT but the kernel
+        // refuses to switch to it because something on the system
+        // (commonly udisks2 having auto-mounted the prior install's
+        // partition at /media/pi/<label>) still has a partition open.
+        emitter.progress(&format!("Releasing kernel-side holders on {}...", data_drive));
+        release_data_drive(data_drive, emitter).await;
+
         emitter.progress(&format!("WARNING: This will delete EVERYTHING on {}", data_drive));
         // Bound every block-device operation. A stalled / wedged USB
         // bridge can hang `wipefs` or `parted` indefinitely, leaving
@@ -287,6 +296,115 @@ async fn cleanup_mounts() {
     for mount in &["/mnt/cam", "/mnt/music", "/mnt/lightshow", "/mnt/boombox", "/backingfiles", "/mutable"] {
         let _ = sentryusb_shell::run("umount", &[mount]).await;
     }
+    tokio::time::sleep(Duration::from_secs(2)).await;
+}
+
+/// Aggressively release every kernel-side reference to `drive` and its
+/// partitions before we rewrite the partition table.
+///
+/// Required because `parted ... mktable` writes the new GPT to disk but
+/// then asks the kernel to re-read it — and that ioctl fails with
+/// "Partition(s) N on /dev/X have been written, but we have been unable
+/// to inform the kernel of the change, probably because it/they are in
+/// use" if anything still holds a reference. The user reported this on
+/// a fresh boot where systemd/udisks2 had auto-mounted the previous
+/// install's `mutable` partition at `/media/pi/mutable`, which the
+/// well-known-paths cleanup never touched.
+///
+/// Steps mirror what desktop "Disks" apps do before reformatting:
+///   1. Disable the USB gadget so configfs isn't holding cam_disk.bin
+///      across this teardown.
+///   2. swapoff any swap partitions on the drive.
+///   3. Lazy-force-unmount every mountpoint anywhere on the system that
+///      lives on a partition of this drive (covers /media/pi/<label>,
+///      /run/media/<user>/<label>, custom locations, anything).
+///   4. Detach any loop devices backed by partitions of this drive.
+///   5. wipefs each existing partition (clears the FS signature so
+///      autofs / udisks2 don't immediately re-probe and grab it back).
+///   6. `partx -d` to drop kernel partition table entries.
+///   7. udevadm settle so pending change events finish.
+///   8. blockdev --flushbufs + --rereadpt to make the kernel re-examine
+///      the disk; if this still fails, parted will too, and the error
+///      surfaces with enough context for the user to act.
+async fn release_data_drive(drive: &str, emitter: &SetupEmitter) {
+    let _ = sentryusb_gadget::disable();
+
+    // Snapshot every partition of this drive plus its mountpoint and
+    // fstype. lsblk pairs are stable; -P quotes them so spaces in
+    // mountpoints don't break parsing. Skip the parent device row.
+    let lsblk_out = sentryusb_shell::run(
+        "lsblk", &["-Pno", "NAME,MOUNTPOINT,FSTYPE", "-p", drive],
+    ).await.unwrap_or_default();
+
+    let mut parts: Vec<(String, String, String)> = Vec::new();
+    for line in lsblk_out.lines() {
+        let mut name = String::new();
+        let mut mp = String::new();
+        let mut fst = String::new();
+        for field in line.split_whitespace() {
+            if let Some(v) = field.strip_prefix("NAME=") {
+                name = v.trim_matches('"').to_string();
+            } else if let Some(v) = field.strip_prefix("MOUNTPOINT=") {
+                mp = v.trim_matches('"').to_string();
+            } else if let Some(v) = field.strip_prefix("FSTYPE=") {
+                fst = v.trim_matches('"').to_string();
+            }
+        }
+        if !name.is_empty() && name != drive {
+            parts.push((name, mp, fst));
+        }
+    }
+
+    // Step 2 — swapoff
+    for (name, _mp, fst) in &parts {
+        if fst == "swap" {
+            emitter.progress(&format!("swapoff {}", name));
+            let _ = sentryusb_shell::run("swapoff", &[name]).await;
+        }
+    }
+
+    // Step 3 — lazy-force-unmount every active mountpoint. Lazy + force
+    // covers cases where a process still has the directory open: the
+    // mount is detached from the namespace immediately so parted can
+    // proceed, and the open fd is reaped when the process exits.
+    for (name, mp, _fst) in &parts {
+        if !mp.is_empty() && mp != "[SWAP]" {
+            emitter.progress(&format!("Unmounting {} from {}", name, mp));
+            let _ = sentryusb_shell::run("umount", &["-lf", mp]).await;
+        }
+    }
+
+    // Step 4 — detach loopbacks. Cheap to ignore failures; -j prints the
+    // matching loop device(s) which we then `-d`.
+    for (name, _mp, _fst) in &parts {
+        let loops = sentryusb_shell::run("losetup", &["-j", name]).await.unwrap_or_default();
+        for line in loops.lines() {
+            if let Some(loop_dev) = line.split(':').next() {
+                let _ = sentryusb_shell::run("losetup", &["-d", loop_dev]).await;
+            }
+        }
+    }
+
+    // Step 5 — wipe FS signatures on each partition. Stops auto-probers
+    // (udisks2, blkid, autofs) from re-grabbing the partition between
+    // our umount and parted's BLKRRPART.
+    for (name, _mp, _fst) in &parts {
+        let _ = sentryusb_shell::run_with_timeout(
+            Duration::from_secs(60), "wipefs", &["-afq", name],
+        ).await;
+    }
+
+    // Step 6 — drop kernel partition table mappings.
+    let _ = sentryusb_shell::run("partx", &["-d", drive]).await;
+
+    // Step 7 — let pending udev events finish before we touch the disk.
+    let _ = sentryusb_shell::run("udevadm", &["settle", "--timeout=10"]).await;
+
+    // Step 8 — flush page cache and force a partition-table reread. If
+    // rereadpt still fails here, parted will give a clearer error.
+    let _ = sentryusb_shell::run("blockdev", &["--flushbufs", drive]).await;
+    let _ = sentryusb_shell::run("blockdev", &["--rereadpt", drive]).await;
+
     tokio::time::sleep(Duration::from_secs(2)).await;
 }
 
