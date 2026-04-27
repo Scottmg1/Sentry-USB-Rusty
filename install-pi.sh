@@ -187,7 +187,12 @@ if curl -fsSL "$BLE_REPO_URL/sentryusb-ble.py" -o "$BLE_INSTALL_PATH" 2>/dev/nul
     apt-get install -y python3-dbus python3-gi bluez >/dev/null 2>&1 || warn "BLE daemon apt deps install failed — the daemon may not start"
     systemctl daemon-reload
     systemctl enable sentryusb-ble 2>/dev/null || true
-    systemctl restart dbus 2>/dev/null || true
+    # Reload (SIGHUP) — NOT restart. Restarting dbus on Pi OS kills logind,
+    # which kills any active SSH session and can wedge the box hard enough
+    # to need a power-cycle. Reload picks up the new policy file (which is
+    # all we need — dbus rereads /etc/dbus-1/system.d/ on SIGHUP) without
+    # dropping any clients.
+    systemctl reload dbus 2>/dev/null || true
     ok "BLE daemon installed at $BLE_INSTALL_PATH"
 else
     warn "Could not fetch BLE daemon — iOS app pairing will be unavailable"
