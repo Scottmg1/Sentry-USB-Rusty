@@ -167,7 +167,7 @@ The Go server exposes these REST API routes:
 
 ## Building a Pi Image
 
-The SentryUSB Pi image is built using [pi-gen](https://github.com/RPi-Distro/pi-gen). See [pi-gen-sources/Readme.md](https://github.com/Scottmg1/Sentry-USB/blob/main-dev/pi-gen-sources/Readme.md) for details.
+The SentryUSB Pi image is built using [pi-gen](https://github.com/RPi-Distro/pi-gen). See [pi-gen-sources/Readme.md](https://github.com/Sentry-Six/Sentry-USB-Rusty/blob/main-dev/pi-gen-sources/Readme.md) for details.
 
 Quick method:
 ```bash

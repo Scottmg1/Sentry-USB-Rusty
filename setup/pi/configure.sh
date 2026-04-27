@@ -79,10 +79,10 @@ function install_prebuilt_rsync {
   local arch="$(uname -m)"
   if [ "$arch" = "aarch64" ]
   then
-    curl -L --fail -o /usr/local/bin/rsync https://github.com/Scottmg1/rsync/releases/download/v3.2.3-arm64/rsync
+    curl -L --fail -o /usr/local/bin/rsync https://github.com/marcone/rsync/releases/download/v3.2.3-arm64/rsync
   elif [[ $arch =~ arm* ]]
   then
-    curl -L --fail -o /usr/local/bin/rsync https://github.com/Scottmg1/rsync/releases/download/v3.2.3-rpi/rsync
+    curl -L --fail -o /usr/local/bin/rsync https://github.com/marcone/rsync/releases/download/v3.2.3-rpi/rsync
   else
     log_progress "No prebuilt rsync for '$arch'"
     return 1

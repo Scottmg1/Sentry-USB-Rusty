@@ -469,9 +469,9 @@ export function AdvancedStep({ data, onChange }: StepProps) {
           </h3>
         </div>
         <div className="grid gap-3 sm:grid-cols-2">
-          <Field label="GitHub Repo" field="REPO" placeholder="Scottmg1"
+          <Field label="GitHub Repo" field="REPO" placeholder="Sentry-Six"
             data={data} onChange={onChange} hint="GitHub user/org for update scripts" />
-          <Field label="Branch" field="BRANCH" placeholder="main-dev"
+          <Field label="Branch" field="BRANCH" placeholder="main"
             data={data} onChange={onChange} />
         </div>
       </div>

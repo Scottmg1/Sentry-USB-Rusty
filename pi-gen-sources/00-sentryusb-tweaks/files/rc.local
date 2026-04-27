@@ -229,9 +229,9 @@ then
 
   if [ ! -e "/root/bin/setup-sentryusb" ]
   then
-    REPO=${REPO:-Scottmg1}
-    REPO_NAME=${REPO_NAME:-Sentry-USB}
-    BRANCH=${BRANCH:-main-dev}
+    REPO=${REPO:-Sentry-Six}
+    REPO_NAME=${REPO_NAME:-Sentry-USB-Rusty}
+    BRANCH=${BRANCH:-main}
     # Script doesn't exist, grab it.
     setup_progress "Grabbing main setup file."
     if ! get_script /root/bin setup-sentryusb setup/pi

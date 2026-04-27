@@ -183,5 +183,5 @@ Not currently. Sentry Connect is iOS-only. For Android, you can use any of the [
 ### Where can I get help?
 
 - [Troubleshooting guide](Troubleshooting) — common issues and fixes
-- [GitHub Issues](https://github.com/Scottmg1/Sentry-USB/issues) — bug reports
+- [GitHub Issues](https://github.com/Sentry-Six/Sentry-USB-Rusty/issues) — bug reports
 - [Discord](https://discord.gg/9QZEzVwdnt) — community chat

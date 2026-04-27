@@ -8,12 +8,12 @@
 #
 # Usage:
 #   sudo -i
-#   curl -fsSL https://raw.githubusercontent.com/Scottmg1/Sentry-USB-Rusty/main/install-pi.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/Sentry-Six/Sentry-USB-Rusty/main/install-pi.sh | bash
 #
 # Or with a local binary:
 #   bash install-pi.sh /path/to/sentryusb-binary
 
-REPO="Scottmg1/Sentry-USB-Rusty"
+REPO="Sentry-Six/Sentry-USB-Rusty"
 INSTALL_DIR="/opt/sentryusb"
 BINARY_NAME="sentryusb"
 

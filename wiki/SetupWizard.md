@@ -167,7 +167,7 @@ Fine-tune system behavior.
 
 **Drive Map**: Automatically extract GPS data from dashcam clips after archiving to build a map of all your drives. Choose distance unit (miles or kilometers).
 
-**Update Source**: Configure which GitHub repo and branch SentryUSB pulls updates from (default: `Scottmg1` / `main-dev`).
+**Update Source**: Configure which GitHub repo and branch SentryUSB pulls updates from (default: `Sentry-Six` / `main`).
 
 ---
 

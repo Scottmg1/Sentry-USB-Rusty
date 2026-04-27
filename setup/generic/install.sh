@@ -131,7 +131,7 @@ then
     cat <<- EOF > /etc/rc.local
 		#!/bin/bash
 		{
-		  while ! curl -s https://raw.githubusercontent.com/Scottmg1/Sentry-USB/main-dev/setup/generic/install.sh
+		  while ! curl -s https://raw.githubusercontent.com/Sentry-Six/Sentry-USB-Rusty/main/setup/generic/install.sh
 		  do
 		    sleep 1
 		  done
@@ -165,7 +165,7 @@ then
     fi
 
     {
-      while ! curl -s https://raw.githubusercontent.com/Scottmg1/Sentry-USB/main-dev/tools/debian-resizefs.sh
+      while ! curl -s https://raw.githubusercontent.com/Sentry-Six/Sentry-USB-Rusty/main/tools/debian-resizefs.sh
       do
         sleep 1
       done
@@ -198,7 +198,7 @@ fi
 # Copy the sample config file from github
 if [ ! -e /sentryusb/sentryusb.conf ] && [ ! -e /root/sentryusb.conf ]
 then
-  while ! curl -o /sentryusb/sentryusb.conf https://raw.githubusercontent.com/Scottmg1/Sentry-USB/main-dev/pi-gen-sources/00-sentryusb-tweaks/files/sentryusb.conf.sample
+  while ! curl -o /sentryusb/sentryusb.conf https://raw.githubusercontent.com/Sentry-Six/Sentry-USB-Rusty/main/pi-gen-sources/00-sentryusb-tweaks/files/sentryusb.conf.sample
   do
     sleep 1
   done
@@ -209,7 +209,7 @@ if ! systemctl -q is-enabled NetworkManager.service 2>/dev/null
 then
   if [ ! -e /sentryusb/wpa_supplicant.conf.sample ]
   then
-    while ! curl -o /sentryusb/wpa_supplicant.conf.sample https://raw.githubusercontent.com/Scottmg1/Sentry-USB/main-dev/pi-gen-sources/00-sentryusb-tweaks/files/wpa_supplicant.conf.sample
+    while ! curl -o /sentryusb/wpa_supplicant.conf.sample https://raw.githubusercontent.com/Sentry-Six/Sentry-USB-Rusty/main/pi-gen-sources/00-sentryusb-tweaks/files/wpa_supplicant.conf.sample
     do
       sleep 1
     done
@@ -223,7 +223,7 @@ touch /sentryusb/WIFI_ENABLED
 # continue using the regular "one step setup" process used
 # for setting up a Raspberry Pi with the prebuilt image
 rm -f /etc/rc.local
-while ! curl -o /etc/rc.local https://raw.githubusercontent.com/Scottmg1/Sentry-USB/main-dev/pi-gen-sources/00-sentryusb-tweaks/files/rc.local
+while ! curl -o /etc/rc.local https://raw.githubusercontent.com/Sentry-Six/Sentry-USB-Rusty/main/pi-gen-sources/00-sentryusb-tweaks/files/rc.local
 do
   sleep 1
 done
@@ -287,7 +287,7 @@ then
 	  echo "| /root/sentryusb.conf with your favorite editor, e.g.                  |"
 	  echo "| 'nano /root/sentryusb.conf' and fill in the required variables.        |"
 	  echo "| in the required variables. Instructions are in the file, and at        |"
-	  echo "| https://github.com/Scottmg1/Sentry-USB/blob/main-dev/doc/OneStepSetup.md  |"
+	  echo "| https://github.com/Sentry-Six/Sentry-USB-Rusty/blob/main-dev/doc/OneStepSetup.md  |"
 	  echo "| (though ignore the Raspberry Pi specific bits about flashing and       |"
 	  echo "| mounting the sd card on a PC)                                          |"
 	  echo "|                                                                        |"

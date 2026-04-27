@@ -8,7 +8,7 @@ Go version, feature-parity and drop-in compatible with existing SD-card layouts.
 
 ```
 sudo -i
-curl -fsSL https://raw.githubusercontent.com/Scottmg1/Sentry-USB-Rusty/main/install-pi.sh | bash
+curl -fsSL https://raw.githubusercontent.com/Sentry-Six/Sentry-USB-Rusty/main/install-pi.sh | bash
 ```
 
 Then open `http://sentryusb.local` in a browser and follow the setup wizard.

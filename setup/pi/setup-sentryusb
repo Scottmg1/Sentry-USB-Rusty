@@ -109,9 +109,9 @@ then
   # source the conf file directly to get REPO, BRANCH or download_sources
   # in case they're set
   safesource /root/sentryusb.conf
-  REPO=${REPO:-Scottmg1}
-  REPO_NAME=${REPO_NAME:-Sentry-USB}
-  BRANCH=${BRANCH:-main-dev}
+  REPO=${REPO:-Sentry-Six}
+  REPO_NAME=${REPO_NAME:-Sentry-USB-Rusty}
+  BRANCH=${BRANCH:-main}
   copy_script setup/pi/envsetup.sh "$THISDIR"
 fi
 # SC can't follow non-constant source
@@ -1199,7 +1199,7 @@ function diagnose {
       echo "WARNING: /mutable is low on inodes: ${inodes}% used"
     fi
 
-    if [[ "$BRANCH" != "main-dev" || "$REPO" != "Scottmg1" ]]
+    if [[ "$BRANCH" != "main" || "$REPO" != "Sentry-Six" ]]
     then
       echo "WARNING: using $REPO/$BRANCH"
     fi

@@ -178,4 +178,4 @@ export PUSHOVER_APP_KEY=your_app_key
 
 Then run `/root/bin/setup-sentryusb` to apply.
 
-See the [sample config file](https://github.com/Scottmg1/Sentry-USB/blob/main-dev/pi-gen-sources/00-sentryusb-tweaks/files/sentryusb.conf.sample) for all available config variables.
+See the [sample config file](https://github.com/Sentry-Six/Sentry-USB-Rusty/blob/main-dev/pi-gen-sources/00-sentryusb-tweaks/files/sentryusb.conf.sample) for all available config variables.

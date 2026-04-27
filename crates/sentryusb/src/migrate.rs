@@ -16,7 +16,7 @@ use tracing::{info, warn};
 
 const VERSION_FILE: &str = "/opt/sentryusb/version";
 const MIGRATE_DIR: &str = "/opt/sentryusb";
-const MIGRATE_REPO: &str = "Scottmg1/Sentry-USB-Rusty";
+const MIGRATE_REPO: &str = "Sentry-Six/Sentry-USB-Rusty";
 const MIGRATE_BRANCH: &str = "main";
 
 pub async fn run_startup_migration() {

@@ -45,7 +45,7 @@ Sentry USB turns a Raspberry Pi into a smart USB drive for your Tesla's dashcam 
 
 ## Links
 
-- **GitHub**: [Scottmg1/Sentry-USB](https://github.com/Scottmg1/Sentry-USB)
-- **Releases**: [Latest release](https://github.com/Scottmg1/Sentry-USB/releases/latest)
+- **GitHub**: [Sentry-Six/Sentry-USB-Rusty](https://github.com/Sentry-Six/Sentry-USB-Rusty)
+- **Releases**: [Latest release](https://github.com/Sentry-Six/Sentry-USB-Rusty/releases/latest)
 - **Discord**: [Community chat](https://discord.gg/9QZEzVwdnt)
 - **License**: MIT

@@ -40,7 +40,7 @@ echo "dtoverlay=dwc2" >> "${ROOTFS_DIR}/boot/firmware/config.txt"
 
 # ── Pre-install SentryUSB binary ──
 # Detect target architecture from the pi-gen build context
-REPO="Scottmg1/Sentry-USB"
+REPO="Sentry-Six/Sentry-USB-Rusty"
 case "$(dpkg --print-architecture 2>/dev/null || echo arm64)" in
     arm64|aarch64) BINARY_SUFFIX="linux-arm64" ;;
     armhf)         BINARY_SUFFIX="linux-armv6" ;;

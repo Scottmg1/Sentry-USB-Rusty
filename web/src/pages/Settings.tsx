@@ -2086,7 +2086,7 @@ export default function Settings() {
             </div>
             {/* Links footer */}
             <div className="border-t border-white/5 px-3 py-2 flex items-center gap-3">
-              <a href="https://github.com/Scottmg1/Sentry-USB" target="_blank" rel="noopener noreferrer"
+              <a href="https://github.com/Sentry-Six/Sentry-USB-Rusty" target="_blank" rel="noopener noreferrer"
                 className="text-xs text-blue-400 hover:text-blue-300">GitHub</a>
               <a
                 href="https://discord.gg/9QZEzVwdnt"

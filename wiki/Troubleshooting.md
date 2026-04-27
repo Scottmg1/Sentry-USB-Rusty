@@ -126,6 +126,6 @@ This collects system info, logs, and configuration (with sensitive values masked
 ## Still Stuck?
 
 - Check the [FAQ](FAQ) for common questions
-- Search [existing issues](https://github.com/Scottmg1/Sentry-USB/issues) on GitHub
+- Search [existing issues](https://github.com/Sentry-Six/Sentry-USB-Rusty/issues) on GitHub
 - Ask on [Discord](https://discord.gg/9QZEzVwdnt)
-- File a [bug report](https://github.com/Scottmg1/Sentry-USB/issues/new?template=bug_report.yml) if you've found a bug
+- File a [bug report](https://github.com/Sentry-Six/Sentry-USB-Rusty/issues/new?template=bug_report.yml) if you've found a bug

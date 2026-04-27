@@ -105,8 +105,8 @@ function read_setup_variables {
   done
 
   # set defaults for things not set in the config
-  REPO=${REPO:-Scottmg1}
-  REPO_NAME=${REPO_NAME:-Sentry-USB}
+  REPO=${REPO:-Sentry-Six}
+  REPO_NAME=${REPO_NAME:-Sentry-USB-Rusty}
   SNAPSHOTS_ENABLED=${SNAPSHOTS_ENABLED:-true}
   if [ "$SNAPSHOTS_ENABLED" != "true" ]
   then
@@ -118,7 +118,7 @@ function read_setup_variables {
       echo "WARNING: using '$BRANCH' branch because SNAPSHOTS_ENABLED is not true"
     fi
   else
-    BRANCH=${BRANCH:-main-dev}
+    BRANCH=${BRANCH:-main}
   fi
   CONFIGURE_ARCHIVING=${CONFIGURE_ARCHIVING:-true}
   UPGRADE_PACKAGES=${UPGRADE_PACKAGES:-false}

@@ -4,7 +4,7 @@
 # Example config file for SentryUSB setup. Lines with "#" are comments/ignored.
 # Remove the "#" before "export" to activate a line. Be sure to rename this file
 # to "sentryusb.conf" and place it in the "boot" folder of your SD card.
-# More info: https://github.com/Scottmg1/Sentry-USB
+# More info: https://github.com/Sentry-Six/Sentry-USB-Rusty
 #
 ######################################################################
 
@@ -30,7 +30,7 @@ export SHARE_PASSWORD='password'
 
 # Variables for rsync archiving
 # For instructions setting up SSH Public Key authentication, view:
-# https://github.com/Scottmg1/Sentry-USB/blob/main-dev/doc/SetupRSync.md#step-1-authentication
+# https://github.com/Sentry-Six/Sentry-USB-Rusty/blob/main-dev/doc/SetupRSync.md#step-1-authentication
 #export ARCHIVE_SYSTEM=rsync
 #export RSYNC_USER=username
 #export RSYNC_SERVER=hostname_or_ip
@@ -292,7 +292,7 @@ export CAM_SIZE=40G
 #   - Added complexity to configure initially
 #   - Some security vulnerability
 #   * See Hardware wiki for more BLE hardware & software support notes:
-#     https://github.com/Scottmg1/Sentry-USB/wiki/Hardware
+#     https://github.com/Sentry-Six/Sentry-USB-Rusty/wiki/Hardware
 #
 # TeslaFi/Tessie Pros/Cons:
 #   + Straightforward to configure initially
@@ -501,8 +501,8 @@ export TEMPERATURE_POSTARCHIVE=true
 #export CPU_GOVERNOR=conservative
 
 # Uncomment and change if you want setup scripts to be pulled
-# from a different repo than github.com/Scottmg1/Sentry-USB
-# export REPO=Scottmg1
+# from a different repo than github.com/Sentry-Six/Sentry-USB-Rusty
+# export REPO=Sentry-Six
 
 # Uncomment and change if you want a different branch than main-dev
 # export BRANCH=main-dev

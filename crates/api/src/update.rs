@@ -111,7 +111,7 @@ pub async fn run_update(
     (StatusCode::OK, Json(serde_json::json!({"status": "started"})))
 }
 
-const UPDATE_REPO: &str = "Scottmg1/Sentry-USB-Rusty";
+const UPDATE_REPO: &str = "Sentry-Six/Sentry-USB-Rusty";
 
 /// Detect the *userspace* architecture (not kernel arch).
 ///

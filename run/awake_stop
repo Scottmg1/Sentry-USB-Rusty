@@ -121,7 +121,7 @@ case "${SENTRY_CASE}" in
       http_response=$(curl -s --connect-timeout 10 --max-time 30 -w "%{http_code}" \
           -H "Authorization: Bearer $TESLAFI_API_TOKEN" \
           -H "Accept: application/json" \
-          -H "User-Agent: github.com/Scottmg1/Sentry-USB" \
+          -H "User-Agent: github.com/Sentry-Six/Sentry-USB-Rusty" \
           "https://www.teslafi.com/feed.php?command=set_sentry_mode&sentryMode=false&noWake=true")
 
       log "TeslaFi: Command sent to disable Sentry Mode."
@@ -168,7 +168,7 @@ case "${SENTRY_CASE}" in
         http_response=$(curl -s --connect-timeout 10 --max-time 30 -w "%{http_code}" \
           -H "Authorization: Bearer $TESSIE_API_TOKEN" \
           -H "Accept: application/json" \
-          -H "User-Agent: github.com/Scottmg1/Sentry-USB" \
+          -H "User-Agent: github.com/Sentry-Six/Sentry-USB-Rusty" \
           "https://api.tessie.com/$TESSIE_VIN/command/disable_sentry")
 
         log "Tessie: Command sent to disable Sentry Mode (attempt $tessie_attempt/3)."
