@@ -1575,6 +1575,7 @@ export default function Settings() {
   const [revertStable, setRevertStable] = useState<{ version: string; release_url: string; release_notes: string } | null>(null)
   const [autoUpdateEnabled, setAutoUpdateEnabled] = useState(true)
   const [includePrerelease, setIncludePrerelease] = useState(false)
+  const [showRestartModal, setShowRestartModal] = useState(false)
 
   useEffect(() => {
     fetch("/api/system/version")
@@ -1582,6 +1583,23 @@ export default function Settings() {
       .then(data => setVersion(data.version || "unknown"))
       .catch(() => setVersion("unknown"))
   }, [updateStatus])
+
+  useEffect(() => {
+    if (updateStatus === "restarting" || updateStatus === "reconnecting") {
+      setShowRestartModal(true)
+    }
+  }, [updateStatus])
+
+  useEffect(() => {
+    if (!showRestartModal) return
+    if (updateStatus === "done") {
+      const t = setTimeout(() => setShowRestartModal(false), 3000)
+      return () => clearTimeout(t)
+    }
+    if (updateStatus === "idle" || updateStatus === "error") {
+      setShowRestartModal(false)
+    }
+  }, [showRestartModal, updateStatus])
 
   useEffect(() => {
     fetch("/api/config")
@@ -2067,6 +2085,33 @@ export default function Settings() {
       {/* Raw Config Editor Modal */}
       {rawConfigOpen && rawConfig && (
         <RawConfigEditor config={rawConfig} onClose={() => { setRawConfigOpen(false); setRawConfig(null) }} />
+      )}
+
+      {/* Restart Modal — shown while the Pi reboots to apply an update */}
+      {showRestartModal && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm">
+          <div className="glass-card w-full max-w-md p-6 text-center">
+            <div className="mb-4 flex justify-center">
+              {updateStatus === "done" ? (
+                <CheckCircle className="h-12 w-12 text-emerald-400" />
+              ) : (
+                <Loader2 className="h-12 w-12 animate-spin text-blue-400" />
+              )}
+            </div>
+            <h2 className="text-lg font-semibold text-slate-100">
+              {updateStatus === "restarting" && "Restarting Pi"}
+              {updateStatus === "reconnecting" && "Waiting for Pi to come back online"}
+              {updateStatus === "done" && "Update complete"}
+            </h2>
+            <p className="mt-2 text-sm text-slate-400">
+              {updateStatus === "restarting" && "Applying update — this takes about 30 seconds."}
+              {updateStatus === "reconnecting" && "Don't close this tab."}
+              {updateStatus === "done" && (
+                <>Now running <span className="font-mono text-slate-200">{version}</span>.</>
+              )}
+            </p>
+          </div>
+        </div>
       )}
     </div>
   )

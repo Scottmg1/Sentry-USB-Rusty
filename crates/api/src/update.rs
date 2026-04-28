@@ -93,7 +93,10 @@ pub async fn check_internet(State(_s): State<AppState>) -> (StatusCode, Json<ser
 /// Empty body / missing version → install whatever `/releases/latest`
 /// currently points to (backward-compatible "install latest" path).
 ///
-/// A service restart is needed to apply.
+/// On success the daemon broadcasts `complete` → `restarting` and then
+/// shells out to `reboot` ~3 s later, so the new binary is running by the
+/// time the user's tab reconnects. The 3 s gap is what lets the client
+/// mount the restart modal before the WebSocket goes away.
 pub async fn run_update(
     State(s): State<AppState>,
     body: String,
@@ -122,8 +125,28 @@ pub async fn run_update(
         UPDATE_RUNNING.store(false, Ordering::SeqCst);
 
         match result {
-            Ok(msg) => hub.broadcast("update_status", &serde_json::json!({"status": "complete", "output": msg})),
-            Err(e) => hub.broadcast("update_status", &serde_json::json!({"status": "error", "error": e.to_string()})),
+            Ok(msg) => {
+                hub.broadcast("update_status", &serde_json::json!({
+                    "status": "complete",
+                    "output": msg
+                }));
+
+                // Give the WS message a moment to land, then announce the restart and reboot.
+                // The 3 s wait between `restarting` and `reboot` lets the modal mount on the
+                // client before the WebSocket dies.
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                hub.broadcast("update_status", &serde_json::json!({
+                    "status": "restarting",
+                    "message": "Restarting Pi to apply update…"
+                }));
+                tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+
+                let _ = sentryusb_shell::run("reboot", &[]).await;
+            }
+            Err(e) => hub.broadcast("update_status", &serde_json::json!({
+                "status": "error",
+                "error": e.to_string()
+            })),
         }
     });
 
@@ -247,7 +270,7 @@ async fn self_update(target_version: Option<String>) -> anyhow::Result<String> {
     }
 
     Ok(format!(
-        "Updated to {}.  Restart the service to apply.",
+        "Updated to {}.",
         if tag.is_empty() { "latest".to_string() } else { tag }
     ))
 }
