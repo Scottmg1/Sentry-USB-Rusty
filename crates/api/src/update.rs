@@ -64,7 +64,26 @@ pub(crate) fn get_fingerprint() -> &'static str {
 
 /// GET /api/system/check-internet
 pub async fn check_internet(State(_s): State<AppState>) -> (StatusCode, Json<serde_json::Value>) {
-    let connected = sentryusb_shell::run("ping", &["-c", "1", "-W", "3", "8.8.8.8"]).await.is_ok();
+    use futures_util::future::select_ok;
+    use std::time::Duration;
+    use tokio::net::TcpStream;
+
+    // Port 443 works on Pi-hole networks (Pi-hole blocks port 53 for non-Pi-hole DNS).
+    // Race two probes so we succeed as soon as either connects.
+    let t = Duration::from_secs(2);
+    let probes: Vec<std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>> + Send>>> = vec![
+        Box::pin(async move {
+            tokio::time::timeout(t, TcpStream::connect("8.8.8.8:443")).await
+                .map_err(|_| anyhow::anyhow!("timeout"))?.map_err(anyhow::Error::from)?;
+            Ok(())
+        }),
+        Box::pin(async move {
+            tokio::time::timeout(t, TcpStream::connect("1.1.1.1:443")).await
+                .map_err(|_| anyhow::anyhow!("timeout"))?.map_err(anyhow::Error::from)?;
+            Ok(())
+        }),
+    ];
+    let connected = select_ok(probes).await.is_ok();
     (StatusCode::OK, Json(serde_json::json!({"connected": connected})))
 }
 
