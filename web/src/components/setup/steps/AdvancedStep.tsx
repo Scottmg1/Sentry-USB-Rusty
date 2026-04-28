@@ -1,6 +1,7 @@
 import { useState, useEffect } from "react"
 import { Cog, Thermometer, MapPin, Search, Battery, AlertTriangle } from "lucide-react"
 import type { StepProps } from "../SetupWizard"
+import { SizeInput } from "../SizeInput"
 
 function Field({ label, field, type = "text", placeholder, data, onChange, hint }: {
   label: string; field: string; type?: string; placeholder?: string
@@ -199,7 +200,7 @@ function TempInput({
   )
 }
 
-export function AdvancedStep({ data, onChange }: StepProps) {
+export function AdvancedStep({ data, onChange, setupAlreadyFinished }: StepProps) {
   const [tzSearch, setTzSearch] = useState("")
   const [isPi5, setIsPi5] = useState(false)
   const useFahrenheit = data.TEMPERATURE_UNIT === "F"
@@ -237,6 +238,18 @@ export function AdvancedStep({ data, onChange }: StepProps) {
         <select
           value={data.TIME_ZONE ?? "auto"}
           onChange={(e) => onChange("TIME_ZONE", e.target.value)}
+          // Native <select> swallows the change event when the user clicks
+          // an option whose value already matches `value` — so after the
+          // search filter narrows the list, clicking the first result was
+          // a no-op when it happened to match the current selection.
+          // Re-fire on every option click so the selection commits even
+          // if the value didn't change.
+          onClick={(e) => {
+            const target = e.target as HTMLOptionElement
+            if (target.tagName === "OPTION" && target.value) {
+              onChange("TIME_ZONE", target.value)
+            }
+          }}
           size={6}
           className="w-full rounded-lg border border-white/10 bg-slate-900 px-3 py-2 text-sm text-slate-100 outline-none transition focus:border-blue-500/50 focus:ring-1 focus:ring-blue-500/25 [&>option]:bg-slate-900 [&>option]:text-slate-100 [&>option:checked]:bg-blue-600"
         >
@@ -402,9 +415,19 @@ export function AdvancedStep({ data, onChange }: StepProps) {
             System Tuning
           </h3>
         </div>
+        <div className="mb-3">
+          <SizeInput
+            label="Increase Root Size"
+            field="INCREASE_ROOT_SIZE"
+            data={data} onChange={onChange}
+            defaultVal=""
+            hint={setupAlreadyFinished
+              ? "Locked. Applied during the root-shrink phase only; once shrink completes, changing this requires a reflash."
+              : "Extra space for packages. Applied during the root-shrink phase only; once shrink completes, changing this requires a reflash."}
+            disabled={setupAlreadyFinished}
+          />
+        </div>
         <div className="grid gap-3 sm:grid-cols-2">
-          <Field label="Increase Root Size" field="INCREASE_ROOT_SIZE" placeholder="e.g. 500M or 2G"
-            data={data} onChange={onChange} hint="Extra space for packages — must include suffix M or G. Applied during the root-shrink phase only; once shrink completes, changing this requires a reflash." />
           <Field label="Additional Packages" field="INSTALL_USER_REQUESTED_PACKAGES" placeholder="iftop mosh sysstat"
             data={data} onChange={onChange} hint="Space-separated list of apt packages" />
           <Field label="CPU Governor" field="CPU_GOVERNOR" placeholder="conservative"
@@ -468,11 +491,16 @@ export function AdvancedStep({ data, onChange }: StepProps) {
             Update Source
           </h3>
         </div>
+        <p className="mb-2 text-xs text-slate-500">
+          GitHub source used for both initial setup tarball downloads and OTA
+          updates. Forks must keep the original repo name (Sentry-USB-Rusty)
+          and use semver-compatible release tags (e.g. v1.2.3).
+        </p>
         <div className="grid gap-3 sm:grid-cols-2">
           <Field label="GitHub Repo" field="REPO" placeholder="Sentry-Six"
-            data={data} onChange={onChange} hint="GitHub user/org for update scripts" />
+            data={data} onChange={onChange} hint="GitHub user/org. Used for both setup downloads and OTA updates." />
           <Field label="Branch" field="BRANCH" placeholder="main"
-            data={data} onChange={onChange} />
+            data={data} onChange={onChange} hint="Setup-time tarball downloads only. OTA updates always use GitHub Releases." />
         </div>
       </div>
     </div>

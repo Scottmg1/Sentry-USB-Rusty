@@ -73,8 +73,13 @@ function formatReviewValue(key: string, value: string, data: StepProps["data"]):
   return value
 }
 
-export function ReviewStep({ data }: StepProps) {
+export function ReviewStep({ data, setupAlreadyFinished }: StepProps) {
   const configuredCount = Object.entries(data).filter(([k, v]) => !k.startsWith("_") && v && v.trim() !== "").length
+
+  // Fields that are locked once initial setup has completed — surfaced
+  // greyed-out with a "(locked)" suffix so the user understands why the
+  // value isn't editable in the wizard.
+  const lockedKeys = new Set(setupAlreadyFinished ? ["INCREASE_ROOT_SIZE"] : [])
 
   return (
     <div className="space-y-5">
@@ -101,14 +106,18 @@ export function ReviewStep({ data }: StepProps) {
               </h4>
             </div>
             <div className="divide-y divide-white/5">
-              {activeFields.map((field) => (
-                <div key={field} className="flex items-center justify-between px-4 py-2">
-                  <span className="font-mono text-xs text-slate-500">{field}</span>
-                  <span className="max-w-[200px] truncate text-right text-sm text-slate-300">
-                    {formatReviewValue(field, data[field], data)}
-                  </span>
-                </div>
-              ))}
+              {activeFields.map((field) => {
+                const locked = lockedKeys.has(field)
+                return (
+                  <div key={field} className="flex items-center justify-between px-4 py-2">
+                    <span className={`font-mono text-xs ${locked ? "text-slate-600" : "text-slate-500"}`}>{field}</span>
+                    <span className={`max-w-[200px] truncate text-right text-sm ${locked ? "text-slate-600" : "text-slate-300"}`}>
+                      {formatReviewValue(field, data[field], data)}
+                      {locked && <span className="ml-1 text-xs text-slate-700">(locked)</span>}
+                    </span>
+                  </div>
+                )
+              })}
             </div>
           </div>
         )

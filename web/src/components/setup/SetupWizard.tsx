@@ -27,6 +27,7 @@ export interface StepProps {
   data: SetupFormData
   onChange: (key: string, value: string) => void
   onBatchChange: (updates: Record<string, string>) => void
+  setupAlreadyFinished: boolean
 }
 
 function networkError(data: SetupFormData): string | null {
@@ -101,21 +102,26 @@ function keepAwakeError(data: SetupFormData): string | null {
 }
 
 function notificationsError(data: SetupFormData): string | null {
-  const requiredPerProvider: [string, string, string[]][] = [
-    ["Pushover", "PUSHOVER_ENABLED", ["PUSHOVER_USER_KEY", "PUSHOVER_APP_KEY"]],
-    ["Gotify", "GOTIFY_ENABLED", ["GOTIFY_DOMAIN", "GOTIFY_APP_TOKEN"]],
-    ["Discord", "DISCORD_ENABLED", ["DISCORD_WEBHOOK_URL"]],
-    ["Telegram", "TELEGRAM_ENABLED", ["TELEGRAM_CHAT_ID", "TELEGRAM_BOT_TOKEN"]],
-    ["IFTTT", "IFTTT_ENABLED", ["IFTTT_EVENT_NAME", "IFTTT_KEY"]],
-    ["Slack", "SLACK_ENABLED", ["SLACK_WEBHOOK_URL"]],
-    ["Signal", "SIGNAL_ENABLED", ["SIGNAL_URL", "SIGNAL_FROM_NUM", "SIGNAL_TO_NUM"]],
-    ["Matrix", "MATRIX_ENABLED", ["MATRIX_SERVER_URL", "MATRIX_USERNAME", "MATRIX_PASSWORD", "MATRIX_ROOM"]],
-    ["AWS SNS", "SNS_ENABLED", ["AWS_REGION", "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SNS_TOPIC_ARN"]],
-    ["Webhook", "WEBHOOK_ENABLED", ["WEBHOOK_URL"]],
+  // Notifications no longer use a per-provider checkbox — a provider is
+  // considered "enabled" when any of its required fields has content.
+  // Flag partial fills so a Telegram chat ID without a bot token still
+  // surfaces as an error.
+  const requiredPerProvider: [string, string[]][] = [
+    ["Pushover", ["PUSHOVER_USER_KEY", "PUSHOVER_APP_KEY"]],
+    ["Gotify", ["GOTIFY_DOMAIN", "GOTIFY_APP_TOKEN"]],
+    ["Discord", ["DISCORD_WEBHOOK_URL"]],
+    ["Telegram", ["TELEGRAM_CHAT_ID", "TELEGRAM_BOT_TOKEN"]],
+    ["IFTTT", ["IFTTT_EVENT_NAME", "IFTTT_KEY"]],
+    ["Slack", ["SLACK_WEBHOOK_URL"]],
+    ["Signal", ["SIGNAL_URL", "SIGNAL_FROM_NUM", "SIGNAL_TO_NUM"]],
+    ["Matrix", ["MATRIX_SERVER_URL", "MATRIX_USERNAME", "MATRIX_PASSWORD", "MATRIX_ROOM"]],
+    ["AWS SNS", ["AWS_REGION", "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SNS_TOPIC_ARN"]],
+    ["Webhook", ["WEBHOOK_URL"]],
   ]
-  for (const [label, enableField, fields] of requiredPerProvider) {
-    if (data[enableField] === "true" && fields.some(f => !data[f]?.trim()))
-      return `Complete all required fields for ${label}.`
+  for (const [label, fields] of requiredPerProvider) {
+    const hasAny = fields.some((f) => (data[f] ?? "").trim() !== "")
+    const hasAll = fields.every((f) => (data[f] ?? "").trim() !== "")
+    if (hasAny && !hasAll) return `Complete all required fields for ${label}.`
   }
   return null
 }
@@ -278,6 +284,11 @@ export function SetupWizard({ initialData, onClose }: SetupWizardProps) {
     RTC_TRICKLE_CHARGE: "false",
   }
   const [formData, setFormData] = useState<SetupFormData>({ ...defaults, ...(initialData ?? {}) })
+  // Mirror formData into a ref so handleApply can read the latest value
+  // after forcing a blur on the active input — the blur-triggered
+  // onChange schedules a setState, and the ref is updated post-render
+  // so we can read the committed value before kicking off doApply.
+  const formDataRef = useRef<SetupFormData>(formData)
   const [saving, setSaving] = useState(false)
   const [saveError, setSaveError] = useState<string | null>(null)
   const [phase, setPhase] = useState<SetupPhase>("wizard")
@@ -300,6 +311,9 @@ export function SetupWizard({ initialData, onClose }: SetupWizardProps) {
   // instead of letting the apply call wedge mid-setup with the same
   // bail!. Null means "no current rejection".
   const [spaceRejection, setSpaceRejection] = useState<string | null>(null)
+
+  // Keep formDataRef in sync with formData on every render.
+  formDataRef.current = formData
 
   const handleChange = useCallback((key: string, value: string) => {
     setFormData((prev) => ({ ...prev, [key]: value }))
@@ -491,12 +505,16 @@ export function SetupWizard({ initialData, onClose }: SetupWizardProps) {
     setSaveError(null)
     setSpaceRejection(null)
     try {
-      const sizeFields = new Set(["CAM_SIZE", "MUSIC_SIZE", "LIGHTSHOW_SIZE", "BOOMBOX_SIZE", "WRAPS_SIZE"])
-      const configData = Object.fromEntries(
+      const sizeFields = new Set(["CAM_SIZE", "MUSIC_SIZE", "LIGHTSHOW_SIZE", "BOOMBOX_SIZE", "WRAPS_SIZE", "INCREASE_ROOT_SIZE"])
+      const configData: Record<string, string> = Object.fromEntries(
         Object.entries(dataToSave)
           .filter(([k, v]) => !k.startsWith("_") && v !== "")
           .map(([k, v]) => {
             if (sizeFields.has(k) && /^\d+$/.test(v)) {
+              // Safety net: if the user clicks Apply before SizeInput's
+              // onBlur committed a unit suffix, fall back to G — matches
+              // the dehumanize() behavior in disk_images.rs and the
+              // sentryusb.conf.sample default neighborhood.
               return [k, v + "G"]
             }
             if ((k === "TEMPERATURE_WARNING" || k === "TEMPERATURE_CAUTION") && v && !v.includes("000")) {
@@ -506,6 +524,26 @@ export function SetupWizard({ initialData, onClose }: SetupWizardProps) {
             return [k, v]
           })
       )
+
+      // Project notification field content → *_ENABLED at apply time so
+      // checkboxes don't drift from the actual filled-in fields. Dropping
+      // this in *_ENABLED form keeps the backend contract unchanged.
+      const notificationEnableMap: Record<string, string[]> = {
+        PUSHOVER_ENABLED: ["PUSHOVER_USER_KEY", "PUSHOVER_APP_KEY"],
+        GOTIFY_ENABLED: ["GOTIFY_DOMAIN", "GOTIFY_APP_TOKEN"],
+        DISCORD_ENABLED: ["DISCORD_WEBHOOK_URL"],
+        TELEGRAM_ENABLED: ["TELEGRAM_CHAT_ID", "TELEGRAM_BOT_TOKEN"],
+        IFTTT_ENABLED: ["IFTTT_EVENT_NAME", "IFTTT_KEY"],
+        SLACK_ENABLED: ["SLACK_WEBHOOK_URL"],
+        SIGNAL_ENABLED: ["SIGNAL_URL", "SIGNAL_FROM_NUM", "SIGNAL_TO_NUM"],
+        MATRIX_ENABLED: ["MATRIX_SERVER_URL", "MATRIX_USERNAME", "MATRIX_PASSWORD", "MATRIX_ROOM"],
+        SNS_ENABLED: ["AWS_REGION", "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SNS_TOPIC_ARN"],
+        WEBHOOK_ENABLED: ["WEBHOOK_URL"],
+        NTFY_ENABLED: ["NTFY_URL"],
+      }
+      for (const [enableField, fields] of Object.entries(notificationEnableMap)) {
+        configData[enableField] = fields.some((k) => (dataToSave[k] ?? "").trim() !== "") ? "true" : "false"
+      }
 
       // Pre-flight: ask the backend whether the proposed drive sizes
       // fit on the backingfiles partition (after a 10% safety reserve
@@ -595,20 +633,30 @@ export function SetupWizard({ initialData, onClose }: SetupWizardProps) {
 
   // Called when user clicks "Apply & Run Setup" — checks for destructive changes first.
   async function handleApply() {
-    const firstInvalidIdx = steps.findIndex((_, i) => getStepError(i, formData) !== null)
+    // SizeInput commits its value on blur. If the user clicks Apply while
+    // still typing in a size field, the typed value (with unit) hasn't
+    // flushed yet. Force the active element to blur, then wait one frame
+    // for the resulting setState to commit before reading formDataRef.
+    if (document.activeElement instanceof HTMLElement) {
+      document.activeElement.blur()
+    }
+    await new Promise<void>((r) => requestAnimationFrame(() => r()))
+    const data = formDataRef.current
+
+    const firstInvalidIdx = steps.findIndex((_, i) => getStepError(i, data) !== null)
     if (firstInvalidIdx !== -1) {
       setCurrentStep(firstInvalidIdx)
-      setSaveError(getStepError(firstInvalidIdx, formData))
+      setSaveError(getStepError(firstInvalidIdx, data))
       return
     }
 
-    const changes = detectDestructiveChanges(formData, originalDataRef.current)
+    const changes = detectDestructiveChanges(data, originalDataRef.current)
     if (changes.length > 0) {
       setDestructiveWarning(changes)
       return
     }
 
-    doApply(formData)
+    doApply(data)
   }
 
   // User confirmed: apply everything including destructive changes.
@@ -836,6 +884,7 @@ export function SetupWizard({ initialData, onClose }: SetupWizardProps) {
             data={formData}
             onChange={handleChange}
             onBatchChange={handleBatchChange}
+            setupAlreadyFinished={setupAlreadyFinished}
           />
         </div>
 

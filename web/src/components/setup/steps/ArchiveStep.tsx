@@ -2,6 +2,7 @@ import { useEffect, useState } from "react"
 import { Archive, Loader2, CheckCircle, XCircle, HardDrive, Save } from "lucide-react"
 import type { StepProps } from "../SetupWizard"
 import { SecretInput } from "../SecretInput"
+import { NasSSHKey } from "../NasSSHKey"
 import { cn } from "@/lib/utils"
 
 const archiveSystems = [
@@ -68,6 +69,10 @@ export function ArchiveStep({ data, onChange }: StepProps) {
   const [testing, setTesting] = useState(false)
   const [testStage, setTestStage] = useState<string | null>(null)
   const [testResult, setTestResult] = useState<{ success: boolean; error?: string } | null>(null)
+  // Lifted to ArchiveStep so the displayed key survives switching between
+  // archive systems (CIFS ↔ rsync) — the file on disk persists either way,
+  // this just keeps the visible state sticky across the conditional render.
+  const [pubKey, setPubKey] = useState<string | null>(null)
 
   // Backend broadcasts `archive_test_status` for the long-running stages of
   // Test Connection — specifically the on-demand `apt-get install` of
@@ -184,11 +189,14 @@ export function ArchiveStep({ data, onChange }: StepProps) {
       )}
 
       {system === "rsync" && (
-        <div className="grid gap-3 sm:grid-cols-2">
-          <Field label="Server" field="RSYNC_SERVER" placeholder="hostname or IP" data={data} onChange={onChange} error={req("RSYNC_SERVER", ["rsync"])} />
-          <Field label="Username" field="RSYNC_USER" placeholder="username" data={data} onChange={onChange} error={req("RSYNC_USER", ["rsync"])} />
-          <Field label="Remote Path" field="RSYNC_PATH" placeholder="/path/on/server" data={data} onChange={onChange} error={req("RSYNC_PATH", ["rsync"])} />
-        </div>
+        <>
+          <div className="grid gap-3 sm:grid-cols-2">
+            <Field label="Server" field="RSYNC_SERVER" placeholder="hostname or IP" data={data} onChange={onChange} error={req("RSYNC_SERVER", ["rsync"])} />
+            <Field label="Username" field="RSYNC_USER" placeholder="username" data={data} onChange={onChange} error={req("RSYNC_USER", ["rsync"])} />
+            <Field label="Remote Path" field="RSYNC_PATH" placeholder="/path/on/server" data={data} onChange={onChange} error={req("RSYNC_PATH", ["rsync"])} />
+          </div>
+          <NasSSHKey pubKey={pubKey} setPubKey={setPubKey} />
+        </>
       )}
 
       {system === "rclone" && (

@@ -1,5 +1,4 @@
-import { useState } from "react"
-import { Lock, Key, Copy, Check, Loader2, RefreshCw } from "lucide-react"
+import { Lock } from "lucide-react"
 import type { StepProps } from "../SetupWizard"
 import { SecretInput } from "../SecretInput"
 import { cn } from "@/lib/utils"
@@ -29,154 +28,6 @@ function Field({ label, field, type = "text", placeholder, data, onChange, hint,
   )
 }
 
-function NasSSHKey() {
-  const [pubKey, setPubKey] = useState<string | null>(null)
-  const [loading, setLoading] = useState(false)
-  const [error, setError] = useState<string | null>(null)
-  const [copied, setCopied] = useState(false)
-
-  async function fetchKey() {
-    setLoading(true)
-    setError(null)
-    try {
-      const res = await fetch("/api/system/ssh-pubkey")
-      if (!res.ok) throw new Error("Failed to fetch SSH key")
-      const data = await res.json()
-      if (data.public_key) {
-        setPubKey(data.public_key)
-      } else {
-        setPubKey(null)
-      }
-    } catch {
-      setPubKey(null)
-    } finally {
-      setLoading(false)
-    }
-  }
-
-  async function generateKey() {
-    setLoading(true)
-    setError(null)
-    try {
-      const res = await fetch("/api/system/ssh-keygen", { method: "POST" })
-      if (!res.ok) {
-        const data = await res.json()
-        throw new Error(data.error || "Failed to generate SSH key")
-      }
-      const data = await res.json()
-      setPubKey(data.public_key)
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "Unknown error")
-    } finally {
-      setLoading(false)
-    }
-  }
-
-  async function copyKey() {
-    if (!pubKey) return
-    // The Pi serves over plain HTTP on the LAN. navigator.clipboard is
-    // gated on a "secure context" (https:// or localhost) in every
-    // modern browser, so calling it from http://sentryusb.local
-    // throws or silently rejects — the user clicks the button and
-    // nothing happens. Try the modern API first (works when the user
-    // accesses via localhost from the Pi itself), fall back to the
-    // legacy execCommand path that does work on insecure http://.
-    let ok = false
-    if (navigator.clipboard && window.isSecureContext) {
-      try {
-        await navigator.clipboard.writeText(pubKey)
-        ok = true
-      } catch {
-        // fall through to legacy fallback
-      }
-    }
-    if (!ok) {
-      const ta = document.createElement("textarea")
-      ta.value = pubKey
-      ta.setAttribute("readonly", "")
-      ta.style.position = "fixed"
-      ta.style.top = "0"
-      ta.style.left = "0"
-      ta.style.opacity = "0"
-      document.body.appendChild(ta)
-      ta.focus()
-      ta.select()
-      try {
-        ok = document.execCommand("copy")
-      } catch {
-        ok = false
-      }
-      document.body.removeChild(ta)
-    }
-    if (ok) {
-      setCopied(true)
-      setTimeout(() => setCopied(false), 2000)
-    } else {
-      setError("Copy failed — select the key text manually with your mouse.")
-    }
-  }
-
-  return (
-    <div className="space-y-3">
-      <div className="flex items-center gap-2">
-        <Key className="h-4 w-4 text-blue-400" />
-        <h4 className="text-sm font-medium text-slate-300">NAS SSH Key (rsync)</h4>
-      </div>
-      <p className="text-xs text-slate-500">
-        Generate an SSH keypair so Sentry USB can connect to your NAS for rsync
-        archiving without a password. Copy the public key below and add it to
-        your NAS's <code className="rounded bg-white/10 px-1">~/.ssh/authorized_keys</code> file.
-      </p>
-
-      {pubKey ? (
-        <div className="space-y-2">
-          <div className="relative">
-            <pre className="overflow-x-auto rounded-lg border border-white/10 bg-white/5 px-3 py-2 pr-10 font-mono text-xs text-slate-300 leading-relaxed">
-              {pubKey}
-            </pre>
-            <button
-              onClick={copyKey}
-              className="absolute right-2 top-2 rounded p-1 text-slate-500 transition hover:bg-white/10 hover:text-slate-300"
-              title="Copy to clipboard"
-            >
-              {copied ? <Check className="h-4 w-4 text-emerald-400" /> : <Copy className="h-4 w-4" />}
-            </button>
-          </div>
-          <button
-            onClick={generateKey}
-            disabled={loading}
-            className="flex items-center gap-1.5 rounded-lg border border-white/10 bg-white/5 px-3 py-1.5 text-xs text-slate-400 transition hover:bg-white/10 hover:text-slate-300 disabled:opacity-50"
-          >
-            {loading ? <Loader2 className="h-3 w-3 animate-spin" /> : <RefreshCw className="h-3 w-3" />}
-            Regenerate Key
-          </button>
-        </div>
-      ) : (
-        <div className="flex items-center gap-3">
-          <button
-            onClick={generateKey}
-            disabled={loading}
-            className="flex items-center gap-1.5 rounded-lg bg-blue-500/20 px-4 py-2 text-sm font-medium text-blue-400 transition hover:bg-blue-500/30 disabled:opacity-50"
-          >
-            {loading ? <Loader2 className="h-4 w-4 animate-spin" /> : <Key className="h-4 w-4" />}
-            Generate SSH Key
-          </button>
-          <button
-            onClick={fetchKey}
-            disabled={loading}
-            className="flex items-center gap-1.5 rounded-lg border border-white/10 bg-white/5 px-3 py-2 text-sm text-slate-400 transition hover:bg-white/10 hover:text-slate-300 disabled:opacity-50"
-          >
-            {loading ? <Loader2 className="h-4 w-4 animate-spin" /> : <RefreshCw className="h-4 w-4" />}
-            Check Existing
-          </button>
-        </div>
-      )}
-
-      {error && <p className="text-xs text-red-400">{error}</p>}
-    </div>
-  )
-}
-
 export function SecurityStep({ data, onChange }: StepProps) {
   return (
     <div className="space-y-6">
@@ -200,9 +51,6 @@ export function SecurityStep({ data, onChange }: StepProps) {
             error={!!(data.WEB_USERNAME?.trim() && !data.WEB_PASSWORD?.trim())} />
         </div>
       </div>
-
-      {/* NAS SSH Key for rsync */}
-      <NasSSHKey />
     </div>
   )
 }

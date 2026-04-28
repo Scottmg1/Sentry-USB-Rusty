@@ -111,7 +111,25 @@ pub async fn run_update(
     (StatusCode::OK, Json(serde_json::json!({"status": "started"})))
 }
 
-const UPDATE_REPO: &str = "Sentry-Six/Sentry-USB-Rusty";
+/// Default GitHub source for OTA updates when the config doesn't override it.
+const DEFAULT_UPDATE_OWNER: &str = "Sentry-Six";
+const DEFAULT_UPDATE_REPO_NAME: &str = "Sentry-USB-Rusty";
+
+/// Resolve the `owner/repo` slug for OTA updates. Honors `REPO` from the
+/// active sentryusb.conf (with the legacy hardcoded default as fallback)
+/// so a user running a fork can point self-update at their own releases
+/// via the wizard's Advanced → Update Source field. `REPO_NAME` stays
+/// hardcoded — forks must keep the original repo name.
+fn update_repo() -> String {
+    let path = sentryusb_config::find_config_path();
+    let (active, _commented) = sentryusb_config::parse_file(path).unwrap_or_default();
+    let owner = active
+        .get("REPO")
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .unwrap_or(DEFAULT_UPDATE_OWNER);
+    format!("{}/{}", owner, DEFAULT_UPDATE_REPO_NAME)
+}
 
 /// Detect the *userspace* architecture (not kernel arch).
 ///
@@ -143,18 +161,19 @@ async fn detect_release_suffix() -> anyhow::Result<&'static str> {
 
 async fn self_update(target_version: Option<String>) -> anyhow::Result<String> {
     let suffix = detect_release_suffix().await?;
+    let repo = update_repo();
 
     // Build the download URL — tag-specific if a target version was requested
     // (Revert to Stable / Install Pre-release), otherwise the latest release.
     let url = if let Some(v) = &target_version {
         format!(
             "https://github.com/{}/releases/download/{}/sentryusb-{}",
-            UPDATE_REPO, v, suffix
+            repo, v, suffix
         )
     } else {
         format!(
             "https://github.com/{}/releases/latest/download/sentryusb-{}",
-            UPDATE_REPO, suffix
+            repo, suffix
         )
     };
 
@@ -194,7 +213,7 @@ async fn self_update(target_version: Option<String>) -> anyhow::Result<String> {
             let tag_cmd = format!(
                 "curl -fsSL --max-time 10 https://api.github.com/repos/{}/releases/latest 2>/dev/null \
                  | grep '\"tag_name\"' | head -1 | sed 's/.*\"tag_name\": *\"\\([^\"]*\\)\".*/\\1/'",
-                UPDATE_REPO
+                repo
             );
             sentryusb_shell::run("bash", &["-c", &tag_cmd])
                 .await
@@ -429,7 +448,7 @@ struct ReleaseInfo {
 
 /// Fetch the most recent releases (stable + prerelease) from GitHub.
 async fn fetch_releases() -> Result<Vec<ReleaseInfo>, String> {
-    let url = format!("https://api.github.com/repos/{}/releases?per_page=20", UPDATE_REPO);
+    let url = format!("https://api.github.com/repos/{}/releases?per_page=20", update_repo());
 
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
