@@ -734,7 +734,7 @@ export function SetupWizard({ initialData, onClose }: SetupWizardProps) {
                 <p
                   className={cn(
                     "mt-1 hidden text-[10px] font-medium sm:block",
-                    i <= currentStep ? "text-slate-400" : "text-slate-700"
+                    i === currentStep ? "text-slate-200" : i < currentStep ? "text-slate-400" : "text-slate-500"
                   )}
                 >
                   {step.title}
@@ -768,7 +768,7 @@ export function SetupWizard({ initialData, onClose }: SetupWizardProps) {
               className={cn(
                 "flex items-center gap-1.5 rounded-lg px-4 py-2 text-sm font-medium transition-colors",
                 isFirst
-                  ? "text-slate-700"
+                  ? "text-slate-600"
                   : "text-slate-400 hover:bg-white/5 hover:text-slate-200"
               )}
             >
