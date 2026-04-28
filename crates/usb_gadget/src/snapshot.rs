@@ -437,7 +437,6 @@ fn make_links_for_snapshot(cur_mnt: &str, final_mnt: &str) -> Result<()> {
             if let Ok(clips) = std::fs::read_dir(&evt_path) {
                 for clip in clips.flatten() {
                     link_clip_into_recents(&clip.path(), cur_mnt, final_mnt);
-                    let target = retarget_path(&clip.path(), cur_mnt, final_mnt);
                     let link = format!(
                         "{}/{}",
                         evt_dest,
@@ -445,7 +444,10 @@ fn make_links_for_snapshot(cur_mnt: &str, final_mnt: &str) -> Result<()> {
                     );
                     let _ = std::fs::remove_file(&link);
                     #[cfg(unix)]
-                    let _ = std::os::unix::fs::symlink(&target, &link);
+                    {
+                        let target = retarget_path(&clip.path(), cur_mnt, final_mnt);
+                        let _ = std::os::unix::fs::symlink(&target, &link);
+                    }
                 }
             }
         }
@@ -466,7 +468,6 @@ fn make_links_for_snapshot(cur_mnt: &str, final_mnt: &str) -> Result<()> {
             if let Ok(clips) = std::fs::read_dir(&evt_path) {
                 for clip in clips.flatten() {
                     link_clip_into_recents(&clip.path(), cur_mnt, final_mnt);
-                    let target = retarget_path(&clip.path(), cur_mnt, final_mnt);
                     let link = format!(
                         "{}/{}",
                         evt_dest,
@@ -474,7 +475,10 @@ fn make_links_for_snapshot(cur_mnt: &str, final_mnt: &str) -> Result<()> {
                     );
                     let _ = std::fs::remove_file(&link);
                     #[cfg(unix)]
-                    let _ = std::os::unix::fs::symlink(&target, &link);
+                    {
+                        let target = retarget_path(&clip.path(), cur_mnt, final_mnt);
+                        let _ = std::os::unix::fs::symlink(&target, &link);
+                    }
                 }
             }
         }
@@ -506,6 +510,7 @@ fn make_links_for_snapshot(cur_mnt: &str, final_mnt: &str) -> Result<()> {
 
 /// `linksnapshotfiletorecents` (bash lines 25-43). Drops a per-clip
 /// symlink under `/mutable/TeslaCam/RecentClips/<YYYY-MM-DD>/`.
+#[cfg_attr(not(unix), allow(unused_variables))]
 fn link_clip_into_recents(file: &Path, cur_mnt: &str, final_mnt: &str) {
     let filename = match file.file_name().map(|s| s.to_string_lossy().to_string()) {
         Some(f) => f,
@@ -517,16 +522,19 @@ fn link_clip_into_recents(file: &Path, cur_mnt: &str, final_mnt: &str) {
     let filedate = &filename[..10];
     let recents = format!("{}/RecentClips/{}", TESLACAM, filedate);
     let _ = std::fs::create_dir_all(&recents);
-    let target = retarget_path(file, cur_mnt, final_mnt);
     let link = format!("{}/{}", recents, filename);
     let _ = std::fs::remove_file(&link);
     #[cfg(unix)]
-    let _ = std::os::unix::fs::symlink(&target, &link);
+    {
+        let target = retarget_path(file, cur_mnt, final_mnt);
+        let _ = std::os::unix::fs::symlink(&target, &link);
+    }
 }
 
 /// Replace `cur_mnt` prefix with `final_mnt` so the symlink target
 /// references the stable `<snapdir>/mnt` path rather than the autofs
 /// `/tmp/snapshots/...` mount which can come and go.
+#[cfg(unix)]
 fn retarget_path(file: &Path, cur_mnt: &str, final_mnt: &str) -> String {
     let s = file.to_string_lossy().to_string();
     if let Some(stripped) = s.strip_prefix(cur_mnt) {

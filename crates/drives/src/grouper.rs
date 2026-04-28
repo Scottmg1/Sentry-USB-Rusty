@@ -1965,75 +1965,6 @@ fn parse_file_timestamp(file_path: &str) -> Option<NaiveDateTime> {
     None
 }
 
-/// Compute median location from the middle 50% of valid lat/lng arrays.
-fn compute_median_location(lats: &[f64], lngs: &[f64]) -> (f64, f64, bool) {
-    if lats.len() <= 2 {
-        return (0.0, 0.0, false);
-    }
-    let q1 = lats.len() / 4;
-    let q3 = lats.len() * 3 / 4;
-    let count = q3 - q1 + 1;
-    let mut sum_lat: f64 = 0.0;
-    let mut sum_lng: f64 = 0.0;
-    for i in q1..=q3 {
-        sum_lat += lats[i];
-        sum_lng += lngs[i];
-    }
-    (sum_lat / count as f64, sum_lng / count as f64, true)
-}
-
-/// Build a validity mask for a clip's points: exclude null island and
-/// median-cluster outliers (>1000km from median).
-fn build_validity_mask(
-    points: &[GpsPoint],
-    has_median: bool,
-    med_lat: f64,
-    med_lng: f64,
-) -> Vec<bool> {
-    const MAX_FROM_MEDIAN_M: f64 = 1_000_000.0;
-    let n = points.len();
-    let mut valid = vec![false; n];
-    for (i, p) in points.iter().enumerate() {
-        if p[0].abs() < 1.0 && p[1].abs() < 1.0 {
-            continue; // null island
-        }
-        if has_median && haversine_m(p[0], p[1], med_lat, med_lng) > MAX_FROM_MEDIAN_M {
-            continue; // too far from median cluster
-        }
-        valid[i] = true;
-    }
-    valid
-}
-
-/// Remove points far from both neighbors in the validity mask.
-fn apply_neighbor_jump_filter(points: &[GpsPoint], valid: &mut [bool]) {
-    const MAX_JUMP_M: f64 = 5000.0;
-    let n = points.len();
-    if n <= 2 {
-        return;
-    }
-    // We need a snapshot to avoid cascading invalidation within one pass
-    let snapshot: Vec<bool> = valid.to_vec();
-    for i in 0..n {
-        if !snapshot[i] {
-            continue;
-        }
-        let has_prev = i > 0 && snapshot[i - 1];
-        let has_next = i < n - 1 && snapshot[i + 1];
-        let far_from_prev = has_prev
-            && haversine_m(points[i - 1][0], points[i - 1][1], points[i][0], points[i][1])
-                > MAX_JUMP_M;
-        let far_from_next = has_next
-            && haversine_m(points[i][0], points[i][1], points[i + 1][0], points[i + 1][1])
-                > MAX_JUMP_M;
-        if (has_prev && has_next && far_from_prev && far_from_next)
-            || (!has_prev && far_from_next)
-            || (!has_next && far_from_prev)
-        {
-            valid[i] = false;
-        }
-    }
-}
 
 /// Compute autopilot percent-of-distance values, rounded to 1 decimal.
 fn compute_autopilot_percents(
@@ -2695,12 +2626,5 @@ mod tests {
         assert_eq!(stats.total_distance_km, 0.0);
     }
 
-    #[test]
-    fn test_build_validity_mask_null_island() {
-        let points = vec![[0.5, 0.5], [37.0, -122.0], [0.0, 0.1]];
-        let valid = build_validity_mask(&points, false, 0.0, 0.0);
-        assert!(!valid[0]); // null island
-        assert!(valid[1]); // valid
-        assert!(!valid[2]); // null island
-    }
+
 }
