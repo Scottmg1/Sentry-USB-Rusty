@@ -82,12 +82,18 @@ pub async fn list_snapshots(
             .map(|d| d.as_secs() as i64)
             .unwrap_or(0);
 
-        // Recursive size. `du -sb` is more accurate for sparse files
-        // than walking from Rust because it knows to count actual
-        // allocated blocks rather than apparent length, which matters
-        // for cam_disk reflink copies that are mostly shared extents.
+        // Recursive size in *allocated* bytes — reflink-aware. We
+        // explicitly avoid `du -sb` (which is `--apparent-size
+        // --block-size=1`) because snapshots are XFS reflink copies
+        // of cam_disk.bin that share nearly all extents with the
+        // live image. Apparent size would report the full file
+        // length (e.g. 64 GB) for a snapshot that only uniquely
+        // owns a few MB of changed blocks, hugely overstating what
+        // the user would reclaim by deleting it. `du -sB1` reports
+        // actual disk usage in bytes, so a freshly-taken snapshot
+        // shows ~0 GB and grows as cam_disk diverges from it.
         let du_out = sentryusb_shell::run(
-            "du", &["-sb", &path.to_string_lossy()],
+            "du", &["-sB1", &path.to_string_lossy()],
         ).await.unwrap_or_default();
         let size_bytes: u64 = du_out
             .split_whitespace()
