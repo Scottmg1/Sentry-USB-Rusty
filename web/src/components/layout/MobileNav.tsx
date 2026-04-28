@@ -19,6 +19,7 @@ import {
   Volume2,
   BellRing,
   Wifi,
+  Camera,
 } from "lucide-react"
 import { cn } from "@/lib/utils"
 import { useAwayMode } from "@/hooks/useAwayMode"
@@ -37,6 +38,7 @@ const baseNavItems = [
   { to: "/", icon: LayoutDashboard, label: "Dashboard" },
   { to: "/viewer", icon: Video, label: "Viewer" },
   { to: "/files", icon: FolderOpen, label: "Files" },
+  { to: "/snapshots", icon: Camera, label: "Snapshots" },
   { to: "/logs", icon: ScrollText, label: "Logs" },
   { to: "/drives", icon: MapPin, label: "Drives" },
   { to: "/community", icon: Users, label: "Community" },
