@@ -155,11 +155,12 @@ fi
 cat > "${ROOTFS_DIR}/lib/systemd/system/sentryusb.service" << 'SERVICEEOF'
 [Unit]
 Description=SentryUSB Web Server
-After=network.target nss-lookup.target
+After=mutable.mount backingfiles.mount
+Wants=mutable.mount backingfiles.mount
 
 [Service]
 Type=simple
-ExecStart=/opt/sentryusb/sentryusb -port 80
+ExecStart=/opt/sentryusb/sentryusb --port 80
 Restart=always
 RestartSec=5
 StandardOutput=journal

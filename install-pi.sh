@@ -140,7 +140,8 @@ info "Installing systemd service..."
 cat > /etc/systemd/system/sentryusb.service << 'EOF'
 [Unit]
 Description=SentryUSB Web Server
-After=network.target nss-lookup.target
+After=mutable.mount backingfiles.mount
+Wants=mutable.mount backingfiles.mount
 Conflicts=nginx.service
 
 [Service]

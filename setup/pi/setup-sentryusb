@@ -475,14 +475,15 @@ function update_sentryusb_service () {
   cat > /etc/systemd/system/sentryusb.service << 'EOF'
 [Unit]
 Description=SentryUSB Web Server
-After=network.target
+After=mutable.mount backingfiles.mount
+Wants=mutable.mount backingfiles.mount
 Conflicts=nginx.service
 
 [Service]
 Type=simple
 ExecStartPre=-/bin/systemctl stop nginx
 ExecStartPre=-/bin/systemctl disable nginx
-ExecStart=/opt/sentryusb/sentryusb -port 80
+ExecStart=/opt/sentryusb/sentryusb --port 80
 Restart=always
 RestartSec=5
 StandardOutput=journal
