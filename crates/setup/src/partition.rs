@@ -68,6 +68,20 @@ pub async fn setup_data_drive(env: &SetupEnv, emitter: &SetupEmitter) -> Result<
         );
     }
 
+    // Belt-and-suspenders: refuse to enter the destructive
+    // wipefs/parted/mkfs branch on a system where setup previously
+    // completed. The runner's skip_partitioning guard is the primary
+    // defense, but it depends on partitions_exist() (label symlink
+    // probe) which can momentarily miss on a udev race. If the
+    // FINISHED marker exists at this point we KNOW the user already
+    // had a working install — surfacing a hard error is always the
+    // right answer over silently destroying their data. They can
+    // delete the marker manually and re-run setup if they really
+    // mean to wipe.
+    let setup_finished = std::path::Path::new("/sentryusb/SENTRYUSB_SETUP_FINISHED").exists()
+        || std::path::Path::new("/boot/firmware/SENTRYUSB_SETUP_FINISHED").exists()
+        || std::path::Path::new("/boot/SENTRYUSB_SETUP_FINISHED").exists();
+
     let bf_ok = check_label_matches(&p2, "backingfiles").await;
     let mut_ok = check_label_matches(&p1, "mutable").await;
     let bf_xfs = check_fstype(&p2, "xfs").await;
@@ -87,9 +101,18 @@ pub async fn setup_data_drive(env: &SetupEnv, emitter: &SetupEmitter) -> Result<
             "Existing backingfiles (xfs) and mutable (ext4) partitions found on {}. Keeping them.",
             data_drive
         ));
-        // Quiesce anything that might be holding the partitions open
-        // before xfs_repair, otherwise it hangs on busy devices. Same
-        // sequence as the bash version's keep-existing path.
+        // Quiesce anything that might be holding the partitions open,
+        // then return. Match teslausb's keep-existing path exactly:
+        // no xfs_repair, no mkfs, just stop using the device so the
+        // next mount call gets it clean. The previous incarnation
+        // ran xfs_repair here, which on the bash side wiped users
+        // when it timed out and fell back to mkfs. Even with a safer
+        // Rust repair_xfs (5 min timeout, no reformat), running it
+        // on every config-only re-run is unnecessary work that
+        // blocks the wizard for minutes on TB-class drives. Mount
+        // itself replays the XFS log when needed; if the log is
+        // genuinely broken, mount surfaces a clear error and the
+        // user can recover manually.
         let _ = sentryusb_shell::run("bash", &["-c", "killall archiveloop 2>/dev/null"]).await;
         let _ = sentryusb_gadget::disable();
         let _ = sentryusb_shell::run(
@@ -104,12 +127,31 @@ pub async fn setup_data_drive(env: &SetupEnv, emitter: &SetupEmitter) -> Result<
         let _ = sentryusb_shell::run("umount", &[p2.as_str()]).await;
         tokio::time::sleep(Duration::from_secs(2)).await;
 
-        // Replay/clear the XFS log so the subsequent mount doesn't hang
-        // for tens of minutes if the previous shutdown was unclean.
-        repair_xfs(&p2, emitter).await;
-
         update_fstab().await?;
         return Ok(false);
+    }
+
+    // We're about to fall through to the destructive branch (wipefs,
+    // parted mktable, mkfs). On an already-finished install this is
+    // never the right answer — refuse loudly. The user gets a clear
+    // error in the wizard log and their data stays put. Recovery
+    // path: investigate why the labels/fstypes drifted (often an
+    // unmounted partition or a transient blkid blip) and re-run.
+    if setup_finished {
+        bail!(
+            "Refusing to wipe {}: setup previously completed on this device, \
+             but the partition labels or filesystem types are not what we \
+             expected ({} backingfiles label match, {} mutable label match, \
+             {} backingfiles is xfs, {} mutable is ext4). The drive contents \
+             have NOT been modified. If the drive really needs to be \
+             reformatted, delete /sentryusb/SENTRYUSB_SETUP_FINISHED and \
+             re-run setup. Otherwise, reboot to let udev resettle and try again.",
+            data_drive,
+            if bf_ok { "✓" } else { "✗" },
+            if mut_ok { "✓" } else { "✗" },
+            if bf_xfs { "✓" } else { "✗" },
+            if mut_ext4 { "✓" } else { "✗" },
+        );
     }
 
     emitter.begin_phase("partitions", "Disk partitioning");
@@ -172,6 +214,23 @@ pub async fn setup_sd_card(env: &SetupEnv, emitter: &SetupEmitter) -> Result<boo
     if partitions_exist().await {
         update_fstab().await?;
         return Ok(false);
+    }
+
+    // Belt-and-suspenders: if setup previously finished we should
+    // never be carving fresh partitions on the SD card. Bail with a
+    // clear error rather than running sfdisk against a working
+    // install. Same reasoning as the data-drive path above.
+    let setup_finished = std::path::Path::new("/sentryusb/SENTRYUSB_SETUP_FINISHED").exists()
+        || std::path::Path::new("/boot/firmware/SENTRYUSB_SETUP_FINISHED").exists()
+        || std::path::Path::new("/boot/SENTRYUSB_SETUP_FINISHED").exists();
+    if setup_finished {
+        bail!(
+            "Refusing to repartition the SD card: setup previously completed \
+             but partitions_exist() returned false (label symlinks may have \
+             temporarily disappeared due to a udev race). Reboot and try \
+             again, or delete /sentryusb/SENTRYUSB_SETUP_FINISHED to force \
+             a fresh install."
+        );
     }
 
     emitter.begin_phase("partitions", "Disk partitioning");
@@ -500,97 +559,6 @@ async fn release_data_drive(drive: &str, emitter: &SetupEmitter) {
     let _ = sentryusb_shell::run("blockdev", &["--rereadpt", drive]).await;
 
     tokio::time::sleep(Duration::from_secs(2)).await;
-}
-
-/// Run `xfs_repair` against an XFS partition before we mount it on a
-/// resume. We can't trust the previous run to have unmounted cleanly
-/// (cttseraser FUSE crash, kernel panic, power loss…), so the FS may
-/// have an uncommitted log entry or genuine metadata damage that
-/// makes `mount` reject it with "Structure needs cleaning."
-///
-/// Strategy: try the safe pass first (no `-L`), fall back to log
-/// zeroing only if a log replay is needed, then run one final pass to
-/// confirm the structure is clean. All output is surfaced to the
-/// wizard log so a stuck install reports something actionable
-/// instead of silently retrying. Errors are non-fatal — the
-/// downstream `mount` call decides whether the FS is usable.
-pub(crate) async fn repair_xfs(dev: &str, emitter: &SetupEmitter) {
-    // 5 min — xfs_repair on a damaged 1 TB SSD with millions of files
-    // can legitimately run for a few minutes. The previous 60s ceiling
-    // was killing repairs mid-flight, leaving the FS half-fixed and
-    // making `mount` fail with "Structure needs cleaning" right
-    // afterward.
-    let timeout = Duration::from_secs(300);
-
-    // Drop the kernel's buffer cache for this device before running
-    // xfs_repair. If a previous mount attempt populated the page
-    // cache with broken metadata (a corrupted FS, a half-formatted
-    // partition, or a USB bridge that briefly returned stale bytes),
-    // xfs_repair would otherwise see the *cached* version of the
-    // device, not what's actually on disk. After a fresh mkfs.xfs on
-    // a USB-attached drive (Samsung T7 etc.) without this flush, the
-    // verify pass sees the previous run's corruption and we false-
-    // positive into "partition unrecoverable".
-    let _ = sentryusb_shell::run("blockdev", &["--flushbufs", dev]).await;
-    let _ = sentryusb_shell::run("sync", &[]).await;
-
-    emitter.progress(&format!("Checking XFS structure on {}...", dev));
-    match sentryusb_shell::run_with_timeout(timeout, "xfs_repair", &[dev]).await {
-        Ok(_) => {
-            emitter.progress(&format!("XFS clean on {}", dev));
-            // One more no-op pass so we know the verify is stable.
-            let _ = sentryusb_shell::run_with_timeout(timeout, "xfs_repair", &[dev]).await;
-            return;
-        }
-        Err(e) => {
-            // Log replay failure surfaces as exit 2 + "needs to replay
-            // a dirty log" on stderr. Other failures (genuine metadata
-            // corruption) generally need `-L` to make any progress
-            // anyway — at worst we drop a few uncommitted writes.
-            let msg = e.to_string();
-            emitter.progress(&format!(
-                "xfs_repair pass on {} reported issues — falling back to log zeroing: {}",
-                dev,
-                truncate_for_log(&msg)
-            ));
-        }
-    }
-
-    emitter.progress(&format!("Clearing XFS log on {} (xfs_repair -L)...", dev));
-    match sentryusb_shell::run_with_timeout(timeout, "xfs_repair", &["-L", dev]).await {
-        Ok(_) => emitter.progress(&format!("XFS log cleared on {}", dev)),
-        Err(e) => emitter.progress(&format!(
-            "xfs_repair -L on {} returned an error (mount may still fail): {}",
-            dev,
-            truncate_for_log(&e.to_string())
-        )),
-    }
-
-    // Verify pass after log zeroing. A clean exit here is what
-    // tells us the subsequent mount has a chance.
-    if let Err(e) = sentryusb_shell::run_with_timeout(timeout, "xfs_repair", &[dev]).await {
-        emitter.progress(&format!(
-            "xfs_repair verify on {} still reports errors — partition may be unrecoverable: {}",
-            dev,
-            truncate_for_log(&e.to_string())
-        ));
-    }
-
-    // Final flush so the subsequent mount reads xfs_repair's writes
-    // from disk rather than the page cache's pre-repair version.
-    let _ = sentryusb_shell::run("sync", &[]).await;
-    let _ = sentryusb_shell::run("blockdev", &["--flushbufs", dev]).await;
-}
-
-/// Trim long stderr blobs so the wizard log stays readable.
-fn truncate_for_log(s: &str) -> String {
-    const MAX: usize = 400;
-    let s = s.trim();
-    if s.len() <= MAX {
-        s.to_string()
-    } else {
-        format!("{}…", &s[..MAX])
-    }
 }
 
 /// Ensure /etc/fstab has entries for backingfiles and mutable.

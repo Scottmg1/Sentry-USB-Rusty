@@ -79,7 +79,23 @@ then
      [ /dev/disk/by-label/mutable -ef "$P1" ]
   then
     log_progress "Existing backingfiles (xfs) and mutable (ext4) partitions found on $DATA_DRIVE. Keeping them."
-    # Unmount before xfs_repair — otherwise it hangs on a busy device.
+    # Quiesce anything that might be holding the partitions open so
+    # the next mount call finds them clean. Match teslausb's behavior
+    # on the keep-existing path: no xfs_repair, no mkfs.
+    #
+    # The previous incarnation of this block ran `xfs_repair -L` with
+    # a 60s timeout and reformatted the partition (`mkfs.xfs -f`) on
+    # any failure. That destroyed every snapshot and the cam_disk.bin
+    # for users whose xfs_repair couldn't finish in 60s OR whose
+    # repair exited non-zero immediately because the partition was
+    # still held by archiveloop / a loop device / a stale mount.
+    # The intent was to dodge a slow mount during XFS journal replay
+    # on 1TB+ drives previously used by TeslaUSB — but a slow mount
+    # is a UX problem, not a data problem. Mount itself handles log
+    # replay safely; if the log is genuinely broken the mount will
+    # fail loudly and the user can run xfs_repair manually. We never
+    # reformat in the keep-existing path. teslausb's
+    # create-backingfiles-partition.sh has worked this way for years.
     killall archiveloop 2>/dev/null || true
     /root/bin/disable_gadget.sh 2>/dev/null || true
     for loop in $(losetup -a 2>/dev/null | grep -E '/backingfiles/|/mnt/' | cut -d: -f1); do
@@ -92,14 +108,6 @@ then
     umount "$P1" 2>/dev/null || true
     umount "$P2" 2>/dev/null || true
     sleep 2
-    # Clear XFS log to prevent slow journal replay when mounting later.
-    # On large drives (1TB+) previously used by TeslaUSB, a dirty journal
-    # can cause the mount to hang for 10+ minutes during replay.
-    log_progress "Clearing XFS log on $P2..."
-    if ! timeout 60 xfs_repair -L "$P2" 2>/dev/null; then
-      log_progress "xfs_repair timed out or failed on $P2, reformatting..."
-      mkfs.xfs -f -m reflink=1 -L backingfiles "$P2"
-    fi
   else
     # Unmount any partitions on the data drive before wiping, otherwise
     # wipefs/parted/mkfs will hang waiting for exclusive device access.

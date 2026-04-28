@@ -846,16 +846,21 @@ async fn mount_partitions(emitter: &SetupEmitter) -> Result<()> {
         emitter.progress("Mounting backingfiles partition...");
         if let Ok(dev) = sentryusb_shell::run("findfs", &["LABEL=backingfiles"]).await {
             let dev = dev.trim().to_string();
-            // Drop any stale auto-mount before xfs_repair — otherwise
-            // the loser still holds /dev/sdaN open exclusively and the
-            // mount below dies with "Can't open blockdev".
+            // Drop any stale auto-mount so the mount below isn't
+            // racing the kernel's auto-mount of the same partition
+            // at /media/<user>/<label>.
             let _ = sentryusb_shell::run("umount", &[dev.as_str()]).await;
             let _ = sentryusb_shell::run("umount", &["/backingfiles"]).await;
-            crate::partition::repair_xfs(&dev, emitter).await;
-            // Let udev reprobe so the kernel releases the inode that
-            // xfs_repair briefly held during log replay.
-            let _ = sentryusb_shell::run("udevadm", &["settle", "--timeout=30"]).await;
+            let _ = sentryusb_shell::run("udevadm", &["settle", "--timeout=10"]).await;
         }
+        // Mount handles XFS log replay safely on its own. We used to
+        // pre-run xfs_repair here, but that is unnecessary work on a
+        // healthy filesystem and could legitimately run for several
+        // minutes on TB drives, blocking the wizard. If the log is
+        // genuinely broken, mount returns a clear error here and
+        // setup bails — much better than silently destroying data
+        // via a runaway repair fallback (the bug that wiped the
+        // user's drive on the bash legacy path).
         sentryusb_shell::run("mount", &["/backingfiles"]).await?;
     }
 
