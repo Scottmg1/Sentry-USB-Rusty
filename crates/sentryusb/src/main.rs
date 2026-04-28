@@ -4,7 +4,8 @@
 // aborts at startup when its compiled-in page size doesn't match the
 // kernel's, which is why we don't use one here.
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
 use clap::{Parser, Subcommand};
 use tower_http::compression::CompressionLayer;
@@ -194,6 +195,7 @@ async fn main() {
         cloud: sentryusb_api::cloud::CloudHandlerState {
             uploader: cloud_uploader,
         },
+        net_sampler: Arc::new(Mutex::new(HashMap::new())),
     };
 
     // Resume setup if it was interrupted by a reboot (e.g. dwc2 overlay, root shrink)

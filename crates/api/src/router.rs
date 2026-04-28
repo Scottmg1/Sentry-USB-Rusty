@@ -7,6 +7,7 @@ use crate::auth::AuthState;
 use crate::cloud::CloudHandlerState;
 use crate::drives_handler::DriveState;
 use crate::keep_awake::KeepAwakeManager;
+use crate::status::NetSampler;
 
 /// Shared application state available to all handlers.
 #[derive(Clone)]
@@ -16,6 +17,7 @@ pub struct AppState {
     pub drives: DriveState,
     pub keep_awake: Arc<KeepAwakeManager>,
     pub cloud: CloudHandlerState,
+    pub net_sampler: NetSampler,
 }
 
 /// Build the complete Axum router with all API routes.

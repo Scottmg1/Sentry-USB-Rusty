@@ -5,7 +5,24 @@ use axum::extract::State;
 use axum::http::StatusCode;
 use serde::Serialize;
 
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
+
 use crate::router::AppState;
+
+// ---------------------------------------------------------------------------
+// Network throughput sampler
+// ---------------------------------------------------------------------------
+
+#[derive(Clone)]
+pub struct NetSample {
+    pub rx_bytes: u64,
+    pub tx_bytes: u64,
+    pub taken_at: Instant,
+}
+
+pub type NetSampler = Arc<Mutex<HashMap<String, NetSample>>>;
 
 // ---------------------------------------------------------------------------
 // GET /api/status
@@ -30,10 +47,14 @@ struct PiStatus {
     device_suffix: String,
     sbc_model: String,
     fan_speed: String,
+    wifi_rx_bps: u64,
+    wifi_tx_bps: u64,
+    ether_rx_bps: u64,
+    ether_tx_bps: u64,
 }
 
 pub async fn get_status(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
 ) -> (StatusCode, Json<serde_json::Value>) {
     let mut s = PiStatus {
         cpu_temp: String::new(),
@@ -53,6 +74,10 @@ pub async fn get_status(
         device_suffix: String::new(),
         sbc_model: String::new(),
         fan_speed: String::new(),
+        wifi_rx_bps: 0,
+        wifi_tx_bps: 0,
+        ether_rx_bps: 0,
+        ether_tx_bps: 0,
     };
 
     // Device suffix from machine-id
@@ -149,6 +174,9 @@ pub async fn get_status(
                 }
             }
         }
+        let (rx, tx) = compute_throughput(&state.net_sampler, &wifi_dev);
+        s.wifi_rx_bps = rx;
+        s.wifi_tx_bps = tx;
     }
 
     // Ethernet info
@@ -176,6 +204,9 @@ pub async fn get_status(
                 }
             }
         }
+        let (rx, tx) = compute_throughput(&state.net_sampler, &eth_dev);
+        s.ether_rx_bps = rx;
+        s.ether_tx_bps = tx;
     }
 
     (StatusCode::OK, Json(serde_json::to_value(s).unwrap_or_default()))
@@ -412,6 +443,32 @@ fn read_fan_speed() -> String {
         }
     }
     String::new()
+}
+
+fn read_net_bytes(dev: &str, stat: &str) -> Option<u64> {
+    let path = format!("/sys/class/net/{}/statistics/{}", dev, stat);
+    std::fs::read_to_string(&path).ok()?.trim().parse::<u64>().ok()
+}
+
+fn compute_throughput(sampler: &NetSampler, dev: &str) -> (u64, u64) {
+    let Some(rx_now) = read_net_bytes(dev, "rx_bytes") else { return (0, 0); };
+    let Some(tx_now) = read_net_bytes(dev, "tx_bytes") else { return (0, 0); };
+    let now = Instant::now();
+    let mut map = sampler.lock().unwrap_or_else(|e| e.into_inner());
+    let result = if let Some(prev) = map.get(dev) {
+        let elapsed = now.duration_since(prev.taken_at).as_secs_f64();
+        if elapsed < 0.1 {
+            (0, 0)
+        } else {
+            let rx_bps = ((rx_now.saturating_sub(prev.rx_bytes) as f64 * 8.0) / elapsed) as u64;
+            let tx_bps = ((tx_now.saturating_sub(prev.tx_bytes) as f64 * 8.0) / elapsed) as u64;
+            (rx_bps, tx_bps)
+        }
+    } else {
+        (0, 0)
+    };
+    map.insert(dev.to_string(), NetSample { rx_bytes: rx_now, tx_bytes: tx_now, taken_at: now });
+    result
 }
 
 fn find_net_device(pattern: &str) -> String {

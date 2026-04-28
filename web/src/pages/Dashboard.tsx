@@ -42,6 +42,12 @@ function getWifiStrengthBars(strength: string): number {
   return 1
 }
 
+function formatThroughput(bps: number): string {
+  if (bps >= 1_000_000) return `${(bps / 1_000_000).toFixed(1)} Mbps`
+  if (bps >= 1_000) return `${Math.round(bps / 1_000)} Kbps`
+  return bps > 0 ? "< 1 Kbps" : "—"
+}
+
 interface ProcessProgress {
   current: number
   total: number
@@ -178,7 +184,7 @@ export default function Dashboard() {
       })
       .catch(() => { })
 
-    const statusInterval = setInterval(fetchStatus, 4000)
+    const statusInterval = setInterval(fetchStatus, 1000)
     const statsInterval = setInterval(fetchDriveStats, 5000)
     const storageInterval = setInterval(fetchStorageBreakdown, 10000)
 
@@ -437,6 +443,13 @@ export default function Dashboard() {
                     <span className="text-xs text-slate-500">WiFi not connected</span>
                   )}
                 </div>
+                {status.wifi_ssid && (status.wifi_rx_bps !== undefined || status.wifi_tx_bps !== undefined) && (
+                  <div className="flex items-center gap-2 pl-5">
+                    <span className="text-[10px] text-emerald-400">↓ {formatThroughput(status.wifi_rx_bps ?? 0)}</span>
+                    <span className="text-[10px] text-slate-500">·</span>
+                    <span className="text-[10px] text-sky-400">↑ {formatThroughput(status.wifi_tx_bps ?? 0)}</span>
+                  </div>
+                )}
                 {status.ether_speed && (
                   <div className="flex items-center gap-2">
                     <Cable className="h-3.5 w-3.5 text-slate-500" />
@@ -450,6 +463,13 @@ export default function Dashboard() {
                     ) : (
                       <span className="text-xs text-slate-500">Ethernet not connected</span>
                     )}
+                  </div>
+                )}
+                {status.ether_speed && status.ether_speed !== "Unknown!" && (status.ether_rx_bps !== undefined || status.ether_tx_bps !== undefined) && (
+                  <div className="flex items-center gap-2 pl-5">
+                    <span className="text-[10px] text-emerald-400">↓ {formatThroughput(status.ether_rx_bps ?? 0)}</span>
+                    <span className="text-[10px] text-slate-500">·</span>
+                    <span className="text-[10px] text-sky-400">↑ {formatThroughput(status.ether_tx_bps ?? 0)}</span>
                   </div>
                 )}
               </div>
