@@ -19,6 +19,11 @@ const SETUP_LOG: &str = "/sentryusb/sentryusb-setup.log";
 const SETUP_PHASES_FILE: &str = "/sentryusb/setup-phases.jsonl";
 const SETUP_FINISHED_MARKER: &str = "/sentryusb/SENTRYUSB_SETUP_FINISHED";
 const SETUP_STARTED_MARKER: &str = "/sentryusb/SENTRYUSB_SETUP_STARTED";
+/// Records the DATA_DRIVE that successfully completed setup, so a
+/// subsequent re-run can detect a swap to a different external disk
+/// and only format the new one (Change 7). Empty file for SD-card
+/// installs where no DATA_DRIVE was used.
+const LAST_DATA_DRIVE_MARKER: &str = "/sentryusb/last-data-drive";
 
 /// Build a `SetupEmitter` whose progress callback writes to the setup log
 /// file and whose phase callback appends to `setup-phases.jsonl`. The two
@@ -72,6 +77,13 @@ pub async fn run_full_setup(emitter: SetupEmitter) -> Result<()> {
     }
 
     let resuming = Path::new(SETUP_STARTED_MARKER).exists();
+    // Capture this BEFORE we delete the finished marker — the partition
+    // phase uses it to skip wipefs/parted entirely on a re-run when the
+    // current DATA_DRIVE matches what last completed setup. Defense in
+    // depth: even if a future bug reintroduces destructive behavior in
+    // setup_data_drive, this prevents it from running on a system the
+    // user already finished setting up.
+    let already_finished = Path::new(SETUP_FINISHED_MARKER).exists();
 
     let _ = std::fs::remove_file(SETUP_FINISHED_MARKER);
     let _ = std::fs::create_dir_all("/sentryusb");
@@ -171,7 +183,28 @@ pub async fn run_full_setup(emitter: SetupEmitter) -> Result<()> {
     fix_uas_quirks(&env, &emitter).await?;
 
     // Partitioning.
-    if env.data_drive.is_some() {
+    //
+    // Guard: if setup previously completed AND the current DATA_DRIVE
+    // matches what was last set up AND the partitions are still
+    // present, skip the partition phase entirely. The user is here to
+    // change a config value (archive server, hostname, samba etc.) —
+    // we have no business calling wipefs/parted on a working install.
+    let last_drive = std::fs::read_to_string(LAST_DATA_DRIVE_MARKER)
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    let current_drive = env.data_drive.clone().unwrap_or_default();
+    let data_drive_unchanged = last_drive == current_drive;
+    let skip_partitioning = already_finished
+        && data_drive_unchanged
+        && crate::partition::partitions_exist().await;
+
+    if skip_partitioning {
+        info!(
+            "[setup] Skipping partition phase: setup already finished, DATA_DRIVE unchanged ({}), partitions present.",
+            if current_drive.is_empty() { "SD card" } else { current_drive.as_str() }
+        );
+    } else if env.data_drive.is_some() {
         crate::partition::setup_data_drive(&env, &emitter).await?;
     } else {
         crate::partition::setup_sd_card(&env, &emitter).await?;
@@ -235,6 +268,13 @@ pub async fn run_full_setup(emitter: SetupEmitter) -> Result<()> {
         ).await;
         let _ = sentryusb_shell::run("apt-get", &["clean"]).await;
     }
+
+    // Record the active DATA_DRIVE so the next setup re-run can detect
+    // a swap (Change 7) and skip partitioning when nothing changed.
+    let _ = std::fs::write(
+        LAST_DATA_DRIVE_MARKER,
+        env.data_drive.clone().unwrap_or_default(),
+    );
 
     let _ = std::fs::remove_file(SETUP_STARTED_MARKER);
     let _ = std::fs::write(SETUP_FINISHED_MARKER, "");

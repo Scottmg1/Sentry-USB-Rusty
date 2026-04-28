@@ -67,14 +67,16 @@ then
   PARTITION_PREFIX=$(partition_prefix_for "$DATA_DRIVE")
   P1="${DATA_DRIVE}${PARTITION_PREFIX}1"
   P2="${DATA_DRIVE}${PARTITION_PREFIX}2"
-  # Reuse existing partitions if they already have the correct labels and
-  # filesystem types. This avoids a slow wipe+format cycle when the user
-  # re-runs the wizard to change settings. Stale TeslaCam data is cleaned
-  # separately by setup-sentryusb before creating backing files.
+  # Reuse existing partitions if they already have the correct labels.
+  # Mirrors the original teslausb 2-condition check so a wizard re-run
+  # for a config-only change (ARCHIVE_SERVER, etc.) cannot trigger a
+  # wipe just because blkid was momentarily slow to return the fstype
+  # or because the FS was being remounted. Stale TeslaCam data is
+  # cleaned separately by setup-sentryusb before creating backing
+  # files; fstab is rewritten unconditionally by update_fstab below
+  # whether we kept partitions or wiped them.
   if [ /dev/disk/by-label/backingfiles -ef "$P2" ] && \
-     [ /dev/disk/by-label/mutable -ef "$P1" ] && \
-     blkid "$P2" | grep -q 'TYPE="xfs"' && \
-     blkid "$P1" | grep -q 'TYPE="ext4"'
+     [ /dev/disk/by-label/mutable -ef "$P1" ]
   then
     log_progress "Existing backingfiles (xfs) and mutable (ext4) partitions found on $DATA_DRIVE. Keeping them."
     # Unmount before xfs_repair — otherwise it hangs on a busy device.

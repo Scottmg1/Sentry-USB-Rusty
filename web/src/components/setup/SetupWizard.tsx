@@ -149,9 +149,14 @@ function getStepError(stepIdx: number, data: SetupFormData): string | null {
 
 // ── Destructive change detection ──
 // These settings cause data loss when changed because the underlying disk
-// images must be deleted and recreated with the new size/filesystem.
+// images must be deleted and recreated with the new size/filesystem. The
+// backingfiles partition itself is preserved across config-only re-runs
+// (the partition wipe used to fire on missing fstab entries — fixed in
+// crates/setup/src/partition.rs setup_data_drive). Snapshots also
+// survive size changes (fixed in disk_images.rs — was being wiped on
+// every CAM_SIZE change).
 const DESTRUCTIVE_SIZE_KEYS: Record<string, string> = {
-  CAM_SIZE: "Dashcam drive (clips & snapshots)",
+  CAM_SIZE: "Dashcam drive (live clips inside)",
   MUSIC_SIZE: "Music drive",
   LIGHTSHOW_SIZE: "Lightshow drive",
   BOOMBOX_SIZE: "Boombox drive",
@@ -178,6 +183,26 @@ function detectDestructiveChanges(
 
   const changes: DestructiveChange[] = []
 
+  // Check if DATA_DRIVE changed — this points setup at a different external
+  // disk, formatting the new one. The OLD drive is left untouched (the Rust
+  // setup_data_drive refuses to proceed if the old drive is still attached
+  // with the SentryUSB labels, prompting the user to disconnect it first
+  // so we never overwrite their old data). Treat as the loudest possible
+  // warning since the user is asking to format a different physical disk.
+  const oldDataDrive = (original.DATA_DRIVE ?? "").trim()
+  const newDataDrive = (current.DATA_DRIVE ?? "").trim()
+  if (oldDataDrive && newDataDrive && oldDataDrive !== newDataDrive) {
+    changes.push({
+      key: "DATA_DRIVE",
+      label: `External data drive: ${newDataDrive}`,
+      reason:
+        `DATA_DRIVE changed from ${oldDataDrive} to ${newDataDrive}. ` +
+        `The new drive will be formatted (everything currently on it will be lost). ` +
+        `Your old drive (${oldDataDrive}) will be left untouched and unmounted — ` +
+        `disconnect it before re-running setup if it's still plugged in.`,
+    })
+  }
+
   // Check if filesystem type changed — this forces ALL drives to be recreated
   const exfatChanged = (current.USE_EXFAT ?? "true") !== (original.USE_EXFAT ?? "true")
   if (exfatChanged) {
@@ -186,7 +211,7 @@ function detectDestructiveChanges(
     changes.push({
       key: "USE_EXFAT",
       label: "All drives",
-      reason: `Filesystem type changed from ${from} to ${to} — all drive images will be recreated`,
+      reason: `Filesystem type changed from ${from} to ${to} — all drive images will be recreated. Snapshots in /backingfiles/snapshots are not affected.`,
     })
     // When exFAT changes, all drives are affected so we don't need to list individual size changes
     return changes
@@ -197,11 +222,15 @@ function detectDestructiveChanges(
     const newVal = normalizeSizeValue(current[key])
     const oldVal = normalizeSizeValue(original[key])
     if (newVal !== oldVal) {
-      changes.push({
-        key,
-        label,
-        reason: `Size changed from ${oldVal || "0"}G to ${newVal}G — drive image will be recreated`,
-      })
+      // Size-change recreates that drive's image only. Sibling drives
+      // and the snapshots directory are preserved (FAT32/exFAT have no
+      // reliable Linux-side resize tool, so the affected image itself
+      // gets a fresh mkfs — same as teslausb has always done).
+      const reason =
+        key === "CAM_SIZE"
+          ? `CAM_SIZE changed from ${oldVal || "0"}G to ${newVal}G. Live clips currently inside the dashcam drive will be lost. Snapshots (in /backingfiles/snapshots) and other drives are not affected.`
+          : `Size changed from ${oldVal || "0"}G to ${newVal}G — only this drive's image will be recreated. Other drives and snapshots are not affected.`
+      changes.push({ key, label, reason })
     }
   }
 
@@ -259,6 +288,18 @@ export function SetupWizard({ initialData, onClose }: SetupWizardProps) {
   const [destructiveWarning, setDestructiveWarning] = useState<DestructiveChange[] | null>(null)
   // Tracks whether the user restored from a backup (affects warning dialog wording)
   const isRestoreFlow = useRef(false)
+  // True when SENTRYUSB_SETUP_FINISHED exists on disk — i.e. the user is
+  // re-running the wizard against an already-set-up system. Used to
+  // (a) show a green "data preserved" banner when no destructive change
+  // is staged, and (b) phrase apply-time copy as a re-configuration
+  // rather than a fresh install.
+  const [setupAlreadyFinished, setSetupAlreadyFinished] = useState(false)
+  // Pre-flight space check: when the user proposes drive sizes that
+  // exceed available backingfiles space, the server returns the gap
+  // and we surface it inline (with a deep-link to the snapshot UI)
+  // instead of letting the apply call wedge mid-setup with the same
+  // bail!. Null means "no current rejection".
+  const [spaceRejection, setSpaceRejection] = useState<string | null>(null)
 
   const handleChange = useCallback((key: string, value: string) => {
     setFormData((prev) => ({ ...prev, [key]: value }))
@@ -275,6 +316,25 @@ export function SetupWizard({ initialData, onClose }: SetupWizardProps) {
       originalDataRef.current = { ...(originalDataRef.current ?? {}), ...baseline }
       isRestoreFlow.current = true
     }
+  }, [])
+
+  // Detect whether the user is re-running the wizard against an already-
+  // completed setup. The Rust backend writes SENTRYUSB_SETUP_FINISHED at
+  // the end of a successful run; /api/setup/status surfaces the marker.
+  // Knowing this lets us show a clear "data preserved" banner so a user
+  // who's just changing ARCHIVE_SERVER doesn't worry that hitting Apply
+  // will format anything (it won't, after the partition.rs idempotency
+  // fix and the runner's already_finished guard).
+  useEffect(() => {
+    let cancelled = false
+    fetch("/api/setup/status")
+      .then((r) => r.json())
+      .then((data) => {
+        if (cancelled) return
+        setSetupAlreadyFinished(Boolean(data?.setup_finished))
+      })
+      .catch(() => { /* status endpoint flake → assume fresh install */ })
+    return () => { cancelled = true }
   }, [])
 
   // Hydrate Community Features prefs from the preference store on mount.
@@ -429,6 +489,7 @@ export function SetupWizard({ initialData, onClose }: SetupWizardProps) {
   async function doApply(dataToSave: SetupFormData) {
     setSaving(true)
     setSaveError(null)
+    setSpaceRejection(null)
     try {
       const sizeFields = new Set(["CAM_SIZE", "MUSIC_SIZE", "LIGHTSHOW_SIZE", "BOOMBOX_SIZE", "WRAPS_SIZE"])
       const configData = Object.fromEntries(
@@ -445,6 +506,31 @@ export function SetupWizard({ initialData, onClose }: SetupWizardProps) {
             return [k, v]
           })
       )
+
+      // Pre-flight: ask the backend whether the proposed drive sizes
+      // fit on the backingfiles partition (after a 10% safety reserve
+      // capped at 2-10 GB, matching disk_images::available_space_kb).
+      // If we're rejected, surface the message inline with a link to
+      // the snapshot management UI — never let the apply silently
+      // wedge mid-setup. On a fresh install where /backingfiles isn't
+      // mounted yet the server returns checked=false and we proceed.
+      try {
+        const pfRes = await fetch("/api/setup/preflight", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(configData),
+        })
+        if (pfRes.ok) {
+          const pf = await pfRes.json()
+          if (pf?.ok === false && pf?.error) {
+            setSpaceRejection(pf.error)
+            setPhase("wizard")
+            setSaving(false)
+            return
+          }
+        }
+      } catch { /* network blip — let the real apply path surface any error */ }
+
       const res = await fetch("/api/setup/config", {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
@@ -755,6 +841,40 @@ export function SetupWizard({ initialData, onClose }: SetupWizardProps) {
 
         {/* Footer navigation */}
         <div className="shrink-0 border-t border-white/5 px-6 py-4">
+          {/*
+            Re-run-aware "data preserved" banner. Only shown on the
+            final step of an already-completed setup, when no
+            destructive change is staged. Communicates clearly that
+            hitting Apply will not touch the partition or drive
+            images — the user is just updating a config value. This
+            removes the surprise factor that drove the original
+            "I changed my archive server and lost everything"
+            complaint.
+          */}
+          {isLast
+            && setupAlreadyFinished
+            && detectDestructiveChanges(formData, originalDataRef.current).length === 0
+            && !saveError
+            && !currentStepError
+            && !spaceRejection && (
+              <div className="mb-3 rounded-lg border border-emerald-500/30 bg-emerald-500/10 px-3 py-2 text-xs text-emerald-300">
+                <span className="font-medium">Your data is safe.</span>{" "}
+                Setup will only update settings — the dashcam drive,
+                snapshots, and other drives will be preserved.
+              </div>
+            )}
+          {spaceRejection && (
+            <div className="mb-3 rounded-lg border border-amber-500/30 bg-amber-500/10 p-3 text-xs">
+              <p className="font-medium text-amber-300">Not enough free space</p>
+              <p className="mt-1 text-slate-300">{spaceRejection}</p>
+              <a
+                href="/snapshots"
+                className="mt-2 inline-block text-amber-300 underline hover:text-amber-200"
+              >
+                Open snapshot management →
+              </a>
+            </div>
+          )}
           {saveError && (
             <p className="mb-2 text-sm text-red-400">{saveError}</p>
           )}

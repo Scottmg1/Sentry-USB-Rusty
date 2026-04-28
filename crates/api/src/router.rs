@@ -36,6 +36,12 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/setup/run", post(crate::setup::run_setup))
         .route("/api/setup/phases", get(crate::setup::get_setup_phases))
         .route("/api/setup/test-archive", post(crate::setup::test_archive))
+        .route("/api/setup/preflight", post(crate::setup::preflight))
+        // Snapshot management — list / delete archived dashcam
+        // snapshots, plus a free-space query for the UI's gauge.
+        .route("/api/snapshots", get(crate::snapshots::list_snapshots))
+        .route("/api/snapshots/{id}", delete(crate::snapshots::delete_snapshot))
+        .route("/api/backingfiles/free-space", get(crate::snapshots::get_free_space))
         // Clips
         .route("/api/clips", get(crate::clips::get_clips))
         .route("/api/clips/telemetry", get(crate::clips::get_clip_telemetry))

@@ -13,6 +13,7 @@ import Terminal from "@/pages/Terminal"
 import FSDAnalytics from "@/pages/FSDAnalytics"
 import Community from "@/pages/Community"
 import Notifications from "@/pages/Notifications"
+import Snapshots from "@/pages/Snapshots"
 import Login from "@/pages/Login"
 import { SetupWizard } from "@/components/setup/SetupWizard"
 import { SetupProgress } from "@/components/setup/SetupProgress"
@@ -189,6 +190,7 @@ function AppContent() {
           <Route path="/terminal" element={<Terminal />} />
           <Route path="/community" element={<Community />} />
           <Route path="/notifications" element={<Notifications />} />
+          <Route path="/snapshots" element={<Snapshots />} />
           <Route path="/settings" element={<Settings />} />
         </Route>
       </Routes>

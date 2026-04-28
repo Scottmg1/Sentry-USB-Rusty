@@ -51,41 +51,69 @@ pub async fn setup_data_drive(env: &SetupEnv, emitter: &SetupEmitter) -> Result<
     let p1 = format!("{}{}{}", data_drive, prefix, 1);
     let p2 = format!("{}{}{}", data_drive, prefix, 2);
 
+    // Change 7: detect a DATA_DRIVE swap where the old drive is still
+    // attached. If LABEL=backingfiles or LABEL=mutable resolves to a
+    // partition that does NOT live on the new data_drive, the user
+    // has changed DATA_DRIVE without disconnecting the old disk.
+    // Proceeding would either wipe the old drive (data loss) or leave
+    // a label conflict that makes mount LABEL=… ambiguous. Refuse
+    // with a clear message so the user can disconnect the old drive
+    // first; their old data is preserved untouched.
+    if let Some(stale) = label_on_other_drive(data_drive).await {
+        bail!(
+            "DATA_DRIVE is set to {} but the {} from a previous setup is still \
+             attached at {}. Disconnect the old drive before re-running setup, \
+             or change DATA_DRIVE back to {}. Your old drive will not be modified.",
+            data_drive, stale.label, stale.device, stale.parent
+        );
+    }
+
     let bf_ok = check_label_matches(&p2, "backingfiles").await;
     let mut_ok = check_label_matches(&p1, "mutable").await;
     let bf_xfs = check_fstype(&p2, "xfs").await;
     let mut_ext4 = check_fstype(&p1, "ext4").await;
 
     let already_partitioned = bf_ok && mut_ok && bf_xfs && mut_ext4;
-    let fstab = std::fs::read_to_string("/etc/fstab").unwrap_or_default();
-    let fstab_complete = fstab.contains("LABEL=backingfiles") && fstab.contains("LABEL=mutable");
 
-    // True idempotency only: partitions exist with correct labels/fstypes
-    // AND fstab already references them. This is the resume-after-reboot
-    // case (or a clean re-run that needs no work). Anything else means
-    // the drive is in an unknown state and we wipe it cleanly.
-    if already_partitioned && fstab_complete {
+    // Idempotency: if the partitions already have the right labels and
+    // filesystems, KEEP them and just (re)write fstab. Fstab is output,
+    // not input — a missing LABEL= line is a 4 KB text repair, not a
+    // reason to wipefs a TB of dashcam footage. This matches how the
+    // original teslausb create-backingfiles-partition.sh has always
+    // behaved. A user re-running the wizard for a config-only change
+    // (e.g. ARCHIVE_SERVER) hits this branch and never loses data.
+    if already_partitioned {
+        emitter.progress(&format!(
+            "Existing backingfiles (xfs) and mutable (ext4) partitions found on {}. Keeping them.",
+            data_drive
+        ));
+        // Quiesce anything that might be holding the partitions open
+        // before xfs_repair, otherwise it hangs on busy devices. Same
+        // sequence as the bash version's keep-existing path.
+        let _ = sentryusb_shell::run("bash", &["-c", "killall archiveloop 2>/dev/null"]).await;
+        let _ = sentryusb_gadget::disable();
+        let _ = sentryusb_shell::run(
+            "bash",
+            &["-c",
+              "for loop in $(losetup -a 2>/dev/null | grep -E '/backingfiles/|/mnt/' | cut -d: -f1); do \
+                 umount \"$loop\" 2>/dev/null; losetup -d \"$loop\" 2>/dev/null; \
+               done"],
+        ).await;
+        cleanup_mounts().await;
+        let _ = sentryusb_shell::run("umount", &[p1.as_str()]).await;
+        let _ = sentryusb_shell::run("umount", &[p2.as_str()]).await;
+        tokio::time::sleep(Duration::from_secs(2)).await;
+
+        // Replay/clear the XFS log so the subsequent mount doesn't hang
+        // for tens of minutes if the previous shutdown was unclean.
+        repair_xfs(&p2, emitter).await;
+
+        update_fstab().await?;
         return Ok(false);
     }
 
     emitter.begin_phase("partitions", "Disk partitioning");
     emitter.progress(&format!("DATA_DRIVE is set to {}", data_drive));
-
-    // No "keep existing" branch — if we got here, either there are no
-    // partitions yet, OR there are partitions but they don't match the
-    // expected configuration (missing fstab entries, leftover state from
-    // a previous install). Either way the right answer is wipe + fresh
-    // mkfs, so the user lands on a known-good drive every time setup
-    // runs to completion. The wizard's destructive-change detection
-    // ([SetupWizard.tsx:140]) already warned the user before they hit
-    // Save, so we're not erasing anything they didn't sign off on.
-    if already_partitioned {
-        emitter.progress(&format!(
-            "Existing partitions on {} look stale (fstab incomplete) — wiping for a clean install",
-            data_drive
-        ));
-    }
-
     emitter.progress(&format!("Unmounting partitions on {}...", data_drive));
     cleanup_mounts().await;
 
@@ -139,22 +167,16 @@ pub async fn setup_sd_card(env: &SetupEnv, emitter: &SetupEmitter) -> Result<boo
     let boot_disk = env.boot_disk.as_deref()
         .context("Could not detect boot disk")?;
 
-    let fstab = std::fs::read_to_string("/etc/fstab").unwrap_or_default();
-    let fstab_complete = fstab.contains("LABEL=backingfiles") && fstab.contains("LABEL=mutable");
-
-    if partitions_exist().await && fstab_complete {
+    // Idempotency: if the partitions exist with the right labels, keep
+    // them and just (re)write fstab. Fstab is output, not input.
+    if partitions_exist().await {
+        update_fstab().await?;
         return Ok(false);
     }
 
     emitter.begin_phase("partitions", "Disk partitioning");
 
     ensure_xfs_tools().await?;
-
-    if partitions_exist().await {
-        emitter.progress("Using existing backingfiles and mutable partitions");
-        update_fstab().await?;
-        return Ok(true);
-    }
 
     emitter.progress("Creating backingfiles and mutable partitions on SD card...");
 
@@ -271,6 +293,78 @@ async fn get_disk_identifier(disk: &str) -> Result<String> {
         )],
     ).await?;
     Ok(output.trim().to_string())
+}
+
+/// One of the SentryUSB labels resolved to a partition on a disk
+/// other than the configured DATA_DRIVE. Returned by
+/// `label_on_other_drive` so the wizard can identify the old disk in
+/// the error message.
+struct StaleLabel {
+    label: &'static str,
+    device: String,
+    parent: String,
+}
+
+/// Check whether either `backingfiles` or `mutable` is currently a
+/// label on a partition that does NOT belong to `data_drive`. Returns
+/// `Some(stale)` for the first one found, or `None` when there is no
+/// conflict (no symlink, or it points to a partition on the new
+/// data_drive).
+async fn label_on_other_drive(data_drive: &str) -> Option<StaleLabel> {
+    for label in &["backingfiles", "mutable"] {
+        let symlink = format!("/dev/disk/by-label/{}", label);
+        let Ok(target) = std::fs::read_link(&symlink) else { continue };
+        // Resolve relative target like "../../sda2" → "/dev/sda2".
+        let resolved = std::path::Path::new("/dev/disk/by-label")
+            .join(target)
+            .canonicalize()
+            .ok()
+            .and_then(|p| p.to_str().map(str::to_string))
+            .unwrap_or_default();
+        if resolved.is_empty() {
+            continue;
+        }
+        // Strip trailing partition digits to get the parent disk.
+        // e.g. /dev/sda2 -> /dev/sda, /dev/mmcblk0p3 -> /dev/mmcblk0
+        let parent = strip_partition_suffix(&resolved);
+        if !parent.is_empty() && parent != data_drive {
+            return Some(StaleLabel {
+                label,
+                device: resolved,
+                parent,
+            });
+        }
+    }
+    None
+}
+
+/// Drop the trailing partition number from a partition device path.
+/// `sd*` partitions are suffixed with the number directly (sda2);
+/// `mmcblk*`/`nvme*`/`loop*` use a `p` separator (mmcblk0p3, nvme0n1p2).
+///
+/// Important: parent disks for the p-style families end in a digit
+/// already (e.g. `/dev/mmcblk0`, `/dev/nvme0n1`), so we cannot just
+/// strip trailing digits universally — that would chop the `0` off
+/// `mmcblk0` and yield a non-existent device. The function dispatches
+/// on the device family and only strips the `p<digits>` suffix when
+/// it's actually present.
+fn strip_partition_suffix(part: &str) -> String {
+    let p_style = part.contains("mmcblk") || part.contains("nvme") || part.contains("loop");
+    if p_style {
+        // Look for `p<digits>$` and strip exactly that. Anything else
+        // (no `p`, or non-digits after the last `p`) means the input
+        // is already the parent disk — return unchanged.
+        if let Some(p_idx) = part.rfind('p') {
+            let suffix = &part[p_idx + 1..];
+            if !suffix.is_empty() && suffix.chars().all(|c| c.is_ascii_digit()) {
+                return part[..p_idx].to_string();
+            }
+        }
+        return part.to_string();
+    }
+    // sd-style: parent ends in a letter; the partition number is just
+    // trailing digits with no separator. Strip any trailing digit run.
+    part.trim_end_matches(|c: char| c.is_ascii_digit()).to_string()
 }
 
 async fn check_label_matches(device: &str, label: &str) -> bool {
@@ -531,4 +625,42 @@ async fn update_fstab() -> Result<()> {
     let _ = std::fs::create_dir_all(MUTABLE_MOUNT);
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn strip_partition_suffix_handles_sd_style() {
+        // sd*: trailing digits attach directly to the device name.
+        assert_eq!(strip_partition_suffix("/dev/sda1"), "/dev/sda");
+        assert_eq!(strip_partition_suffix("/dev/sda12"), "/dev/sda");
+        assert_eq!(strip_partition_suffix("/dev/sdb"), "/dev/sdb");
+    }
+
+    #[test]
+    fn strip_partition_suffix_handles_p_style() {
+        // mmcblk/nvme/loop use a `p` separator before the digits.
+        assert_eq!(strip_partition_suffix("/dev/mmcblk0p1"), "/dev/mmcblk0");
+        assert_eq!(strip_partition_suffix("/dev/mmcblk0p11"), "/dev/mmcblk0");
+        assert_eq!(strip_partition_suffix("/dev/nvme0n1p2"), "/dev/nvme0n1");
+        assert_eq!(strip_partition_suffix("/dev/loop0p1"), "/dev/loop0");
+    }
+
+    #[test]
+    fn strip_partition_suffix_no_digits_returns_input() {
+        // Already a parent disk → unchanged.
+        assert_eq!(strip_partition_suffix("/dev/sda"), "/dev/sda");
+        assert_eq!(strip_partition_suffix("/dev/mmcblk0"), "/dev/mmcblk0");
+    }
+
+    #[test]
+    fn partition_prefix_routes_devices_correctly() {
+        assert_eq!(partition_prefix("/dev/sda"), "");
+        assert_eq!(partition_prefix("/dev/sdb"), "");
+        assert_eq!(partition_prefix("/dev/mmcblk0"), "p");
+        assert_eq!(partition_prefix("/dev/nvme0n1"), "p");
+        assert_eq!(partition_prefix("/dev/loop0"), "p");
+    }
 }

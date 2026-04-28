@@ -30,7 +30,7 @@ const DRIVE_SPECS: &[DriveSpec] = &[
 ];
 
 /// Parse a human-readable size like "30G", "4G", "100M" into KB.
-pub(crate) fn dehumanize(s: &str) -> Result<u64> {
+pub fn dehumanize(s: &str) -> Result<u64> {
     let s = s.trim().to_uppercase()
         .replace("GB", "G")
         .replace("MB", "M")
@@ -247,45 +247,23 @@ pub async fn create_disk_images(env: &SetupEnv, emitter: &SetupEmitter) -> Resul
     let use_exfat = ensure_exfat_tools(use_exfat_cfg, emitter).await?;
     ensure_vfat_tools().await?;
 
-    // Space check
+    // Space check. teslausb auto-shrinks because it has no UI to ask
+    // the user; we have a UI, so we reject explicitly with a clear
+    // breakdown. The wizard pre-flight surfaces the same calculation
+    // before submit (see verify::verify_disk_space). Never auto-delete
+    // snapshots as a side effect of a settings change.
     let total_requested: u64 = sizes.iter().map(|(_, _, sz, _)| sz).sum();
     let available = available_space_kb().await.unwrap_or(0);
     if total_requested > available {
-        emitter.progress(&format!(
-            "Total requested ({} KB) exceeds available ({} KB), adjusting...",
-            total_requested, available
-        ));
-        // Auto-reduce sizes by 5% iteratively
-        let mut adjusted = sizes.iter().map(|(_, _, sz, _)| *sz).collect::<Vec<_>>();
-        let mins = [
-            dehumanize("30G").unwrap_or(0),
-            dehumanize("4G").unwrap_or(0),
-            dehumanize("1G").unwrap_or(0),
-            dehumanize("500M").unwrap_or(0),
-            0,
-        ];
-        for _ in 0..100 {
-            let sum: u64 = adjusted.iter().sum();
-            if sum <= available {
-                break;
-            }
-            let mut any_reduced = false;
-            for (i, sz) in adjusted.iter_mut().enumerate() {
-                if *sz > mins[i] {
-                    let new = (*sz * 95 / 100).max(mins[i]);
-                    if new < *sz {
-                        *sz = new;
-                        any_reduced = true;
-                    }
-                }
-            }
-            if !any_reduced {
-                bail!("Cannot fit requested drive images into available space");
-            }
-        }
-        for (i, (_, _, sz, _)) in sizes.iter_mut().enumerate() {
-            *sz = adjusted[i];
-        }
+        let need_gb = (total_requested - available) / 1024 / 1024;
+        let req_gb = total_requested / 1024 / 1024;
+        let avail_gb = available / 1024 / 1024;
+        bail!(
+            "Disk images need {} GB but backingfiles has only {} GB free \
+             (after safety reserve). Free at least {} GB by deleting \
+             snapshots from the snapshot management page, then re-run setup.",
+            req_gb, avail_gb, need_gb,
+        );
     }
 
     // Release everything that might be using the images
@@ -301,9 +279,14 @@ pub async fn create_disk_images(env: &SetupEnv, emitter: &SetupEmitter) -> Resul
         create_drive(name, label, *size_kb, use_exfat, emitter).await?;
     }
 
-    // Clean up cam-related data when cam drive was changed/removed
+    // Clean up stale /mutable/TeslaCam symlinks when cam drive was
+    // changed/removed — those symlinks point into the old cam_disk and
+    // are dangling after the recreate. Snapshots are intentionally NOT
+    // touched: they live independently on backingfiles and represent
+    // the user's archived footage history. Wiping them on a CAM_SIZE
+    // change is the same "I changed a setting, why did I lose data"
+    // failure mode the partition wipe used to cause.
     if sizes[0].2 == 0 || cam_changed {
-        let _ = std::fs::remove_dir_all(format!("{}/snapshots", BACKINGFILES));
         if Path::new("/mutable/TeslaCam").is_dir() {
             for dir in &["RecentClips", "SavedClips", "SentryClips", "TeslaTrackMode"] {
                 let _ = std::fs::remove_dir_all(format!("/mutable/TeslaCam/{}", dir));

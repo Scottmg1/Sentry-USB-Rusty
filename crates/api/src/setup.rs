@@ -430,3 +430,116 @@ pub async fn test_archive(
         }
     }
 }
+
+/// POST /api/setup/preflight
+///
+/// Body: JSON map of `*_SIZE` keys (CAM_SIZE, MUSIC_SIZE, etc.) as
+/// human-readable size strings ("40G", "4GB", "100M").
+///
+/// Returns whether the proposed sizes will fit on the backingfiles
+/// partition with the runtime safety reserve. Used by the wizard to
+/// reject Apply before any destructive action runs and direct the
+/// user at the snapshot management page when they need to free
+/// space.
+///
+/// On a fresh install where /backingfiles isn't mounted yet, returns
+/// `ok: true` with `checked: false` — the actual check will run at
+/// setup time and bail with the same message if sizes don't fit.
+pub async fn preflight(
+    State(_s): State<AppState>,
+    Json(body): Json<std::collections::HashMap<String, String>>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    const SIZE_KEYS: &[&str] = &[
+        "CAM_SIZE",
+        "MUSIC_SIZE",
+        "LIGHTSHOW_SIZE",
+        "BOOMBOX_SIZE",
+        "WRAPS_SIZE",
+    ];
+
+    let mut requested_kb: u64 = 0;
+    let mut breakdown = serde_json::Map::new();
+    for key in SIZE_KEYS {
+        let raw = body.get(*key).cloned().unwrap_or_default();
+        let kb = sentryusb_setup::disk_images::dehumanize(&raw).unwrap_or(0);
+        requested_kb = requested_kb.saturating_add(kb);
+        breakdown.insert((*key).to_string(), serde_json::json!({
+            "raw": raw,
+            "kb": kb,
+        }));
+    }
+
+    // Use df on /backingfiles. If not mounted yet (fresh install), we
+    // can't compute available — return ok with checked=false so the
+    // wizard can proceed and the setup phase will do the real check.
+    let df = sentryusb_shell::run(
+        "df", &["--output=size,avail", "--block-size=1K", "/backingfiles/"],
+    ).await;
+
+    let (total_kb, avail_kb) = match df {
+        Ok(out) => {
+            let mut total = 0u64;
+            let mut avail = 0u64;
+            if let Some(line) = out.lines().last() {
+                let mut it = line.split_whitespace();
+                if let Some(t) = it.next() {
+                    total = t.parse().unwrap_or(0);
+                }
+                if let Some(a) = it.next() {
+                    avail = a.parse().unwrap_or(0);
+                }
+            }
+            (total, avail)
+        }
+        Err(_) => (0, 0),
+    };
+
+    if total_kb == 0 {
+        return (StatusCode::OK, Json(serde_json::json!({
+            "ok": true,
+            "checked": false,
+            "reason": "backingfiles partition not mounted yet (fresh install)",
+            "requested_kb": requested_kb,
+            "breakdown": breakdown,
+        })));
+    }
+
+    // Mirror disk_images::available_space_kb: 10% of total, capped 2-10 GB.
+    let ten_pct = total_kb / 10;
+    let min_pad = 2 * 1024 * 1024; // 2 GB in KB
+    let max_pad = 10 * 1024 * 1024; // 10 GB in KB
+    let padding = ten_pct.max(min_pad).min(max_pad);
+    let usable_kb = avail_kb.saturating_sub(padding);
+
+    if requested_kb <= usable_kb {
+        return (StatusCode::OK, Json(serde_json::json!({
+            "ok": true,
+            "checked": true,
+            "requested_kb": requested_kb,
+            "available_kb": usable_kb,
+            "padding_kb": padding,
+            "breakdown": breakdown,
+        })));
+    }
+
+    let need_kb = requested_kb - usable_kb;
+    let need_gb = (need_kb + 1024 * 1024 - 1) / (1024 * 1024);
+    let req_gb = requested_kb / 1024 / 1024;
+    let avail_gb = usable_kb / 1024 / 1024;
+
+    (StatusCode::OK, Json(serde_json::json!({
+        "ok": false,
+        "checked": true,
+        "requested_kb": requested_kb,
+        "available_kb": usable_kb,
+        "padding_kb": padding,
+        "need_kb": need_kb,
+        "breakdown": breakdown,
+        "error": format!(
+            "Disk images need {} GB but backingfiles has only {} GB free \
+             (after safety reserve). Free at least {} GB by deleting \
+             snapshots from the snapshot management page, then re-run setup.",
+            req_gb, avail_gb, need_gb,
+        ),
+    })))
+}
