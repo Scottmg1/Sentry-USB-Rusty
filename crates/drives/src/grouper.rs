@@ -797,7 +797,11 @@ fn build_summary(
 
     DriveSummary {
         id: idx as i32,
-        date: first_clip.route.date.clone(),
+        // Derive from the parsed start_time, not the raw `date_dir` column.
+        // Tesla directories are `YYYY-MM-DD_HH-MM-SS`; the web UI parses
+        // `.date` as a JS `new Date(date + "T00:00:00")` which fails on
+        // anything other than `YYYY-MM-DD` and renders "INVALID DATE".
+        date: start_time.format("%Y-%m-%d").to_string(),
         start_time: start_time_str,
         end_time: end_time.format("%Y-%m-%dT%H:%M:%S").to_string(),
         duration_ms,
@@ -827,7 +831,16 @@ fn build_summary(
         tacc_distance_km: round2(tacc_dist_m / 1000.0),
         tacc_distance_mi: round2(tacc_dist_m / 1609.344),
         assisted_percent,
-        source: first_clip.route.source.clone(),
+        // Default null source to "sei" so the JSON contract matches Go
+        // (`hide_tessie_overlapping_sei` and the FSD analytics filter
+        // both compare to the literal "sei" string).
+        source: Some(
+            first_clip
+                .route
+                .source
+                .clone()
+                .unwrap_or_else(|| "sei".to_string()),
+        ),
         external_signature: first_clip.route.external_signature.clone(),
         tessie_autopilot_percent: first_clip.route.tessie_autopilot_percent,
     }
@@ -1802,6 +1815,79 @@ fn build_fsd_analytics(summaries: &[DriveSummary], period: &str) -> FsdAnalytics
 }
 
 // ---------------------------------------------------------------------------
+// Tessie/SEI overlap filter
+// ---------------------------------------------------------------------------
+
+/// Filter out Tessie-imported drives whose `[start_time, end_time]` window
+/// overlaps any native SEI drive. Tessie drives that fall in SEI gaps are
+/// kept. Port of Go's `hideTessieOverlappingSEI` (server/api/drives.go).
+///
+/// Without this filter, the same physical trip can appear twice in the
+/// drive list — once as a high-fidelity SEI drive (date stored as the
+/// raw TeslaCam directory name) and once as the Tessie fallback (date
+/// stored as just `YYYY-MM-DD`). Hide policy is applied on read; the
+/// underlying clip rows stay in the DB so the Tessie drive resurfaces
+/// if the SEI drive is later removed.
+///
+/// Drive `id` values are NOT renumbered — callers that look up drives
+/// by ID (e.g. `find_drive_files`) must continue to operate on the
+/// un-hidden grouping so the IDs handed to the frontend stay valid.
+pub fn hide_tessie_overlapping_sei(summaries: Vec<DriveSummary>) -> Vec<DriveSummary> {
+    // Build sorted list of [start, end] ranges from the SEI drives.
+    let mut sei_ranges: Vec<(i64, i64)> = Vec::new();
+    for d in &summaries {
+        if is_tessie(&d.source) {
+            continue;
+        }
+        let (Some(s), Some(e)) = (parse_iso_seconds(&d.start_time), parse_iso_seconds(&d.end_time))
+        else {
+            continue;
+        };
+        sei_ranges.push((s, e));
+    }
+    if sei_ranges.is_empty() {
+        return summaries;
+    }
+    sei_ranges.sort_by_key(|r| r.0);
+
+    let mut out = Vec::with_capacity(summaries.len());
+    for d in summaries {
+        if !is_tessie(&d.source) {
+            out.push(d);
+            continue;
+        }
+        let (Some(ts), Some(te)) = (parse_iso_seconds(&d.start_time), parse_iso_seconds(&d.end_time))
+        else {
+            // Unparseable timestamps — keep the drive rather than silently
+            // hiding it (matches Go's defensive behavior).
+            out.push(d);
+            continue;
+        };
+        let mut hide = false;
+        for &(rs, re) in &sei_ranges {
+            if re <= ts {
+                continue;
+            }
+            if rs >= te {
+                break;
+            }
+            hide = true;
+            break;
+        }
+        if !hide {
+            out.push(d);
+        }
+    }
+    out
+}
+
+fn parse_iso_seconds(s: &str) -> Option<i64> {
+    NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S")
+        .ok()
+        .map(|dt| dt.and_utc().timestamp())
+}
+
+// ---------------------------------------------------------------------------
 // Utility functions
 // ---------------------------------------------------------------------------
 
@@ -2317,7 +2403,9 @@ fn build_summary_from_aggregates(
 
     DriveSummary {
         id: idx as i32,
-        date: first_clip.summary.date.clone(),
+        // See `build_summary` above — derive from start_time so the web
+        // UI's `new Date(date + "T00:00:00")` parses cleanly.
+        date: start_time.format("%Y-%m-%d").to_string(),
         start_time: start_time_str,
         end_time: end_time.format("%Y-%m-%dT%H:%M:%S").to_string(),
         duration_ms,
@@ -2347,7 +2435,14 @@ fn build_summary_from_aggregates(
         tacc_distance_km: round2(tacc_dist_m / 1000.0),
         tacc_distance_mi: round2(tacc_dist_m / 1609.344),
         assisted_percent,
-        source: first_clip.summary.source.clone(),
+        // Match Go: null/empty source becomes "sei".
+        source: Some(
+            first_clip
+                .summary
+                .source
+                .clone()
+                .unwrap_or_else(|| "sei".to_string()),
+        ),
         external_signature: first_clip.summary.external_signature.clone(),
         tessie_autopilot_percent: None,
     }

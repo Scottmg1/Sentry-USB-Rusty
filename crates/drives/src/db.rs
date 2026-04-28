@@ -39,7 +39,16 @@ pub const LEGACY_JSON_PATH: &str = "/root/drive-data.json";
 
 /// Archive-side JSON copy for CIFS/NFS mounts.
 pub const ARCHIVE_DATA_PATH: &str = "/mnt/archive/drive-data.json";
-const DRIVE_LIST_CACHE_ALGO_VERSION: &str = "2";
+// Bump on every drive-list-shape change so existing on-disk caches
+// rebuild on first boot after upgrade.
+//
+// v3 (2026-04-28): switched cache from BLOB grouper (group_clips) to
+// summary grouper (group_summary_clips), added hide_tessie_overlapping_sei
+// filter, and changed `DriveSummary.date` to derive from start_time
+// (was the raw date_dir column). Aligns the list endpoint with what
+// the single-drive endpoint already does, so clicking a drive in the
+// list returns the matching points.
+const DRIVE_LIST_CACHE_ALGO_VERSION: &str = "3";
 
 /// Ordered list of paths the one-shot importer checks on first boot.
 /// The first that exists wins.
@@ -730,10 +739,19 @@ fn apply_pragmas(conn: &Connection) -> Result<()> {
 /// along with the route count and tag row count used to validate the cache
 /// on the next startup.
 fn rebuild_drive_list_cache(conn: &Connection) -> Result<()> {
-    // Accuracy-first cache build: use the full route grouper path so drive
-    // boundaries/count match Sentry-Drive exactly.
-    let routes = select_all_routes(conn)?;
-    let route_count = routes.len() as i64;
+    // Use the BLOB-free summary grouper so this cache and the
+    // `single_drive` endpoint (which also resolves drive IDs through
+    // the summary grouper) agree on drive count, boundaries, and IDs.
+    // The previous BLOB-grouper cache could split a clip mid-park-gap
+    // while the summary grouper kept the whole clip in one drive,
+    // producing different drive lists for /api/drives vs
+    // /api/drives/{id} and causing clicked drives to load wrong points.
+    //
+    // Heap win: ~5 MB instead of ~300 MB on a 5500-route DB (no BLOB
+    // decode here). Numerical drift on noisy GPS is fractions of a
+    // percent, invisible after the UI's 0.1-mi / whole-percent rounding.
+    let summaries = select_all_route_summaries(conn)?;
+    let route_count = summaries.len() as i64;
 
     let mut tags = std::collections::HashMap::<String, Vec<String>>::new();
     let mut tags_count: i64 = 0;
@@ -749,8 +767,13 @@ fn rebuild_drive_list_cache(conn: &Connection) -> Result<()> {
         }
     }
 
-    let drives = crate::grouper::group_summaries(&routes, &tags);
-    let json = serde_json::to_string(&drives)
+    // Group with original (un-hidden) IDs first — these are what
+    // `find_drive_files` looks up against, so the cached list must
+    // hold the same IDs even after the Tessie-overlap filter strips
+    // duplicates.
+    let drives = crate::grouper::group_summaries_fast(&summaries, &tags);
+    let visible = crate::grouper::hide_tessie_overlapping_sei(drives.clone());
+    let json = serde_json::to_string(&visible)
         .map_err(|e| anyhow::anyhow!("drive cache serialize: {}", e))?;
     schema::meta_set(conn, "drive_list_cache", &json)?;
     schema::meta_set(conn, "drive_list_cache_route_count", &route_count.to_string())?;
@@ -824,8 +847,9 @@ fn rebuild_drive_list_cache(conn: &Connection) -> Result<()> {
     schema::meta_set(conn, "fsd_analytics_cache", &fsd_json)?;
 
     info!(
-        "[drives] Drive list cache rebuilt ({} drives from {} routes)",
+        "[drives] Drive list cache rebuilt ({} drives, {} visible after Tessie/SEI hide, from {} routes)",
         drives.len(),
+        visible.len(),
         route_count
     );
     Ok(())
