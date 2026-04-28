@@ -1895,7 +1895,7 @@ export default function Settings() {
         </div>
       </div>
 
-      {/* Preferences */}
+      {/* Preferences & Connections */}
       <div>
         <p className="section-label mb-2 px-1">Preferences</p>
         <div className="grid grid-cols-1 gap-2 lg:grid-cols-3">
@@ -1924,13 +1924,6 @@ export default function Settings() {
               setWizardOpen(true)
             }}
           />
-        </div>
-      </div>
-
-      {/* Connections & Updates — side by side */}
-      <div>
-        <p className="section-label mb-2 px-1">Connections & Updates</p>
-        <div className="grid grid-cols-1 gap-2 lg:grid-cols-2">
           <div className="space-y-2">
             <MobileNotificationsSection />
             {piConfig?.uses_ble === "yes" && <BlePairButton />}
