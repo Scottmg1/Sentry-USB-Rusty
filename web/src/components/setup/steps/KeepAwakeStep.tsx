@@ -13,7 +13,6 @@ const methods = [
 
 const sentryCases = [
   { id: "1", label: "Case 1: Sentry ON everywhere except home", desc: "Sentry Mode turns OFF after archiving at home. Turns ON when you drive." },
-  { id: "2", label: "Case 2: Sentry OFF everywhere except archiving", desc: "Sentry Mode turns ON only during archiving, then back OFF." },
   { id: "3", label: "Case 3: No Sentry Mode (periodic nudge)", desc: "Periodic keep-awake command without Sentry Mode. BLE/Tessie/Webhook only." },
 ]
 
