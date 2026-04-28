@@ -22,8 +22,6 @@ const ALLOWED_BASES: &[&str] = &[
     "/mutable",
     "/mnt/cam",
     "/mnt/cam/TeslaCam",
-    "/mnt/wraps",
-    "/mnt/wraps/Wraps",
     "/mutable/LicensePlate",
     "/mutable/LockChime",
     "/mnt/music",
@@ -265,8 +263,8 @@ pub async fn delete_file(State(_s): State<AppState>, Query(params): Query<Delete
     match result {
         Ok(()) => {
             // Path is rooted at /mutable/Wraps/* — write a zero-byte tombstone so
-            // archiveloop's reverse-sync (--ignore-existing) won't resurrect it
-            // from the wraps disk on the next loop. Tombstones are cleared after
+            // archiveloop's reverse-sync (--ignore-existing) from the cam drive
+            // won't resurrect it on the next loop. Tombstones are cleared after
             // a successful forward-sync.
             if clean_str.starts_with("/mutable/Wraps/") {
                 let tombstone_dir = std::path::Path::new("/mutable/.wraps_deleted");

@@ -166,7 +166,6 @@ const DESTRUCTIVE_SIZE_KEYS: Record<string, string> = {
   MUSIC_SIZE: "Music drive",
   LIGHTSHOW_SIZE: "Lightshow drive",
   BOOMBOX_SIZE: "Boombox drive",
-  WRAPS_SIZE: "Wraps drive",
 }
 
 interface DestructiveChange {
@@ -505,7 +504,7 @@ export function SetupWizard({ initialData, onClose }: SetupWizardProps) {
     setSaveError(null)
     setSpaceRejection(null)
     try {
-      const sizeFields = new Set(["CAM_SIZE", "MUSIC_SIZE", "LIGHTSHOW_SIZE", "BOOMBOX_SIZE", "WRAPS_SIZE", "INCREASE_ROOT_SIZE"])
+      const sizeFields = new Set(["CAM_SIZE", "MUSIC_SIZE", "LIGHTSHOW_SIZE", "BOOMBOX_SIZE", "INCREASE_ROOT_SIZE"])
       const configData: Record<string, string> = Object.fromEntries(
         Object.entries(dataToSave)
           .filter(([k, v]) => !k.startsWith("_") && v !== "")

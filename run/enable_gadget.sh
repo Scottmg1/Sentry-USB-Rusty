@@ -94,14 +94,6 @@ then
   ((++lun))
 fi
 
-if [ -e "/backingfiles/wraps_disk.bin" ]
-then
-  mkdir -p "$gadget_root/functions/mass_storage.0/lun.${lun}"
-  echo "/backingfiles/wraps_disk.bin" > "$gadget_root/functions/mass_storage.0/lun.${lun}/file"
-  echo "SentryUSB WRAPS $(du -h /backingfiles/wraps_disk.bin | awk '{print $1}')" > "$gadget_root/functions/mass_storage.0/lun.${lun}/inquiry_string"
-  ((++lun))
-fi
-
 ln -sf "$gadget_root/functions/mass_storage.0" "$gadget_root/configs/$cfg.1"
 
 # activate

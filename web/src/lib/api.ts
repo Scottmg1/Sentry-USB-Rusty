@@ -102,7 +102,6 @@ export interface StorageBreakdown {
   music_size: number
   lightshow_size: number
   boombox_size: number
-  wraps_size: number
   snapshots_size: number
   total_space: number
   free_space: number

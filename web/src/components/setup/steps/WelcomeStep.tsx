@@ -71,7 +71,6 @@ const LEGACY_KEY_MAP: Record<string, string> = {
   musicsize: "MUSIC_SIZE",
   lightshowsize: "LIGHTSHOW_SIZE",
   boomboxsize: "BOOMBOX_SIZE",
-  wrapssize: "WRAPS_SIZE",
   sharename: "SHARE_NAME",
   musicsharename: "MUSIC_SHARE_NAME",
   shareuser: "SHARE_USER",

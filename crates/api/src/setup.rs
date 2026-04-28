@@ -454,7 +454,6 @@ pub async fn preflight(
         "MUSIC_SIZE",
         "LIGHTSHOW_SIZE",
         "BOOMBOX_SIZE",
-        "WRAPS_SIZE",
     ];
 
     let mut requested_kb: u64 = 0;

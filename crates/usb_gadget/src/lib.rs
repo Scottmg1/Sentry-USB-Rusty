@@ -22,7 +22,6 @@ const DISK_IMAGES: &[(&str, &str)] = &[
     ("/backingfiles/music_disk.bin", "MUSIC"),
     ("/backingfiles/lightshow_disk.bin", "LIGHTSHOW"),
     ("/backingfiles/boombox_disk.bin", "BOOMBOX"),
-    ("/backingfiles/wraps_disk.bin", "WRAPS"),
 ];
 
 /// Find the configfs root mount point.

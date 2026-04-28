@@ -1451,28 +1451,18 @@ function ConfigBackupSection() {
 
 // ─── Community Features section ────────────────────────────────────────────
 
-function CommunityFeaturesSection({ onOpenWizardForWraps }: { onOpenWizardForWraps: () => void }) {
+function CommunityFeaturesSection() {
   const [wrapsEnabled, setWrapsEnabled] = useState<boolean>(true)
   const [chimesEnabled, setChimesEnabled] = useState<boolean>(true)
-  const [hasWrapsPartition, setHasWrapsPartition] = useState<boolean>(false)
   const [loaded, setLoaded] = useState(false)
 
   function refreshState() {
     Promise.all([
       fetch("/api/config/preference?key=community_wraps_enabled").then((r) => r.json()).catch(() => ({ value: null })),
       fetch("/api/config/preference?key=community_chimes_enabled").then((r) => r.json()).catch(() => ({ value: null })),
-      fetch("/api/setup/config").then((r) => r.ok ? r.json() : null).catch(() => null),
-    ]).then(([wraps, chimes, config]) => {
+    ]).then(([wraps, chimes]) => {
       setWrapsEnabled(wraps?.value == null ? true : wraps.value !== "disabled")
       setChimesEnabled(chimes?.value == null ? true : chimes.value !== "disabled")
-      if (config) {
-        const entry = config.WRAPS_SIZE as { value?: string; active?: boolean } | undefined
-        const raw = entry?.active ? (entry.value ?? "") : ""
-        const num = parseInt(raw.replace(/[^0-9]/g, "") || "0", 10)
-        setHasWrapsPartition(num > 0)
-      } else {
-        setHasWrapsPartition(false)
-      }
       setLoaded(true)
     })
   }
@@ -1494,11 +1484,6 @@ function CommunityFeaturesSection({ onOpenWizardForWraps }: { onOpenWizardForWra
   }
 
   async function handleWrapsToggle(next: boolean) {
-    if (next && !hasWrapsPartition) {
-      // Need to allocate a partition — open the setup wizard pre-set to enable wraps.
-      onOpenWizardForWraps()
-      return
-    }
     setWrapsEnabled(next)
     await setPref("community_wraps_enabled", next)
   }
@@ -1528,11 +1513,9 @@ function CommunityFeaturesSection({ onOpenWizardForWraps }: { onOpenWizardForWra
             <div>
               <span className="text-xs font-medium text-slate-200">Wraps &amp; License Plates</span>
               <span className="block text-[10px] text-slate-500 mt-0.5">
-                {hasWrapsPartition
-                  ? wrapsEnabled
-                    ? "Tab visible. Toggle off to hide without removing your wraps drive."
-                    : "Hidden. Toggle on to show — your wraps drive is preserved."
-                  : "Requires a dedicated drive partition. Toggling on opens the setup wizard."}
+                {wrapsEnabled
+                  ? "Tab visible. Toggle off to hide."
+                  : "Hidden. Toggle on to show — your wraps and plates are preserved."}
               </span>
             </div>
           </div>
@@ -1902,28 +1885,7 @@ export default function Settings() {
           <KeepAwakePreference />
           <AwayModeControl />
           <ConfigBackupSection />
-          <CommunityFeaturesSection
-            onOpenWizardForWraps={async () => {
-              try {
-                const res = await fetch("/api/setup/config")
-                if (res.ok) {
-                  const data = await res.json()
-                  const flat: Record<string, string> = {}
-                  for (const [k, v] of Object.entries(data)) {
-                    const entry = v as { value: string; active: boolean }
-                    if (entry.active) flat[k] = entry.value
-                  }
-                  flat._community_wraps_enabled = "true"
-                  setWizardInitialData(flat)
-                } else {
-                  setWizardInitialData({ _community_wraps_enabled: "true" })
-                }
-              } catch {
-                setWizardInitialData({ _community_wraps_enabled: "true" })
-              }
-              setWizardOpen(true)
-            }}
-          />
+          <CommunityFeaturesSection />
           <div className="space-y-2">
             <MobileNotificationsSection />
             {piConfig?.uses_ble === "yes" && <BlePairButton />}

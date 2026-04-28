@@ -496,7 +496,6 @@ export default function Dashboard() {
               { label: "Music", size: storageBreakdown.music_size, color: "#a855f7" },
               { label: "Lightshow", size: storageBreakdown.lightshow_size, color: "#f59e0b" },
               { label: "Boombox", size: storageBreakdown.boombox_size, color: "#ec4899" },
-              { label: "Wraps", size: storageBreakdown.wraps_size, color: "#14b8a6" },
               { label: "Snapshots", size: storageBreakdown.snapshots_size, color: "#6366f1" },
             ].filter(s => s.size > 0)
             const total = storageBreakdown.total_space

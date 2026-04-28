@@ -57,7 +57,6 @@ fi
 
 export CAM_MOUNT=/mnt/cam
 export MUSIC_MOUNT=/mnt/music
-export WRAPS_MOUNT=/mnt/wraps
 
 # read the setup variables and define other environment variables and functions
 source /root/bin/envsetup.sh
@@ -147,47 +146,16 @@ function sync_user_media_to_cam () {
   fi
   log "Syncing user media to cam drive..."
 
-  # Sync Wraps to its own dedicated disk if available, otherwise to cam
-  if [ -e /backingfiles/wraps_disk.bin ] && [ -d "/mutable/Wraps" ] && [ -n "$(ls -A /mutable/Wraps 2>/dev/null)" ]
-  then
-    if ensure_mountpoint_is_mounted "$WRAPS_MOUNT"
-    then
-      mkdir -p "$WRAPS_MOUNT/Wraps"
-      rsync -a --delete "/mutable/Wraps/" "$WRAPS_MOUNT/Wraps/" >> "$LOG_FILE" 2>&1 \
-        || log "Failed to sync Wraps to wraps drive"
-      # Forward-sync propagated deletions to disk; tombstones no longer needed
-      rm -rf /mutable/.wraps_deleted 2>/dev/null || true
-      unmount_mount_point "$WRAPS_MOUNT"
-      log "Synced Wraps to dedicated wraps drive."
-    else
-      log "Could not mount wraps drive, falling back to cam drive for Wraps."
-      # Fall through to cam-based sync below
-      if ensure_mountpoint_is_mounted "$CAM_MOUNT"
-      then
-        mkdir -p "$CAM_MOUNT/Wraps"
-        rsync -a --delete "/mutable/Wraps/" "$CAM_MOUNT/Wraps/" >> "$LOG_FILE" 2>&1 \
-          || log "Failed to sync Wraps to cam drive"
-        # Forward-sync propagated deletions to disk; tombstones no longer needed
-        rm -rf /mutable/.wraps_deleted 2>/dev/null || true
-        unmount_mount_point "$CAM_MOUNT"
-      fi
-    fi
-  fi
-
-  # Sync LicensePlate (and Wraps if no dedicated wraps disk) to cam drive
+  # Wraps & LicensePlate live as folders on the cam drive (no dedicated partition).
   if ensure_mountpoint_is_mounted "$CAM_MOUNT"
   then
-    if [ ! -e /backingfiles/wraps_disk.bin ]
+    if [ -d "/mutable/Wraps" ] && [ -n "$(ls -A /mutable/Wraps 2>/dev/null)" ]
     then
-      # No dedicated wraps disk — sync Wraps to cam drive (legacy behavior)
-      if [ -d "/mutable/Wraps" ] && [ -n "$(ls -A /mutable/Wraps 2>/dev/null)" ]
-      then
-        mkdir -p "$CAM_MOUNT/Wraps"
-        rsync -a --delete "/mutable/Wraps/" "$CAM_MOUNT/Wraps/" >> "$LOG_FILE" 2>&1 \
-          || log "Failed to sync Wraps to cam drive"
-        # Forward-sync propagated deletions to disk; tombstones no longer needed
-        rm -rf /mutable/.wraps_deleted 2>/dev/null || true
-      fi
+      mkdir -p "$CAM_MOUNT/Wraps"
+      rsync -a --delete "/mutable/Wraps/" "$CAM_MOUNT/Wraps/" >> "$LOG_FILE" 2>&1 \
+        || log "Failed to sync Wraps to cam drive"
+      # Forward-sync propagated deletions to disk; tombstones no longer needed
+      rm -rf /mutable/.wraps_deleted 2>/dev/null || true
     fi
     if [ -d "/mutable/LicensePlate" ] && [ -n "$(ls -A /mutable/LicensePlate 2>/dev/null)" ]
     then
@@ -222,41 +190,16 @@ function sync_user_media_to_cam () {
 function sync_disk_media_to_host () {
   log "Reverse-syncing disk media to host paths..."
 
-  # Reverse-sync Wraps: files uploaded via USB (directly to the wraps disk
-  # image) need to appear in /mutable/Wraps so the web UI can see them.
-  if [ -e /backingfiles/wraps_disk.bin ]
-  then
-    if ensure_mountpoint_is_mounted "$WRAPS_MOUNT"
-    then
-      if [ -d "$WRAPS_MOUNT/Wraps" ] && [ -n "$(ls -A "$WRAPS_MOUNT/Wraps" 2>/dev/null)" ]
-      then
-        mkdir -p /mutable/Wraps
-        # Build exclude list from tombstones to prevent resurrection of deleted wraps
-        _wraps_exclude_file=$(mktemp)
-        if [ -d /mutable/.wraps_deleted ]; then
-          for _tombstone in /mutable/.wraps_deleted/*; do
-            [ -e "$_tombstone" ] && basename "$_tombstone" >> "$_wraps_exclude_file"
-          done
-        fi
-        rsync -a --ignore-existing --exclude-from="$_wraps_exclude_file" "$WRAPS_MOUNT/Wraps/" "/mutable/Wraps/" >> "$LOG_FILE" 2>&1 \
-          || log "Failed to reverse-sync Wraps from wraps drive"
-        rm -f "$_wraps_exclude_file"
-        log "Reverse-synced Wraps from wraps drive to /mutable/Wraps."
-      fi
-      unmount_mount_point "$WRAPS_MOUNT"
-    fi
-  fi
-
-  # Reverse-sync LicensePlate (and Wraps when no dedicated wraps disk)
-  # from the cam drive.
+  # Reverse-sync Wraps & LicensePlate from the cam drive (the only place
+  # they live now — no dedicated wraps partition).
   if [ -e /backingfiles/cam_disk.bin ]
   then
     if ensure_mountpoint_is_mounted "$CAM_MOUNT"
     then
-      if [ ! -e /backingfiles/wraps_disk.bin ] && [ -d "$CAM_MOUNT/Wraps" ] && [ -n "$(ls -A "$CAM_MOUNT/Wraps" 2>/dev/null)" ]
+      if [ -d "$CAM_MOUNT/Wraps" ] && [ -n "$(ls -A "$CAM_MOUNT/Wraps" 2>/dev/null)" ]
       then
         mkdir -p /mutable/Wraps
-        # Build exclude list from tombstones (same as dedicated disk path above)
+        # Build exclude list from tombstones to prevent resurrection of deleted wraps
         _wraps_exclude_file=$(mktemp)
         if [ -d /mutable/.wraps_deleted ]; then
           for _tombstone in /mutable/.wraps_deleted/*; do

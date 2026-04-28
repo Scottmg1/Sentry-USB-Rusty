@@ -122,7 +122,6 @@ pub async fn health_check(State(_s): State<AppState>) -> (StatusCode, Json<serde
         ("/backingfiles/music_disk.bin", "music disk image", Some("MUSIC_SIZE")),
         ("/backingfiles/lightshow_disk.bin", "lightshow disk image", Some("LIGHTSHOW_SIZE")),
         ("/backingfiles/boombox_disk.bin", "boombox disk image", Some("BOOMBOX_SIZE")),
-        ("/backingfiles/wraps_disk.bin", "wraps disk image", Some("WRAPS_SIZE")),
     ];
     for (img, label, size_key) in disks {
         // Optional disk the user didn't ask for → skip the check entirely.

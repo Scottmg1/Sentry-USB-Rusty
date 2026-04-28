@@ -879,13 +879,15 @@ async fn update_image_fstab_entries() -> Result<()> {
         ("/backingfiles/music_disk.bin", "/mnt/music"),
         ("/backingfiles/lightshow_disk.bin", "/mnt/lightshow"),
         ("/backingfiles/boombox_disk.bin", "/mnt/boombox"),
-        ("/backingfiles/wraps_disk.bin", "/mnt/wraps"),
     ];
 
     let mut fstab = std::fs::read_to_string("/etc/fstab").unwrap_or_default();
 
+    // Always strip any pre-migration wraps_disk.bin line so reruns don't
+    // leave a stale fstab entry pointing at a deleted backing file.
     let fstab_lines: Vec<&str> = fstab.lines()
         .filter(|l| !images.iter().any(|(img, _)| l.starts_with(img)))
+        .filter(|l| !l.starts_with("/backingfiles/wraps_disk.bin"))
         .collect();
     fstab = fstab_lines.join("\n");
 
@@ -908,12 +910,13 @@ async fn update_image_fstab_entries() -> Result<()> {
 async fn initialize_drive_directories() -> Result<()> {
     let _ = sentryusb_gadget::disable();
 
+    // Wraps & LicensePlate are folders on the cam drive — Tesla reads them
+    // from there, no dedicated partition needed.
     let drives: &[(&str, &[&str])] = &[
-        ("/mnt/cam", &["TeslaCam", "TeslaTrackMode"]),
+        ("/mnt/cam", &["TeslaCam", "TeslaTrackMode", "Wraps", "LicensePlate"]),
         ("/mnt/music", &[]),
         ("/mnt/lightshow", &["LightShow"]),
         ("/mnt/boombox", &["Boombox"]),
-        ("/mnt/wraps", &["Wraps"]),
     ];
 
     for (mnt, dirs) in drives {

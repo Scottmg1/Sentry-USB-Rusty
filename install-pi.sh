@@ -269,7 +269,6 @@ export CAM_SIZE=30G
 #export MUSIC_SIZE=4G
 #export LIGHTSHOW_SIZE=1G
 #export BOOMBOX_SIZE=100M
-#export WRAPS_SIZE=0
 
 # Archive system: none, cifs, nfs, rsync, rclone
 #export ARCHIVE_SYSTEM=none

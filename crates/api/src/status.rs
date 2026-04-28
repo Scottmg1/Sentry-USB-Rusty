@@ -222,7 +222,6 @@ struct StorageBreakdown {
     music_size: i64,
     lightshow_size: i64,
     boombox_size: i64,
-    wraps_size: i64,
     snapshots_size: i64,
     total_space: i64,
     free_space: i64,
@@ -236,7 +235,6 @@ pub async fn get_storage_breakdown(
         music_size: disk_usage("/backingfiles/music_disk.bin"),
         lightshow_size: disk_usage("/backingfiles/lightshow_disk.bin"),
         boombox_size: disk_usage("/backingfiles/boombox_disk.bin"),
-        wraps_size: disk_usage("/backingfiles/wraps_disk.bin"),
         snapshots_size: 0,
         total_space: 0,
         free_space: 0,
@@ -257,7 +255,7 @@ pub async fn get_storage_breakdown(
     }
 
     // Derive snapshot usage by subtraction (reflink clones make du unreliable)
-    let disk_images = sb.cam_size + sb.music_size + sb.lightshow_size + sb.boombox_size + sb.wraps_size;
+    let disk_images = sb.cam_size + sb.music_size + sb.lightshow_size + sb.boombox_size;
     let used = sb.total_space - sb.free_space;
     sb.snapshots_size = (used - disk_images).max(0);
 
@@ -288,7 +286,6 @@ pub async fn get_config(
         "has_music": has("/backingfiles/music_disk.bin"),
         "has_lightshow": has("/backingfiles/lightshow_disk.bin"),
         "has_boombox": has("/backingfiles/boombox_disk.bin"),
-        "has_wraps": has("/backingfiles/wraps_disk.bin"),
         "uses_ble": uses_ble,
     })))
 }

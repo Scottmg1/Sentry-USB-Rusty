@@ -1,19 +1,12 @@
-import { useState, useEffect } from "react"
+import { useEffect } from "react"
 import { Users, Paintbrush, Volume2, Info } from "lucide-react"
 import type { StepProps } from "../SetupWizard"
-
-const DEFAULT_WRAPS_SIZE_GB = "4"
 
 function isWrapsEnabled(data: StepProps["data"]): boolean {
   const v = data._community_wraps_enabled
   if (v === "true") return true
   if (v === "false") return false
-  // Migration / first-load: derive from WRAPS_SIZE in the existing config.
-  // If wraps was never configured (size empty or 0), default to enabled
-  // so new-install users see the choice as opt-out, matching today's UX.
-  const raw = (data.WRAPS_SIZE ?? "").replace(/[gGmM]/g, "").trim()
-  if (!raw) return true
-  return parseInt(raw, 10) > 0
+  return true
 }
 
 function isChimesEnabled(data: StepProps["data"]): boolean {
@@ -23,20 +16,9 @@ function isChimesEnabled(data: StepProps["data"]): boolean {
   return true
 }
 
-function numericWrapsSize(data: StepProps["data"]): string {
-  return (data.WRAPS_SIZE ?? "").replace(/[^0-9]/g, "")
-}
-
 export function CommunityStep({ data, onChange, onBatchChange }: StepProps) {
   const wrapsEnabled = isWrapsEnabled(data)
   const chimesEnabled = isChimesEnabled(data)
-  const [sizeFocused, setSizeFocused] = useState(false)
-  const [sizeLocal, setSizeLocal] = useState(numericWrapsSize(data))
-
-  // Mirror size from formData when not actively editing (e.g., backup restore)
-  useEffect(() => {
-    if (!sizeFocused) setSizeLocal(numericWrapsSize(data))
-  }, [data, sizeFocused])
 
   // On mount, persist any derived defaults so the rest of the wizard
   // and the eventual save handler see explicit values rather than re-deriving.
@@ -49,42 +31,21 @@ export function CommunityStep({ data, onChange, onBatchChange }: StepProps) {
       updates._community_chimes_enabled = chimesEnabled ? "true" : "false"
     }
     if (Object.keys(updates).length > 0) onBatchChange(updates)
-    // Run only when undefined keys are first detected — derived values are
-    // stable for a given config snapshot.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
   function setWraps(enabled: boolean) {
-    if (enabled) {
-      const current = numericWrapsSize(data)
-      const ensureSize = current && parseInt(current, 10) > 0 ? data.WRAPS_SIZE ?? "" : DEFAULT_WRAPS_SIZE_GB
-      onBatchChange({
-        _community_wraps_enabled: "true",
-        WRAPS_SIZE: ensureSize,
-      })
-      setSizeLocal(ensureSize.replace(/[^0-9]/g, "") || DEFAULT_WRAPS_SIZE_GB)
-    } else {
-      onBatchChange({
-        _community_wraps_enabled: "false",
-        WRAPS_SIZE: "0",
-      })
-    }
+    // WRAPS_SIZE is always 0 — Wraps & LicensePlate are folders on the cam
+    // drive now, no dedicated partition. Writing "0" keeps any older code
+    // path that still reads the key happy.
+    onBatchChange({
+      _community_wraps_enabled: enabled ? "true" : "false",
+      WRAPS_SIZE: "0",
+    })
   }
 
   function setChimes(enabled: boolean) {
     onChange("_community_chimes_enabled", enabled ? "true" : "false")
-  }
-
-  function commitSize(raw: string) {
-    const cleaned = raw.replace(/[^0-9]/g, "")
-    if (!cleaned || parseInt(cleaned, 10) === 0) {
-      // Empty/zero in the size field while Wraps is enabled snaps back to default
-      onChange("WRAPS_SIZE", DEFAULT_WRAPS_SIZE_GB)
-      setSizeLocal(DEFAULT_WRAPS_SIZE_GB)
-    } else {
-      onChange("WRAPS_SIZE", cleaned)
-      setSizeLocal(cleaned)
-    }
   }
 
   const noneSelected = !wrapsEnabled && !chimesEnabled
@@ -118,37 +79,10 @@ export function CommunityStep({ data, onChange, onBatchChange }: StepProps) {
                 <span className="text-sm font-medium text-slate-200">Wraps &amp; License Plates</span>
               </div>
               <p className="mt-1 text-xs text-slate-500">
-                Browse and apply community-made wraps and license plates. Requires a dedicated drive partition.
+                Browse and apply community-made wraps and license plates. Stored as folders on the cam drive — no extra partition.
               </p>
             </div>
           </label>
-
-          {wrapsEnabled && (
-            <div className="mt-4 ml-7">
-              <div className="flex items-center justify-between">
-                <label className="text-xs font-medium text-slate-300">Wraps Drive Size</label>
-                <span className="font-mono text-xs text-blue-400">
-                  {(sizeFocused ? sizeLocal : numericWrapsSize(data)) || DEFAULT_WRAPS_SIZE_GB} GB
-                </span>
-              </div>
-              <div className="mt-2 flex gap-2">
-                <input
-                  type="text"
-                  inputMode="numeric"
-                  value={sizeFocused ? sizeLocal : numericWrapsSize(data)}
-                  onFocus={() => { setSizeFocused(true); setSizeLocal(numericWrapsSize(data)) }}
-                  onBlur={(e) => { setSizeFocused(false); commitSize(e.target.value) }}
-                  onChange={(e) => setSizeLocal(e.target.value.replace(/[^0-9]/g, ""))}
-                  placeholder={DEFAULT_WRAPS_SIZE_GB}
-                  className="w-24 rounded-lg border border-white/10 bg-white/5 px-3 py-1.5 text-sm text-slate-100 placeholder-slate-600 outline-none transition focus:border-blue-500/50 focus:ring-1 focus:ring-blue-500/25"
-                />
-                <span className="self-center text-xs text-slate-500">GB</span>
-              </div>
-              <p className="mt-1.5 text-[11px] text-slate-600">
-                Storage reserved on the USB drive for community wraps. 4 GB is plenty for most users.
-              </p>
-            </div>
-          )}
         </div>
 
         {/* Lock Chimes */}

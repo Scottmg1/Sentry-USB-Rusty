@@ -1,7 +1,8 @@
 //! Disk image creation — replaces `create-backingfiles.sh`.
 //!
-//! Creates FAT32/exFAT disk images for cam, music, lightshow, boombox, and
-//! wraps drives in /backingfiles/.
+//! Creates FAT32/exFAT disk images for cam, music, lightshow, and boombox
+//! drives in /backingfiles/. Wraps & License Plates live as folders on the
+//! cam drive — no dedicated partition.
 
 use std::path::Path;
 use std::time::Duration;
@@ -26,8 +27,16 @@ const DRIVE_SPECS: &[DriveSpec] = &[
     DriveSpec { name: "music", label: "MUSIC", config_key: "MUSIC_SIZE", default_fallback: "4G" },
     DriveSpec { name: "lightshow", label: "LIGHTSHOW", config_key: "LIGHTSHOW_SIZE", default_fallback: "1G" },
     DriveSpec { name: "boombox", label: "BOOMBOX", config_key: "BOOMBOX_SIZE", default_fallback: "100M" },
-    DriveSpec { name: "wraps", label: "WRAPS", config_key: "WRAPS_SIZE", default_fallback: "0" },
 ];
+
+/// One-time cleanup for installs that previously had a dedicated wraps disk.
+/// The 4 GB image is no longer used — Wraps & LicensePlate are now folders
+/// on the cam drive. Reclaim the space on the next setup re-run.
+fn purge_legacy_wraps_disk() {
+    let _ = std::fs::remove_file(format!("{}/wraps_disk.bin", BACKINGFILES));
+    let _ = std::fs::remove_file(format!("{}/wraps_disk.bin.opts", BACKINGFILES));
+    let _ = std::fs::remove_dir("/mnt/wraps");
+}
 
 /// Parse a human-readable size like "30G", "4G", "100M" into KB.
 pub fn dehumanize(s: &str) -> Result<u64> {
@@ -167,6 +176,8 @@ async fn release_all_images() {
     let _ = sentryusb_shell::run("bash", &["-c", "killall archiveloop 2>/dev/null"]).await;
     // Use the usb_gadget crate to disable
     let _ = sentryusb_gadget::disable();
+    // /mnt/wraps stays in the list to drain any leftover mount from a
+    // pre-migration install before purge_legacy_wraps_disk runs.
     for mount in &["/mnt/cam", "/mnt/music", "/mnt/lightshow", "/mnt/boombox", "/mnt/wraps"] {
         let _ = sentryusb_shell::run("umount", &["-d", mount]).await;
     }
@@ -236,8 +247,19 @@ pub async fn create_disk_images(env: &SetupEnv, emitter: &SetupEmitter) -> Resul
         sizes.push((spec.name.to_string(), spec.label.to_string(), size_kb, filename));
     }
 
+    // Reclaim the 4 GB the dedicated wraps disk used to occupy. Runs before
+    // the all-match early exit so a pre-migration install gets cleaned up
+    // even when the user hasn't changed any sizes.
+    let legacy_wraps_path = format!("{}/wraps_disk.bin", BACKINGFILES);
+    let legacy_wraps = Path::new(&legacy_wraps_path).exists();
+    if legacy_wraps {
+        emitter.progress("Removing legacy wraps disk image — using cam drive folders now...");
+        let _ = sentryusb_shell::run("umount", &["-d", "/mnt/wraps"]).await;
+        purge_legacy_wraps_disk();
+    }
+
     let all_match = sizes.iter().all(|(_, _, sz, f)| image_matches(f, *sz));
-    if all_match {
+    if all_match && !legacy_wraps {
         return Ok(false);
     }
 
