@@ -460,7 +460,7 @@ async fn check_root_shrink(env: &SetupEnv, emitter: &SetupEmitter) -> Result<boo
         let _ = std::fs::remove_file(resize_result_file);
 
         if result == "success" {
-            emitter.begin_phase("root_shrink", "Shrinking root partition");
+            emitter.begin_phase("root_shrink", "Shrinking root partition table");
             emitter.progress("Root filesystem resize completed successfully during boot.");
             let _ = std::fs::remove_file(resize_marker);
 
@@ -546,7 +546,7 @@ async fn check_root_shrink(env: &SetupEnv, emitter: &SetupEmitter) -> Result<boo
         bail!("Previous root shrink attempt failed. Reflash with Balena Etcher instead of Raspberry Pi Imager.");
     }
 
-    emitter.begin_phase("root_shrink", "Shrinking root partition");
+    emitter.begin_phase("root_shrink", "Shrinking root filesystem");
     emitter.progress(&format!(
         "Insufficient unpartitioned space ({} MB). Root partition needs shrinking.",
         unpart_bytes / 1024 / 1024
