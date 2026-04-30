@@ -1,5 +1,6 @@
 //! Clip listing and telemetry.
 
+use std::collections::BTreeMap;
 use std::path::Path;
 
 use axum::Json;
@@ -43,6 +44,75 @@ struct EventMeta {
     longitude: Option<String>,
 }
 
+/// Validate and extract the `YYYY-MM-DD` prefix of a Tesla clip filename.
+fn date_prefix(name: &str) -> Option<&str> {
+    let prefix = name.get(..10)?;
+    let b = prefix.as_bytes();
+    let ok = b[0..4].iter().all(u8::is_ascii_digit)
+        && b[4] == b'-'
+        && b[5..7].iter().all(u8::is_ascii_digit)
+        && b[7] == b'-'
+        && b[8..10].iter().all(u8::is_ascii_digit);
+    ok.then_some(prefix)
+}
+
+/// Group Tesla's flat-file `RecentClips/` layout by date prefix.
+///
+/// Tesla stores RecentClips as MP4 files at the top level of the folder
+/// (e.g. `2025-02-22_17-58-00-front.mp4`), not in dated subdirectories like
+/// SavedClips/SentryClips. We bucket them by the first ten characters of the
+/// filename so each date becomes a single `ClipEntry`, and the frontend's
+/// existing per-timestamp grouping chains the minute-segments into one
+/// continuous playback sequence.
+///
+/// Returned vector is ordered newest date first; each date's files are sorted
+/// alphabetically (which equals chronologically for Tesla's timestamp format).
+fn group_recent_clip_files_by_date(filenames: Vec<String>) -> Vec<(String, Vec<String>)> {
+    let mut by_date: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for name in filenames {
+        if !name.ends_with(".mp4") { continue; }
+        let Some(date) = date_prefix(&name) else { continue; };
+        by_date.entry(date.to_string()).or_default().push(name);
+    }
+    let mut result: Vec<(String, Vec<String>)> = by_date
+        .into_iter()
+        .map(|(d, mut files)| {
+            files.sort();
+            (d, files)
+        })
+        .collect();
+    result.sort_by(|a, b| b.0.cmp(&a.0));
+    result
+}
+
+/// Read a `RecentClips/` directory and group its flat files by date.
+fn enumerate_recent_clips(base: &Path) -> Vec<(String, Vec<String>)> {
+    let names: Vec<String> = match std::fs::read_dir(base) {
+        Ok(entries) => entries
+            .flatten()
+            .filter(|e| e.path().is_file())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .collect(),
+        Err(_) => return Vec::new(),
+    };
+    group_recent_clip_files_by_date(names)
+}
+
+/// Read a `SavedClips/` or `SentryClips/` directory and return the dated
+/// subfolders newest first.
+fn enumerate_event_dirs(base: &Path) -> Vec<String> {
+    let mut dirs: Vec<String> = match std::fs::read_dir(base) {
+        Ok(entries) => entries
+            .flatten()
+            .filter(|e| e.path().is_dir())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .collect(),
+        Err(_) => return Vec::new(),
+    };
+    dirs.sort_by(|a, b| b.cmp(a));
+    dirs
+}
+
 /// GET /api/clips?category=RecentClips&limit=20[&before=<date>]
 pub async fn get_clips(
     State(_s): State<AppState>,
@@ -64,24 +134,44 @@ pub async fn get_clips(
         return (StatusCode::OK, Json(empty_group));
     }
 
-    // Enumerate event dirs, newest first.
-    let mut event_dirs: Vec<String> = match std::fs::read_dir(&base) {
-        Ok(entries) => entries.flatten()
-            .filter(|e| e.path().is_dir())
-            .map(|e| e.file_name().to_string_lossy().to_string())
-            .collect(),
-        Err(_) => return (StatusCode::OK, Json(empty_group)),
-    };
-    event_dirs.sort_by(|a, b| b.cmp(a));
+    if category == "RecentClips" {
+        let mut grouped = enumerate_recent_clips(&base);
+        if let Some(before) = &params.before {
+            grouped.retain(|(d, _)| d.as_str() < before.as_str());
+        }
+        let has_more = grouped.len() > limit;
+        grouped.truncate(limit);
 
-    // Pagination: drop everything >= before, then take `limit + 1`
+        let path_prefix = format!("/TeslaCam/{}", category);
+        let entries: Vec<ClipEntry> = grouped
+            .into_iter()
+            .map(|(date, files)| ClipEntry {
+                date,
+                path: path_prefix.clone(),
+                files,
+                event: None,
+            })
+            .collect();
+
+        return (
+            StatusCode::OK,
+            Json(serde_json::json!([{
+                "name": category,
+                "clips": entries,
+                "hasMore": has_more,
+            }])),
+        );
+    }
+
+    // SavedClips / SentryClips: each clip is a dated subfolder.
+    let mut event_dirs = enumerate_event_dirs(&base);
     if let Some(before) = &params.before {
         event_dirs.retain(|d| d.as_str() < before.as_str());
     }
     let has_more = event_dirs.len() > limit;
     event_dirs.truncate(limit);
 
-    let mut clips = Vec::with_capacity(event_dirs.len());
+    let mut entries = Vec::with_capacity(event_dirs.len());
     for dir_name in event_dirs {
         let dir_path = base.join(&dir_name);
         let mut files = Vec::new();
@@ -99,7 +189,7 @@ pub async fn get_clips(
             .ok()
             .and_then(|s| serde_json::from_str::<EventMeta>(&s).ok());
 
-        clips.push(ClipEntry {
+        entries.push(ClipEntry {
             date: dir_name.clone(),
             path: format!("/TeslaCam/{}/{}", category, dir_name),
             files,
@@ -107,12 +197,14 @@ pub async fn get_clips(
         });
     }
 
-    let response = serde_json::json!([{
-        "name": category,
-        "clips": clips,
-        "hasMore": has_more,
-    }]);
-    (StatusCode::OK, Json(response))
+    (
+        StatusCode::OK,
+        Json(serde_json::json!([{
+            "name": category,
+            "clips": entries,
+            "hasMore": has_more,
+        }])),
+    )
 }
 
 /// GET /api/clips/telemetry?path=/TeslaCam/SentryClips/<event>&file=<camera>.mp4
@@ -200,4 +292,121 @@ pub async fn get_clip_telemetry(
         "has_gps": has_gps,
         "has_autopilot": has_autopilot,
     })))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use tempfile::TempDir;
+
+    fn s(values: &[&str]) -> Vec<String> {
+        values.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn date_prefix_accepts_well_formed_filename() {
+        assert_eq!(
+            date_prefix("2025-02-22_17-58-00-front.mp4"),
+            Some("2025-02-22"),
+        );
+    }
+
+    #[test]
+    fn date_prefix_rejects_short_or_malformed_names() {
+        assert_eq!(date_prefix(""), None);
+        assert_eq!(date_prefix("front.mp4"), None);
+        assert_eq!(date_prefix("event.json"), None);
+        assert_eq!(date_prefix("2025/02/22-front.mp4"), None);
+        assert_eq!(date_prefix("XXXX-02-22_17-58-00-front.mp4"), None);
+    }
+
+    #[test]
+    fn group_recent_clip_files_groups_by_date_newest_first() {
+        let files = s(&[
+            "2025-02-22_17-58-00-front.mp4",
+            "2025-02-22_17-58-00-back.mp4",
+            "2025-02-23_09-12-00-front.mp4",
+            "event.json",
+            "thumb.png",
+            "2025-02-22_17-59-00-front.mp4",
+        ]);
+        let grouped = group_recent_clip_files_by_date(files);
+        assert_eq!(grouped.len(), 2);
+        assert_eq!(grouped[0].0, "2025-02-23");
+        assert_eq!(grouped[0].1, vec!["2025-02-23_09-12-00-front.mp4"]);
+        assert_eq!(grouped[1].0, "2025-02-22");
+        assert_eq!(
+            grouped[1].1,
+            vec![
+                "2025-02-22_17-58-00-back.mp4",
+                "2025-02-22_17-58-00-front.mp4",
+                "2025-02-22_17-59-00-front.mp4",
+            ],
+        );
+    }
+
+    #[test]
+    fn group_recent_clip_files_skips_non_mp4_and_unparseable_names() {
+        let files = s(&[
+            "event.json",
+            "no-prefix.mp4",
+            "2025-02-22_17-58-00-front.txt",
+            "2025-02-22_17-58-00-front.mp4",
+        ]);
+        let grouped = group_recent_clip_files_by_date(files);
+        assert_eq!(grouped.len(), 1);
+        assert_eq!(grouped[0].1, vec!["2025-02-22_17-58-00-front.mp4"]);
+    }
+
+    #[test]
+    fn group_recent_clip_files_returns_empty_for_empty_input() {
+        let grouped = group_recent_clip_files_by_date(Vec::new());
+        assert!(grouped.is_empty());
+    }
+
+    #[test]
+    fn enumerate_recent_clips_walks_flat_files_only() {
+        let dir = TempDir::new().unwrap();
+        // Flat MP4 files (the Tesla RecentClips layout)
+        for name in &[
+            "2025-02-22_17-58-00-front.mp4",
+            "2025-02-22_17-58-00-back.mp4",
+            "2025-02-23_09-12-00-front.mp4",
+        ] {
+            fs::write(dir.path().join(name), b"").unwrap();
+        }
+        // A subfolder that should be ignored (RecentClips shouldn't have these,
+        // but we don't want to descend into them if they appear).
+        fs::create_dir(dir.path().join("subdir")).unwrap();
+        fs::write(
+            dir.path().join("subdir").join("2025-02-22_17-58-00-front.mp4"),
+            b"",
+        )
+        .unwrap();
+
+        let grouped = enumerate_recent_clips(dir.path());
+        assert_eq!(grouped.len(), 2);
+        assert_eq!(grouped[0].0, "2025-02-23");
+        assert_eq!(grouped[1].0, "2025-02-22");
+        assert_eq!(grouped[1].1.len(), 2);
+    }
+
+    #[test]
+    fn enumerate_recent_clips_handles_missing_dir() {
+        let grouped = enumerate_recent_clips(Path::new("/nonexistent/path/abc"));
+        assert!(grouped.is_empty());
+    }
+
+    #[test]
+    fn enumerate_event_dirs_returns_subfolders_newest_first() {
+        let dir = TempDir::new().unwrap();
+        fs::create_dir(dir.path().join("2025-02-22_17-58-00")).unwrap();
+        fs::create_dir(dir.path().join("2025-02-23_09-12-00")).unwrap();
+        // Stray file should be ignored
+        fs::write(dir.path().join("README.txt"), b"").unwrap();
+
+        let dirs = enumerate_event_dirs(dir.path());
+        assert_eq!(dirs, vec!["2025-02-23_09-12-00", "2025-02-22_17-58-00"]);
+    }
 }

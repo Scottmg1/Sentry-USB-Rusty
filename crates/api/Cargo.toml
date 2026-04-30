@@ -36,3 +36,6 @@ sentryusb-notify = { path = "../notify", package = "sentryusb-notify" }
 sentryusb-setup = { path = "../setup", package = "sentryusb-setup" }
 sentryusb-gadget = { path = "../usb_gadget", package = "sentryusb-gadget" }
 sentryusb-cloud-uploader = { path = "../cloud_uploader", package = "sentryusb-cloud-uploader" }
+
+[dev-dependencies]
+tempfile = "3"

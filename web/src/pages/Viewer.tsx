@@ -82,11 +82,20 @@ function formatTime(s: number): string {
 function formatClipDate(date: string): string {
   // Tesla format: 2025-02-22_17-58-00 → Feb 22, 5:58 PM
   const match = date.match(/^(\d{4})-(\d{2})-(\d{2})_(\d{2})-(\d{2})-(\d{2})$/)
-  if (!match) return date
-  const [, y, mo, d, h, mi] = match
-  const dt = new Date(+y, +mo - 1, +d, +h, +mi)
-  return dt.toLocaleDateString("en-US", { month: "short", day: "numeric" }) +
-    ", " + dt.toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit" })
+  if (match) {
+    const [, y, mo, d, h, mi] = match
+    const dt = new Date(+y, +mo - 1, +d, +h, +mi)
+    return dt.toLocaleDateString("en-US", { month: "short", day: "numeric" }) +
+      ", " + dt.toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit" })
+  }
+  // RecentClips entries are bucketed per day: 2025-02-22 → Sun, Feb 22
+  const dateOnly = date.match(/^(\d{4})-(\d{2})-(\d{2})$/)
+  if (dateOnly) {
+    const [, y, mo, d] = dateOnly
+    const dt = new Date(+y, +mo - 1, +d)
+    return dt.toLocaleDateString("en-US", { weekday: "short", month: "short", day: "numeric" })
+  }
+  return date
 }
 
 export default function Viewer() {
@@ -645,31 +654,36 @@ export default function Viewer() {
                           </div>
                         )}
                       </button>
-                      {/* Delete button */}
-                      <button
-                        onClick={(e) => { e.stopPropagation(); setDeleteConfirm(clip.date) }}
-                        className="absolute right-1 top-1 hidden rounded p-0.5 text-slate-600 transition-colors hover:bg-red-500/15 hover:text-red-400 group-hover:block"
-                        title="Delete clip"
-                      >
-                        <Trash2 className="h-3 w-3" />
-                      </button>
-                      {/* Delete confirmation */}
-                      {deleteConfirm === clip.date && (
-                        <div className="mx-1 mb-1 flex items-center gap-1 rounded-md bg-red-500/10 px-2 py-1.5">
-                          <span className="flex-1 text-[10px] text-red-400">Delete this clip?</span>
+                      {/* Delete button — RecentClips are auto-rotated by the
+                          car and stored as flat files (no per-date folder), so
+                          there's nothing meaningful to delete from the UI. */}
+                      {activeCategory !== "RecentClips" && (
+                        <>
                           <button
-                            onClick={() => handleDeleteClip(clip)}
-                            className="rounded bg-red-500/20 px-2 py-0.5 text-[10px] font-medium text-red-400 hover:bg-red-500/30"
+                            onClick={(e) => { e.stopPropagation(); setDeleteConfirm(clip.date) }}
+                            className="absolute right-1 top-1 hidden rounded p-0.5 text-slate-600 transition-colors hover:bg-red-500/15 hover:text-red-400 group-hover:block"
+                            title="Delete clip"
                           >
-                            Yes
+                            <Trash2 className="h-3 w-3" />
                           </button>
-                          <button
-                            onClick={() => setDeleteConfirm(null)}
-                            className="rounded bg-white/5 px-2 py-0.5 text-[10px] text-slate-400 hover:bg-white/10"
-                          >
-                            No
-                          </button>
-                        </div>
+                          {deleteConfirm === clip.date && (
+                            <div className="mx-1 mb-1 flex items-center gap-1 rounded-md bg-red-500/10 px-2 py-1.5">
+                              <span className="flex-1 text-[10px] text-red-400">Delete this clip?</span>
+                              <button
+                                onClick={() => handleDeleteClip(clip)}
+                                className="rounded bg-red-500/20 px-2 py-0.5 text-[10px] font-medium text-red-400 hover:bg-red-500/30"
+                              >
+                                Yes
+                              </button>
+                              <button
+                                onClick={() => setDeleteConfirm(null)}
+                                className="rounded bg-white/5 px-2 py-0.5 text-[10px] text-slate-400 hover:bg-white/10"
+                              >
+                                No
+                              </button>
+                            </div>
+                          )}
+                        </>
                       )}
                     </div>
                   )
@@ -925,14 +939,16 @@ export default function Viewer() {
                   </div>
 
 
-                  {/* Download */}
-                  <button
-                    onClick={handleDownload}
-                    className="rounded-lg p-1.5 text-slate-500 transition-colors hover:bg-white/5 hover:text-slate-300"
-                    title="Download clip folder"
-                  >
-                    <Download className="h-3.5 w-3.5" />
-                  </button>
+                  {/* Download — RecentClips have no per-date folder to zip. */}
+                  {activeCategory !== "RecentClips" && (
+                    <button
+                      onClick={handleDownload}
+                      className="rounded-lg p-1.5 text-slate-500 transition-colors hover:bg-white/5 hover:text-slate-300"
+                      title="Download clip folder"
+                    >
+                      <Download className="h-3.5 w-3.5" />
+                    </button>
+                  )}
 
                   {/* Fullscreen */}
                   <button
