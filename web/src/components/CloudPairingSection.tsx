@@ -146,17 +146,17 @@ export default function CloudPairingSection({ compact = false }: Props) {
 
   return (
     <div className="glass-card overflow-hidden">
-      <div className="flex items-center gap-3 border-b border-white/5 px-3 py-2">
+      <div className="flex items-center gap-3 border-b border-white/5 px-3 py-2.5">
         <div
           className={cn(
-            "flex h-7 w-7 shrink-0 items-center justify-center rounded-lg",
+            "flex h-8 w-8 shrink-0 items-center justify-center rounded-lg",
             paired ? "bg-emerald-500/15" : "bg-sky-500/15",
           )}
         >
           {paired ? (
-            <Cloud className="h-3.5 w-3.5 text-emerald-400" />
+            <Cloud className="h-4 w-4 text-emerald-400" />
           ) : (
-            <CloudOff className="h-3.5 w-3.5 text-sky-400" />
+            <CloudOff className="h-4 w-4 text-sky-400" />
           )}
         </div>
         <h3 className="text-sm font-semibold text-slate-200">SentryCloud</h3>

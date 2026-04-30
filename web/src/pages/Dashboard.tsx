@@ -286,7 +286,7 @@ export default function Dashboard() {
           to="/settings"
           className="glass-card flex items-center gap-3 border border-amber-500/20 bg-amber-500/5 p-3 transition-colors hover:bg-amber-500/10"
         >
-          <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-amber-500/20">
+          <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-amber-500/20">
             <Download className="h-4 w-4 text-amber-400" />
           </div>
           <div className="flex-1">
@@ -301,7 +301,7 @@ export default function Dashboard() {
 
       {rtcWarning && (
         <div className="glass-card flex items-center gap-3 border border-amber-500/20 bg-amber-500/5 p-3">
-          <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-amber-500/20">
+          <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-amber-500/20">
             <AlertTriangle className="h-4 w-4 text-amber-400" />
           </div>
           <div className="flex-1">
@@ -314,18 +314,18 @@ export default function Dashboard() {
       <CloudPairingSection />
 
       {/* Row 1: Status tiles */}
-      <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3">
+      <div className="columns-1 gap-2 sm:columns-2 lg:columns-3 [&>*]:mb-2 [&>*]:break-inside-avoid">
         {/* System tile: Uptime + CPU Temp + USB Drives */}
-        <div className="glass-card p-4">
+        <div className="glass-card p-3">
           <div className="flex items-start gap-3">
             <div
-              className={`flex h-10 w-10 shrink-0 items-center justify-center rounded-lg ${
+              className={`flex h-8 w-8 shrink-0 items-center justify-center rounded-lg ${
                 cpuTemp > 0
                   ? { emerald: "text-emerald-400 bg-emerald-500/15", amber: "text-amber-400 bg-amber-500/15", red: "text-red-400 bg-red-500/15" }[getTempColor(cpuTemp)]
                   : "text-blue-400 bg-blue-500/15"
               }`}
             >
-              <Activity className="h-5 w-5" />
+              <Activity className="h-4 w-4" />
             </div>
             <div className="min-w-0 flex-1">
               <p className="text-xs font-medium uppercase tracking-wider text-slate-500">
@@ -370,10 +370,10 @@ export default function Dashboard() {
         </div>
 
         {/* Storage tile: Storage + Snapshots */}
-        <div className="glass-card p-4">
+        <div className="glass-card p-3">
           <div className="flex items-start gap-3">
             <div
-              className={`flex h-10 w-10 shrink-0 items-center justify-center rounded-lg ${
+              className={`flex h-8 w-8 shrink-0 items-center justify-center rounded-lg ${
                 parseInt(usedPercent) > 90
                   ? "text-red-400 bg-red-500/15"
                   : parseInt(usedPercent) > 75
@@ -381,7 +381,7 @@ export default function Dashboard() {
                     : "text-emerald-400 bg-emerald-500/15"
               }`}
             >
-              <HardDrive className="h-5 w-5" />
+              <HardDrive className="h-4 w-4" />
             </div>
             <div className="min-w-0 flex-1">
               <div className="flex items-center gap-1.5">
@@ -416,16 +416,16 @@ export default function Dashboard() {
         </div>
 
         {/* Network tile: WiFi + Ethernet */}
-        <div className="glass-card p-4">
+        <div className="glass-card p-3">
           <div className="flex items-start gap-3">
             <div
-              className={`flex h-10 w-10 shrink-0 items-center justify-center rounded-lg ${
+              className={`flex h-8 w-8 shrink-0 items-center justify-center rounded-lg ${
                 status.wifi_ssid || (status.ether_speed && status.ether_speed !== "Unknown!")
                   ? "text-emerald-400 bg-emerald-500/15"
                   : "text-red-400 bg-red-500/15"
               }`}
             >
-              <Wifi className="h-5 w-5" />
+              <Wifi className="h-4 w-4" />
             </div>
             <div className="min-w-0 flex-1">
               <p className="text-xs font-medium uppercase tracking-wider text-slate-500">
@@ -481,11 +481,11 @@ export default function Dashboard() {
       </div>
 
       {/* Row 2: Storage Usage + Archive Progress side by side */}
-      <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
+      <div className="columns-1 gap-2 sm:columns-2 [&>*]:mb-2 [&>*]:break-inside-avoid">
         {/* Storage Usage */}
-        <div className="glass-card p-4">
+        <div className="glass-card p-3">
           <div className="mb-2 flex items-center justify-between">
-            <span className="text-sm font-medium text-slate-300">Storage Usage</span>
+            <span className="text-sm font-semibold text-slate-200">Storage Usage</span>
             <span className="text-xs text-slate-500">
               {formatBytes(usedSpace)} / {formatBytes(totalSpace)} · {usedPercent}% used
             </span>
@@ -541,9 +541,9 @@ export default function Dashboard() {
         </div>
 
         {/* Clip Archive Progress */}
-        <div className="glass-card p-4">
+        <div className="glass-card p-3">
           <div className="mb-2 flex items-center justify-between">
-            <span className="text-sm font-medium text-slate-300">Clip Archive</span>
+            <span className="text-sm font-semibold text-slate-200">Clip Archive</span>
             {active && (
               <span className={`flex items-center gap-1.5 text-xs ${archiveProgress ? "text-emerald-400" : "text-blue-400"}`}>
                 <span className={`inline-block h-1.5 w-1.5 animate-pulse rounded-full ${archiveProgress ? "bg-emerald-400" : "bg-blue-400"}`} />
@@ -671,15 +671,15 @@ function KeepAwakeTile() {
         : "Tap to start"
 
   return (
-    <div className="glass-card relative p-4">
+    <div className="glass-card relative p-3">
       <div className="flex items-start gap-3">
-        <div className={`flex h-10 w-10 shrink-0 items-center justify-center rounded-lg ${colorMap[color]}`}>
+        <div className={`flex h-8 w-8 shrink-0 items-center justify-center rounded-lg ${colorMap[color]}`}>
           {isActive ? (
-            <HeartPulse className="h-5 w-5 animate-pulse" />
+            <HeartPulse className="h-4 w-4 animate-pulse" />
           ) : isPending ? (
-            <Timer className="h-5 w-5 animate-pulse" />
+            <Timer className="h-4 w-4 animate-pulse" />
           ) : (
-            <HeartPulse className="h-5 w-5" />
+            <HeartPulse className="h-4 w-4" />
           )}
         </div>
         <div className="min-w-0 flex-1">
