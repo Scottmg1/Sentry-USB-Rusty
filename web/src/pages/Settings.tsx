@@ -1914,10 +1914,8 @@ export default function Settings() {
           <AwayModeControl />
           <ConfigBackupSection />
           <CommunityFeaturesSection />
-          <div className="flex flex-col gap-2">
-            <MobileNotificationsSection />
-            {piConfig?.uses_ble === "yes" && <BlePairButton />}
-          </div>
+          <MobileNotificationsSection />
+          {piConfig?.uses_ble === "yes" && <BlePairButton />}
 
           {/* Update tile — version + check + banners merged */}
           <div className="glass-card overflow-hidden">
