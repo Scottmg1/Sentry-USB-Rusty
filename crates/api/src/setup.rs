@@ -468,9 +468,26 @@ pub async fn preflight(
         }));
     }
 
-    // Use df on /backingfiles. If not mounted yet (fresh install), we
-    // can't compute available — return ok with checked=false so the
-    // wizard can proceed and the setup phase will do the real check.
+    // On a fresh install the /backingfiles directory exists on the
+    // SD-card root FS but the backingfiles partition has not been
+    // carved yet, so `df /backingfiles/` reports root-FS stats and
+    // would falsely reject sizes intended for the (much larger)
+    // external drive the user selected. Defer to the canonical
+    // "partitions set up?" probe used by runner.rs.
+    if !sentryusb_setup::partition::partitions_exist().await {
+        return (StatusCode::OK, Json(serde_json::json!({
+            "ok": true,
+            "checked": false,
+            "reason": "backingfiles partition not created yet (fresh install)",
+            "requested_kb": requested_kb,
+            "breakdown": breakdown,
+        })));
+    }
+
+    // Use df on /backingfiles. If not mounted yet (transient unmount
+    // window during a re-run), we can't compute available — return
+    // ok with checked=false so the wizard can proceed and the setup
+    // phase will do the real check.
     let df = sentryusb_shell::run(
         "df", &["--output=size,avail", "--block-size=1K", "/backingfiles/"],
     ).await;
