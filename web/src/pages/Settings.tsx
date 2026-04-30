@@ -339,7 +339,7 @@ function BlePairButton() {
   const isActive = bleState !== "idle" && bleState !== "paired" && bleState !== "error"
 
   return (
-    <div className="glass-card overflow-hidden flex flex-col">
+    <div className="glass-card overflow-hidden">
       <div className="flex items-center gap-3 border-b border-white/5 px-3 py-2.5">
         <div
           className={cn(
@@ -365,7 +365,7 @@ function BlePairButton() {
           <span className="ml-auto rounded-full bg-emerald-500/15 px-2 py-0.5 text-[10px] font-semibold text-emerald-400">Paired</span>
         )}
       </div>
-      <div className="flex-1 p-3 space-y-2">
+      <div className="p-3 space-y-2">
         <p className={cn(
           "text-xs",
           bleState === "paired" ? "text-emerald-400" :
@@ -480,14 +480,14 @@ function MobileNotificationsSection() {
   }
 
   return (
-    <div className="glass-card overflow-hidden flex flex-col">
+    <div className="glass-card overflow-hidden">
       <div className="flex items-center gap-3 border-b border-white/5 px-3 py-2.5">
         <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-violet-500/15">
           <Bell className="h-4 w-4 text-violet-400" />
         </div>
         <h3 className="text-sm font-semibold text-slate-200">Mobile Notifications</h3>
       </div>
-      <div className="flex-1 p-3 space-y-2">
+      <div className="p-3 space-y-2">
         {/* Generate Code */}
         <div className="flex items-center gap-3">
           {pairingCode ? (
@@ -901,14 +901,14 @@ function KeepAwakePreference() {
   const { mode, updateMode } = useKeepAwake()
 
   return (
-    <div className="glass-card overflow-hidden flex flex-col">
+    <div className="glass-card overflow-hidden">
       <div className="flex items-center gap-3 border-b border-white/5 px-3 py-2.5">
         <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-rose-500/15">
           <HeartPulse className="h-4 w-4 text-rose-400" />
         </div>
         <h3 className="text-sm font-semibold text-slate-200">Keep Awake</h3>
       </div>
-      <div className="flex-1 p-3 space-y-2">
+      <div className="p-3 space-y-2">
         <div className="grid grid-cols-3 gap-1.5">
           {KEEP_AWAKE_MODES.map((m) => (
             <button
@@ -988,7 +988,7 @@ function AwayModeControl() {
   }
 
   return (
-    <div className="glass-card overflow-hidden flex flex-col">
+    <div className="glass-card overflow-hidden">
       <div className="flex items-center gap-3 border-b border-white/5 px-3 py-2.5">
         <div className={cn(
           "flex h-8 w-8 shrink-0 items-center justify-center rounded-lg",
@@ -1008,7 +1008,7 @@ function AwayModeControl() {
         )}
       </div>
 
-      <div className="flex-1 p-3 space-y-2">
+      <div className="p-3 space-y-2">
         {/* Non-RTC warning */}
         {status.has_rtc === false && (
           <div className="flex gap-2 rounded-lg border border-amber-500/20 bg-amber-500/5 p-2 text-[10px] text-amber-400/80">
@@ -1256,14 +1256,14 @@ function ConfigBackupSection() {
   }
 
   return (
-    <div className="glass-card overflow-hidden flex flex-col">
+    <div className="glass-card overflow-hidden">
       <div className="flex items-center gap-3 border-b border-white/5 px-3 py-2.5">
         <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-blue-500/15">
           <Save className="h-4 w-4 text-blue-400" />
         </div>
         <h3 className="text-sm font-semibold text-slate-200">Config Backup</h3>
       </div>
-      <div className="flex-1 p-3 space-y-2">
+      <div className="p-3 space-y-2">
         {/* Location + backup trigger inline */}
         <div className="flex items-center gap-2">
           <span className="text-[10px] text-slate-500">Location:</span>
@@ -1507,7 +1507,7 @@ function CommunityFeaturesSection() {
   }
 
   return (
-    <div className="glass-card overflow-hidden flex flex-col">
+    <div className="glass-card overflow-hidden">
       <div className="flex items-center gap-3 border-b border-white/5 px-3 py-2.5">
         <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-blue-500/15">
           <Users className="h-4 w-4 text-blue-400" />
@@ -1516,7 +1516,7 @@ function CommunityFeaturesSection() {
       </div>
 
       {/* Wraps toggle */}
-      <div className="flex-1 px-3 py-2.5">
+      <div className="px-3 py-2.5">
         <label className="flex cursor-pointer items-start justify-between gap-3">
           <div className="flex items-start gap-2">
             <Paintbrush className="mt-0.5 h-3.5 w-3.5 shrink-0 text-blue-400" />
@@ -1909,7 +1909,7 @@ export default function Settings() {
       {/* Preferences & Connections */}
       <div>
         <p className="section-label mb-2 px-1">Preferences</p>
-        <div className="grid grid-cols-1 gap-2 lg:grid-cols-3 items-stretch">
+        <div className="columns-1 gap-2 lg:columns-3 [&>*]:mb-2 [&>*]:break-inside-avoid">
           <KeepAwakePreference />
           <AwayModeControl />
           <ConfigBackupSection />
@@ -1920,7 +1920,7 @@ export default function Settings() {
           </div>
 
           {/* Update tile — version + check + banners merged */}
-          <div className="glass-card overflow-hidden flex flex-col">
+          <div className="glass-card overflow-hidden">
             <div className="flex items-center gap-3 border-b border-white/5 px-3 py-2.5">
               <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-emerald-500/15">
                 {updateStatus === "error" ? (
@@ -2068,7 +2068,7 @@ export default function Settings() {
               </label>
             </div>
             {/* Links footer */}
-            <div className="mt-auto border-t border-white/5 px-3 py-2 flex items-center gap-3">
+            <div className="border-t border-white/5 px-3 py-2 flex items-center gap-3">
               <a href="https://github.com/Sentry-Six/Sentry-USB-Rusty" target="_blank" rel="noopener noreferrer"
                 className="text-xs text-blue-400 hover:text-blue-300">GitHub</a>
               <a
