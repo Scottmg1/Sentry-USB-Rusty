@@ -339,36 +339,35 @@ function BlePairButton() {
   const isActive = bleState !== "idle" && bleState !== "paired" && bleState !== "error"
 
   return (
-    <button
-      onClick={bleState === "idle" ? handlePair : bleState === "paired" ? handlePairedClick : bleState === "error" ? handleReset : undefined}
-      disabled={isActive}
-      className="glass-card glass-card-hover flex items-start gap-3 p-4 text-left transition-all disabled:opacity-70"
-    >
-      <div
-        className={cn(
-          "flex h-8 w-8 shrink-0 items-center justify-center rounded-xl transition-colors",
-          bleState === "paired" ? "bg-emerald-500/15 text-emerald-400" :
-            bleState === "error" ? "bg-red-500/15 text-red-400" :
-              isActive ? "bg-amber-500/15 text-amber-400" :
-                "bg-blue-500/15 text-blue-400"
-        )}
-      >
-        {isActive ? (
-          <Loader2 className="h-4 w-4 animate-spin" />
-        ) : bleState === "paired" ? (
-          <CheckCircle className="h-4 w-4" />
-        ) : bleState === "error" ? (
-          <AlertCircle className="h-4 w-4" />
-        ) : (
-          <Bluetooth className="h-4 w-4" />
+    <div className="glass-card overflow-hidden flex flex-col">
+      <div className="flex items-center gap-3 border-b border-white/5 px-3 py-2.5">
+        <div
+          className={cn(
+            "flex h-8 w-8 shrink-0 items-center justify-center rounded-lg transition-colors",
+            bleState === "paired" ? "bg-emerald-500/15 text-emerald-400" :
+              bleState === "error" ? "bg-red-500/15 text-red-400" :
+                isActive ? "bg-amber-500/15 text-amber-400" :
+                  "bg-blue-500/15 text-blue-400"
+          )}
+        >
+          {isActive ? (
+            <Loader2 className="h-4 w-4 animate-spin" />
+          ) : bleState === "paired" ? (
+            <CheckCircle className="h-4 w-4" />
+          ) : bleState === "error" ? (
+            <AlertCircle className="h-4 w-4" />
+          ) : (
+            <Bluetooth className="h-4 w-4" />
+          )}
+        </div>
+        <h3 className="text-sm font-semibold text-slate-200">BLE Pairing</h3>
+        {bleState === "paired" && (
+          <span className="ml-auto rounded-full bg-emerald-500/15 px-2 py-0.5 text-[10px] font-semibold text-emerald-400">Paired</span>
         )}
       </div>
-      <div className="min-w-0 flex-1">
-        <p className="text-sm font-medium text-slate-200">
-          {bleState === "paired" ? "BLE Paired" : bleState === "error" ? "BLE Pairing Failed" : isActive ? "Pairing..." : "Pair BLE"}
-        </p>
+      <div className="flex-1 p-3 space-y-2">
         <p className={cn(
-          "mt-0.5 text-xs",
+          "text-xs",
           bleState === "paired" ? "text-emerald-400" :
             bleState === "error" ? "text-red-400" :
               bleState === "waiting" ? "text-amber-400 font-medium" :
@@ -376,8 +375,20 @@ function BlePairButton() {
         )}>
           {bleMsg || "Initiate Bluetooth Low Energy pairing with your car"}
         </p>
+        <button
+          onClick={bleState === "idle" ? handlePair : bleState === "paired" ? handlePairedClick : bleState === "error" ? handleReset : undefined}
+          disabled={isActive}
+          className={cn(
+            "rounded-lg px-3 py-1.5 text-xs font-medium transition-colors disabled:opacity-50",
+            bleState === "paired" ? "bg-white/5 text-slate-300 hover:bg-white/10" :
+              bleState === "error" ? "bg-red-500/15 text-red-400 hover:bg-red-500/25" :
+                "bg-blue-500/15 text-blue-400 hover:bg-blue-500/25"
+          )}
+        >
+          {bleState === "paired" ? "Re-pair" : bleState === "error" ? "Retry" : isActive ? "Pairing..." : "Pair BLE"}
+        </button>
       </div>
-    </button>
+    </div>
   )
 }
 
@@ -469,14 +480,14 @@ function MobileNotificationsSection() {
   }
 
   return (
-    <div className="glass-card overflow-hidden">
-      <div className="flex items-center gap-3 border-b border-white/5 px-3 py-2">
-        <div className="flex h-7 w-7 shrink-0 items-center justify-center rounded-lg bg-violet-500/15">
-          <Bell className="h-3.5 w-3.5 text-violet-400" />
+    <div className="glass-card overflow-hidden flex flex-col">
+      <div className="flex items-center gap-3 border-b border-white/5 px-3 py-2.5">
+        <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-violet-500/15">
+          <Bell className="h-4 w-4 text-violet-400" />
         </div>
         <h3 className="text-sm font-semibold text-slate-200">Mobile Notifications</h3>
       </div>
-      <div className="p-3 space-y-2">
+      <div className="flex-1 p-3 space-y-2">
         {/* Generate Code */}
         <div className="flex items-center gap-3">
           {pairingCode ? (
@@ -890,32 +901,34 @@ function KeepAwakePreference() {
   const { mode, updateMode } = useKeepAwake()
 
   return (
-    <div className="glass-card overflow-hidden p-3">
-      <div className="flex items-center gap-3 mb-2">
-        <div className="flex h-7 w-7 shrink-0 items-center justify-center rounded-lg bg-rose-500/15">
-          <HeartPulse className="h-3.5 w-3.5 text-rose-400" />
+    <div className="glass-card overflow-hidden flex flex-col">
+      <div className="flex items-center gap-3 border-b border-white/5 px-3 py-2.5">
+        <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-rose-500/15">
+          <HeartPulse className="h-4 w-4 text-rose-400" />
         </div>
         <h3 className="text-sm font-semibold text-slate-200">Keep Awake</h3>
       </div>
-      <div className="grid grid-cols-3 gap-1.5">
-        {KEEP_AWAKE_MODES.map((m) => (
-          <button
-            key={m.value}
-            onClick={() => updateMode(m.value)}
-            className={cn(
-              "rounded-lg border px-2.5 py-1.5 text-center text-xs font-medium transition-all",
-              (mode ?? "") === m.value
-                ? "border-blue-500/40 bg-blue-500/10 text-blue-400"
-                : "border-white/5 bg-white/[0.02] text-slate-400 hover:bg-white/[0.05]"
-            )}
-          >
-            {m.label}
-          </button>
-        ))}
+      <div className="flex-1 p-3 space-y-2">
+        <div className="grid grid-cols-3 gap-1.5">
+          {KEEP_AWAKE_MODES.map((m) => (
+            <button
+              key={m.value}
+              onClick={() => updateMode(m.value)}
+              className={cn(
+                "rounded-lg border px-2.5 py-1.5 text-center text-xs font-medium transition-all",
+                (mode ?? "") === m.value
+                  ? "border-blue-500/40 bg-blue-500/10 text-blue-400"
+                  : "border-white/5 bg-white/[0.02] text-slate-400 hover:bg-white/[0.05]"
+              )}
+            >
+              {m.label}
+            </button>
+          ))}
+        </div>
+        <p className="text-[10px] text-slate-600">
+          {KEEP_AWAKE_MODES.find(m => m.value === (mode ?? ""))?.desc}
+        </p>
       </div>
-      <p className="mt-1.5 text-[10px] text-slate-600">
-        {KEEP_AWAKE_MODES.find(m => m.value === (mode ?? ""))?.desc}
-      </p>
     </div>
   )
 }
@@ -975,16 +988,16 @@ function AwayModeControl() {
   }
 
   return (
-    <div className="glass-card overflow-hidden p-3">
-      <div className="flex items-center gap-3 mb-2">
+    <div className="glass-card overflow-hidden flex flex-col">
+      <div className="flex items-center gap-3 border-b border-white/5 px-3 py-2.5">
         <div className={cn(
-          "flex h-7 w-7 shrink-0 items-center justify-center rounded-lg",
+          "flex h-8 w-8 shrink-0 items-center justify-center rounded-lg",
           isActive ? "bg-blue-500/15" : "bg-slate-500/10"
         )}>
           {isActive ? (
-            <Wifi className="h-3.5 w-3.5 text-blue-400" />
+            <Wifi className="h-4 w-4 text-blue-400" />
           ) : (
-            <WifiOff className="h-3.5 w-3.5 text-slate-500" />
+            <WifiOff className="h-4 w-4 text-slate-500" />
           )}
         </div>
         <h3 className="text-sm font-semibold text-slate-200">Away Mode</h3>
@@ -995,7 +1008,7 @@ function AwayModeControl() {
         )}
       </div>
 
-      <div className="space-y-2">
+      <div className="flex-1 p-3 space-y-2">
         {/* Non-RTC warning */}
         {status.has_rtc === false && (
           <div className="flex gap-2 rounded-lg border border-amber-500/20 bg-amber-500/5 p-2 text-[10px] text-amber-400/80">
@@ -1243,14 +1256,14 @@ function ConfigBackupSection() {
   }
 
   return (
-    <div className="glass-card overflow-hidden p-3">
-      <div className="flex items-center gap-3 mb-2">
-        <div className="flex h-7 w-7 shrink-0 items-center justify-center rounded-lg bg-blue-500/15">
-          <Save className="h-3.5 w-3.5 text-blue-400" />
+    <div className="glass-card overflow-hidden flex flex-col">
+      <div className="flex items-center gap-3 border-b border-white/5 px-3 py-2.5">
+        <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-blue-500/15">
+          <Save className="h-4 w-4 text-blue-400" />
         </div>
         <h3 className="text-sm font-semibold text-slate-200">Config Backup</h3>
       </div>
-      <div className="space-y-2">
+      <div className="flex-1 p-3 space-y-2">
         {/* Location + backup trigger inline */}
         <div className="flex items-center gap-2">
           <span className="text-[10px] text-slate-500">Location:</span>
@@ -1305,145 +1318,145 @@ function ConfigBackupSection() {
             </button>
           </div>
         </div>
+      </div>
 
-        {/* Restore section */}
-        <div className="border-t border-white/5 pt-2">
-          {restoreState === "success" && restoreResult ? (
-            <div className="rounded-xl border border-emerald-500/20 bg-emerald-500/5 p-4">
-              <div className="flex items-start gap-3">
-                <CheckCircle className="mt-0.5 h-5 w-5 shrink-0 text-emerald-400" />
-                <div>
-                  <p className="text-sm font-medium text-emerald-300">Config Restored</p>
-                  <p className="mt-1 text-xs text-slate-400">
-                    Backup from {restoreResult.date} has been restored
-                    {restoreResult.hostname ? ` (${restoreResult.hostname})` : ""}.
-                    Run setup to apply the restored configuration.
-                  </p>
+      {/* Restore section */}
+      <div className="border-t border-white/5 px-3 py-2.5 space-y-2">
+        {restoreState === "success" && restoreResult ? (
+          <div className="rounded-xl border border-emerald-500/20 bg-emerald-500/5 p-4">
+            <div className="flex items-start gap-3">
+              <CheckCircle className="mt-0.5 h-5 w-5 shrink-0 text-emerald-400" />
+              <div>
+                <p className="text-sm font-medium text-emerald-300">Config Restored</p>
+                <p className="mt-1 text-xs text-slate-400">
+                  Backup from {restoreResult.date} has been restored
+                  {restoreResult.hostname ? ` (${restoreResult.hostname})` : ""}.
+                  Run setup to apply the restored configuration.
+                </p>
+                <button
+                  onClick={() => {
+                    setRestoreState("idle")
+                    setSelectedBackup(null)
+                    setRestoreResult(null)
+                    setShowRestore(false)
+                  }}
+                  className="mt-3 rounded-lg bg-white/5 px-3 py-1.5 text-xs font-medium text-slate-300 transition-colors hover:bg-white/10"
+                >
+                  Done
+                </button>
+              </div>
+            </div>
+          </div>
+        ) : restoreState === "confirm" && selectedBackup ? (
+          <div className="rounded-xl border border-amber-500/20 bg-amber-500/5 p-4">
+            <div className="flex items-start gap-3">
+              <AlertTriangle className="mt-0.5 h-5 w-5 shrink-0 text-amber-400" />
+              <div>
+                <p className="text-sm font-medium text-amber-300">Confirm Restore</p>
+                <p className="mt-1 text-xs text-slate-400">
+                  This will overwrite your current configuration with the backup from{" "}
+                  <span className="text-slate-300">
+                    {new Date(selectedBackup.timestamp).toLocaleDateString(undefined, {
+                      weekday: "short",
+                      month: "short",
+                      day: "numeric",
+                      year: "numeric",
+                    })}
+                  </span>
+                  . SSH keys, BLE pairing, and notification credentials will also be restored.
+                  You will need to run setup afterward to apply changes.
+                </p>
+                <div className="mt-3 flex gap-2">
                   <button
-                    onClick={() => {
-                      setRestoreState("idle")
-                      setSelectedBackup(null)
-                      setRestoreResult(null)
-                      setShowRestore(false)
-                    }}
-                    className="mt-3 rounded-lg bg-white/5 px-3 py-1.5 text-xs font-medium text-slate-300 transition-colors hover:bg-white/10"
+                    onClick={() => { setRestoreState("idle"); setSelectedBackup(null) }}
+                    className="rounded-lg border border-white/10 px-3 py-1.5 text-xs font-medium text-slate-400 transition-colors hover:bg-white/5"
                   >
-                    Done
+                    Cancel
+                  </button>
+                  <button
+                    onClick={handleRestore}
+                    className="rounded-lg bg-amber-500/20 px-3 py-1.5 text-xs font-medium text-amber-300 transition-colors hover:bg-amber-500/30"
+                  >
+                    Restore Config
                   </button>
                 </div>
               </div>
             </div>
-          ) : restoreState === "confirm" && selectedBackup ? (
-            <div className="rounded-xl border border-amber-500/20 bg-amber-500/5 p-4">
-              <div className="flex items-start gap-3">
-                <AlertTriangle className="mt-0.5 h-5 w-5 shrink-0 text-amber-400" />
-                <div>
-                  <p className="text-sm font-medium text-amber-300">Confirm Restore</p>
-                  <p className="mt-1 text-xs text-slate-400">
-                    This will overwrite your current configuration with the backup from{" "}
-                    <span className="text-slate-300">
-                      {new Date(selectedBackup.timestamp).toLocaleDateString(undefined, {
-                        weekday: "short",
-                        month: "short",
-                        day: "numeric",
-                        year: "numeric",
-                      })}
-                    </span>
-                    . SSH keys, BLE pairing, and notification credentials will also be restored.
-                    You will need to run setup afterward to apply changes.
-                  </p>
-                  <div className="mt-3 flex gap-2">
-                    <button
-                      onClick={() => { setRestoreState("idle"); setSelectedBackup(null) }}
-                      className="rounded-lg border border-white/10 px-3 py-1.5 text-xs font-medium text-slate-400 transition-colors hover:bg-white/5"
-                    >
-                      Cancel
-                    </button>
-                    <button
-                      onClick={handleRestore}
-                      className="rounded-lg bg-amber-500/20 px-3 py-1.5 text-xs font-medium text-amber-300 transition-colors hover:bg-amber-500/30"
-                    >
-                      Restore Config
-                    </button>
-                  </div>
-                </div>
+          </div>
+        ) : !showRestore ? (
+          <button
+            onClick={() => setShowRestore(true)}
+            className="flex w-full items-center justify-center gap-2 rounded-xl border border-white/10 bg-white/[0.02] px-4 py-2.5 text-xs text-slate-400 transition-colors hover:border-white/20 hover:bg-white/[0.04] hover:text-slate-300"
+          >
+            <RotateCcw className="h-3.5 w-3.5" />
+            Restore from Backup
+          </button>
+        ) : (
+          <div className="space-y-2">
+            <div className="flex items-center justify-between">
+              <p className="text-xs font-medium text-slate-400">Available Backups</p>
+              <button
+                onClick={() => { setShowRestore(false); setSelectedBackup(null); setRestoreState("idle") }}
+                className="text-[10px] text-slate-600 transition-colors hover:text-slate-400"
+              >
+                Close
+              </button>
+            </div>
+            {loadingBackups ? (
+              <div className="flex items-center justify-center py-4">
+                <Loader2 className="h-4 w-4 animate-spin text-blue-400" />
+                <span className="ml-2 text-xs text-slate-500">Scanning for backups...</span>
               </div>
-            </div>
-          ) : !showRestore ? (
-            <button
-              onClick={() => setShowRestore(true)}
-              className="flex w-full items-center justify-center gap-2 rounded-xl border border-white/10 bg-white/[0.02] px-4 py-2.5 text-xs text-slate-400 transition-colors hover:border-white/20 hover:bg-white/[0.04] hover:text-slate-300"
-            >
-              <RotateCcw className="h-3.5 w-3.5" />
-              Restore from Backup
-            </button>
-          ) : (
-            <div className="space-y-2">
-              <div className="flex items-center justify-between">
-                <p className="text-xs font-medium text-slate-400">Available Backups</p>
-                <button
-                  onClick={() => { setShowRestore(false); setSelectedBackup(null); setRestoreState("idle") }}
-                  className="text-[10px] text-slate-600 transition-colors hover:text-slate-400"
-                >
-                  Close
-                </button>
+            ) : backups.length === 0 ? (
+              <p className="py-3 text-center text-xs text-slate-500">
+                No backups found. Backups are created automatically after each archive.
+              </p>
+            ) : (
+              <div className="max-h-48 space-y-1.5 overflow-y-auto">
+                {backups.map((b) => (
+                  <button
+                    key={b.date}
+                    onClick={() => { setSelectedBackup(b); setRestoreState("confirm") }}
+                    disabled={restoreState === "restoring"}
+                    className="flex w-full items-center justify-between rounded-lg border border-white/5 bg-white/[0.02] px-3 py-2.5 text-left transition-colors hover:bg-white/[0.05] hover:border-white/10 disabled:opacity-50"
+                  >
+                    <div>
+                      <p className="text-xs font-medium text-slate-300">
+                        {new Date(b.timestamp).toLocaleDateString(undefined, {
+                          weekday: "short",
+                          month: "short",
+                          day: "numeric",
+                          year: "numeric",
+                        })}
+                      </p>
+                      <p className="text-[10px] text-slate-500">
+                        {new Date(b.timestamp).toLocaleTimeString(undefined, {
+                          hour: "2-digit",
+                          minute: "2-digit",
+                        })}
+                        {" · "}
+                        {b.location === "archive" ? "Archive server" : "Local SSD"}
+                        {" · "}
+                        {(b.size / 1024).toFixed(1)} KB
+                      </p>
+                    </div>
+                    {restoreState === "restoring" && selectedBackup?.date === b.date ? (
+                      <Loader2 className="h-4 w-4 animate-spin text-blue-400" />
+                    ) : (
+                      <RotateCcw className="h-3.5 w-3.5 text-slate-500" />
+                    )}
+                  </button>
+                ))}
               </div>
-              {loadingBackups ? (
-                <div className="flex items-center justify-center py-4">
-                  <Loader2 className="h-4 w-4 animate-spin text-blue-400" />
-                  <span className="ml-2 text-xs text-slate-500">Scanning for backups...</span>
-                </div>
-              ) : backups.length === 0 ? (
-                <p className="py-3 text-center text-xs text-slate-500">
-                  No backups found. Backups are created automatically after each archive.
-                </p>
-              ) : (
-                <div className="max-h-48 space-y-1.5 overflow-y-auto">
-                  {backups.map((b) => (
-                    <button
-                      key={b.date}
-                      onClick={() => { setSelectedBackup(b); setRestoreState("confirm") }}
-                      disabled={restoreState === "restoring"}
-                      className="flex w-full items-center justify-between rounded-lg border border-white/5 bg-white/[0.02] px-3 py-2.5 text-left transition-colors hover:bg-white/[0.05] hover:border-white/10 disabled:opacity-50"
-                    >
-                      <div>
-                        <p className="text-xs font-medium text-slate-300">
-                          {new Date(b.timestamp).toLocaleDateString(undefined, {
-                            weekday: "short",
-                            month: "short",
-                            day: "numeric",
-                            year: "numeric",
-                          })}
-                        </p>
-                        <p className="text-[10px] text-slate-500">
-                          {new Date(b.timestamp).toLocaleTimeString(undefined, {
-                            hour: "2-digit",
-                            minute: "2-digit",
-                          })}
-                          {" · "}
-                          {b.location === "archive" ? "Archive server" : "Local SSD"}
-                          {" · "}
-                          {(b.size / 1024).toFixed(1)} KB
-                        </p>
-                      </div>
-                      {restoreState === "restoring" && selectedBackup?.date === b.date ? (
-                        <Loader2 className="h-4 w-4 animate-spin text-blue-400" />
-                      ) : (
-                        <RotateCcw className="h-3.5 w-3.5 text-slate-500" />
-                      )}
-                    </button>
-                  ))}
-                </div>
-              )}
-            </div>
-          )}
-          {restoreState === "error" && (
-            <div className="mt-2 flex items-center gap-2 rounded-lg bg-red-500/10 px-3 py-2 text-xs text-red-400">
-              <AlertCircle className="h-3.5 w-3.5 shrink-0" />
-              Restore failed. Please try again.
-            </div>
-          )}
-        </div>
+            )}
+          </div>
+        )}
+        {restoreState === "error" && (
+          <div className="mt-2 flex items-center gap-2 rounded-lg bg-red-500/10 px-3 py-2 text-xs text-red-400">
+            <AlertCircle className="h-3.5 w-3.5 shrink-0" />
+            Restore failed. Please try again.
+          </div>
+        )}
       </div>
     </div>
   )
@@ -1494,19 +1507,16 @@ function CommunityFeaturesSection() {
   }
 
   return (
-    <div className="glass-card overflow-hidden">
+    <div className="glass-card overflow-hidden flex flex-col">
       <div className="flex items-center gap-3 border-b border-white/5 px-3 py-2.5">
-        <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-blue-500/20">
+        <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-blue-500/15">
           <Users className="h-4 w-4 text-blue-400" />
         </div>
-        <div className="min-w-0 flex-1">
-          <p className="text-xs font-semibold text-slate-200">Community Features</p>
-          <p className="text-[10px] text-slate-500">Choose which community features appear in the sidebar</p>
-        </div>
+        <h3 className="text-sm font-semibold text-slate-200">Community Features</h3>
       </div>
 
       {/* Wraps toggle */}
-      <div className="px-3 py-2.5">
+      <div className="flex-1 px-3 py-2.5">
         <label className="flex cursor-pointer items-start justify-between gap-3">
           <div className="flex items-start gap-2">
             <Paintbrush className="mt-0.5 h-3.5 w-3.5 shrink-0 text-blue-400" />
@@ -1899,20 +1909,20 @@ export default function Settings() {
       {/* Preferences & Connections */}
       <div>
         <p className="section-label mb-2 px-1">Preferences</p>
-        <div className="grid grid-cols-1 gap-2 lg:grid-cols-3">
+        <div className="grid grid-cols-1 gap-2 lg:grid-cols-3 items-stretch">
           <KeepAwakePreference />
           <AwayModeControl />
           <ConfigBackupSection />
           <CommunityFeaturesSection />
-          <div className="space-y-2">
+          <div className="flex flex-col gap-2">
             <MobileNotificationsSection />
             {piConfig?.uses_ble === "yes" && <BlePairButton />}
           </div>
 
           {/* Update tile — version + check + banners merged */}
-          <div className="glass-card overflow-hidden">
+          <div className="glass-card overflow-hidden flex flex-col">
             <div className="flex items-center gap-3 border-b border-white/5 px-3 py-2.5">
-              <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-emerald-500/20">
+              <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-emerald-500/15">
                 {updateStatus === "error" ? (
                   <AlertCircle className="h-4 w-4 text-red-400" />
                 ) : updateStatus === "done" ? (
@@ -2016,7 +2026,7 @@ export default function Settings() {
             )}
 
             {/* Update preferences */}
-            <div className="px-3 py-2">
+            <div className="px-3 py-2.5">
               <label className="flex cursor-pointer items-center justify-between">
                 <span className="text-xs text-slate-400">Auto-check after each archive</span>
                 <input
@@ -2035,7 +2045,7 @@ export default function Settings() {
                 />
               </label>
             </div>
-            <div className="border-t border-white/5 px-3 py-2">
+            <div className="border-t border-white/5 px-3 py-2.5">
               <label className="flex cursor-pointer items-center justify-between gap-3">
                 <div>
                   <span className="text-xs text-slate-400">Include pre-releases</span>
@@ -2058,7 +2068,7 @@ export default function Settings() {
               </label>
             </div>
             {/* Links footer */}
-            <div className="border-t border-white/5 px-3 py-2 flex items-center gap-3">
+            <div className="mt-auto border-t border-white/5 px-3 py-2 flex items-center gap-3">
               <a href="https://github.com/Sentry-Six/Sentry-USB-Rusty" target="_blank" rel="noopener noreferrer"
                 className="text-xs text-blue-400 hover:text-blue-300">GitHub</a>
               <a

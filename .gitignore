@@ -7,3 +7,4 @@ Thumbs.db
 Sentry-USB-OLD
 .cursorignore
 server/ble/__pycache__
+.claude
