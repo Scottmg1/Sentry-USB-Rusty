@@ -574,11 +574,19 @@ pub async fn download_data(
 /// `post-archive-process.sh` can ship it to the rsync / rclone archive
 /// server. Returns the byte count of the regenerated file so the shell
 /// script can log it.
+///
+/// Runs on the blocking thread pool so the 3+ minute regeneration on a
+/// well-used Pi (~848 MB on a year of dashcam data) doesn't block any
+/// async runtime worker. `DriveStore::export_json_for_sync` opens its
+/// own read-only SQLite handle, so the writer mutex stays free for
+/// concurrent `/api/drives` requests too.
 pub async fn export_for_sync(
     State(state): State<AppState>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    match state.drives.store.export_json_for_sync() {
-        Ok(()) => {
+    let store = state.drives.store.clone();
+    let export_result = tokio::task::spawn_blocking(move || store.export_json_for_sync()).await;
+    match export_result {
+        Ok(Ok(())) => {
             let bytes = std::fs::metadata(sentryusb_drives::db::DEFAULT_JSON_MIRROR_PATH)
                 .map(|m| m.len())
                 .unwrap_or(0);
@@ -587,7 +595,11 @@ pub async fn export_for_sync(
                 Json(serde_json::json!({ "status": "ok", "bytes": bytes })),
             )
         }
-        Err(e) => crate::json_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+        Ok(Err(e)) => crate::json_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+        Err(e) => crate::json_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("export task panic: {}", e),
+        ),
     }
 }
 

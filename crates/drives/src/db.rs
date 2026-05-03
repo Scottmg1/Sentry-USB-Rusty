@@ -13,7 +13,7 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 
 use anyhow::{Context, Result};
-use rusqlite::{params, Connection, ToSql};
+use rusqlite::{params, Connection, OpenFlags, ToSql};
 use tracing::{info, warn};
 
 use crate::aggregate::compute_route_aggregates;
@@ -577,6 +577,16 @@ impl DriveStore {
 
     /// Export current DB contents as `drive-data.json` at `path`.
     /// Atomic via tmp + rename.
+    ///
+    /// Opens a fresh read-only connection rather than locking the shared
+    /// writer connection, so the 3+ minute mirror regeneration on a
+    /// well-used Pi doesn't block `/api/drives`, `/api/drives/routes`,
+    /// or any other DB-touching endpoint. WAL mode (set in
+    /// `apply_pragmas`) lets this reader stream a consistent snapshot
+    /// concurrently with writes from the main connection. Falls back
+    /// to the in-memory `:memory:` path by reusing the shared
+    /// connection, since you can't open a second handle to an
+    /// in-memory DB.
     pub fn export_json_to_file(&self, path: &str) -> Result<()> {
         if let Some(dir) = Path::new(path).parent() {
             if !dir.as_os_str().is_empty() && dir != Path::new("/") {
@@ -584,14 +594,13 @@ impl DriveStore {
             }
         }
         let tmp = format!("{}.tmp", path);
-        {
+        if self.path == ":memory:" {
             let conn = self.conn.lock().unwrap();
-            let mut f = std::fs::File::create(&tmp)?;
-            crate::json_compat::export_json(&conn, &mut f)
-                .context("export_json")?;
-            use std::io::Write;
-            f.flush()?;
-            f.sync_all()?;
+            write_export_json(&conn, &tmp)?;
+        } else {
+            let conn = open_readonly_connection(&self.path)
+                .with_context(|| format!("export_json_to_file: open read-only {}", self.path))?;
+            write_export_json(&conn, &tmp)?;
         }
         if let Err(e) = std::fs::rename(&tmp, path) {
             let _ = std::fs::remove_file(&tmp);
@@ -725,6 +734,22 @@ fn open_connection(path: &str) -> Result<Connection> {
     Ok(conn)
 }
 
+/// Open a second SQLite handle on the same DB file, in read-only mode,
+/// for long-running reads (the JSON export mirror) that would otherwise
+/// hold the shared writer connection's mutex for minutes. WAL mode on
+/// the writer lets this handle see a consistent snapshot.
+fn open_readonly_connection(path: &str) -> Result<Connection> {
+    let flags = OpenFlags::SQLITE_OPEN_READ_ONLY
+        | OpenFlags::SQLITE_OPEN_URI
+        | OpenFlags::SQLITE_OPEN_NO_MUTEX;
+    let conn = Connection::open_with_flags(path, flags)?;
+    conn.execute_batch(
+        "PRAGMA query_only = ON;
+         PRAGMA busy_timeout = 5000;",
+    )?;
+    Ok(conn)
+}
+
 fn apply_pragmas(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         "PRAGMA journal_mode = WAL;
@@ -732,6 +757,15 @@ fn apply_pragmas(conn: &Connection) -> Result<()> {
          PRAGMA foreign_keys = ON;
          PRAGMA busy_timeout = 5000;",
     )?;
+    Ok(())
+}
+
+fn write_export_json(conn: &Connection, tmp_path: &str) -> Result<()> {
+    use std::io::Write;
+    let mut f = std::fs::File::create(tmp_path)?;
+    crate::json_compat::export_json(conn, &mut f).context("export_json")?;
+    f.flush()?;
+    f.sync_all()?;
     Ok(())
 }
 

@@ -552,4 +552,55 @@ mod streaming_export_tests {
 
         let _ = std::fs::remove_file(&tmp);
     }
+
+    /// Covers the on-disk path that opens a fresh read-only SQLite handle
+    /// rather than locking the writer mutex (the production path used by
+    /// `/api/drives/data/export-for-sync`). The `:memory:` tests above
+    /// fall through to the locked-connection branch since you can't open
+    /// a second handle on an in-memory DB.
+    #[test]
+    fn streaming_export_from_on_disk_db_uses_readonly_handle() {
+        let pid = std::process::id();
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let db_path = std::env::temp_dir()
+            .join(format!("sentryusb-readonly-{}-{}.db", pid, nanos));
+        let json_path = std::env::temp_dir()
+            .join(format!("sentryusb-readonly-{}-{}.json", pid, nanos));
+        let db_str = db_path.to_string_lossy().to_string();
+        let json_str = json_path.to_string_lossy().to_string();
+
+        let store = DriveStore::open(&db_str).unwrap();
+        let pts: Vec<GpsPoint> = vec![[37.7749, -122.4194], [37.7750, -122.4195]];
+        store
+            .add_route(
+                "2025-01-15/clip.mp4",
+                "2025-01-15",
+                &pts,
+                &[4, 4],
+                &[1, 1],
+                &[25.0, 26.0],
+                &[0.5, 0.6],
+                0,
+                2,
+                &[GearRun { gear: 4, frames: 2 }],
+            )
+            .unwrap();
+        store.export_json_to_file(&json_str).unwrap();
+
+        let raw = std::fs::read(&json_path).unwrap();
+        let data: StoreData = serde_json::from_slice(&raw).unwrap();
+        assert_eq!(data.routes.len(), 1);
+        assert_eq!(data.routes[0].file, "2025-01-15/clip.mp4");
+        assert_eq!(data.routes[0].points, pts);
+        assert_eq!(data.processed_files, vec!["2025-01-15/clip.mp4"]);
+
+        drop(store);
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_file(format!("{}-wal", db_str));
+        let _ = std::fs::remove_file(format!("{}-shm", db_str));
+        let _ = std::fs::remove_file(&json_path);
+    }
 }
