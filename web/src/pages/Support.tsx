@@ -137,21 +137,6 @@ export default function Support() {
     setStatus({ text: "Sending...", type: "loading" })
 
     try {
-      let diagnostics: string | null = null
-      if (includeDiagnostics) {
-        setStatus({ text: "Collecting diagnostics...", type: "loading" })
-        // Refresh diagnostics first
-        await fetch("/api/diagnostics/refresh", { method: "POST" }).catch(() => { })
-        const diagRes = await fetch("/api/diagnostics")
-        let rawDiag = await diagRes.text()
-        // Sanitize: strip ANSI escape codes and replace lone surrogates / invalid chars
-        // that would break PostgreSQL JSONB on the support server
-        rawDiag = rawDiag.replace(/\x1b\[[0-9;]*[a-zA-Z]/g, "") // ANSI escapes
-        rawDiag = rawDiag.replace(/[\uD800-\uDFFF]/g, "\uFFFD") // lone surrogates
-        rawDiag = rawDiag.replace(/[\x00-\x08\x0B\x0C\x0E-\x1F]/g, "") // control chars (keep \t \n \r)
-        diagnostics = rawDiag
-      }
-
       // Track the active ticket for this send (needed because setState is async)
       let activeTicket = ticket
 
@@ -163,8 +148,7 @@ export default function Support() {
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
             message: message.trim(),
-            diagnostics,
-            hasAttachments: !!attachment,
+            hasAttachments: includeDiagnostics || !!attachment,
           }),
         })
         const data = await res.json()
@@ -186,11 +170,46 @@ export default function Support() {
               "Content-Type": "application/json",
               "X-Auth-Token": activeTicket.authToken,
             },
-            body: JSON.stringify({ message: message.trim(), diagnostics }),
+            body: JSON.stringify({ message: message.trim() }),
           })
           const data = await res.json()
           if (!data.success) throw new Error(data.error || "Failed to send message")
         }
+      }
+
+      // Upload diagnostics as a file attachment (byte-faithful — matches the
+      // Logs tab Download). Use /api/logs/diagnostics, not /api/diagnostics:
+      // the latter strips ANSI/control chars server-side, which loses bytes
+      // (NULs from device-tree files, etc.) the support agent may need.
+      if (includeDiagnostics && activeTicket) {
+        setStatus({ text: "Collecting diagnostics...", type: "loading" })
+        await fetch("/api/diagnostics/refresh", { method: "POST" }).catch(() => { })
+
+        const diagRes = await fetch("/api/logs/diagnostics?" + Math.random())
+        const diagBlob = await diagRes.blob()
+
+        setStatus({ text: "Uploading diagnostics...", type: "loading" })
+        const diagMediaData = await new Promise<string>((resolve, reject) => {
+          const r = new FileReader()
+          r.onload = () => resolve(r.result as string)
+          r.onerror = reject
+          r.readAsDataURL(diagBlob)
+        })
+
+        await fetch(`/api/support/ticket/${activeTicket.ticketId}/media`, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "X-Auth-Token": activeTicket.authToken,
+          },
+          body: JSON.stringify({
+            mediaData: diagMediaData,
+            fileName: "diagnostics.log",
+            fileType: "text/plain",
+            fileSize: diagBlob.size,
+            message: "",
+          }),
+        })
       }
 
       // Upload attachment if present
@@ -215,7 +234,6 @@ export default function Support() {
             fileType: attachment.type,
             fileSize: attachment.size,
             message: message.trim(),
-            diagnostics,
           }),
         })
       }
