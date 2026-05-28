@@ -60,7 +60,7 @@ sha1 = "0.10"
 sha2 = "0.10"
 hex = "0.4"
 uuid = "1"
-rand = "0.8"
+rand = "0.9"
 
 # NIST P-256 ECDH for the session handshake.
 # `pem` reads the on-disk private key file Tesla pairing produced.
