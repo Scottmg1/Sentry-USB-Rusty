@@ -19,7 +19,7 @@ chrono = { workspace = true }
 
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 base64 = "0.22"
-rusqlite = { version = "0.32", features = ["bundled"] }
+rusqlite = { version = "0.40", features = ["bundled"] }
 # Ring is used inside encrypt.rs for the per-route 32-byte randomness.
 ring = "0.17"
 

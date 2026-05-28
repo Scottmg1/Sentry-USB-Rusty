@@ -26,7 +26,7 @@ tokio-util = { version = "0.7", features = ["io"] }
 # telemetry_samples (temperature_series, tire_history). The drives
 # crate already brings this transitively; declaring it here is just
 # so we can reference `rusqlite::params!` directly.
-rusqlite = { version = "0.32", features = ["bundled", "chrono", "blob"] }
+rusqlite = { version = "0.40", features = ["bundled", "chrono", "blob"] }
 
 sentryusb-config = { path = "../config", package = "sentryusb-config" }
 sentryusb-shell = { path = "../shell", package = "sentryusb-shell" }
