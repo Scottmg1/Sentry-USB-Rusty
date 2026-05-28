@@ -24,7 +24,7 @@ jobs:
       - uses: actions/checkout@v6
 
       - name: Push wiki/ to GitHub wiki
-        uses: Andrew-Chen-Wang/github-wiki-action@v4
+        uses: Andrew-Chen-Wang/github-wiki-action@v5
         with:
           path: wiki/
           token: ${{ secrets.GITHUB_TOKEN }}
