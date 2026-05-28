@@ -156,7 +156,7 @@ jobs:
           key: ${{ runner.os }}-${{ runner.arch }}-cargo-${{ matrix.target }}-${{ matrix.cpu }}-${{ hashFiles('**/Cargo.lock', 'web/src/**', 'web/public/**', 'web/package-lock.json', 'web/package.json', 'web/index.html', 'web/vite.config.*', 'web/tsconfig*.json') }}
 
       - name: Set up Node.js
-        uses: actions/setup-node@v5
+        uses: actions/setup-node@v6
         with:
           node-version: '22'
           cache: 'npm'
