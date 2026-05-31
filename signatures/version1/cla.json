@@ -1,3 +1,12 @@
 {
-  "signedContributors": []
+  "signedContributors": [
+    {
+      "name": "jrmedia24hrs-droid",
+      "id": 289371247,
+      "comment_id": 4586246680,
+      "created_at": "2026-05-31T09:04:24Z",
+      "repoId": 1212174474,
+      "pullRequestNo": 45
+    }
+  ]
 }
