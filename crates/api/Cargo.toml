@@ -40,4 +40,4 @@ sentryusb-cloud-uploader = { path = "../cloud_uploader", package = "sentryusb-cl
 [dev-dependencies]
 tempfile = "3"
 # Only used by tests to read archives back and validate the hand-rolled writer.
-zip = { version = "2", default-features = false, features = ["deflate"] }
+zip = { version = "8", default-features = false, features = ["deflate"] }
