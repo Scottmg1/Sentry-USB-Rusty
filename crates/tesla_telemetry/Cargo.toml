@@ -34,7 +34,7 @@ sentryusb-config = { path = "../config", package = "sentryusb-config" }
 sentryusb-shell = { path = "../shell", package = "sentryusb-shell" }
 sentryusb-drives = { path = "../drives", package = "sentryusb-drives" }
 sentryusb-tesla-ble = { path = "../tesla_ble", package = "sentryusb-tesla-ble" }
-prost-types = "0.13"
+prost-types = "0.14"
 
 [dev-dependencies]
 tempfile = "3"
