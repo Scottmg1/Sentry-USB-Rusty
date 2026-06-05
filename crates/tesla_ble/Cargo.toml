@@ -54,8 +54,8 @@ tracing-subscriber = { workspace = true }
 
 btleplug = "0.11"
 futures = "0.3"
-prost = "0.13"
-prost-types = "0.13"
+prost = "0.14"
+prost-types = "0.14"
 sha1 = "0.11"
 sha2 = "0.10"
 hex = "0.4"
@@ -71,7 +71,7 @@ pem = "3"
 aes-gcm = "0.10"
 
 [build-dependencies]
-prost-build = "0.13"
+prost-build = "0.14"
 # Vendored protoc so users don't need to apt install protobuf-compiler.
 protoc-bin-vendored = "3"
 
