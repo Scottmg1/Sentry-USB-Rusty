@@ -10,24 +10,22 @@ export default defineConfig({
       "@": path.resolve(__dirname, "./src"),
     },
   },
-  esbuild: {
-    // Strip development noise from the production bundle without
-    // touching console.warn / console.error — those carry real user-
-    // facing diagnostics (e.g. 3D preview fallbacks in CommunityWraps).
-    pure: ['console.log', 'console.debug'],
-  },
   build: {
     rollupOptions: {
       output: {
         // Named vendor chunks so an OTA update that only changes app
         // code doesn't bust the cache for libraries that haven't
         // moved. Each library lives in its own content-hashed file.
-        manualChunks: {
-          'vendor-react': ['react', 'react-dom', 'react-router-dom'],
-          'vendor-charts': ['recharts'],
-          'vendor-maps': ['leaflet'],
-          'vendor-term': ['@xterm/xterm', '@xterm/addon-fit'],
-          'vendor-icons': ['lucide-react'],
+        // Vite 8 / Rolldown removed object-form manualChunks; this is
+        // the codeSplitting equivalent (matched by node_modules path).
+        codeSplitting: {
+          groups: [
+            { name: 'vendor-react', test: /[\\/]node_modules[\\/](react|react-dom|react-router|react-router-dom)[\\/]/ },
+            { name: 'vendor-charts', test: /[\\/]node_modules[\\/]recharts[\\/]/ },
+            { name: 'vendor-maps', test: /[\\/]node_modules[\\/]leaflet[\\/]/ },
+            { name: 'vendor-term', test: /[\\/]node_modules[\\/]@xterm[\\/]/ },
+            { name: 'vendor-icons', test: /[\\/]node_modules[\\/]lucide-react[\\/]/ },
+          ],
         },
       },
     },
