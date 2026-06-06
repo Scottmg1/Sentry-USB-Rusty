@@ -378,17 +378,20 @@ pub async fn current_charging(
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_secs() as i64)
                 .unwrap_or(l.ts);
-            if now - l.ts <= 600 && is_charging(l.power_kw, l.rate_mph) {
-                CurrentCharge {
-                    charging: true,
-                    soc: l.soc,
-                    limit_soc: l.limit_soc,
-                    power_kw: l.power_kw,
-                    minutes_to_full: l.minutes_to_full,
-                    range_mi: l.range_mi,
-                }
-            } else {
-                CurrentCharge::idle()
+            let age = now - l.ts;
+            let charging = age <= 600 && is_charging(l.power_kw, l.rate_mph);
+            // Battery % is shown for the persistent car-status banner as long
+            // as the data is reasonably fresh (<= 24h), so the banner doesn't
+            // vanish the moment a charge ends. The charging-only fields are
+            // present only while actively charging.
+            let soc = if age <= 86_400 { l.soc } else { None };
+            CurrentCharge {
+                charging,
+                soc,
+                limit_soc: if charging { l.limit_soc } else { None },
+                power_kw: if charging { l.power_kw } else { None },
+                minutes_to_full: if charging { l.minutes_to_full } else { None },
+                range_mi: if charging { l.range_mi } else { l.range_mi.filter(|_| soc.is_some()) },
             }
         }
         _ => CurrentCharge::idle(),
