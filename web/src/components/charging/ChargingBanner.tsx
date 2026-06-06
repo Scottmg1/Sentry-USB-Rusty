@@ -5,16 +5,26 @@ import type { CurrentCharge } from "@/types/charging"
 
 const POLL_MS = 30_000
 
+/** "3h 45m to full" / "45m to full" — null/0 renders nothing. */
+function fmtToFull(mins: number | null): string | null {
+  if (mins == null || mins <= 0) return null
+  const h = Math.floor(mins / 60)
+  const m = mins % 60
+  if (h > 0) return `~${h}h ${m}m to full`
+  return `~${m}m to full`
+}
+
 /**
  * Persistent dashboard car-status banner. Polls /api/charging/current and
  * stays visible whenever there's recent battery data.
  *
  * Charging vs idle is conveyed by color + icon — green pulsing
  * `BatteryCharging` for active charging, subdued `Battery` when not.
- * The content is the same in both states (battery % · range) so the
- * banner reads as a steady "this is your car's battery right now" strip
- * rather than two visually different cards. Same pattern as drive-detail:
- * the unit comes from `DRIVE_MAP_UNIT` in setup config (default imperial).
+ * Both states show `battery % · range`; the charging state additionally
+ * shows the estimated time-to-full when the car reports it. No redundant
+ * "Charging" / "Not charging" text — the color and icon already convey
+ * that state. Same unit pattern as drive-detail: range comes from
+ * `DRIVE_MAP_UNIT` in setup config (default imperial).
  */
 export default function ChargingBanner() {
   const [cur, setCur] = useState<CurrentCharge | null>(null)
@@ -72,7 +82,9 @@ export default function ChargingBanner() {
 
   if (cur.charging) {
     // Active charging — green strip, pulsing icon. Color carries the
-    // "this is charging" signal so the text doesn't have to.
+    // "this is charging" signal so the text doesn't have to. Time-to-full
+    // is the one piece of info color can't convey, so it stays.
+    const toFull = fmtToFull(cur.minutesToFull)
     return (
       <div className="mb-4 flex flex-wrap items-center gap-x-2 gap-y-0.5 rounded-xl border border-emerald-500/20 bg-emerald-500/10 px-4 py-2.5 text-sm text-emerald-300 tabular-nums">
         <BatteryCharging className="h-4 w-4 shrink-0 animate-pulse" />
@@ -81,6 +93,12 @@ export default function ChargingBanner() {
           <span className="flex items-center gap-2">
             <span className="text-emerald-400/50">·</span>
             {range}
+          </span>
+        )}
+        {toFull && (
+          <span className="flex items-center gap-2">
+            <span className="text-emerald-400/50">·</span>
+            {toFull}
           </span>
         )}
       </div>
