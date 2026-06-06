@@ -297,6 +297,12 @@ async fn main() -> Result<()> {
     // polls legitimately omit coords). Feeds the keep-accessory geofence.
     let mut last_lat: Option<f64> = None;
     let mut last_lon: Option<f64> = None;
+    // Last known reverse-geocoded address from the drive poll, held across
+    // ticks. Tesla returns locationName only on `state drive`, which doesn't
+    // run every tick — so a short charge (no drive poll) would otherwise get
+    // a sample with no address. Held + stamped like lat/lon so every sample
+    // carries the last-known address.
+    let mut last_location_name: Option<String> = None;
     // Throttle for the geofence `state location` poll (keep-accessory only).
     let mut last_location_poll: Option<Instant> = None;
     // Keep-Accessory-Power automation policy state (see keep_accessory.rs).
@@ -375,6 +381,7 @@ async fn main() -> Result<()> {
                 &mut last_gate_log,
                 &mut last_lat,
                 &mut last_lon,
+                &mut last_location_name,
                 &mut last_location_poll,
             ) => {
                 // Keep-Accessory-Power automation runs after each tick
@@ -459,6 +466,7 @@ async fn tick(
     last_gate_log: &mut Option<Instant>,
     last_lat: &mut Option<f64>,
     last_lon: &mut Option<f64>,
+    last_location_name: &mut Option<String>,
     last_location_poll: &mut Option<Instant>,
 ) -> Duration {
     let cfg = match BleConfig::load() {
@@ -866,7 +874,12 @@ async fn tick(
                     }
                     try_sync_clock(d.meta);
                     sample.odometer_mi = d.odometer_mi;
-                    sample.location_name = d.location_name;
+                    // Hold the last-known address across ticks (the stamp
+                    // below applies it to every sample, so a charge-only
+                    // tick still carries the address).
+                    if d.location_name.is_some() {
+                        *last_location_name = d.location_name.clone();
+                    }
                     shift_state_observed = d.shift_state;
                     // Hold last-known GPS across ticks (parked polls omit
                     // coords); feeds the keep-accessory geofence.
@@ -1099,6 +1112,14 @@ async fn tick(
             // NULL until a location poll has supplied coords.
             sample.latitude = *last_lat;
             sample.longitude = *last_lon;
+            // Stamp the held address too (same rationale as lat/lon): a
+            // charge-only tick where the drive poll didn't run still gets
+            // the last-known address, so a short charge shows it. Only
+            // overwrite from the held value when this tick didn't already
+            // set one.
+            if sample.location_name.is_none() {
+                sample.location_name = last_location_name.clone();
+            }
             persist(conn, sample);
         }
 
