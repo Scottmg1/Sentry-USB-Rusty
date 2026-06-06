@@ -332,71 +332,111 @@ impl CurrentCharge {
     }
 }
 
-/// The single most-recent telemetry row, charge-relevant columns only.
-struct LatestCharge {
-    ts: i64,
-    soc: Option<f64>,
-    limit_soc: Option<i64>,
-    power_kw: Option<i64>,
-    rate_mph: Option<f64>,
-    minutes_to_full: Option<i64>,
-    range_mi: Option<f64>,
-}
+/// Charge-relevant fields from the latest tick that actually polled
+/// the charger (power / rate / limit / minutes-to-full).
+type ChargeFields = (Option<i64>, Option<f64>, Option<i64>, Option<i64>);
 
-/// GET /api/charging/current — is the car charging right now, with the
-/// fields the dashboard banner shows. Reads one row (latest by ts); a
-/// sample older than 10 minutes counts as "not charging" so a long-asleep
-/// car doesn't keep the banner stuck on.
+/// Battery-relevant fields from the latest tick that actually polled
+/// the battery (soc / range_mi).
+type BatteryFields = (Option<f64>, Option<f64>);
+
+/// GET /api/charging/current — current charging state + persistent
+/// battery readout for the dashboard banner.
+///
+/// Two reads, two freshness windows:
+///   * **Charge fields** (power / rate / limit / mins-to-full): the most
+///     recent row where any of them is non-NULL, within the last 10
+///     minutes. Drive-only ticks (every 15s in Active mode) carry NULL
+///     for these columns, so naively reading "latest row by ts" reports
+///     not-charging every time a drive tick lands between charge polls
+///     and the banner flickers off.
+///   * **Battery fields** (soc / range): the most recent row where soc
+///     is non-NULL, within the last 24 hours. Drive-only ticks AND
+///     body-controller-only polls (Quiet mode) have NULL soc; without
+///     this window the persistent banner would vanish a few seconds
+///     after every charge poll, and vanish entirely once the car sleeps.
 pub async fn current_charging(
     State(state): State<AppState>,
 ) -> (StatusCode, Json<serde_json::Value>) {
     use rusqlite::OptionalExtension;
-    let latest = state.drives.store.with_locked_conn(|conn| {
-        conn.query_row(
-            "SELECT ts, battery_pct, charge_limit_soc, charger_power_kw, \
-                    charge_rate_mph, charge_minutes_to_full, battery_range_mi \
-             FROM telemetry_samples ORDER BY ts DESC LIMIT 1",
-            [],
-            |r| {
-                Ok(LatestCharge {
-                    ts: r.get(0)?,
-                    soc: r.get(1)?,
-                    limit_soc: r.get(2)?,
-                    power_kw: r.get(3)?,
-                    rate_mph: r.get(4)?,
-                    minutes_to_full: r.get(5)?,
-                    range_mi: r.get(6)?,
-                })
-            },
-        )
-        .optional()
-    });
 
-    let cur = match latest {
-        Ok(Some(l)) => {
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs() as i64)
-                .unwrap_or(l.ts);
-            let age = now - l.ts;
-            let charging = age <= 600 && is_charging(l.power_kw, l.rate_mph);
-            // Battery % is shown for the persistent car-status banner as long
-            // as the data is reasonably fresh (<= 24h), so the banner doesn't
-            // vanish the moment a charge ends. The charging-only fields are
-            // present only while actively charging.
-            let soc = if age <= 86_400 { l.soc } else { None };
-            CurrentCharge {
-                charging,
-                soc,
-                limit_soc: if charging { l.limit_soc } else { None },
-                power_kw: if charging { l.power_kw } else { None },
-                minutes_to_full: if charging { l.minutes_to_full } else { None },
-                range_mi: if charging { l.range_mi } else { l.range_mi.filter(|_| soc.is_some()) },
-            }
-        }
-        _ => CurrentCharge::idle(),
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let charge_cutoff = now - 600; // 10 min — currently-charging window
+    let battery_cutoff = now - 86_400; // 24 h — banner freshness window
+
+    let result: rusqlite::Result<(Option<ChargeFields>, Option<BatteryFields>)> =
+        state.drives.store.with_locked_conn(|conn| {
+            // Latest row that actually has charge data (skips drive-only
+            // ticks where the charge poll didn't fire). The OR'd
+            // IS NOT NULL on power_kw / rate_mph is the load-bearing
+            // filter — a charge poll always sets at least one of them
+            // when the car is plugged in.
+            let charge: Option<ChargeFields> = conn
+                .query_row(
+                    "SELECT charger_power_kw, charge_rate_mph, charge_limit_soc, \
+                            charge_minutes_to_full \
+                     FROM telemetry_samples \
+                     WHERE (charger_power_kw IS NOT NULL OR charge_rate_mph IS NOT NULL) \
+                       AND ts >= ?1 \
+                     ORDER BY ts DESC LIMIT 1",
+                    [charge_cutoff],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+                )
+                .optional()?;
+
+            // Latest row that actually has battery data. battery_pct is
+            // only populated by the charge poll (Active 60s / parked-awake
+            // 3min); body-controller polls and drive ticks leave it NULL.
+            // This is what keeps the banner up between charge polls and
+            // when the car is asleep but the data is still fresh.
+            let battery: Option<BatteryFields> = conn
+                .query_row(
+                    "SELECT battery_pct, battery_range_mi \
+                     FROM telemetry_samples \
+                     WHERE battery_pct IS NOT NULL AND ts >= ?1 \
+                     ORDER BY ts DESC LIMIT 1",
+                    [battery_cutoff],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .optional()?;
+
+            Ok((charge, battery))
+        });
+
+    let cur = match result {
+        Ok((charge, battery)) => assemble_current(charge, battery),
+        Err(_) => CurrentCharge::idle(),
     };
     (StatusCode::OK, Json(serde_json::to_value(cur).unwrap()))
+}
+
+/// Pure assembly of the two latest-non-null lookups into the wire
+/// shape. Factored out so the disappearing-banner regression is a
+/// straight unit test — no rusqlite, no fixture DB.
+fn assemble_current(
+    charge: Option<ChargeFields>,
+    battery: Option<BatteryFields>,
+) -> CurrentCharge {
+    let (power_kw, rate_mph, limit_soc, minutes_to_full) =
+        charge.unwrap_or((None, None, None, None));
+    let (soc, range_mi) = battery.unwrap_or((None, None));
+
+    let charging = is_charging(power_kw, rate_mph);
+
+    CurrentCharge {
+        charging,
+        soc,
+        limit_soc: if charging { limit_soc } else { None },
+        power_kw: if charging { power_kw } else { None },
+        minutes_to_full: if charging { minutes_to_full } else { None },
+        // range tracks soc — the same poll sets both, so showing range
+        // without a soc would be inconsistent. With the battery lookup
+        // gated on `battery_pct IS NOT NULL`, this lines up by default.
+        range_mi,
+    }
 }
 
 #[cfg(test)]
@@ -495,5 +535,82 @@ mod tests {
             assert!(jp.contains(&format!("\"{key}\"")), "point must emit {key}: {jp}");
         }
         assert!(!jp.contains("\"power_kw\""), "point must NOT emit snake_case: {jp}");
+    }
+
+    // ── /api/charging/current — dashboard banner persistence ────────────
+    //
+    // Regression suite for the on-vehicle "banner disappears after a
+    // while" bug. The sampler writes a row every tick, but only the
+    // 60s charge poll populates `battery_pct` (and the charge fields).
+    // Drive ticks (every 15s) and body-controller polls (sleep mode)
+    // leave those columns NULL. The old endpoint asked for "latest row
+    // by ts" → got a drive tick or body-controller row → soc=None →
+    // React `if (cur.soc == null) return null` → banner vanishes.
+    //
+    // The fix is two queries with two freshness windows. These tests
+    // pin the assembly: what the banner shows for each combination of
+    // present/absent charge data and present/absent battery data.
+
+    #[test]
+    fn banner_persists_when_charge_poll_is_stale_but_battery_is_fresh() {
+        // The bug scenario: no recent charge poll (car not currently
+        // charging, or charge poll hasn't fired yet) but the last
+        // battery sample is well inside the 24h window. Banner must
+        // show the idle "🔋 X% · Y mi" state, not vanish.
+        let cur = assemble_current(
+            None,                              // no recent charge data
+            Some((Some(63.0), Some(199.0))),   // last known: 63% / 199 mi
+        );
+        assert!(!cur.charging, "not charging when no charge data is fresh");
+        assert_eq!(cur.soc, Some(63.0), "soc must carry the last battery sample");
+        assert_eq!(cur.range_mi, Some(199.0), "range tracks soc");
+        assert!(cur.power_kw.is_none(), "no charging fields when not charging");
+        assert!(cur.minutes_to_full.is_none());
+        assert!(cur.limit_soc.is_none());
+    }
+
+    #[test]
+    fn banner_shows_charging_strip_when_charge_data_is_fresh() {
+        // Active-mode charge poll just fired with nonzero power.
+        // Banner shows the full green strip.
+        let cur = assemble_current(
+            Some((Some(4), Some(20.3), Some(80), Some(225))), // 4 kW, 80%, 3h45m
+            Some((Some(55.0), Some(170.0))),                  // 55% / 170 mi
+        );
+        assert!(cur.charging);
+        assert_eq!(cur.soc, Some(55.0));
+        assert_eq!(cur.limit_soc, Some(80));
+        assert_eq!(cur.power_kw, Some(4));
+        assert_eq!(cur.minutes_to_full, Some(225));
+        assert_eq!(cur.range_mi, Some(170.0));
+    }
+
+    #[test]
+    fn banner_hides_when_no_recent_data_at_all() {
+        // Fresh install, or 24h+ since the last battery sample.
+        // Banner renders nothing.
+        let cur = assemble_current(None, None);
+        assert!(!cur.charging);
+        assert!(cur.soc.is_none());
+        assert!(cur.range_mi.is_none());
+        assert!(cur.power_kw.is_none());
+    }
+
+    #[test]
+    fn charging_data_present_but_power_zero_means_plugged_in_idle() {
+        // Edge case: the car is plugged in but pulling no power
+        // (full, scheduled charge, etc.). `is_charging` is the
+        // canonical truthiness check — it requires nonzero power
+        // OR nonzero rate. With both zero, banner shows the idle
+        // state even though charge columns are non-NULL.
+        let cur = assemble_current(
+            Some((Some(0), Some(0.0), Some(80), None)),
+            Some((Some(80.0), Some(245.0))),
+        );
+        assert!(!cur.charging, "plugged in but pulling zero power is not 'charging'");
+        assert_eq!(cur.soc, Some(80.0));
+        assert_eq!(cur.range_mi, Some(245.0));
+        assert!(cur.power_kw.is_none(), "charging-only fields suppressed when not charging");
+        assert!(cur.limit_soc.is_none());
     }
 }
