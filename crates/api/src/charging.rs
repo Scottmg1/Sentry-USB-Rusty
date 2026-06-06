@@ -27,7 +27,7 @@ use crate::router::AppState;
 const SESSION_GAP_SECS: i64 = 30 * 60;
 
 /// One row pulled from `telemetry_samples`, already filtered to samples
-/// where the car was drawing power.
+/// where the car was actively charging (see `is_actively_charging`).
 struct ChargeRow {
     ts: i64,
     power_kw: Option<i64>,
@@ -44,6 +44,11 @@ struct ChargeRow {
     location: Option<String>,
     lat: Option<f64>,
     lon: Option<f64>,
+    /// Persisted Tesla charge phase (v14+, lowercase). `None` on pre-v14
+    /// rows or when the sampler couldn't decode it that tick. When
+    /// present, this is the authoritative signal — see
+    /// `is_actively_charging`.
+    charging_state: Option<String>,
 }
 
 /// Summary of one charge session for the list view.
@@ -114,11 +119,46 @@ fn avg(it: impl Iterator<Item = f64>) -> Option<f64> {
     if n == 0 { None } else { Some(sum / n as f64) }
 }
 
-/// A sample counts as actively charging when the car reports nonzero
-/// power or a nonzero charge rate. Parked-and-plugged rows (power 0,
-/// carried-over energy) are excluded so they don't pad a session.
+/// Heuristic "is this row charging?" for pre-v14 rows that don't carry a
+/// persisted Tesla phase. `rate_mph` is the authoritative truth when the
+/// car reports it: nonzero rate = energy is going into the battery; an
+/// explicit `Some(0.0)` rate means "not charging" even when `power_kw`
+/// is positive (cabin pre-conditioning, 12V top-up, and BMS thermal
+/// management all draw power without charging). Only when rate is
+/// missing entirely do we fall back to power — that covers the rare
+/// decode failure where the car is genuinely charging but the rate field
+/// didn't come through.
+///
+/// For v14+ rows callers should use `is_actively_charging`, which uses
+/// the persisted phase directly and falls back to this heuristic only
+/// when phase is `None`.
 fn is_charging(power_kw: Option<i64>, rate_mph: Option<f64>) -> bool {
-    power_kw.is_some_and(|p| p > 0) || rate_mph.is_some_and(|r| r > 0.0)
+    match rate_mph {
+        Some(r) => r > 0.0,
+        None => power_kw.is_some_and(|p| p > 0),
+    }
+}
+
+/// Phase-first "is this row charging?" — the predicate `load_charge_rows`
+/// uses to decide whether a sample belongs in a charge session. When the
+/// row carries a persisted Tesla phase (v14+) it's authoritative:
+/// `charging`/`starting`/`calibrating` → yes, everything else → no.
+/// Pre-v14 rows fall back to `is_charging` over power and rate.
+///
+/// Why both layers: phase alone misses the entire pre-v14 fleet; the
+/// heuristic alone produces phantom sessions when the car wakes from
+/// sleep plugged in but full (it draws a couple of kW for cabin
+/// pre-conditioning, the old heuristic saw `power_kw > 0` and counted
+/// it as a charge session that added zero kWh).
+fn is_actively_charging(
+    phase: Option<&str>,
+    power_kw: Option<i64>,
+    rate_mph: Option<f64>,
+) -> bool {
+    match phase_is_active(phase) {
+        Some(active) => active,
+        None => is_charging(power_kw, rate_mph),
+    }
 }
 
 /// How stale the latest charge row may be before the banner gives up
@@ -145,15 +185,21 @@ fn load_charge_rows(
     to: Option<i64>,
 ) -> anyhow::Result<Vec<ChargeRow>> {
     let upper = to.unwrap_or(i64::MAX);
+    // SQL pulls every row with any charge-related signal (phase OR power
+    // OR rate non-NULL); the Rust filter below decides whether each one
+    // is actually charging via `is_actively_charging`. This split keeps
+    // the SQL simple and the predicate unit-testable.
     let mut stmt = conn.prepare(
         "SELECT ts, charger_power_kw, charger_actual_current_a, charger_voltage_v, \
                 charge_rate_mph, charge_energy_added_kwh, charge_limit_soc, \
                 battery_range_mi, battery_pct, \
                 battery_temp_c, interior_temp_c, exterior_temp_c, location_name, \
-                latitude, longitude \
+                latitude, longitude, charging_state \
          FROM telemetry_samples \
          WHERE ts BETWEEN ?1 AND ?2 \
-           AND (charger_power_kw IS NOT NULL OR charge_rate_mph IS NOT NULL) \
+           AND (charging_state IS NOT NULL \
+                OR charger_power_kw IS NOT NULL \
+                OR charge_rate_mph IS NOT NULL) \
          ORDER BY ts ASC",
     )?;
     let rows = stmt.query_map(rusqlite::params![from, upper], |r| {
@@ -173,12 +219,13 @@ fn load_charge_rows(
             location: r.get(12)?,
             lat: r.get(13)?,
             lon: r.get(14)?,
+            charging_state: r.get(15)?,
         })
     })?;
     let mut out = Vec::new();
     for row in rows {
         let row = row?;
-        if is_charging(row.power_kw, row.rate_mph) {
+        if is_actively_charging(row.charging_state.as_deref(), row.power_kw, row.rate_mph) {
             out.push(row);
         }
     }
@@ -458,6 +505,7 @@ mod tests {
             location: None,
             lat: None,
             lon: None,
+            charging_state: None,
         }
     }
 
@@ -492,8 +540,83 @@ mod tests {
     fn non_charging_rows_excluded_by_is_charging() {
         assert!(!is_charging(Some(0), Some(0.0)));
         assert!(!is_charging(None, None));
-        assert!(is_charging(Some(7), None));
+        assert!(
+            is_charging(Some(7), None),
+            "no rate signal at all — trust nonzero power as a real-charge proxy",
+        );
         assert!(is_charging(None, Some(12.0)));
+    }
+
+    #[test]
+    fn rate_zero_overrides_nonzero_power() {
+        // Regression for the phantom-session bug. On-vehicle, the user
+        // woke the car with the cabin AC remote-start on. Car was at
+        // 79% with an 80% limit so it wasn't charging, but BMS routed
+        // 2 kW to climate. Tesla reported power_kw=2, rate_mph=0.0,
+        // energy_added_kwh=17.48 (carried over from the prior charge).
+        // The old `power > 0 || rate > 0` predicate said "charging" on
+        // the strength of the 2 kW alone, the row entered a "session",
+        // a phantom session appeared in the UI with 0 kWh added.
+        //
+        // The fix: when rate is reported, trust it. An explicit zero
+        // rate means no energy is going to the battery, regardless of
+        // power draw elsewhere in the car.
+        assert!(
+            !is_charging(Some(2), Some(0.0)),
+            "rate=0 explicitly reported → not charging, even with nonzero power \
+             (cabin AC / BMS thermal / 12V top-up all draw power without charging)",
+        );
+        assert!(
+            !is_charging(Some(4), Some(0.0)),
+            "and the larger AC-startup draw at wake-from-sleep is not charging either",
+        );
+    }
+
+    // ── Phase-first session predicate ──────────────────────────────────
+    //
+    // `is_actively_charging` is what `load_charge_rows` actually uses to
+    // decide whether a sample belongs in a charge session. When the row
+    // has a persisted Tesla phase (v14+, written by the sampler) the
+    // phase is authoritative; pre-v14 rows fall back to `is_charging`.
+    // These tests pin both layers.
+
+    #[test]
+    fn phase_charging_is_included_even_with_weak_signals() {
+        // Tesla says "charging"; trust the phase even if power_kw is
+        // reported as 0 (mid-handshake) or rate_mph as None (decode glitch).
+        assert!(is_actively_charging(Some("charging"), Some(0), Some(0.0)));
+        assert!(is_actively_charging(Some("charging"), None, None));
+        assert!(is_actively_charging(Some("starting"), Some(1), None));
+        assert!(is_actively_charging(Some("calibrating"), None, Some(0.0)));
+    }
+
+    #[test]
+    fn phase_complete_excludes_phantom_power_draw() {
+        // The on-vehicle scenario again, but now with the v14 phase
+        // present. The phase says "complete" (charge limit reached);
+        // any power draw at this point is climate / 12V / BMS, NOT
+        // charging. Trust the phase, ignore the nonzero power.
+        assert!(!is_actively_charging(Some("complete"), Some(2), Some(0.0)));
+        assert!(!is_actively_charging(Some("stopped"), Some(4), Some(0.0)));
+        assert!(!is_actively_charging(Some("disconnected"), None, None));
+        assert!(!is_actively_charging(Some("nopower"), Some(0), Some(0.0)));
+        assert!(
+            !is_actively_charging(Some("unknown"), Some(7), Some(20.0)),
+            "Tesla explicitly said 'unknown'; be conservative — would rather \
+             miss a row than create a phantom session",
+        );
+    }
+
+    #[test]
+    fn no_phase_falls_back_to_heuristic() {
+        // Pre-v14 row (or v14 row where the sampler couldn't decode the
+        // phase that tick): no `charging_state` value persisted. Defer
+        // to `is_charging`, which itself prefers rate over power.
+        assert!(is_actively_charging(None, Some(4), Some(20.0)));
+        assert!(is_actively_charging(None, Some(7), None));
+        assert!(!is_actively_charging(None, Some(2), Some(0.0))); // phantom
+        assert!(!is_actively_charging(None, None, None));
+        assert!(!is_actively_charging(None, Some(0), Some(0.0)));
     }
 
     #[test]
