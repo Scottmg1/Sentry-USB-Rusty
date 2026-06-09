@@ -57,7 +57,7 @@ futures = "0.3"
 prost = "0.14"
 prost-types = "0.14"
 sha1 = "0.11"
-sha2 = "0.10"
+sha2 = "0.11"
 hex = "0.4"
 uuid = "1"
 rand = "0.9"
@@ -68,7 +68,11 @@ p256 = { version = "0.13", features = ["ecdh", "pem", "pkcs8"] }
 pem = "3"
 
 # AES-128-GCM for signed-command authentication.
-aes-gcm = "0.10"
+# `std` is explicit so `InvalidLength` implements `std::error::Error`
+# (needed for `.context()` in auth.rs). It was previously pulled in
+# transitively via sha2 0.10's digest stack; sha2 0.11 moved to a newer
+# crypto-common, so we now request it directly.
+aes-gcm = { version = "0.10", features = ["std"] }
 
 [build-dependencies]
 prost-build = "0.14"
