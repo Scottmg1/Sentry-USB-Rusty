@@ -26,7 +26,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use axum::Json;
 use axum::extract::{Path as AxumPath, State};
 use axum::http::StatusCode;
-use rand::RngCore;
+use rand::Rng;
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 

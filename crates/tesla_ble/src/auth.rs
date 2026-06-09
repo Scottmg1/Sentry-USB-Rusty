@@ -42,7 +42,7 @@
 
 use anyhow::{Context, Result};
 use prost::Message;
-use rand::RngCore;
+use rand::Rng;
 use sha2::{Digest, Sha256};
 use tracing::debug;
 
@@ -201,7 +201,7 @@ pub fn sign(
     // Random 12-byte nonce. AES-GCM needs only per-(key,message)
     // uniqueness, and replay protection comes from the metadata counter.
     let mut nonce_bytes = [0u8; 12];
-    rand::thread_rng().fill_bytes(&mut nonce_bytes);
+    rand::rng().fill_bytes(&mut nonce_bytes);
 
     let cipher = Aes128Gcm::new_from_slice(session_key.as_bytes())
         .context("Aes128Gcm new_from_slice")?;
@@ -326,8 +326,8 @@ pub fn build_signed_routable_message(
 ) -> Vec<u8> {
     let mut from_uuid = [0u8; 16];
     let mut req_uuid = [0u8; 16];
-    rand::thread_rng().fill_bytes(&mut from_uuid);
-    rand::thread_rng().fill_bytes(&mut req_uuid);
+    rand::rng().fill_bytes(&mut from_uuid);
+    rand::rng().fill_bytes(&mut req_uuid);
 
     let msg = RoutableMessage {
         to_destination: Some(Destination {

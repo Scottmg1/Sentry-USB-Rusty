@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use prost::Message;
-use rand::RngCore;
+use rand::Rng;
 use tracing::{debug, info};
 
 use crate::gatt::Connection;

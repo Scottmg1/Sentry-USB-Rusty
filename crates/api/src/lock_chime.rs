@@ -7,7 +7,7 @@ use axum::body::Bytes;
 use axum::extract::{Path as AxumPath, State};
 use axum::http::StatusCode;
 use chrono::{Datelike, Timelike};
-use rand::Rng;
+use rand::RngExt;
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 use tracing::info;

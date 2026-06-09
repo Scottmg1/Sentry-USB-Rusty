@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use anyhow::Context;
 use prost::Message;
-use rand::RngCore;
+use rand::Rng;
 use thiserror::Error;
 use tracing::{debug, info, warn};
 
