@@ -172,6 +172,12 @@ async fn main() {
     // WebSocket hub
     let hub = sentryusb_ws::Hub::new();
 
+    // If a restore queued a replacement app-data DB, install it before
+    // opening SQLite. The running daemon cannot safely replace its own open
+    // DB handle during the restore request, so restore stages the DB and this
+    // startup hook completes the swap.
+    sentryusb_api::backup::apply_pending_app_data_restore_at_startup();
+
     // Drive store (SQLite)
     let db_path = sentryusb_drives::DEFAULT_DB_PATH;
     let store = match sentryusb_drives::DriveStore::open(db_path) {

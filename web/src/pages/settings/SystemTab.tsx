@@ -26,7 +26,7 @@ interface Props {
  * Settings → System. Consolidates what used to be three sparse, low-traffic
  * tabs — Backups, About, and Privacy — into one admin/maintenance surface:
  *
- *   - Config Backup / Export / Raw Config   (was: Backups tab)
+ *   - System Backup / Export / Raw Config   (was: Backups tab)
  *   - Setup Wizard + Resources              (was: About tab)
  *   - Analytics opt-in + disclosure         (was: Privacy tab)
  */

@@ -167,6 +167,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/system/backup", post(crate::backup::create_backup))
         .route("/api/system/backups", get(crate::backup::list_backups))
         .route("/api/system/backup/{date}", get(crate::backup::get_backup))
+        .route("/api/system/backup/{date}/app-data", get(crate::backup::get_app_data_backup))
         .route("/api/system/restore", post(crate::backup::restore_backup))
         // Drives
         .route("/api/drives", get(crate::drives_handler::list_drives))

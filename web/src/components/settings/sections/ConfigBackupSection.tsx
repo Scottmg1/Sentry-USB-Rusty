@@ -18,6 +18,10 @@ interface BackupEntry {
   location: string
   size: number
   filename: string
+  app_data_included?: boolean
+  app_data_size?: number
+  app_data_filename?: string
+  total_size?: number
 }
 
 const INLINE_CAP = 5
@@ -37,6 +41,8 @@ export function ConfigBackupSection() {
   const [restoreResult, setRestoreResult] = useState<{
     date: string
     hostname: string
+    appDataRestored: boolean
+    restartRequired: boolean
   } | null>(null)
 
   useEffect(() => {
@@ -98,6 +104,7 @@ export function ConfigBackupSection() {
       const backupRes = await fetch(`/api/system/backup/${selectedBackup.date}`)
       if (!backupRes.ok) throw new Error("Failed to fetch backup")
       const backupData = await backupRes.json()
+      backupData.app_data_included = Boolean(selectedBackup.app_data_included)
 
       const restoreRes = await fetch("/api/system/restore", {
         method: "POST",
@@ -106,7 +113,12 @@ export function ConfigBackupSection() {
       })
       if (!restoreRes.ok) throw new Error("Restore failed")
       const result = await restoreRes.json()
-      setRestoreResult({ date: result.date, hostname: result.hostname })
+      setRestoreResult({
+        date: result.date,
+        hostname: result.hostname,
+        appDataRestored: Boolean(result.app_data_restored),
+        restartRequired: Boolean(result.restart_required),
+      })
       setRestoreState("success")
     } catch {
       setRestoreState("error")
@@ -124,7 +136,7 @@ export function ConfigBackupSection() {
     <PrefCard
       icon={<Save className="h-3.5 w-3.5" />}
       halo="blue"
-      title="Config Backup"
+      title="System Backup"
     >
       {/* Location + backup trigger */}
       <div className="flex flex-wrap items-center gap-2">
@@ -190,11 +202,16 @@ export function ConfigBackupSection() {
           <div className="flex items-start gap-3">
             <CheckCircle className="mt-0.5 h-5 w-5 shrink-0 text-emerald-400" />
             <div>
-              <p className="text-sm font-medium text-emerald-300">Config Restored</p>
+              <p className="text-sm font-medium text-emerald-300">System Restored</p>
               <p className="mt-1 text-xs text-slate-400">
                 Backup from {restoreResult.date} has been restored
-                {restoreResult.hostname ? ` (${restoreResult.hostname})` : ""}. Run setup to
-                apply the restored configuration.
+                {restoreResult.hostname ? ` (${restoreResult.hostname})` : ""}.
+                {restoreResult.appDataRestored
+                  ? " App data was restored."
+                  : " Configuration was restored."}
+                {restoreResult.restartRequired
+                  ? " Reboot to load the restored drive, charge, and telemetry database."
+                  : " Run setup to apply the restored configuration."}
               </p>
               <button
                 onClick={() => {
@@ -227,8 +244,14 @@ export function ConfigBackupSection() {
                     year: "numeric",
                   })}
                 </span>
-                . SSH keys, BLE pairing, and notification credentials will also be restored. You
-                will need to run setup afterward to apply changes.
+                . Configuration, SSH keys, BLE pairing, notification credentials
+                {selectedBackup.app_data_included
+                  ? ", drive history, charge sessions, telemetry, lock chimes, wraps, network/Bluetooth state, and app state"
+                  : ", and stored credentials"}
+                {" "}will be restored.
+                {selectedBackup.app_data_included
+                  ? " A reboot is required before restored drive data is active."
+                  : " You will need to run setup afterward to apply changes."}
               </p>
               <div className="mt-3 flex gap-2">
                 <button
@@ -244,7 +267,7 @@ export function ConfigBackupSection() {
                   onClick={handleRestore}
                   className="rounded-lg bg-amber-500/20 px-3 py-1.5 text-xs font-medium text-amber-300 transition-colors hover:bg-amber-500/30"
                 >
-                  Restore Config
+                  Restore Backup
                 </button>
               </div>
             </div>
@@ -296,7 +319,9 @@ export function ConfigBackupSection() {
                   {" · "}
                   {b.location === "archive" ? "Archive server" : "Local SSD"}
                   {" · "}
-                  {(b.size / 1024).toFixed(1)} KB
+                  {((b.total_size ?? b.size) / 1024).toFixed(1)} KB
+                  {" · "}
+                  {b.app_data_included ? "App data" : "Config only"}
                 </p>
               </div>
               {restoreState === "restoring" && selectedBackup?.date === b.date ? (

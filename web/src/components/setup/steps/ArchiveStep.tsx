@@ -279,16 +279,16 @@ export function ArchiveStep({ data, onChange }: StepProps) {
         </div>
       )}
 
-      {/* Config backup location */}
+      {/* System backup location */}
       <div className="space-y-2 rounded-lg border border-white/5 bg-white/[0.02] p-4">
         <div className="flex items-center gap-2">
           <Save className="h-4 w-4 text-blue-400" />
           <p className="text-xs font-medium uppercase tracking-wider text-slate-500">
-            Config Backup Location
+            System Backup Location
           </p>
         </div>
         <p className="text-xs text-slate-500">
-          Your configuration is automatically backed up after each archive.
+          Your configuration and app data are automatically backed up after each archive.
           Choose where to store backups for easy recovery if the SD card fails.
         </p>
         <div className="grid grid-cols-2 gap-2">

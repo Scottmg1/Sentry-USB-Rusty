@@ -185,6 +185,10 @@ interface BackupEntry {
   location: string
   size: number
   filename: string
+  app_data_included?: boolean
+  app_data_size?: number
+  app_data_filename?: string
+  total_size?: number
 }
 
 export function WelcomeStep({ data: _data, onChange: _onChange, onBatchChange }: StepProps) {
@@ -281,6 +285,7 @@ export function WelcomeStep({ data: _data, onChange: _onChange, onBatchChange }:
       const backupRes = await fetch(`/api/system/backup/${backup.date}`)
       if (!backupRes.ok) throw new Error("Failed to fetch backup")
       const backupData = await backupRes.json()
+      backupData.app_data_included = Boolean(backup.app_data_included)
 
       // Send to restore endpoint
       const restoreRes = await fetch("/api/system/restore", {
@@ -321,7 +326,9 @@ export function WelcomeStep({ data: _data, onChange: _onChange, onBatchChange }:
   // yet (its credentials live inside the backup), so /api/system/backups
   // returns an empty list and the user has no way to pick a backup. POST
   // the file straight to /api/system/restore — the backend writes config,
-  // SSH keys, rclone config, BLE keys, and notification creds back.
+  // SSH keys, rclone config, BLE keys, and notification creds back. Uploaded
+  // JSON restores are config-only because the companion app-data tarball is
+  // not uploaded by this control.
   async function handleBackupFileUpload(file: File) {
     if (!file.name.endsWith(".json")) {
       setUploadError("Please select a .json backup file")
@@ -344,11 +351,12 @@ export function WelcomeStep({ data: _data, onChange: _onChange, onBatchChange }:
         setUploadError("Invalid backup file — missing version or config data")
         return
       }
+      backupData.app_data_included = false
 
       const restoreRes = await fetch("/api/system/restore", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: text,
+        body: JSON.stringify(backupData),
       })
       if (!restoreRes.ok) throw new Error("Restore failed")
       const result = await restoreRes.json()
@@ -535,7 +543,9 @@ export function WelcomeStep({ data: _data, onChange: _onChange, onBatchChange }:
                               {" · "}
                               {b.location === "archive" ? "Archive server" : "Local SSD"}
                               {" · "}
-                              {(b.size / 1024).toFixed(1)} KB
+                              {((b.total_size ?? b.size) / 1024).toFixed(1)} KB
+                              {" · "}
+                              {b.app_data_included ? "App data" : "Config only"}
                             </p>
                           </div>
                           {restoringDate === b.date ? (
