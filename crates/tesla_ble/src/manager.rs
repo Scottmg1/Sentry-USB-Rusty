@@ -842,13 +842,20 @@ async fn try_signed_request_once(
         inner.len(),
         counter
     );
-    // round_trip validator: require the frame to decode as a
-    // RoutableMessage. Discards mid-frame garbage from late
-    // notifications (seen on bluez 5.82 post-reconnect) at the
-    // transport layer.
+    // Correlate the response to THIS request before accepting it. The
+    // car echoes our per-request `from_destination` routing address into
+    // the response's `to_destination` (and stamps the domain it came
+    // from). The old shape-only validator accepted ANY decodable
+    // RoutableMessage, so a late straggler from a prior or cross-domain
+    // query on the shared persistent session was taken as our response —
+    // the root cause of the spurious `aead::Error` (a stale *signed*
+    // reply decrypted with this request's REQUEST_HASH) and
+    // "no sub_sig_data" (a VCSEC body-controller reply) failures. See
+    // `crate::correlate`.
+    let (our_uuid, our_addr) = crate::correlate::our_correlators(&envelope);
     let resp_bytes = conn
         .round_trip(&envelope, QUERY_TIMEOUT, |b| {
-            RoutableMessage::decode(b).is_ok()
+            crate::correlate::is_response_to(b, &our_uuid, &our_addr, domain)
         })
         .await?;
 

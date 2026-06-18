@@ -3,6 +3,7 @@
 pub mod actions;
 pub mod auth;
 pub mod body_controller;
+pub mod correlate;
 pub mod crypto;
 pub mod gatt;
 pub mod keys;
