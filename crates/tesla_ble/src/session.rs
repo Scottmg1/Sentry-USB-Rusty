@@ -72,13 +72,15 @@ pub async fn request_session_info(
         payload.len(),
         domain,
     );
-    // Validator: must decode as a RoutableMessage. Same rationale
-    // as the other round_trip callers; the session-info handshake
-    // runs right after a fresh connect when stale notifications
-    // are most likely to be in the BLE pipeline.
+    // Correlate the response to our request (echoed request_uuid +
+    // originating domain) so a stale straggler on the shared session
+    // can't be mistaken for the handshake reply. See `crate::correlate`.
+    let our_uuid = RoutableMessage::decode(payload.as_slice())
+        .map(|m| m.uuid)
+        .unwrap_or_default();
     let response = conn
         .round_trip(&payload, Duration::from_secs(10), |b| {
-            RoutableMessage::decode(b).is_ok()
+            crate::correlate::is_response_to(b, &our_uuid, domain)
         })
         .await
         .context("session-info round-trip")?;

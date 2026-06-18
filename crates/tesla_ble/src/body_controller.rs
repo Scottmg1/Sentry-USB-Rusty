@@ -13,7 +13,7 @@ use tracing::{debug, info};
 
 use crate::gatt::Connection;
 use crate::proto::universal_message::{
-    Destination, RoutableMessage, destination, routable_message,
+    Destination, Domain, RoutableMessage, destination, routable_message,
 };
 use crate::proto::vcsec::{
     FromVcsecMessage, InformationRequest, InformationRequestType, UnsignedMessage,
@@ -25,13 +25,17 @@ use crate::proto::vcsec::{
 pub async fn query(conn: &mut Connection) -> Result<VehicleStatus> {
     let payload = build_request();
     info!("body-controller-state: TX {} bytes", payload.len());
-    // Validator: must decode as a RoutableMessage. Same rationale
-    // as the manager.rs signed-query path — discards desynced
-    // frames at the transport layer so the response parser only
-    // sees frames that survived a proto-level smoke test.
+    // Correlate the response to our request: it must originate from the
+    // VEHICLE_SECURITY domain we addressed (and echo our request_uuid if
+    // present). Without this, a late Infotainment straggler on the
+    // shared session could be parsed as a VCSEC reply. See
+    // `crate::correlate`.
+    let our_uuid = RoutableMessage::decode(payload.as_slice())
+        .map(|m| m.uuid)
+        .unwrap_or_default();
     let response_bytes = conn
         .round_trip(&payload, Duration::from_secs(10), |b| {
-            RoutableMessage::decode(b).is_ok()
+            crate::correlate::is_response_to(b, &our_uuid, Domain::VehicleSecurity)
         })
         .await
         .context("BLE round-trip")?;
