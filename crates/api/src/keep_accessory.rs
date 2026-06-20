@@ -58,6 +58,48 @@ pub async fn set_keep_accessory(
     {
         Ok(_) => {
             info!("[keep-accessory] {} ok", verb);
+            // Fire a `keep_accessory` push so the manual override produces the
+            // same user-facing signal as the automatic geofence-driven flips
+            // do (see tesla_telemetry::keep_accessory::notify_event). Fan out
+            // through the local Notification Center, which is gated by the
+            // `keep_accessory` pref toggle and routes to every configured
+            // channel including Sentry Connect. Best-effort — failures don't
+            // affect the API response.
+            let title = if req.on {
+                "Keep Accessory ON (manual)"
+            } else {
+                "Keep Accessory OFF (manual)"
+            };
+            let message = if req.on {
+                "Accessory power was turned on from the web UI / mobile app."
+            } else {
+                "Accessory power was turned off from the web UI / mobile app."
+            };
+            let body = serde_json::json!({
+                "notification_type": "keep_accessory",
+                "title": title,
+                "message": message,
+            })
+            .to_string();
+            tokio::spawn(async move {
+                let _ = tokio::task::spawn_blocking(move || {
+                    std::process::Command::new("curl")
+                        .args([
+                            "-s",
+                            "--max-time",
+                            "15",
+                            "-X",
+                            "POST",
+                            "http://localhost/api/notifications/send",
+                            "-H",
+                            "Content-Type: application/json",
+                            "-d",
+                            &body,
+                        ])
+                        .output()
+                })
+                .await;
+            });
             (
                 StatusCode::OK,
                 Json(serde_json::json!({ "ok": true, "on": req.on })),
