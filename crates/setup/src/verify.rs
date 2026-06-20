@@ -102,6 +102,7 @@ fn check_supported_hardware(env: &SetupEnv) -> Result<()> {
             "STOP: unsupported hardware: Raspberry Pi 2. \
              (only Pi Zero 2 W, Pi 3, Pi 4, and Pi 5 have the necessary hardware to run SentryUSB)"
         ),
+        PiModel::Rock4CPlus => Ok(()),
         PiModel::Other => {
             // Could be a RockPi / Radxa Zero / genuinely unknown board.
             // Bash returns silently for non-Pi boards; we do the same.

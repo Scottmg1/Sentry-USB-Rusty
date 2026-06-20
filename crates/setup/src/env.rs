@@ -14,6 +14,7 @@ pub enum PiModel {
     PiZero2,
     PiZeroW,
     Pi2,
+    Rock4CPlus,
     Other,
 }
 
@@ -41,6 +42,12 @@ impl PiModel {
             PiModel::PiZeroW
         } else if lower.contains("raspberry pi 2") {
             PiModel::Pi2
+        } else if lower.contains("rock 4c+")
+            || lower.contains("rock-4c-plus")
+            || lower.contains("rock pi 4c+")
+            || dt_compatible_contains("rock-4c-plus")
+        {
+            PiModel::Rock4CPlus
         } else {
             PiModel::Other
         }
@@ -65,9 +72,20 @@ impl PiModel {
             PiModel::PiZero2 => "Raspberry Pi Zero 2 W",
             PiModel::PiZeroW => "Raspberry Pi Zero W",
             PiModel::Pi2 => "Raspberry Pi 2",
+            PiModel::Rock4CPlus => "Radxa ROCK 4C+",
             PiModel::Other => "Unknown board",
         }
     }
+}
+
+/// True if the device-tree `compatible` string contains `needle`. The model
+/// string alone can vary across vendor DTBs (e.g. "Radxa ROCK 4C+" vs
+/// "RADXA ROCK 4C Plus"), so `compatible` (e.g. `radxa,rock-4c-plus`) is the
+/// reliable fallback for board detection.
+fn dt_compatible_contains(needle: &str) -> bool {
+    fs::read_to_string("/sys/firmware/devicetree/base/compatible")
+        .map(|s| s.replace('\0', " ").to_lowercase().contains(needle))
+        .unwrap_or(false)
 }
 
 /// Detected environment paths and configuration.

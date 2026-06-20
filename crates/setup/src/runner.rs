@@ -462,6 +462,96 @@ async fn configure_dwc2_overlay(env: &SetupEnv, emitter: &SetupEmitter) -> Resul
 }
 
 /// Check whether the root partition needs shrinking (Pi Imager auto-expand case).
+/// Shrink the partition-table entry of the (already filesystem-shrunk) root
+/// partition down to match its filesystem, freeing the tail of the disk for
+/// setup's backingfiles/mutable partitions. Only call this once the root
+/// filesystem itself has been shrunk (by resize2fs in initramfs).
+async fn shrink_root_partition_table(
+    root_dev: &str,
+    boot_disk: &str,
+    root_part_num: &str,
+    emitter: &SetupEmitter,
+) {
+    emitter.progress("Shrinking root partition table entry to match filesystem...");
+    let sector_size = sentryusb_shell::run(
+        "bash", &["-c", &format!(
+            "cat /sys/block/$(lsblk -no pkname '{}')/queue/hw_sector_size", root_dev
+        )],
+    ).await.unwrap_or_else(|_| "512".to_string()).trim().parse::<u64>().unwrap_or(512);
+
+    let tune2fs_out = sentryusb_shell::run(
+        "bash", &["-c", &format!(
+            "tune2fs -l '{}' | grep 'Block count:\\|Block size:' | awk '{{print $2}}' FS=: | tr -d ' '",
+            root_dev
+        )],
+    ).await.unwrap_or_default();
+    let parts: Vec<&str> = tune2fs_out.trim().lines().collect();
+    if parts.len() == 2 {
+        let block_count: u64 = parts[0].trim().parse().unwrap_or(0);
+        let block_size: u64 = parts[1].trim().parse().unwrap_or(4096);
+        let fs_sectors = block_count * block_size / sector_size;
+
+        let start_sector = sentryusb_shell::run(
+            "bash", &["-c", &format!("partx --show -g -o START '{}'", root_dev)],
+        ).await.unwrap_or_default().trim().to_string();
+
+        emitter.progress(&format!("Resizing partition to {} sectors", fs_sectors));
+        let _ = sentryusb_shell::run_with_timeout(
+            Duration::from_secs(30),
+            "bash", &["-c", &format!(
+                "echo '{},{}' | sfdisk --force --no-reread '{}' -N {}",
+                start_sector, fs_sectors, boot_disk, root_part_num
+            )],
+        ).await;
+    }
+
+    if Path::new("/sentryusb/config.txt").exists() {
+        let config = std::fs::read_to_string("/sentryusb/config.txt").unwrap_or_default();
+        if config.contains("SENTRYUSB-REMOVE") {
+            let cleaned: String = config.lines()
+                .filter(|l| !l.contains("SENTRYUSB-REMOVE"))
+                .collect::<Vec<_>>().join("\n");
+            let _ = std::fs::write("/sentryusb/config.txt", cleaned + "\n");
+            let initrd = format!("initrd.img-{}", std::env::consts::ARCH);
+            let _ = std::fs::remove_file(format!("/boot/{}", initrd));
+        } else {
+            let _ = sentryusb_shell::run("update-initramfs", &["-u"]).await;
+        }
+    }
+}
+
+/// Root filesystem size in the disk's hardware sectors (block_count *
+/// block_size / hw_sector_size), or None if it can't be read.
+async fn root_fs_sectors(root_dev: &str) -> Option<u64> {
+    let sector_size = sentryusb_shell::run(
+        "bash", &["-c", &format!(
+            "cat /sys/block/$(lsblk -no pkname '{}')/queue/hw_sector_size", root_dev
+        )],
+    ).await.ok()?.trim().parse::<u64>().unwrap_or(512);
+    let tune2fs_out = sentryusb_shell::run(
+        "bash", &["-c", &format!(
+            "tune2fs -l '{}' | grep 'Block count:\\|Block size:' | awk '{{print $2}}' FS=: | tr -d ' '",
+            root_dev
+        )],
+    ).await.ok()?;
+    let parts: Vec<&str> = tune2fs_out.trim().lines().collect();
+    if parts.len() == 2 {
+        let block_count: u64 = parts[0].trim().parse().unwrap_or(0);
+        let block_size: u64 = parts[1].trim().parse().unwrap_or(4096);
+        if block_count > 0 {
+            return Some(block_count * block_size / sector_size);
+        }
+    }
+    None
+}
+
+/// Size of the root partition itself, in sectors.
+async fn root_partition_sectors(root_dev: &str) -> Option<u64> {
+    sentryusb_shell::run(
+        "bash", &["-c", &format!("partx --show -g -o SECTORS '{}'", root_dev)],
+    ).await.ok()?.trim().parse::<u64>().ok()
+}
+
 async fn check_root_shrink(env: &SetupEnv, emitter: &SetupEmitter) -> Result<bool> {
     // Mirror the verify_disk_space branch: the shrink exists solely to free
     // 8 GB on the SD for backingfiles+mutable. When DATA_DRIVE is set those
@@ -502,52 +592,7 @@ async fn check_root_shrink(env: &SetupEnv, emitter: &SetupEmitter) -> Result<boo
             emitter.progress("Root filesystem resize completed successfully during boot.");
             let _ = std::fs::remove_file(resize_marker);
 
-            emitter.progress("Shrinking root partition table entry to match filesystem...");
-            let sector_size = sentryusb_shell::run(
-                "bash", &["-c", &format!(
-                    "cat /sys/block/$(lsblk -no pkname '{}')/queue/hw_sector_size", root_dev
-                )],
-            ).await.unwrap_or_else(|_| "512".to_string()).trim().parse::<u64>().unwrap_or(512);
-
-            let tune2fs_out = sentryusb_shell::run(
-                "bash", &["-c", &format!(
-                    "tune2fs -l '{}' | grep 'Block count:\\|Block size:' | awk '{{print $2}}' FS=: | tr -d ' '",
-                    root_dev
-                )],
-            ).await.unwrap_or_default();
-            let parts: Vec<&str> = tune2fs_out.trim().lines().collect();
-            if parts.len() == 2 {
-                let block_count: u64 = parts[0].trim().parse().unwrap_or(0);
-                let block_size: u64 = parts[1].trim().parse().unwrap_or(4096);
-                let fs_sectors = block_count * block_size / sector_size;
-
-                let start_sector = sentryusb_shell::run(
-                    "bash", &["-c", &format!("partx --show -g -o START '{}'", root_dev)],
-                ).await.unwrap_or_default().trim().to_string();
-
-                emitter.progress(&format!("Resizing partition to {} sectors", fs_sectors));
-                let _ = sentryusb_shell::run_with_timeout(
-                    Duration::from_secs(30),
-                    "bash", &["-c", &format!(
-                        "echo '{},{}' | sfdisk --force --no-reread '{}' -N {}",
-                        start_sector, fs_sectors, boot_disk, root_part_num
-                    )],
-                ).await;
-            }
-
-            if Path::new("/sentryusb/config.txt").exists() {
-                let config = std::fs::read_to_string("/sentryusb/config.txt").unwrap_or_default();
-                if config.contains("SENTRYUSB-REMOVE") {
-                    let cleaned: String = config.lines()
-                        .filter(|l| !l.contains("SENTRYUSB-REMOVE"))
-                        .collect::<Vec<_>>().join("\n");
-                    let _ = std::fs::write("/sentryusb/config.txt", cleaned + "\n");
-                    let initrd = format!("initrd.img-{}", std::env::consts::ARCH);
-                    let _ = std::fs::remove_file(format!("/boot/{}", initrd));
-                } else {
-                    let _ = sentryusb_shell::run("update-initramfs", &["-u"]).await;
-                }
-            }
+            shrink_root_partition_table(&root_dev, &boot_disk, &root_part_num, emitter).await;
 
             emitter.progress("Root partition shrink complete, rebooting...");
             reboot().await;
@@ -580,6 +625,27 @@ async fn check_root_shrink(env: &SetupEnv, emitter: &SetupEmitter) -> Result<boo
     }
 
     if Path::new(resize_marker).exists() {
+        // The initramfs resize records success by writing /root/RESIZE_RESULT,
+        // but some non-Raspberry-Pi initramfs environments (e.g. DietPi on
+        // RK3399 / Radxa 4C+) can't persist that marker even when resize2fs
+        // succeeded — which previously stranded setup on a permanent FATAL.
+        // Trust the disk, not the marker: if the filesystem is already smaller
+        // than its partition, the resize did happen, so finish the partition-
+        // table shrink instead of bailing.
+        let fs_sectors = root_fs_sectors(&root_dev).await.unwrap_or(0);
+        let part_sectors = root_partition_sectors(&root_dev).await.unwrap_or(0);
+        // 64 MiB of slack so a partition already matching its filesystem isn't
+        // needlessly reshrunk.
+        let slack = 64 * 1024 * 1024 / 512;
+        if fs_sectors > 0 && part_sectors > 0 && fs_sectors + slack < part_sectors {
+            emitter.begin_phase("root_shrink", "Shrinking root partition table");
+            emitter.progress("Filesystem already shrunk but the resize marker was lost (common on DietPi initramfs); finishing the partition-table shrink...");
+            let _ = std::fs::remove_file(resize_marker);
+            shrink_root_partition_table(&root_dev, &boot_disk, &root_part_num, emitter).await;
+            emitter.progress("Root partition shrink complete, rebooting...");
+            reboot().await;
+            return Ok(true);
+        }
         emitter.progress("FATAL: Previous root shrink attempt failed. Delete /root/RESIZE_ATTEMPTED and try again, or reflash with Balena Etcher.");
         bail!("Previous root shrink attempt failed. Reflash with Balena Etcher instead of Raspberry Pi Imager.");
     }
