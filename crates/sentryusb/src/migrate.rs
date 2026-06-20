@@ -71,6 +71,35 @@ pub async fn run_startup_migration() {
         .await
         {
             Ok(_) => {
+                // Re-apply runtime patches AFTER the migration. The migration
+                // script unconditionally rewrites /root/bin/sentryusb-ble.py
+                // from the upstream tarball — which silently undoes board-
+                // specific fixes the OTA updater already applied (BCM4345C0
+                // non-fatal-adv on Rock 4C+ is the headline case: OTA patches
+                // ble.py → reboot → this migration unpatches it → BLE crash
+                // loop on next start). Invoke the standalone runtime-patches
+                // script (idempotent + detection-gated) so the patches survive
+                // every migration. Best-effort: a missing script just yields
+                // an info log — the OTA flow's bootstrap path will populate
+                // it on the next update.
+                if std::path::Path::new("/usr/local/bin/sentryusb-apply-runtime-patches").exists() {
+                    match sentryusb_shell::run_with_timeout(
+                        Duration::from_secs(30),
+                        "/usr/local/bin/sentryusb-apply-runtime-patches",
+                        &[],
+                    )
+                    .await
+                    {
+                        Ok(_) => info!("[migrate] runtime-patches re-applied post-migration"),
+                        Err(e) => warn!(
+                            "[migrate] runtime-patches post-migration run failed: {} — BLE pairing may be broken on Rock 4C+",
+                            e
+                        ),
+                    }
+                } else {
+                    info!("[migrate] runtime-patches script not present (pre-bootstrap install) — skipping; OTA path will populate it");
+                }
+
                 let _ = tokio::fs::create_dir_all(MIGRATE_DIR).await;
                 if let Err(e) = tokio::fs::write(&marker_file, b"migrated\n").await {
                     warn!("[migrate] Failed to write marker {}: {}", marker_file, e);
