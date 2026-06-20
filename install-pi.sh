@@ -525,7 +525,13 @@ DTS
     #     event-driven when hci0 appears (UART BT attaches late on cold boot).
     BLE_PY=/root/bin/sentryusb-ble.py
     if [ -f "$BLE_PY" ] && ! grep -q 'legacy btmgmt advertising' "$BLE_PY"; then
-        python3 - "$BLE_PY" <<'PYEOF' || true
+        # Capture the patcher's stdout so we can tell "patched" from
+        # "anchor-not-found" — the previous version printed an unconditional
+        # OK after the heredoc and silently shipped images where the patch
+        # never applied (observed on the v3.11.1 bench install: GATT crashed
+        # 320+ times in a row because register_ad_error_cb still sys.exit'd
+        # on the BCM4345C0's Invalid Params 0x0d adv rejection).
+        PATCH_RESULT="$(python3 - "$BLE_PY" 2>&1 <<'PYEOF'
 import sys
 p = sys.argv[1]; s = open(p).read()
 a = s.find('def register_ad_error_cb(error):'); b = s.find('\ndef register_app_cb', a)
@@ -541,7 +547,29 @@ if a >= 0 and b >= 0:
 else:
     print('anchor-not-found')
 PYEOF
-        ok "Patched sentryusb-ble.py: BlueZ adv failure no longer kills the GATT server"
+)" || PATCH_RESULT="python-error"
+        # Verify the file actually contains the patch marker post-run. The
+        # patcher's stdout AND a content check both have to agree, otherwise
+        # SC discovery + BLE pairing silently break on every 4C+ install.
+        if [ "$PATCH_RESULT" = "patched" ] && grep -q 'legacy btmgmt advertising' "$BLE_PY"; then
+            ok "Patched sentryusb-ble.py: BlueZ adv failure no longer kills the GATT server"
+        else
+            warn "sentryusb-ble.py patch did NOT apply ($PATCH_RESULT) — falling back to sed"
+            # sed fallback: replace the whole register_ad_error_cb body line by
+            # line. Less surgical than the AST-aware Python path, but it lands
+            # the same marker so SC can be sure the patch is live.
+            sed -i '/^def register_ad_error_cb(error):$/,/^def register_app_cb/{
+                /^def register_ad_error_cb(error):$/!{
+                    /^def register_app_cb/!d
+                }
+            }' "$BLE_PY"
+            sed -i '/^def register_ad_error_cb(error):$/a\    log.warning(f"BlueZ advertisement registration failed ({error}); using legacy btmgmt advertising instead; GATT stays up.")\n' "$BLE_PY"
+            if grep -q 'legacy btmgmt advertising' "$BLE_PY"; then
+                ok "Patched sentryusb-ble.py via sed fallback"
+            else
+                warn "BOTH patch paths failed — SC discovery may be broken on this 4C+ install"
+            fi
+        fi
     fi
     cat > /usr/local/bin/sentryusb-ble-adv.sh <<'ADVSH'
 #!/bin/bash
