@@ -1507,6 +1507,13 @@ def main():
     adapter_props.Set('org.bluez.Adapter1', 'Alias', dbus.String(ble_name))
     log.info(f'BLE adapter alias set to: {ble_name}')
 
+    # Characteristics are unencrypted (app-PIN auth), so no bond is required.
+    # Disable pairing so the phone OS doesn't re-offer it on every connect.
+    try:
+        adapter_props.Set('org.bluez.Adapter1', 'Pairable', dbus.Boolean(False))
+    except Exception as e:
+        log.warning(f'could not set Pairable=False: {e}')
+
     # Update Avahi mDNS service name to match the unique BLE name
     update_avahi_service_name(ble_name)
 
