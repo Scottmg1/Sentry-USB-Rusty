@@ -249,6 +249,26 @@ else
     warn "Could not fetch BLE daemon — iOS app pairing will be unavailable"
 fi
 
+# ── Step 3b2: Disable EATT (no recurring BLE pairing prompt) ────────
+# The BLE GATT is app-PIN over plain (unencrypted) ATT, but a phone's EATT
+# (PSM 0x0027) open needs an encrypted link — bluetoothd refuses it and sends an
+# SMP Security Request, popping a pair prompt on every connect. Channels=1 keeps
+# plain ATT (same GATT), so no prompt. Safe on all boards (no security change).
+MAIN_CONF=/etc/bluetooth/main.conf
+if [ -f "$MAIN_CONF" ] && ! grep -qE '^Channels[[:space:]]*=[[:space:]]*1' "$MAIN_CONF"; then
+    if grep -qE '^\[GATT\]' "$MAIN_CONF"; then
+        if grep -qiE '^[# ]*Channels' "$MAIN_CONF"; then
+            sed -i -E 's/^[# ]*Channels[ ]*=.*/Channels = 1/' "$MAIN_CONF"
+        else
+            sed -i '/^\[GATT\]/a Channels = 1' "$MAIN_CONF"
+        fi
+    else
+        printf '\n[GATT]\nChannels = 1\n' >> "$MAIN_CONF"
+    fi
+    systemctl restart bluetooth 2>/dev/null || true
+    ok "EATT disabled (no recurring BLE pairing prompt)"
+fi
+
 # ── Step 3c: archiveloop ↔ gadget shim scripts ─────────────────────
 #
 # archiveloop (shell) calls /root/bin/enable_gadget.sh and disable_gadget.sh
