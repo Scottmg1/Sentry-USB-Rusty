@@ -13,7 +13,7 @@
 # Or with a local binary:
 #   bash install-pi.sh /path/to/sentryusb-binary
 
-REPO="Sentry-Six/Sentry-USB-Rusty"
+REPO="${REPO:-Sentry-Six/Sentry-USB-Rusty}"
 INSTALL_DIR="/opt/sentryusb"
 BINARY_NAME="sentryusb"
 
