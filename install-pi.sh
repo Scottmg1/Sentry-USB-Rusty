@@ -297,6 +297,261 @@ if ! grep -q SENTRYUSB_TIP1 /root/.bashrc 2>/dev/null; then
     ok "Added remountfs_rw reminder to /root/.bashrc"
 fi
 
+# ── Step 3e: Rock Pi 4C+ (RK3399 / dwc3) hardware setup ────────────────────
+# A NO-OP on Raspberry Pi and every non-4C+ board (detection-gated). On a Rock
+# Pi 4C+ a generic install leaves three things broken, all fixed here so SC works
+# with WiFi + BLE out of the box:
+#   1. rfkill — the BLE daemon's unit calls /usr/sbin/rfkill; DietPi's minimal
+#      base omits it, so sentryusb-ble.service fails 203/EXEC without it.
+#   2. dwc3 overlay → OTG port to PERIPHERAL/high-speed (else /sys/class/udc is
+#      empty → no USB mass-storage gadget → Tesla never sees the dashcam).
+#   3. BT+WiFi firmware (AP6256/BCM4345C0 combo) + a legacy raw-HCI LE advertiser
+#      (the chip rejects BlueZ extended advertising, so SC can't discover it).
+# Best-effort: each sub-step warns on failure rather than aborting the install.
+is_rock_4cplus() {
+    grep -qai 'rock-4c-plus\|rockpi4c-plus\|ROCK 4C+' \
+        /proc/device-tree/model /proc/device-tree/compatible 2>/dev/null
+}
+has_dietpi_overlays() {
+    [ -f /boot/dietpiEnv.txt ] && grep -q '^overlay_path=' /boot/dietpiEnv.txt
+}
+
+NEEDS_REBOOT=0
+if is_rock_4cplus; then
+    info "Rock Pi 4C+ detected — applying USB-gadget + BLE hardware setup..."
+    # Best-effort section: don't let a minor apt/systemd hiccup abort the install.
+    set +e
+
+    # 1. BLE daemon dependency
+    if apt-get install -y rfkill >/dev/null 2>&1; then
+        ok "rfkill installed (BLE daemon dependency)"
+        systemctl reset-failed sentryusb-ble.service 2>/dev/null || true
+        systemctl restart sentryusb-ble.service 2>/dev/null || true
+    else
+        warn "rfkill install failed — BLE daemon may not start"
+    fi
+
+    # 2. High-speed dwc3 peripheral overlay (compiled on-device → self-contained)
+    if has_dietpi_overlays; then
+        apt-get install -y device-tree-compiler >/dev/null 2>&1 || true
+        mkdir -p /boot/overlay-user
+        cat > /tmp/sentryusb-dwc3-hs.dts <<'DTS'
+/dts-v1/;
+/plugin/;
+/ {
+    metadata {
+        title = "SentryUSB: OTG peripheral high-speed (Rock 4C+)";
+        compatible = "rockchip,rk3399";
+        category = "misc";
+        exclusive = "usbdrd_dwc3_0-dr_mode";
+        description = "dwc3 OTG → peripheral mode, high-speed, for the USB gadget.";
+    };
+    fragment@0 {
+        target = <&usbdrd_dwc3_0>;
+        __overlay__ {
+            status = "okay";
+            dr_mode = "peripheral";
+            maximum-speed = "high-speed";
+        };
+    };
+};
+DTS
+        if dtc -@ -I dts -O dtb -o /boot/overlay-user/sentryusb-dwc3-hs.dtbo \
+               /tmp/sentryusb-dwc3-hs.dts 2>/dev/null; then
+            ok "Compiled high-speed dwc3 overlay → /boot/overlay-user/sentryusb-dwc3-hs.dtbo"
+            cur=$(grep '^user_overlays=' /boot/dietpiEnv.txt | cut -d= -f2-)
+            case " $cur " in
+                *" sentryusb-dwc3-hs "*)
+                    ok "Overlay already registered in user_overlays" ;;
+                *)
+                    new=$(echo "$cur sentryusb-dwc3-hs" | xargs)
+                    cp /boot/dietpiEnv.txt /boot/dietpiEnv.txt.sentryusb.bak
+                    sed -i "s/^user_overlays=.*/user_overlays=$new/" /boot/dietpiEnv.txt
+                    ok "Registered overlay (user_overlays=$new)"
+                    NEEDS_REBOOT=1 ;;
+            esac
+        else
+            warn "dwc3 overlay compile failed — USB gadget will NOT appear until applied manually"
+        fi
+    else
+        warn "Rock 4C+ but no DietPi/Armbian overlay mechanism found — apply a dwc3"
+        warn "peripheral+high-speed overlay for your image manually, or no USB gadget."
+    fi
+
+    # 3. Bluetooth + WiFi firmware — AP6256 (BCM4345C0 WiFi+BT combo) coexistence.
+    #    BT .hcd MUST be the GENERIC patch, NOT BCM4345C0.raspberrypi,*.hcd — the Pi
+    #    profile kills the WiFi SDIO half (brcmf rxctl timeout / wlan0 I/O error).
+    BRCM=/lib/firmware/brcm
+    HCD=""
+    for c in BCM4345C0_003.001.025.0162.0000_Generic_UART_37_4MHz_wlbga_ref_iLNA_iTR_eLG.hcd \
+             BCM4345C0.raspberrypi,4-compute-module.hcd; do
+        [ -e "$BRCM/$c" ] && { HCD="$c"; break; }
+    done
+    [ -z "$HCD" ] && HCD=$(cd "$BRCM" 2>/dev/null && ls BCM4345C0*.hcd 2>/dev/null | grep -vE 'radxa,rock-4c-plus|raspberrypi' | head -1)
+    if [ -n "$HCD" ] && [ -e "$BRCM/$HCD" ]; then
+        ln -sf "$HCD" "$BRCM/BCM4345C0.radxa,rock-4c-plus.hcd"
+        ln -sf "$HCD" "$BRCM/BCM4345C0.hcd"
+        ok "BT firmware → $HCD (generic AP6256 patch, NOT the Pi profile) — reboot to load"
+        NEEDS_REBOOT=1
+    else
+        warn "BCM4345C0 .hcd not found — 'apt install --reinstall armbian-firmware', then"
+        warn "symlink BCM4345C0.radxa,rock-4c-plus.hcd → the generic BCM4345C0 .hcd."
+    fi
+    if [ -e "$BRCM/nvram_ap6256.txt" ]; then
+        ln -sf nvram_ap6256.txt "$BRCM/brcmfmac43455-sdio.radxa,rock-4c-plus.txt"
+        [ -e "$BRCM/brcmfmac43455-sdio.bin" ] && \
+            ln -sf brcmfmac43455-sdio.bin "$BRCM/brcmfmac43455-sdio.radxa,rock-4c-plus.bin"
+        [ -e "$BRCM/brcmfmac43455-sdio.clm_blob" ] && \
+            ln -sf brcmfmac43455-sdio.clm_blob "$BRCM/brcmfmac43455-sdio.radxa,rock-4c-plus.clm_blob"
+        ok "WiFi nvram → nvram_ap6256.txt (AP6256 calibration) — WiFi now survives BT"
+        NEEDS_REBOOT=1
+    else
+        warn "nvram_ap6256.txt not found — WiFi may be unstable with BT (generic calibration)."
+    fi
+
+    # 3b. THE BLE-advertising fix. The BCM4345C0 firmware rejects BlueZ EXTENDED
+    #     advertising (mgmt 0x0054/55 → "Invalid Parameters 0x0d"), and even legacy
+    #     `btmgmt add-adv` is unreliable (ActiveInstances:0 / ~1280ms interval →
+    #     Android misses it → connectGatt 147). Fix = (i) daemon doesn't sys.exit on
+    #     BlueZ adv failure; (ii) a helper programs legacy ADV_IND @ 100ms directly
+    #     over raw HCI (SC then connects to the real MAC + authenticates); (iii) start
+    #     event-driven when hci0 appears (UART BT attaches late on cold boot).
+    BLE_PY=/root/bin/sentryusb-ble.py
+    if [ -f "$BLE_PY" ] && ! grep -q 'legacy btmgmt advertising' "$BLE_PY"; then
+        python3 - "$BLE_PY" <<'PYEOF' || true
+import sys
+p = sys.argv[1]; s = open(p).read()
+a = s.find('def register_ad_error_cb(error):'); b = s.find('\ndef register_app_cb', a)
+if a >= 0 and b >= 0:
+    cb = ("def register_ad_error_cb(error):\n"
+          "    # BCM4345C0 (Rock 4C+): BlueZ uses EXTENDED advertising which this chip\n"
+          "    # rejects ('Invalid Parameters 0x0d'). Do NOT exit (that tears down GATT\n"
+          "    # and loops forever); keep GATT up. Legacy btmgmt advertising is enabled\n"
+          "    # out-of-band by sentryusb-ble-adv.service.\n"
+          "    log.warning(f'BlueZ advertisement registration failed ({error}); '\n"
+          "                'using legacy btmgmt advertising instead; GATT stays up.')\n")
+    open(p, 'w').write(s[:a] + cb + s[b+1:]); print('patched')
+else:
+    print('anchor-not-found')
+PYEOF
+        ok "Patched sentryusb-ble.py: BlueZ adv failure no longer kills the GATT server"
+    fi
+    cat > /usr/local/bin/sentryusb-ble-adv.sh <<'ADVSH'
+#!/bin/bash
+# Raw legacy LE advertising for the BCM4345C0 (Rock Pi 4C+ / AP6256 module).
+#
+# WHY RAW HCI instead of btmgmt (validated on-device 2026-06-19): on this chip
+# BlueZ's mgmt advertiser is unreliable. Extended advertising (mgmt 0x0054/55) is
+# rejected outright; the LEGACY `btmgmt add-adv` REPORTS success but
+# `bluetoothctl show` reports ActiveInstances:0, AND it uses the controller's slow
+# ~1280ms default interval — so Android rarely catches the advert and connectGatt
+# fails with GATT_CONNECTION_TIMEOUT(147). Programming legacy ADV_IND directly over
+# HCI at a 100ms interval is the only reliable path: SC then connects to the real
+# MAC (2C:3B:70:69:4B:88) and authenticates. The SentryUSB apps filter scans by the
+# "SentryUSB-" NAME prefix, so the name MUST be in the scan response or the advert
+# is invisible to them. (hcitool ships with the `bluez` package.)
+#
+# Byte layout below is the exact validated sequence — do not "tidy" it.
+UUID_LE="9e ca dc 24 0e e5 a9 e0 93 f3 a3 b5 01 00 40 6e"   # 6e400001-b5a3-f393-e0a9-e50e24dcca9e, little-endian
+ADV_DATA="15 02 01 06 11 07 ${UUID_LE} 00 00 00 00 00 00 00 00 00 00 00 00 00"
+
+# Scan-response bytes = [len][0x09 Complete Local Name][name…], space-separated for
+# hcitool. Defined BEFORE the run-guard so `source sentryusb-ble-adv.sh;
+# build_scanrsp` is testable without entering the advertising loop below.
+build_scanrsp() {
+    local name hex namebytes len
+    name=$(timeout 5 btmgmt info 2>/dev/null | sed -n 's/^[[:space:]]*name[[:space:]]*//p' | head -1)
+    [ -z "$name" ] && name=$(hostname)
+    name=${name:0:29}                                   # scan-rsp budget: 31 - 2 (len+type)
+    hex=$(printf '%s' "$name" | od -An -tx1 | tr -d ' \n')
+    namebytes=$(( ${#hex} / 2 ))
+    len=$(( namebytes + 1 ))                             # +1 for the AD type byte
+    printf '%02x 09 %s' "$len" "$(echo "$hex" | sed 's/../& /g')"
+}
+
+# Program legacy ADV_IND directly via HCI (bypasses BlueZ mgmt):
+#   disable → set adv data → set scan-rsp (name, zero-padded to 31) →
+#   adv params (100ms min/max ADV_IND connectable undirected, public addr, all 3 chans) → enable
+assert_raw_adv() {
+    local scanrsp; scanrsp=$(build_scanrsp)
+    hcitool -i hci0 cmd 0x08 0x000a 00 >/dev/null 2>&1 || true
+    hcitool -i hci0 cmd 0x08 0x0008 $ADV_DATA >/dev/null 2>&1 || true
+    hcitool -i hci0 cmd 0x08 0x0009 $scanrsp 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 >/dev/null 2>&1 || true
+    hcitool -i hci0 cmd 0x08 0x0006 a0 00 a0 00 00 00 00 00 00 00 00 00 00 07 00 >/dev/null 2>&1 || true
+    hcitool -i hci0 cmd 0x08 0x000a 01 >/dev/null 2>&1 || true
+}
+
+# Run the advertising loop ONLY when executed directly (the systemd ExecStart),
+# never when sourced — otherwise testing build_scanrsp() would loop forever.
+if [ "${BASH_SOURCE[0]}" != "${0}" ]; then
+    return 0 2>/dev/null || exit 0
+fi
+
+for i in $(seq 1 30); do busctl status org.bluez >/dev/null 2>&1 && break; sleep 1; done
+sleep 3   # let the daemon's (failing) ext-adv RegisterAdvertisement settle first
+timeout 5 btmgmt le on >/dev/null 2>&1 || true
+timeout 5 btmgmt connectable on >/dev/null 2>&1 || true
+while true; do
+    # Re-assert only while IDLE — reprogramming advertising while a phone is
+    # connected can disturb Broadcom controllers and isn't needed for a live link.
+    if ! timeout 3 btmgmt con 2>/dev/null | grep -q 'type LE'; then
+        assert_raw_adv
+    fi
+    sleep 5
+done
+ADVSH
+    chmod +x /usr/local/bin/sentryusb-ble-adv.sh
+    cat > /etc/systemd/system/sentryusb-ble-adv.service <<'ADVSVC'
+[Unit]
+Description=SentryUSB: legacy LE advertising (Rock 4C+ BCM4345C0 ext-adv workaround)
+After=bluetooth.service sentryusb-ble.service
+Wants=bluetooth.service
+BindsTo=sentryusb-ble.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/sentryusb-ble-adv.sh
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+ADVSVC
+    cat > /etc/udev/rules.d/99-sentryusb-ble-hci.rules <<'UDEV'
+# Rock 4C+ (BCM4345C0): the UART BT controller attaches a few seconds into boot,
+# AFTER systemd checks bluetooth.service's ConditionPathIsDirectory, so the BLE
+# stack is skipped on a cold boot. Start it the moment hci0 appears (condition now
+# passes; the daemon's Wants= pulls bluetooth.service + the advertising helper).
+ACTION=="add", SUBSYSTEM=="bluetooth", KERNEL=="hci0", TAG+="systemd", ENV{SYSTEMD_WANTS}+="sentryusb-ble.service"
+UDEV
+    mkdir -p /etc/systemd/system/sentryusb-ble.service.d
+    cat > /etc/systemd/system/sentryusb-ble.service.d/wants-bluetooth.conf <<'WANTS'
+[Unit]
+Wants=bluetooth.service sentryusb-ble-adv.service
+WANTS
+    systemctl disable --now sentryusb-ble-le.service 2>/dev/null || true
+    rm -f /etc/systemd/system/sentryusb-ble-le.service 2>/dev/null
+    rm -rf /etc/systemd/system/sentryusb-ble-le.service.d 2>/dev/null
+    systemctl enable bluetooth.service >/dev/null 2>&1 || true
+    systemctl daemon-reload 2>/dev/null || true
+    udevadm control --reload-rules 2>/dev/null || true
+    systemctl enable sentryusb-ble-adv.service >/dev/null 2>&1 || true
+    ok "BLE legacy-advertising fix installed (daemon patch + adv service + hci0 udev rule)"
+    NEEDS_REBOOT=1
+
+    # 4. (Recommended) OpenSSH instead of Dropbear — Dropbear ships no SFTP
+    #    subsystem, so scp/sftp to the Pi fail.
+    if command -v dropbear >/dev/null 2>&1 && [ -x /boot/dietpi/func/dietpi-set_software ]; then
+        if /boot/dietpi/func/dietpi-set_software ssh-server openssh >/dev/null 2>&1; then
+            ok "Switched SSH server to OpenSSH (scp/sftp support)"
+        else
+            warn "OpenSSH switch failed — Dropbear left in place (scp/sftp unavailable)"
+        fi
+    fi
+
+    set -e  # end best-effort section
+fi
+
 # ── Step 4: Sample Config ───────────────────────────────────────────
 
 if [ ! -f /root/sentryusb.conf ]; then
@@ -408,3 +663,11 @@ echo -e "  Config:  /root/sentryusb.conf"
 echo -e "  Binary:  ${INSTALL_DIR}/sentryusb-current → $(readlink "${INSTALL_DIR}/sentryusb-current" 2>/dev/null || echo "<picker has not run yet>")"
 echo -e "  Logs:    journalctl -u sentryusb -f"
 echo ""
+
+if [ "${NEEDS_REBOOT:-0}" = "1" ]; then
+    warn "Rock 4C+: a REBOOT is required to activate the USB gadget (dwc3 → peripheral)"
+    warn "          and load the BT/WiFi firmware."
+    echo -e "  Run:  ${BLUE}reboot${NC}  — afterward /sys/class/udc/ shows fe800000.usb (Tesla"
+    echo -e "        sees the dashcam) and SC can discover + BLE-pair the 4C+."
+    echo ""
+fi
