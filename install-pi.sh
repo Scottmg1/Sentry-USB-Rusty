@@ -300,6 +300,19 @@ chmod +x /root/bin/disable_gadget.sh
 
 ok "Gadget shims installed at /root/bin/{enable,disable}_gadget.sh"
 
+# Fetch envsetup.sh from the repo. archiveloop sources this at runtime to read
+# /root/sentryusb.conf and export CAM_MOUNT / MUSIC_MOUNT / ARCHIVE_* etc. The
+# pi-gen image build deploys it as part of the image; install-pi.sh users never
+# get it, so sentryusb-archive.service fails fast with "envsetup.sh: No such
+# file or directory" and respawns until systemd gives up.
+if curl -fsSL "https://raw.githubusercontent.com/${REPO}/main/setup/pi/envsetup.sh" \
+       -o /root/bin/envsetup.sh 2>/dev/null; then
+    chmod +x /root/bin/envsetup.sh
+    ok "envsetup.sh installed (archiveloop runtime config)"
+else
+    warn "envsetup.sh fetch failed — sentryusb-archive.service may crash on boot"
+fi
+
 # ── Step 3d: remountfs_rw helper + /root/.bashrc reminder ──────────
 # `remountfs_rw` is created by the pi-gen image build; install-pi.sh users
 # (any non-pi-gen install, e.g. DietPi/Armbian) never get it. The BLE daemon
