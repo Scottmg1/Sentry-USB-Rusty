@@ -684,6 +684,42 @@ async fn self_update(target_version: Option<String>) -> anyhow::Result<String> {
     // confusion we hit on the Rock Pi 4C+ tester. Surface failures
     // here so the user knows to investigate (usually: read-only
     // rootfs needs a remount, or a release missing one of the assets).
+    // ── Re-apply install-time patches that must survive an OTA swap ──
+    //
+    // The standalone /usr/local/bin/sentryusb-apply-runtime-patches script
+    // ships with install-pi.sh and re-applies things the binary swap can't
+    // own — e.g. the BCM4345C0 non-fatal-adv patch to /root/bin/sentryusb-ble.py
+    // on Rock 4C+ which otherwise crash-loops the BLE daemon after every
+    // update. The script is idempotent + detection-gated, so it's a no-op on
+    // non-4C+ boards and a no-op on already-patched files. Best-effort: a
+    // missing script (older install that pre-dates this scheme) just yields
+    // a warning instead of failing the whole update.
+    if std::path::Path::new("/usr/local/bin/sentryusb-apply-runtime-patches").exists() {
+        match sentryusb_shell::run_with_timeout(
+            std::time::Duration::from_secs(30),
+            "/usr/local/bin/sentryusb-apply-runtime-patches",
+            &[],
+        )
+        .await
+        {
+            Ok(_) => tracing::info!("update.rs: runtime-patches re-applied successfully"),
+            Err(e) => install_warnings.push(format!(
+                "runtime-patches re-apply FAILED: {e} — board-specific fixes \
+                 (BCM4345C0 BLE on Rock 4C+, etc.) may not survive this update; \
+                 if BLE pairing is broken after this update, re-run install-pi.sh"
+            )),
+        }
+    } else {
+        // Pre-v3.11.3 installs don't have the runtime-patches script. Surface
+        // as a warning so 4C+ owners know to re-run install-pi.sh once to
+        // pick up the new auto-heal scheme.
+        install_warnings.push(
+            "runtime-patches script missing — install-time fixes won't auto-reapply on future \
+             updates. Re-run install-pi.sh once to land the new auto-heal scheme."
+                .to_string(),
+        );
+    }
+
     if install_warnings.is_empty() {
         Ok(format!(
             "Updated to {}.",
