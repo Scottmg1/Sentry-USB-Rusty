@@ -486,26 +486,16 @@ PYEOF
     fi
     cat > /usr/local/bin/sentryusb-ble-adv.sh <<'ADVSH'
 #!/bin/bash
-# Raw legacy LE advertising for the BCM4345C0 (Rock Pi 4C+ / AP6256 module).
-#
-# WHY RAW HCI instead of btmgmt (validated on-device 2026-06-19): on this chip
-# BlueZ's mgmt advertiser is unreliable. Extended advertising (mgmt 0x0054/55) is
-# rejected outright; the LEGACY `btmgmt add-adv` REPORTS success but
-# `bluetoothctl show` reports ActiveInstances:0, AND it uses the controller's slow
-# ~1280ms default interval — so Android rarely catches the advert and connectGatt
-# fails with GATT_CONNECTION_TIMEOUT(147). Programming legacy ADV_IND directly over
-# HCI at a 100ms interval is the only reliable path: SC then connects to the real
-# MAC (2C:3B:70:69:4B:88) and authenticates. The SentryUSB apps filter scans by the
-# "SentryUSB-" NAME prefix, so the name MUST be in the scan response or the advert
-# is invisible to them. (hcitool ships with the `bluez` package.)
-#
-# Byte layout below is the exact validated sequence — do not "tidy" it.
+# Legacy ADV_IND advertiser for BCM4345C0. BlueZ's mgmt path is unreliable on
+# this chip (ext-adv rejected, legacy add-adv runs at ~1280ms — too slow for
+# Android scans), so program advertising directly over HCI at 100ms.
+# The SentryUSB apps filter scans by the "SentryUSB-" name prefix, so the
+# local name must be in the scan response.
 UUID_LE="9e ca dc 24 0e e5 a9 e0 93 f3 a3 b5 01 00 40 6e"   # 6e400001-b5a3-f393-e0a9-e50e24dcca9e, little-endian
 ADV_DATA="15 02 01 06 11 07 ${UUID_LE} 00 00 00 00 00 00 00 00 00 00 00 00 00"
 
-# Scan-response bytes = [len][0x09 Complete Local Name][name…], space-separated for
-# hcitool. Defined BEFORE the run-guard so `source sentryusb-ble-adv.sh;
-# build_scanrsp` is testable without entering the advertising loop below.
+# Scan-response bytes = [len][0x09 Complete Local Name][name…]. Function is
+# defined before the run-guard so it's sourceable for unit-style testing.
 build_scanrsp() {
     local name hex namebytes len
     name=$(timeout 5 btmgmt info 2>/dev/null | sed -n 's/^[[:space:]]*name[[:space:]]*//p' | head -1)
