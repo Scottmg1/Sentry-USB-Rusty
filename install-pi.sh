@@ -300,10 +300,24 @@ chmod +x /root/bin/disable_gadget.sh
 
 ok "Gadget shims installed at /root/bin/{enable,disable}_gadget.sh"
 
-# ── Step 3d: /root/.bashrc remountfs_rw reminder ───────────────────
-# Prints the read-only/remountfs_rw tip on every `sudo -i`. The pi-gen
-# image build adds the same block; this branch covers install-pi.sh
-# users who never ran pi-gen.
+# ── Step 3d: remountfs_rw helper + /root/.bashrc reminder ──────────
+# `remountfs_rw` is created by the pi-gen image build; install-pi.sh users
+# (any non-pi-gen install, e.g. DietPi/Armbian) never get it. The BLE daemon
+# calls it to remount root RW before saving the pairing PIN, and fails with
+# "Failed to save PIN: No such file or directory: '/root/bin/remountfs_rw'"
+# if absent — blocks BLE pair from SC. Always-install a tiny stub: works
+# whether root is RO (does the remount) or already RW (no-op + exit 0).
+mkdir -p /root/bin
+if [ ! -f /root/bin/remountfs_rw ]; then
+    cat > /root/bin/remountfs_rw <<'REMOUNT_RW'
+#!/bin/bash
+# remount root RW (no-op if already RW). Used by sentryusb-ble.py for PIN save.
+mount -o remount,rw / 2>/dev/null
+exit 0
+REMOUNT_RW
+    chmod +x /root/bin/remountfs_rw
+    ok "Installed /root/bin/remountfs_rw stub (BLE daemon PIN save)"
+fi
 if ! grep -q SENTRYUSB_TIP1 /root/.bashrc 2>/dev/null; then
     cat >> /root/.bashrc <<- 'EOC'
 	if [ -n "$PS1" ]; then
@@ -342,13 +356,14 @@ if is_rock_4cplus; then
     # Best-effort section: don't let a minor apt/systemd hiccup abort the install.
     set +e
 
-    # 1. BLE daemon dependency
-    if apt-get install -y rfkill >/dev/null 2>&1; then
-        ok "rfkill installed (BLE daemon dependency)"
+    # 1. Apt dependencies — rfkill (BLE daemon calls it) and device-tree-compiler
+    #    (sub-step 2 compiles a dwc3 overlay with `dtc`; DietPi minimal ships neither).
+    if apt-get install -y rfkill device-tree-compiler >/dev/null 2>&1; then
+        ok "rfkill + device-tree-compiler installed"
         systemctl reset-failed sentryusb-ble.service 2>/dev/null || true
         systemctl restart sentryusb-ble.service 2>/dev/null || true
     else
-        warn "rfkill install failed — BLE daemon may not start"
+        warn "rfkill/dtc install failed — BLE daemon and dwc3 overlay may not work"
     fi
 
     # 2. High-speed dwc3 peripheral overlay (compiled on-device → self-contained)
