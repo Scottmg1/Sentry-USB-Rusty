@@ -1,0 +1,14 @@
+[Unit]
+Description=SentryUSB: legacy LE advertising (Broadcom Pi-family chip workaround)
+After=bluetooth.service sentryusb-ble.service
+Wants=bluetooth.service
+BindsTo=sentryusb-ble.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/sentryusb-ble-adv.sh
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

@@ -525,112 +525,6 @@ DTS
         warn "nvram_ap6256.txt not found — WiFi may be unstable with BT (generic calibration)."
     fi
 
-    # 3b. THE BLE-advertising fix. The BCM4345C0 firmware rejects BlueZ EXTENDED
-    #     advertising (mgmt 0x0054/55 → "Invalid Parameters 0x0d"), and even legacy
-    #     `btmgmt add-adv` is unreliable (ActiveInstances:0 / ~1280ms interval →
-    #     Android misses it → connectGatt 147). Fix = (i) daemon doesn't sys.exit on
-    #     BlueZ adv failure; (ii) a helper programs legacy ADV_IND @ 100ms directly
-    #     over raw HCI (SC then connects to the real MAC + authenticates); (iii) start
-    #     event-driven when hci0 appears (UART BT attaches late on cold boot).
-    # The actual BLE non-fatal-adv patch lives in a standalone script
-    # (sentryusb-apply-runtime-patches.sh) that is ALSO invoked by the
-    # Rust binary's in-app updater after every OTA swap — so existing
-    # users heal automatically on update instead of needing a re-install.
-    # Installed below in the universal section; the call here just primes
-    # the patch state for first-install.
-    cat > /usr/local/bin/sentryusb-ble-adv.sh <<'ADVSH'
-#!/bin/bash
-# Legacy ADV_IND advertiser for BCM4345C0. BlueZ's mgmt path is unreliable on
-# this chip (ext-adv rejected, legacy add-adv runs at ~1280ms — too slow for
-# Android scans), so program advertising directly over HCI at 100ms.
-# The SentryUSB apps filter scans by the "SentryUSB-" name prefix, so the
-# local name must be in the scan response.
-UUID_LE="9e ca dc 24 0e e5 a9 e0 93 f3 a3 b5 01 00 40 6e"   # 6e400001-b5a3-f393-e0a9-e50e24dcca9e, little-endian
-ADV_DATA="15 02 01 06 11 07 ${UUID_LE} 00 00 00 00 00 00 00 00 00 00 00 00 00"
-
-# Scan-response bytes = [len][0x09 Complete Local Name][name…]. Function is
-# defined before the run-guard so it's sourceable for unit-style testing.
-build_scanrsp() {
-    local name hex namebytes len
-    name=$(timeout 5 btmgmt info 2>/dev/null | sed -n 's/^[[:space:]]*name[[:space:]]*//p' | head -1)
-    [ -z "$name" ] && name=$(hostname)
-    name=${name:0:29}                                   # scan-rsp budget: 31 - 2 (len+type)
-    hex=$(printf '%s' "$name" | od -An -tx1 | tr -d ' \n')
-    namebytes=$(( ${#hex} / 2 ))
-    len=$(( namebytes + 1 ))                             # +1 for the AD type byte
-    printf '%02x 09 %s' "$len" "$(echo "$hex" | sed 's/../& /g')"
-}
-
-# Program legacy ADV_IND directly via HCI (bypasses BlueZ mgmt):
-#   disable → set adv data → set scan-rsp (name, zero-padded to 31) →
-#   adv params (100ms min/max ADV_IND connectable undirected, public addr, all 3 chans) → enable
-assert_raw_adv() {
-    local scanrsp; scanrsp=$(build_scanrsp)
-    hcitool -i hci0 cmd 0x08 0x000a 00 >/dev/null 2>&1 || true
-    hcitool -i hci0 cmd 0x08 0x0008 $ADV_DATA >/dev/null 2>&1 || true
-    hcitool -i hci0 cmd 0x08 0x0009 $scanrsp 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 >/dev/null 2>&1 || true
-    hcitool -i hci0 cmd 0x08 0x0006 a0 00 a0 00 00 00 00 00 00 00 00 00 00 07 00 >/dev/null 2>&1 || true
-    hcitool -i hci0 cmd 0x08 0x000a 01 >/dev/null 2>&1 || true
-}
-
-# Run the advertising loop ONLY when executed directly (the systemd ExecStart),
-# never when sourced — otherwise testing build_scanrsp() would loop forever.
-if [ "${BASH_SOURCE[0]}" != "${0}" ]; then
-    return 0 2>/dev/null || exit 0
-fi
-
-for i in $(seq 1 30); do busctl status org.bluez >/dev/null 2>&1 && break; sleep 1; done
-sleep 3   # let the daemon's (failing) ext-adv RegisterAdvertisement settle first
-timeout 5 btmgmt le on >/dev/null 2>&1 || true
-timeout 5 btmgmt connectable on >/dev/null 2>&1 || true
-while true; do
-    # Re-assert only while IDLE — reprogramming advertising while a phone is
-    # connected can disturb Broadcom controllers and isn't needed for a live link.
-    if ! timeout 3 btmgmt con 2>/dev/null | grep -q 'type LE'; then
-        assert_raw_adv
-    fi
-    sleep 5
-done
-ADVSH
-    chmod +x /usr/local/bin/sentryusb-ble-adv.sh
-    cat > /etc/systemd/system/sentryusb-ble-adv.service <<'ADVSVC'
-[Unit]
-Description=SentryUSB: legacy LE advertising (Rock 4C+ BCM4345C0 ext-adv workaround)
-After=bluetooth.service sentryusb-ble.service
-Wants=bluetooth.service
-BindsTo=sentryusb-ble.service
-
-[Service]
-Type=simple
-ExecStart=/usr/local/bin/sentryusb-ble-adv.sh
-Restart=always
-RestartSec=10
-
-[Install]
-WantedBy=multi-user.target
-ADVSVC
-    cat > /etc/udev/rules.d/99-sentryusb-ble-hci.rules <<'UDEV'
-# Rock 4C+ (BCM4345C0): the UART BT controller attaches a few seconds into boot,
-# AFTER systemd checks bluetooth.service's ConditionPathIsDirectory, so the BLE
-# stack is skipped on a cold boot. Start it the moment hci0 appears (condition now
-# passes; the daemon's Wants= pulls bluetooth.service + the advertising helper).
-ACTION=="add", SUBSYSTEM=="bluetooth", KERNEL=="hci0", TAG+="systemd", ENV{SYSTEMD_WANTS}+="sentryusb-ble.service"
-UDEV
-    mkdir -p /etc/systemd/system/sentryusb-ble.service.d
-    cat > /etc/systemd/system/sentryusb-ble.service.d/wants-bluetooth.conf <<'WANTS'
-[Unit]
-Wants=bluetooth.service sentryusb-ble-adv.service
-WANTS
-    systemctl disable --now sentryusb-ble-le.service 2>/dev/null || true
-    rm -f /etc/systemd/system/sentryusb-ble-le.service 2>/dev/null
-    rm -rf /etc/systemd/system/sentryusb-ble-le.service.d 2>/dev/null
-    systemctl enable bluetooth.service >/dev/null 2>&1 || true
-    systemctl daemon-reload 2>/dev/null || true
-    udevadm control --reload-rules 2>/dev/null || true
-    systemctl enable sentryusb-ble-adv.service >/dev/null 2>&1 || true
-    ok "BLE legacy-advertising fix installed (daemon patch + adv service + hci0 udev rule)"
-    NEEDS_REBOOT=1
-
     # 4. (Recommended) OpenSSH instead of Dropbear — Dropbear ships no SFTP
     #    subsystem, so scp/sftp to the Pi fail.
     if command -v dropbear >/dev/null 2>&1 && [ -x /boot/dietpi/func/dietpi-set_software ]; then
@@ -642,6 +536,65 @@ WANTS
     fi
 
     set -e  # end best-effort section
+fi
+
+# ── Step 3g: BLE legacy-advertising helper (chip-gated install) ────
+#
+# A small per-chip workaround: Broadcom controllers in the BCM4345/43430/43438
+# family reject BlueZ's modern RegisterAdvertisement (or default to a
+# scannable-but-non-connectable advertising type), so SC's connect attempt
+# fails ~10s later with "GATT 147 bond=BOND_NONE". The helper service
+# installed here programs legacy ADV_IND (connectable) directly over raw
+# HCI at 100ms intervals, plus a udev rule that brings the BLE stack up the
+# moment hci0 appears (UART BT attaches late on cold boot).
+#
+# Gate: only install where the chip is known affected. Pi 4 / Pi 5
+# (BCM43455 / CYW43455) are deliberately EXCLUDED — their modern bluetoothd
+# path works, and the raw-HCI helper here would override their good ext-adv
+# with legacy adv (regression). If a Pi 4/5 user DOES hit the same
+# "GATT 147 bond=BOND_NONE" symptom they can opt in with:
+#     sudo touch /mutable/force-ble-adv-helper
+# That sentinel forces install regardless of chip detection.
+is_known_broken_ble_chip() {
+    [ -f /mutable/force-ble-adv-helper ] && return 0   # operator override
+    local chips="BCM4345C0\|BCM43430B0\|BCM43438"
+    dmesg 2>/dev/null | grep -qE "hci0: ($chips)" && return 0
+    grep -qai 'rock-4c-plus\|rockpi4c-plus\|ROCK 4C+\|Raspberry Pi Zero 2 W\|Raspberry Pi 3 Model B\|Raspberry Pi Zero W' \
+        /proc/device-tree/model 2>/dev/null && return 0
+    return 1
+}
+if is_known_broken_ble_chip; then
+    info "Known-affected BLE chip detected — installing raw-HCI advertising helper..."
+    BLE_ADV_BASE_URL="https://raw.githubusercontent.com/${REPO}/main/setup/pi"
+    LOCAL_PI_DIR="$(dirname "${1:-/dev/null}")/setup/pi"
+    fetch_file() {
+        # $1 = filename, $2 = destination. Tries local repo first, then URL.
+        if [ -f "$LOCAL_PI_DIR/$1" ]; then
+            install -m 644 "$LOCAL_PI_DIR/$1" "$2"
+        elif curl -fsSL --max-time 15 "$BLE_ADV_BASE_URL/$1" -o "$2" 2>/dev/null; then
+            :
+        else
+            warn "Failed to fetch $1 — BLE LE advertising may not work"
+            return 1
+        fi
+        return 0
+    }
+    if fetch_file sentryusb-ble-adv.sh /usr/local/bin/sentryusb-ble-adv.sh; then
+        chmod +x /usr/local/bin/sentryusb-ble-adv.sh
+        fetch_file sentryusb-ble-adv.service /etc/systemd/system/sentryusb-ble-adv.service
+        fetch_file 99-sentryusb-ble-hci.rules /etc/udev/rules.d/99-sentryusb-ble-hci.rules
+        mkdir -p /etc/systemd/system/sentryusb-ble.service.d
+        fetch_file sentryusb-ble-wants-bluetooth.conf /etc/systemd/system/sentryusb-ble.service.d/wants-bluetooth.conf
+        # Retire any older single-purpose unit from earlier installs.
+        systemctl disable --now sentryusb-ble-le.service 2>/dev/null || true
+        rm -f /etc/systemd/system/sentryusb-ble-le.service 2>/dev/null
+        rm -rf /etc/systemd/system/sentryusb-ble-le.service.d 2>/dev/null
+        systemctl enable bluetooth.service >/dev/null 2>&1 || true
+        systemctl daemon-reload 2>/dev/null || true
+        udevadm control --reload-rules 2>/dev/null || true
+        systemctl enable sentryusb-ble-adv.service >/dev/null 2>&1 || true
+        ok "BLE legacy-advertising helper installed (script + service + hci0 udev rule)"
+    fi
 fi
 
 # ── Step 4: Sample Config ───────────────────────────────────────────
