@@ -10,7 +10,7 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 clap = { version = "4", features = ["derive"] }
 axum = { version = "0.8", features = ["ws"] }
-tower-http = { version = "0.6", features = ["compression-full", "fs"] }
+tower-http = { version = "0.7", features = ["compression-full", "fs"] }
 # Files stored uncompressed so file.data is a Cow::Borrowed slice into
 # .rodata — zero allocation, zero CPU per request. The bulk of bytes
 # (JS/CSS/HTML) ship as pre-compressed .br/.gz siblings produced by
