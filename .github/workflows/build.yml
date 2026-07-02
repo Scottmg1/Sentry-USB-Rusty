@@ -92,7 +92,7 @@ jobs:
             gcc: gcc-arm-linux-gnueabihf
             artifact_suffix: linux-armv7
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -298,7 +298,7 @@ jobs:
     name: Test
     runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - name: Cache cargo registry + build
         # Without this the test job recompiles the whole workspace + every
@@ -331,7 +331,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Download all binaries
         uses: actions/download-artifact@v8
