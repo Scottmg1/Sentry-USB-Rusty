@@ -28,7 +28,7 @@ getrandom = "0.3"
 hex = "0.4"
 
 # Vendored libxfuse (xfs-fuse 0.7.1, BSD-2-Clause) dependencies.
-bincode-next = { version = "2.1.0", default-features = false, features = ["derive", "std"] }
+bincode-next = { version = "3.1.1", default-features = false, features = ["derive", "std"] }
 bitflags = "2.4"
 byteorder = "1.4.3"
 cfg-if = "1.0"
