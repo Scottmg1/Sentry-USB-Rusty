@@ -42,6 +42,39 @@ fn use_networkmanager() -> bool {
         .unwrap_or(false)
 }
 
+/// Decide whether NetworkManager owns wifi, tolerating the early-boot window.
+///
+/// `use_networkmanager()` is a point-in-time `is-active` probe. `restore_from_file`
+/// starts the AP on boot (booted-while-away) *before* NetworkManager has finished
+/// activating — `sentryusb.service` has no ordering after it — so `is-active`
+/// returns false there and `start_ap_bg` would wrongly take the ifupdown path,
+/// which fails on a NM image (no /etc/hostapd/hostapd.conf, no `ifup`) and leaves
+/// the AP down after a reboot while away. Wait for NM to reach `active` before
+/// committing. On genuine ifupdown systems the NetworkManager unit is not enabled,
+/// so return immediately and never delay their path. Waiting on the required
+/// precondition (NM active) rather than the cause absorbs any transient early-boot
+/// reason for the false reading.
+async fn wait_for_networkmanager() -> bool {
+    // ifupdown image (NetworkManager not the manager) — don't wait.
+    let nm_managed = std::process::Command::new("systemctl")
+        .args(["--quiet", "is-enabled", "NetworkManager.service"])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !nm_managed {
+        return false;
+    }
+    // Enabled but possibly still activating at early boot — poll up to ~30s.
+    for _ in 0..60 {
+        if use_networkmanager() {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    warn!("[away-mode] NetworkManager enabled but not active within timeout; using NM path anyway");
+    true
+}
+
 /// Parse `iw wlan0 info` for the current STA channel + band. On
 /// BCM43455-family chipsets (Pi 4/5, Pi Zero 2 W, Rock 4C+) STA and AP are
 /// constrained to the same channel — the AP must match wlan0's channel or
@@ -547,7 +580,7 @@ async fn wait_for_ap0_ready() -> bool {
 
 fn start_ap_bg() {
     tokio::spawn(async {
-        if use_networkmanager() {
+        if wait_for_networkmanager().await {
             // NetworkManager path (Pi OS / pi-gen).
             if let Err(e) = ensure_ap0().await {
                 away_mode_log(&format!("Failed to create ap0: {}", e));
