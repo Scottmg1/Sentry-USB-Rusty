@@ -84,6 +84,11 @@ do
       message="Temperature Monitor: $(readable "$raw_temp") (max=$(readable "$peak_temp") $peak_time)"
       /root/bin/send-push-message "$NOTIFICATION_TITLE:" "$message" "" temperature || log "Temperature Monitor: Failed to send push message."
     fi
+    # Start a fresh peak for the next cycle, after the message above has
+    # reported the one just ending. Sits outside the POSTARCHIVE check
+    # because interval logging needs the per-cycle reset too.
+    peak_temp=$raw_temp
+    peak_time=$timestamp
   fi
 
   sleep 60
