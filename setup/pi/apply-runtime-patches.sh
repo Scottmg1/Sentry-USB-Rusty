@@ -468,6 +468,107 @@ DISCONNECT_EOF
     log "archive-mount-lock: lock-aware connect/disconnect-archive.sh installed"
 }
 
+# ── WiFi rfkill unblock — ROCK 4C+ only ─────────────────────────────────
+#
+# On the 4C+ the WLAN radio boots soft-blocked. systemd-rfkill would normally
+# restore last boot's unblocked state, but make-root-fs-readonly puts
+# /var/lib/systemd/rfkill on tmpfs (so a stale block can't be restored) — which
+# also means the UNBLOCKED state has nothing to restore from. WiFi therefore
+# stays dead on every boot after setup, locking out WiFi-only users. Bluetooth
+# already has an equivalent boot service (BLE / Tesla key); this is the WiFi
+# twin. Existing installs can't get it from the setup scripts (those only run
+# at install time), so heal them here.
+#
+# Opt out on a board that should stay radio-silent:
+#   echo off > /etc/sentryusb/wifi-radio
+apply_rfkill_unblock_wifi() {
+    is_rock_4cplus || return 0
+
+    local unit=/etc/systemd/system/rfkill-unblock-wifi.service
+    local helper=/usr/local/sbin/sentryusb-unblock-wifi
+
+    # Marker: unit installed and pointing at an executable helper.
+    if grep -q "$helper" "$unit" 2>/dev/null && [ -x "$helper" ]; then
+        return 0
+    fi
+
+    # Root is read-only on a deployed unit: unlock, write, then lock back.
+    # Leaving root writable on a device that loses power when the car sleeps
+    # is what the read-only root exists to prevent.
+    local ro_before=no
+    findmnt -no OPTIONS / 2>/dev/null | grep -qE '(^|,)ro(,|$)' && ro_before=yes
+    if [ "$ro_before" = yes ]; then
+        [ -x /root/bin/remountfs_rw ] && /root/bin/remountfs_rw >/dev/null 2>&1 \
+            || mount -o remount,rw / 2>/dev/null || true
+    fi
+    _relock() {
+        [ "$ro_before" = yes ] || return 0
+        sync
+        mount -o remount,ro / 2>/dev/null || true
+    }
+
+    mkdir -p /usr/local/sbin /etc/systemd/system 2>/dev/null || true
+
+    cat > "$helper" << 'WIFIHELPER'
+#!/bin/sh
+# Managed by SentryUSB (ROCK 4C+). Unblocks the WiFi radio at boot.
+# To keep this board radio-silent:  echo off > /etc/sentryusb/wifi-radio
+set -u
+
+OVERRIDE=/etc/sentryusb/wifi-radio
+if [ -r "$OVERRIDE" ]; then
+  case "$(tr -d '[:space:]' < "$OVERRIDE" | tr '[:upper:]' '[:lower:]')" in
+    off|0|false|disabled)
+      exit 0 ;;
+  esac
+fi
+
+i=0
+while [ "$i" -lt 25 ]; do
+  for d in /sys/class/rfkill/rfkill*; do
+    [ -r "$d/type" ] || continue
+    if [ "$(cat "$d/type" 2>/dev/null)" = "wlan" ]; then
+      exec /usr/sbin/rfkill unblock wifi
+    fi
+  done
+  i=$((i + 1))
+  sleep 0.2
+done
+exec /usr/sbin/rfkill unblock wifi
+WIFIHELPER
+    chmod 755 "$helper" 2>/dev/null || true
+
+    cat > "$unit" << 'WIFIUNIT'
+[Unit]
+Description=Unblock WiFi RF-kill (ROCK 4C+)
+DefaultDependencies=no
+Wants=network-pre.target
+Before=network-pre.target NetworkManager.service
+After=sysinit.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/sentryusb-unblock-wifi
+
+[Install]
+WantedBy=multi-user.target
+WIFIUNIT
+
+    # A silent write failure would leave the bug unfixed while reporting success.
+    if ! grep -q "$helper" "$unit" 2>/dev/null || [ ! -x "$helper" ]; then
+        err "rfkill-wifi: install failed (read-only fs? check remountfs_rw)"
+        _relock
+        return 1
+    fi
+
+    systemctl enable rfkill-unblock-wifi.service 2>/dev/null || true
+    systemctl daemon-reload 2>/dev/null || true
+    "$helper" 2>/dev/null || true   # take effect now, not just next boot
+    _relock
+    log "rfkill-wifi: WiFi unblock boot service installed (ROCK 4C+)"
+}
+
 # ── Run all patches ─────────────────────────────────────────────────────
 
 apply_ble_nonfatal_adv
@@ -476,6 +577,7 @@ apply_eatt_disable
 apply_backingfiles_bfq
 apply_hardware_watchdog
 apply_archive_mount_lock_scripts
+apply_rfkill_unblock_wifi
 
 # Future patches that must survive an OTA update get appended here. Each
 # one self-checks board / precondition / marker so the whole script stays
