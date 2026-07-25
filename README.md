@@ -83,6 +83,7 @@ Sentry USB is one of four free tools for Tesla owners from the [Sentry Six](http
 
 ## Install
 
+> [!NOTE]
 > **No prebuilt SD card image yet.** You start from stock Raspberry Pi OS Lite and run a one-liner over SSH. A prebuilt image is on the roadmap — for now this is the only supported install path. See the [full Getting Started guide](https://github.com/Sentry-Six/Sentry-USB-Rusty/wiki/Getting-Started) for the click-by-click walkthrough.
 
 On a Pi already running **Raspberry Pi OS Lite (64-bit)**:
@@ -93,7 +94,8 @@ sudo -i
 curl -fsSL https://usb.sentry-six.com | bash
 ```
 
-> The `apt update && apt upgrade` step is required. Pi OS images bake in an apt cache from whenever the image was built; if Debian has shipped a point release since then, the cache points at `.deb` versions that no longer exist on the mirrors and the install will hit `404 Not Found` errors. Refreshing first avoids the round trip.
+> [!WARNING]
+> The `apt update && apt upgrade` step is required. Pi OS images bake in an apt cache from whenever the image was built; if Debian has shipped with a newer version, the install will hit `404 Not Found` errors. Running the update and upgrade command will prevent this issue.
 
 Then open `http://sentryusb.local` in a browser and the setup wizard takes you the rest of the way.
 
