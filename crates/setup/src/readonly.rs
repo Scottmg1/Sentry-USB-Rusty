@@ -347,6 +347,40 @@ pub async fn make_readonly(env: &SetupEnv, emitter: &SetupEmitter) -> Result<boo
         "systemctl", &["enable", "rfkill-unblock-bluetooth.service"],
     ).await;
 
+    // ---- WiFi rfkill — ROCK 4C+ only ----
+    // Deliberately board-scoped: the 4C+ is the board whose WLAN boots
+    // soft-blocked (leaving WiFi-only users locked out after setup). Every
+    // other board keeps its current behaviour, so this can't switch a radio on
+    // anywhere it wasn't already.
+    if env.pi_model == crate::env::PiModel::Rock4CPlus {
+        emitter.progress("Installing WiFi rfkill-unblock boot service (ROCK 4C+)");
+        let _ = std::fs::create_dir_all("/usr/local/sbin");
+        // Helper before the unit, so a partial install can never leave a unit
+        // pointing at a script that doesn't exist.
+        if let Err(e) = std::fs::write("/usr/local/sbin/sentryusb-unblock-wifi", WIFI_UNBLOCK_HELPER)
+        {
+            emitter.progress(&format!("WiFi unblock helper write failed: {e}"));
+        } else {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(
+                    "/usr/local/sbin/sentryusb-unblock-wifi",
+                    std::fs::Permissions::from_mode(0o755),
+                );
+            }
+            std::fs::write(
+                "/etc/systemd/system/rfkill-unblock-wifi.service",
+                WIFI_UNBLOCK_SERVICE,
+            )?;
+            let _ = sentryusb_shell::run(
+                "systemctl", &["enable", "rfkill-unblock-wifi.service"],
+            ).await;
+            // Unblock now as well, so WiFi works for the rest of setup.
+            let _ = sentryusb_shell::run("/usr/local/sbin/sentryusb-unblock-wifi", &[]).await;
+        }
+    }
+
     // ---- Reload NM config (dns=none + dispatcher) non-disruptively ----
     // A full restart would drop WiFi and kill SSH sessions mid-setup. The
     // reboot that follows will fully apply the new config.
@@ -817,4 +851,69 @@ ExecStart=/usr/sbin/rfkill unblock bluetooth
 
 [Install]
 WantedBy=multi-user.target
+"#;
+
+/// ROCK 4C+ only. Same idea as the Bluetooth unit above, for WiFi.
+///
+/// On the 4C+ (RK3399/Armbian) the WLAN radio comes up soft-blocked. Normally
+/// systemd-rfkill would restore the unblocked state saved from last boot — but
+/// `make_readonly` puts /var/lib/systemd/rfkill on tmpfs (so a stale block can
+/// never be restored), which also means there is nothing to restore the
+/// UNBLOCKED state from. Result: WiFi is dead on every boot after setup, and a
+/// WiFi-only 4C+ user is locked out of their appliance.
+///
+/// Ordered before `network-pre.target` (which NetworkManager declares
+/// `After=`) rather than `network.target` — NM declares `Before=network.target`
+/// itself, so ordering against that target would NOT guarantee running first.
+///
+/// Escape hatch for a 4C+ that should stay radio-silent (e.g. ethernet-only):
+///   echo off > /etc/sentryusb/wifi-radio
+const WIFI_UNBLOCK_SERVICE: &str = r#"[Unit]
+Description=Unblock WiFi RF-kill (ROCK 4C+)
+DefaultDependencies=no
+Wants=network-pre.target
+Before=network-pre.target NetworkManager.service
+After=sysinit.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/sentryusb-unblock-wifi
+
+[Install]
+WantedBy=multi-user.target
+"#;
+
+/// Unblocks WiFi unless the operator opted out. Also waits briefly for the
+/// WLAN rfkill device to appear: it can register after sysinit.target, and a
+/// oneshot that ran too early would silently do nothing until the next boot.
+const WIFI_UNBLOCK_HELPER: &str = r#"#!/bin/sh
+# Managed by SentryUSB setup (ROCK 4C+). Unblocks the WiFi radio at boot.
+# To keep this board radio-silent:  echo off > /etc/sentryusb/wifi-radio
+set -u
+
+OVERRIDE=/etc/sentryusb/wifi-radio
+if [ -r "$OVERRIDE" ]; then
+  case "$(tr -d '[:space:]' < "$OVERRIDE" | tr '[:upper:]' '[:lower:]')" in
+    off|0|false|disabled)
+      exit 0 ;;
+  esac
+fi
+
+# The WLAN rfkill device may not be registered yet this early in boot; a
+# type-wide unblock issued before it exists is a no-op that never retries
+# (Type=oneshot). Wait up to ~5s for it, then unblock regardless — the
+# type-wide op also sets the default for devices that appear later.
+i=0
+while [ "$i" -lt 25 ]; do
+  for d in /sys/class/rfkill/rfkill*; do
+    [ -r "$d/type" ] || continue
+    if [ "$(cat "$d/type" 2>/dev/null)" = "wlan" ]; then
+      exec /usr/sbin/rfkill unblock wifi
+    fi
+  done
+  i=$((i + 1))
+  sleep 0.2
+done
+exec /usr/sbin/rfkill unblock wifi
 "#;
