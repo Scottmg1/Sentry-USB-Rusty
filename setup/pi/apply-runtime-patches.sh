@@ -48,15 +48,24 @@ is_rock_4cplus() {
 # kernel logs on first BT probe (e.g. "Bluetooth: hci0: BCM43430B0 (002.001.012)").
 #
 # Currently:
-#   BCM4345C0 — Rock 4C+ (confirmed broken via field evidence)
+#   BCM4345C0 — Rock 4C+ (confirmed broken via field evidence) AND
+#     Raspberry Pi 4 Model B (confirmed broken via btmon trace 2026-07-25:
+#     "Add Extended Advertising Data (0x0055) → Invalid Parameters (0x0d)";
+#     without the helper only LE Set Advertising Parameters + Enable are
+#     issued — no Set Advertising Data (0x0008) — so the Pi advertises an
+#     EMPTY packet and is undiscoverable by name/UUID). Pi 4B's BT loads
+#     firmware brcm/BCM4345C0.raspberrypi,4-model-b.hcd — same silicon.
 #   BCM43430B0 — Pi Zero 2 W (confirmed broken via btmon trace 2026-06-20)
 #   BCM43438 — Pi 3B/3B+, Pi Zero W (same chip family / same firmware tree)
 #
 # DELIBERATELY EXCLUDED until tested:
-#   BCM43455 / CYW43455 — Pi 4 / Pi 5; their modern bluetoothd path is
-#   reported to work fine, and running our raw-HCI helper there would
-#   override their working ext-adv with legacy adv (regression). If a Pi
-#   4/5 user does hit "GATT 147 bond=BOND_NONE" they can opt in with:
+#   BCM43455 / CYW43455 — Pi 5; its modern bluetoothd path is reported to
+#   work fine, and running our raw-HCI helper there would override its
+#   working ext-adv with legacy adv (regression). (Note: Raspberry Pi 4
+#   Model B was previously excluded here on the assumption it uses
+#   BCM43455 — in the field its BT identifies as BCM4345C0 and rejects
+#   ext-adv, so it is now in the broken list above.) If an excluded board
+#   does hit "GATT 147 bond=BOND_NONE" the operator can opt in with:
 #       sudo touch /mutable/force-ble-adv-helper
 #   That sentinel forces install regardless of chip detection. The next OTA
 #   (or `sudo /usr/local/bin/sentryusb-apply-runtime-patches`) lands it.
@@ -67,9 +76,11 @@ is_known_broken_ble_chip() {
     local chips="BCM4345C0\|BCM43430B0\|BCM43438"
     dmesg 2>/dev/null | grep -qE "hci0: ($chips)" && return 0
     # dmesg may not retain that line on a long-running box; also check the
-    # board model as a backstop (4C+'s 4345C0 + Zero 2 W's 43430B0 are
-    # board-specific so model match is unambiguous).
-    grep -qai 'rock-4c-plus\|rockpi4c-plus\|ROCK 4C+\|Raspberry Pi Zero 2 W\|Raspberry Pi 3 Model B\|Raspberry Pi Zero W' \
+    # board model as a backstop (4C+'s 4345C0, Zero 2 W's 43430B0 and Pi 4B's
+    # 4345C0 are board-specific so model match is unambiguous). Without this,
+    # a Pi 4B whose boot-time "hci0: BCM4345C0" line has rotated out of dmesg
+    # fails detection and never gets the helper — advertising an empty packet.
+    grep -qai 'rock-4c-plus\|rockpi4c-plus\|ROCK 4C+\|Raspberry Pi Zero 2 W\|Raspberry Pi 3 Model B\|Raspberry Pi Zero W\|Raspberry Pi 4 Model B' \
         /proc/device-tree/model 2>/dev/null && return 0
     return 1
 }
