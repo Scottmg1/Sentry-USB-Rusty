@@ -2894,14 +2894,16 @@ mod tests {
 
     #[test]
     fn test_round2() {
-        assert_eq!(round2(3.14159), 3.14);
+        // Not 3.14159: clippy's approx_constant refuses π look-alikes.
+        assert_eq!(round2(1.23456), 1.23);
         assert_eq!(round2(0.005), 0.01);
     }
 
     #[test]
     fn test_round1() {
-        assert_eq!(round1(3.14), 3.1);
-        assert_eq!(round1(3.15), 3.2);
+        assert_eq!(round1(1.24), 1.2);
+        // 1.25 is exactly representable, so this pins half-away-from-zero.
+        assert_eq!(round1(1.25), 1.3);
     }
 
     #[test]

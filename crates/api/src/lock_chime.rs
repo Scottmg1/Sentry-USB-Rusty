@@ -1707,10 +1707,12 @@ mod tests {
     fn gain_boost_never_wraps_or_clips_hard() {
         let wav = make_wav(&[30000, -30000, 32000]);
         let out = samples_of(&apply_gain_db(&wav, 12.0));
-        // Soft limiter: loud but inside i16, sign preserved, no wraparound
-        assert!(out[0] > 28000 && out[0] <= 32767, "got {}", out[0]);
+        // Soft limiter: loud, sign preserved, no wraparound. An i16 can't
+        // exceed 32767 by construction; a wrapped sample would be negative,
+        // which the lower bound rejects.
+        assert!(out[0] > 28000, "got {}", out[0]);
         assert!(out[1] < -28000, "got {}", out[1]);
-        assert!(out[2] > 28000 && out[2] <= 32767, "got {}", out[2]);
+        assert!(out[2] > 28000, "got {}", out[2]);
     }
 
     #[test]
