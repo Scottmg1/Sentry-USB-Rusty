@@ -351,6 +351,19 @@ pub async fn configure_archive(env: &SetupEnv, emitter: &SetupEmitter) -> Result
         ArchiveSystem::Nfs => configure_nfs_mount(env, emitter).await?,
         ArchiveSystem::Cifs => configure_cifs_mount(env, emitter).await?,
         ArchiveSystem::Rsync => trust_rsync_host_key(env, emitter).await?,
+        ArchiveSystem::Rclone => {
+            // rclone rewrites rclone.conf whenever it refreshes an OAuth
+            // token (e.g. Google Drive, roughly hourly); on the read-only
+            // root that write fails and archiving dies once the token
+            // expires. Relocate the config to /mutable behind a symlink.
+            // Non-fatal: the OTA runtime patch retries on fielded devices.
+            emitter.progress("Ensuring rclone config lives on /mutable...");
+            if let Err(e) = ensure_rclone_config_on_mutable().await {
+                emitter.progress(&format!(
+                    "WARNING: could not move rclone config to /mutable: {e}"
+                ));
+            }
+        }
         _ => {}
     }
 
@@ -370,6 +383,141 @@ pub async fn configure_archive(env: &SetupEnv, emitter: &SetupEmitter) -> Result
 
     emitter.progress("Archive configuration complete.");
     Ok(true)
+}
+
+// ── rclone config on /mutable ─────────────────────────────────────────────
+
+const RCLONE_CONFIG_LINK: &str = "/root/.config/rclone";
+const RCLONE_MUTABLE_DIR: &str = "/mutable/configs/rclone";
+
+/// Ensure `/root/.config/rclone` is a symlink to `/mutable/configs/rclone`.
+///
+/// rclone persists refreshed OAuth tokens by rewriting `rclone.conf` in
+/// place, which fails on the read-only root ("Failed to save config after
+/// 10 tries: ... read-only file system"). The legacy bash installer did
+/// this migration in `verify-and-configure-archive.sh`; the Rust flow
+/// installs that script but never runs it, so it happens here instead.
+///
+/// Skips (without error) when `/mutable` can't be mounted, so a wizard run
+/// on an unusual system never hard-fails on this.
+pub async fn ensure_rclone_config_on_mutable() -> Result<()> {
+    let link = std::path::Path::new(RCLONE_CONFIG_LINK);
+    let target = std::path::Path::new(RCLONE_MUTABLE_DIR);
+
+    // Fast path: correct symlink with an existing target.
+    if std::fs::read_link(link).ok().as_deref() == Some(target) && target.is_dir() {
+        return Ok(());
+    }
+
+    // /mutable must actually be the mounted partition before we move the
+    // config into it, or the "migrated" config lands on the RO root.
+    if sentryusb_shell::run("findmnt", &["--mountpoint", "/mutable"]).await.is_err() {
+        let _ = sentryusb_shell::run("mount", &["/mutable"]).await;
+        if sentryusb_shell::run("findmnt", &["--mountpoint", "/mutable"]).await.is_err() {
+            info!("/mutable not mounted; skipping rclone config migration");
+            return Ok(());
+        }
+    }
+
+    // Root may be read-only on a standalone re-run. Flip rw for the
+    // rename/symlink and restore ro only if it was ro before — mid-setup
+    // the runner keeps root rw and later phases still need it that way.
+    let was_ro = root_mounted_readonly();
+    let _ = std::process::Command::new("bash")
+        .args([
+            "-c",
+            "/root/bin/remountfs_rw 2>/dev/null || mount -o remount,rw / 2>/dev/null || true",
+        ])
+        .status();
+
+    let result = migrate_rclone_config(link, target);
+
+    if was_ro {
+        let _ = std::process::Command::new("sh")
+            .args(["-c", "mount -o remount,ro / 2>/dev/null || true"])
+            .status();
+    }
+    result
+}
+
+fn root_mounted_readonly() -> bool {
+    std::process::Command::new("findmnt")
+        .args(["-no", "OPTIONS", "/"])
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|opts| opts.trim().split(',').any(|o| o == "ro"))
+        .unwrap_or(false)
+}
+
+/// Filesystem state machine for the migration. Pure fs operations on the
+/// given paths (testable off-device). Handles: nothing yet, real directory,
+/// half-migrated (both real dir and mutable copy exist), and a wrong or
+/// dangling symlink.
+fn migrate_rclone_config(link: &std::path::Path, target: &std::path::Path) -> Result<()> {
+    use std::os::unix::fs::{symlink, PermissionsExt};
+
+    match std::fs::symlink_metadata(link) {
+        Ok(meta) if meta.file_type().is_symlink() => {
+            // Wrong or dangling symlink → point it at the mutable dir.
+            std::fs::create_dir_all(target)
+                .with_context(|| format!("create {}", target.display()))?;
+            if std::fs::read_link(link).ok().as_deref() != Some(target) {
+                std::fs::remove_file(link).with_context(|| format!("remove {}", link.display()))?;
+                symlink(target, link).with_context(|| format!("symlink {}", link.display()))?;
+            }
+        }
+        Ok(meta) if meta.is_dir() => {
+            // Real directory on the RO root. `rename` can't cross the
+            // filesystem boundary to /mutable, so copy then delete. If a
+            // mutable copy already exists (half-migrated, or an old install
+            // that lost its symlink), the mutable copy wins conflicts — it
+            // holds the freshest OAuth tokens.
+            copy_tree_no_clobber(link, target)?;
+            std::fs::remove_dir_all(link).with_context(|| format!("remove {}", link.display()))?;
+            symlink(target, link).with_context(|| format!("symlink {}", link.display()))?;
+        }
+        Ok(_) => {
+            anyhow::bail!(
+                "{} exists but is neither a directory nor a symlink",
+                link.display()
+            );
+        }
+        Err(_) => {
+            // Nothing configured yet: pre-provision the symlink so a later
+            // `rclone config` over SSH writes through to /mutable without
+            // needing a read-write root.
+            std::fs::create_dir_all(target)
+                .with_context(|| format!("create {}", target.display()))?;
+            if let Some(parent) = link.parent() {
+                std::fs::create_dir_all(parent)
+                    .with_context(|| format!("create {}", parent.display()))?;
+            }
+            symlink(target, link).with_context(|| format!("symlink {}", link.display()))?;
+        }
+    }
+
+    // Token material lives here — keep the dir private like ~/.ble et al.
+    let _ = std::fs::set_permissions(target, std::fs::Permissions::from_mode(0o700));
+    Ok(())
+}
+
+/// Recursively copy `src` into `dst`, never overwriting an existing file in
+/// `dst`. `std::fs::copy` preserves permissions (rclone.conf is 0600).
+fn copy_tree_no_clobber(src: &std::path::Path, dst: &std::path::Path) -> Result<()> {
+    std::fs::create_dir_all(dst).with_context(|| format!("create {}", dst.display()))?;
+    for entry in std::fs::read_dir(src).with_context(|| format!("read {}", src.display()))? {
+        let entry = entry?;
+        let to = dst.join(entry.file_name());
+        let ty = entry.file_type()?;
+        if ty.is_dir() {
+            copy_tree_no_clobber(&entry.path(), &to)?;
+        } else if !to.exists() {
+            std::fs::copy(entry.path(), &to)
+                .with_context(|| format!("copy {} -> {}", entry.path().display(), to.display()))?;
+        }
+    }
+    Ok(())
 }
 
 // ── Per-archive-system bash helper scripts ────────────────────────────────
@@ -782,5 +930,116 @@ mod tests {
             ("KEEP_AWAKE_WEBHOOK_URL", "http://ha.local/hook"),
         ]);
         assert!(validate_wake_apis(&env).is_ok());
+    }
+
+    // ── migrate_rclone_config state machine ──────────────────────────────
+
+    struct MigrationSandbox {
+        root: std::path::PathBuf,
+    }
+
+    impl MigrationSandbox {
+        fn new(name: &str) -> Self {
+            let root = std::env::temp_dir().join(format!(
+                "sentryusb-rclone-migrate-{}-{}",
+                name,
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&root);
+            std::fs::create_dir_all(&root).unwrap();
+            Self { root }
+        }
+        fn link(&self) -> std::path::PathBuf {
+            self.root.join("root/.config/rclone")
+        }
+        fn target(&self) -> std::path::PathBuf {
+            self.root.join("mutable/configs/rclone")
+        }
+    }
+
+    impl Drop for MigrationSandbox {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    fn assert_migrated(sb: &MigrationSandbox) {
+        assert_eq!(
+            std::fs::read_link(sb.link()).unwrap(),
+            sb.target(),
+            "link must point at the mutable dir"
+        );
+        assert!(sb.target().is_dir());
+    }
+
+    #[test]
+    fn migrate_provisions_symlink_when_nothing_exists() {
+        let sb = MigrationSandbox::new("fresh");
+        migrate_rclone_config(&sb.link(), &sb.target()).unwrap();
+        assert_migrated(&sb);
+        // Idempotent on re-run.
+        migrate_rclone_config(&sb.link(), &sb.target()).unwrap();
+        assert_migrated(&sb);
+    }
+
+    #[test]
+    fn migrate_moves_real_directory() {
+        let sb = MigrationSandbox::new("realdir");
+        std::fs::create_dir_all(sb.link()).unwrap();
+        std::fs::write(sb.link().join("rclone.conf"), "[gdrive]\ntoken=old\n").unwrap();
+        migrate_rclone_config(&sb.link(), &sb.target()).unwrap();
+        assert_migrated(&sb);
+        assert_eq!(
+            std::fs::read_to_string(sb.target().join("rclone.conf")).unwrap(),
+            "[gdrive]\ntoken=old\n"
+        );
+        // The conf is now reachable *through the link*.
+        assert!(sb.link().join("rclone.conf").exists());
+    }
+
+    #[test]
+    fn migrate_half_migrated_keeps_mutable_copy() {
+        let sb = MigrationSandbox::new("half");
+        std::fs::create_dir_all(sb.link()).unwrap();
+        std::fs::write(sb.link().join("rclone.conf"), "stale-root-copy").unwrap();
+        std::fs::write(sb.link().join("only-on-root.txt"), "keep me").unwrap();
+        std::fs::create_dir_all(sb.target()).unwrap();
+        std::fs::write(sb.target().join("rclone.conf"), "fresh-mutable-copy").unwrap();
+        migrate_rclone_config(&sb.link(), &sb.target()).unwrap();
+        assert_migrated(&sb);
+        // Mutable copy wins the conflict (it has the refreshed tokens)...
+        assert_eq!(
+            std::fs::read_to_string(sb.target().join("rclone.conf")).unwrap(),
+            "fresh-mutable-copy"
+        );
+        // ...but files only present on the root side are preserved.
+        assert_eq!(
+            std::fs::read_to_string(sb.target().join("only-on-root.txt")).unwrap(),
+            "keep me"
+        );
+    }
+
+    #[test]
+    fn migrate_fixes_wrong_or_dangling_symlink() {
+        let sb = MigrationSandbox::new("dangling");
+        std::fs::create_dir_all(sb.link().parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(sb.root.join("nowhere"), sb.link()).unwrap();
+        migrate_rclone_config(&sb.link(), &sb.target()).unwrap();
+        assert_migrated(&sb);
+    }
+
+    #[test]
+    fn migrate_correct_symlink_is_noop() {
+        let sb = MigrationSandbox::new("noop");
+        std::fs::create_dir_all(sb.target()).unwrap();
+        std::fs::write(sb.target().join("rclone.conf"), "token").unwrap();
+        std::fs::create_dir_all(sb.link().parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(sb.target(), sb.link()).unwrap();
+        migrate_rclone_config(&sb.link(), &sb.target()).unwrap();
+        assert_migrated(&sb);
+        assert_eq!(
+            std::fs::read_to_string(sb.target().join("rclone.conf")).unwrap(),
+            "token"
+        );
     }
 }

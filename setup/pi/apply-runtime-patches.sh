@@ -569,6 +569,239 @@ WIFIUNIT
     log "rfkill-wifi: WiFi unblock boot service installed (ROCK 4C+)"
 }
 
+# ── rclone config → /mutable migration ──────────────────────────────────
+#
+# rclone persists refreshed OAuth tokens (Google Drive et al.) by rewriting
+# rclone.conf in place. On fielded devices /root/.config/rclone is a real
+# directory on the read-only root, so every refresh fails ("Failed to save
+# config after 10 tries: ... read-only file system") and archiving dies
+# once the token expires. The legacy bash installer migrated the dir to
+# /mutable/configs/rclone behind a symlink; the Rust setup flow never ran
+# that migration, so heal it here. Mirrors
+# crates/setup/src/archive.rs::ensure_rclone_config_on_mutable.
+apply_rclone_config_mutable_migration() {
+    # Only relevant when rclone is the archive backend (its archive-clips.sh
+    # variant is the only one invoking "rclone --config") or a config already
+    # exists at the legacy location.
+    if ! grep -q 'rclone --config' /root/bin/archive-clips.sh 2>/dev/null \
+       && [ ! -e /root/.config/rclone ] && [ ! -L /root/.config/rclone ]; then
+        log "rclone-config: not applicable"
+        return 0
+    fi
+
+    if [ -L /root/.config/rclone ] \
+       && [ "$(readlink /root/.config/rclone)" = /mutable/configs/rclone ] \
+       && [ -d /mutable/configs/rclone ]; then
+        log "rclone-config: already on /mutable"
+        return 0
+    fi
+
+    # The whole point is persisting onto the mutable partition — if it can't
+    # be mounted, migrating now would strand the config. Retry next OTA.
+    if ! findmnt --mountpoint /mutable >/dev/null 2>&1; then
+        mount /mutable 2>/dev/null || true
+    fi
+    if ! findmnt --mountpoint /mutable >/dev/null 2>&1; then
+        warn "rclone-config: /mutable not mounted — skipping migration"
+        return 0
+    fi
+
+    local ro_before=no
+    findmnt -no OPTIONS / 2>/dev/null | grep -qE '(^|,)ro(,|$)' && ro_before=yes
+    if [ "$ro_before" = yes ]; then
+        [ -x /root/bin/remountfs_rw ] && /root/bin/remountfs_rw >/dev/null 2>&1 \
+            || mount -o remount,rw / 2>/dev/null || true
+    fi
+    _rclone_relock() {
+        [ "$ro_before" = yes ] || return 0
+        sync
+        mount -o remount,ro / 2>/dev/null || true
+    }
+
+    mkdir -p /mutable/configs /root/.config 2>/dev/null || true
+
+    if [ -L /root/.config/rclone ]; then
+        # Wrong or dangling symlink → recreate it.
+        mkdir -p /mutable/configs/rclone
+        rm -f /root/.config/rclone
+        ln -s /mutable/configs/rclone /root/.config/rclone
+    elif [ -d /root/.config/rclone ]; then
+        if [ -d /mutable/configs/rclone ]; then
+            # Half-migrated (e.g. power loss mid-move): the mutable copy wins
+            # conflicts — it holds the freshest OAuth tokens. cp -n never
+            # overwrites; copy anything only present on the root side.
+            cp -an /root/.config/rclone/. /mutable/configs/rclone/ 2>/dev/null || true
+            rm -rf /root/.config/rclone
+        else
+            mv /root/.config/rclone /mutable/configs/
+        fi
+        ln -s /mutable/configs/rclone /root/.config/rclone
+    else
+        # Nothing configured yet: pre-provision so a later `rclone config`
+        # over SSH writes through to /mutable without needing an rw root.
+        mkdir -p /mutable/configs/rclone
+        ln -s /mutable/configs/rclone /root/.config/rclone
+    fi
+    chmod 700 /mutable/configs/rclone 2>/dev/null || true
+
+    _rclone_relock
+
+    if [ -L /root/.config/rclone ] && [ -d /mutable/configs/rclone ]; then
+        log "rclone-config: migrated to /mutable/configs/rclone"
+    else
+        err "rclone-config: migration failed (read-only fs? check remountfs_rw)"
+        return 1
+    fi
+}
+
+# ── rclone watchdog fix ──────────────────────────────────────────────────
+#
+# The shipped rclone archive-clips.sh probed "$RCLONE_DRIVE" — the rclone
+# remote *name* (e.g. "gdrive"), not a hostname — so the connection monitor
+# could never see a live connection and killed rclone ~7s into every
+# archive run ("connection dead, killing rclone archive", exit 143,
+# "Archived 0 files"). The fixed script probes ARCHIVE_SERVER (a pingable
+# IP, 8.8.8.8 default), honors Travel Mode, and scopes the kill to its own
+# rclone invocation. /root/bin scripts are only rewritten at wizard time,
+# so existing installs need this refresh.
+#
+# The heredocs below MUST stay byte-identical to
+# run/rclone_archive/archive-clips.sh and
+# run/rclone_archive/archive-is-reachable.sh.
+apply_rclone_watchdog_fix() {
+    # Only the rclone variant invokes "rclone --config"; cifs/nfs/rsync
+    # installs have their own archive-clips.sh which must stay untouched.
+    if ! grep -q 'rclone --config' /root/bin/archive-clips.sh 2>/dev/null; then
+        log "rclone-watchdog: not applicable"
+        return 0
+    fi
+    if grep -q 'RCLONE_MONITOR_V2' /root/bin/archive-clips.sh 2>/dev/null \
+       && grep -q 'ARCHIVE_PING_TIMEOUT' /root/bin/archive-is-reachable.sh 2>/dev/null; then
+        log "rclone-watchdog: already patched"
+        return 0
+    fi
+
+    local ro_before=no
+    findmnt -no OPTIONS / 2>/dev/null | grep -qE '(^|,)ro(,|$)' && ro_before=yes
+    if [ "$ro_before" = yes ]; then
+        [ -x /root/bin/remountfs_rw ] && /root/bin/remountfs_rw >/dev/null 2>&1 \
+            || mount -o remount,rw / 2>/dev/null || true
+    fi
+    _rclone_wd_relock() {
+        [ "$ro_before" = yes ] || return 0
+        sync
+        mount -o remount,ro / 2>/dev/null || true
+    }
+
+    # Staged + atomic rename: a power loss or disk-full mid-write must never
+    # leave a truncated live script (archiveloop invokes these every cycle,
+    # and a half-written file containing the marker would make the next
+    # patch run report "already patched").
+    cat > /root/bin/archive-clips.sh.new <<'RCLONECLIPS_EOF'
+#!/bin/bash -eu
+
+# read the setup variables again because arrays, like RCLONE_FLAGS, don't export to subshells/child scripts
+source /root/bin/envsetup.sh
+
+# RCLONE_MONITOR_V2: probes ARCHIVE_SERVER, travel-mode aware, scoped kill.
+#
+# Connection monitor: poll the liveness IP every ~10s. Consecutive misses
+# kill rclone (and this script) so archiveloop can reach
+# `connect_usb_drives_to_host` and put the gadget back online instead of
+# hanging on a dropped TCP/cloud connection while the user drives away.
+# The `--timeout`/`--contimeout` flags below give rclone its own internal
+# floor; the monitor is a hard outer bound for cases where rclone's retry
+# loop takes too long to surrender.
+#
+# The probe target is ARCHIVE_SERVER (a pingable IP, 8.8.8.8 by default for
+# cloud remotes — see run/archiveloop), NOT $RCLONE_DRIVE: that is rclone's
+# remote *name* (e.g. "gdrive"), which is not a hostname and can never
+# answer a ping, so probing it killed every archive run within seconds.
+#
+# Travel Mode (passed fresh by archiveloop as TRAVEL_MODE_ACTIVE) relaxes the
+# thresholds for slow, high-latency mobile links, mirroring
+# run/rsync_archive/archive-clips.sh. Normal mode keeps the original snappy
+# values so "drive away from home" recovery is unchanged.
+if [ "${TRAVEL_MODE_ACTIVE:-0}" = "1" ]; then
+  MONITOR_MISSES=20            # ~minutes of sustained loss before giving up
+  MONITOR_TIMEOUT=20           # must exceed the patient probe below
+  export ARCHIVE_PING_TIMEOUT=4
+else
+  MONITOR_MISSES=5
+  MONITOR_TIMEOUT=6
+fi
+
+function connectionmonitor {
+  while true
+  do
+    for (( i = 1; i <= MONITOR_MISSES; i++ ))
+    do
+      if timeout "$MONITOR_TIMEOUT" /root/bin/archive-is-reachable.sh "${ARCHIVE_SERVER:-8.8.8.8}"
+      then
+        sleep 5
+        continue 2
+      fi
+      sleep 1
+    done
+    log "connection dead, killing rclone archive"
+    # Scoped to this script's own move invocation: a plain `killall rclone`
+    # would also take out unrelated rclone processes (the drive-data sync in
+    # post-archive-process.sh, an in-flight cloud config backup).
+    pkill -f 'rclone --config /root/\.config/rclone/rclone\.conf move' || true
+    sleep 2
+    pkill -9 -f 'rclone --config /root/\.config/rclone/rclone\.conf move' || true
+    kill -9 "$1" || true
+    return
+  done
+}
+
+connectionmonitor $$ &
+
+# Layer-1 (rclone-level) safety nets. The bash monitor is layer-2.
+flags=("-L" "--transfers=1" "--timeout=30s" "--contimeout=10s" "--retries=1")
+if [[ -v RCLONE_FLAGS ]]
+then
+  flags+=("${RCLONE_FLAGS[@]}")
+fi
+
+while [ -n "${1+x}" ]
+do
+  # Low I/O + CPU priority so the archive reads never starve the car's
+  # dashcam writes on the same disk (see run/rsync_archive/archive-clips.sh
+  # for the full rationale; -c2 -n7 not -c3 so progress is guaranteed).
+  ionice -c2 -n7 nice -n19 rclone --config /root/.config/rclone/rclone.conf move "${flags[@]}" --files-from "$2" "$1" "$RCLONE_DRIVE:$RCLONE_PATH" >> "$LOG_FILE" 2>&1
+  shift 2
+done
+
+# Stop the monitor so it doesn't leak past archive completion.
+kill %1 || true
+RCLONECLIPS_EOF
+
+    cat > /root/bin/archive-is-reachable.sh.new <<'RCLONEREACH_EOF'
+#!/bin/bash -eu
+
+# $1 is a pingable liveness IP (ARCHIVE_SERVER, default 8.8.8.8 for cloud
+# remotes). ARCHIVE_PING_TIMEOUT is exported by archive-clips.sh in Travel
+# Mode for slow mobile links; default matches the original 1s probe.
+ping -q -w "${ARCHIVE_PING_TIMEOUT:-1}" -c 1 "$1" > /dev/null 2>&1
+RCLONEREACH_EOF
+
+    chmod 755 /root/bin/archive-clips.sh.new /root/bin/archive-is-reachable.sh.new 2>/dev/null || true
+
+    if ! bash -n /root/bin/archive-clips.sh.new 2>/dev/null \
+       || ! bash -n /root/bin/archive-is-reachable.sh.new 2>/dev/null; then
+        err "rclone-watchdog: staged script failed bash -n (disk full? truncated write?)"
+        rm -f /root/bin/archive-clips.sh.new /root/bin/archive-is-reachable.sh.new
+        _rclone_wd_relock
+        return 1
+    fi
+
+    mv /root/bin/archive-clips.sh.new /root/bin/archive-clips.sh
+    mv /root/bin/archive-is-reachable.sh.new /root/bin/archive-is-reachable.sh
+    _rclone_wd_relock
+    log "rclone-watchdog: archive scripts refreshed (probe ARCHIVE_SERVER, scoped kill)"
+}
+
 # ── Run all patches ─────────────────────────────────────────────────────
 
 apply_ble_nonfatal_adv
@@ -578,6 +811,8 @@ apply_backingfiles_bfq
 apply_hardware_watchdog
 apply_archive_mount_lock_scripts
 apply_rfkill_unblock_wifi
+apply_rclone_config_mutable_migration
+apply_rclone_watchdog_fix
 
 # Future patches that must survive an OTA update get appended here. Each
 # one self-checks board / precondition / marker so the whole script stays

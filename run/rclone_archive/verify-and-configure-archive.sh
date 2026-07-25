@@ -17,7 +17,9 @@ function verify_configuration () {
         exit 1
     fi
 
-    if ! rclone lsd "$RCLONE_DRIVE:$RCLONE_PATH" > /dev/null
+    # Explicit --config: match every other rclone invocation (archive-clips.sh
+    # etc.) instead of relying on $HOME resolution, which differs under systemd.
+    if ! rclone --config /root/.config/rclone/rclone.conf lsd "$RCLONE_DRIVE:$RCLONE_PATH" > /dev/null
     then
         log_progress "STOP: Could not find the $RCLONE_DRIVE:$RCLONE_PATH"
         exit 1

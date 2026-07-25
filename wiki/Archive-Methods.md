@@ -49,8 +49,10 @@ For cloud storage — Google Drive, OneDrive, Dropbox, S3, Backblaze B2, and ~60
 **Set up the remote first** by SSH'ing into the Pi and running:
 
 ```bash
-sudo -u sentryusb rclone config
+sudo rclone config
 ```
+
+(Run it as root — the archive loop reads `/root/.config/rclone/rclone.conf`.)
 
 Follow the prompts — it'll ask which cloud service, walk you through OAuth, and let you name the remote (e.g., `gdrive`).
 

@@ -492,8 +492,14 @@ pub async fn test_archive(
                 return crate::json_error(StatusCode::BAD_REQUEST, "Missing required rclone fields");
             }
             let target = format!("{}:{}", drive, rpath);
+            // Explicit --config: every archive-path invocation reads
+            // /root/.config/rclone/rclone.conf, so the wizard's test must
+            // probe the same file rather than whatever $HOME resolves to
+            // under systemd.
             let res = sentryusb_shell::run_with_timeout(
-                timeout, "rclone", &["lsd", &target],
+                timeout,
+                "rclone",
+                &["--config", "/root/.config/rclone/rclone.conf", "lsd", &target],
             ).await;
             res.map(|_| ()).map_err(|e| e.to_string())
         }
