@@ -55,6 +55,19 @@ connect_in_flight() {
     [ "$age" -ge 0 ] && [ "$age" -lt "$CONNECTING_FLAG_MAX_AGE" ]
 }
 
+# True only when a central (a phone) is connected TO us — i.e. we hold a
+# PERIPHERAL-role LE link. The Tesla keep-awake link is the OPPOSITE: the Pi
+# dials out to the car, so it is a CENTRAL-role link. That link must NOT
+# suppress advertising, otherwise the Pi is undiscoverable to the phone the
+# whole time keep-awake holds the car connection (the in-app "connect over
+# Bluetooth" step then fails). The controller does advertising + an outbound
+# central link simultaneously without issue (field-verified: asserting adv
+# while the car link is up left the car link intact). hcitool reports the
+# LOCAL role as "lm PERIPHERAL" (older BlueZ: "lm SLAVE").
+peripheral_link_up() {
+    hcitool con 2>/dev/null | grep -qiE 'lm (PERIPHERAL|SLAVE)'
+}
+
 # Run the advertising loop ONLY when executed directly (the systemd ExecStart),
 # never when sourced — otherwise testing build_scanrsp() would loop forever.
 if [ "${BASH_SOURCE[0]}" != "${0}" ]; then
@@ -66,8 +79,12 @@ sleep 3   # let bluetoothd's (failing) ext-adv RegisterAdvertisement settle firs
 timeout 5 btmgmt le on >/dev/null 2>&1 || true
 timeout 5 btmgmt connectable on >/dev/null 2>&1 || true
 while true; do
-    # Re-assert only while IDLE and no central connect is in flight.
-    if ! connect_in_flight && ! timeout 3 btmgmt con 2>/dev/null | grep -q 'type LE'; then
+    # Re-assert while IDLE: skip only while a phone connect is in flight, or a
+    # phone is already connected (a PERIPHERAL-role link). Do NOT skip merely
+    # because an LE connection exists — the Tesla keep-awake is a CENTRAL-role
+    # link and must not silence advertising, or the phone can never discover us
+    # while the car is awake.
+    if ! connect_in_flight && ! peripheral_link_up; then
         assert_raw_adv
     fi
     sleep 5
