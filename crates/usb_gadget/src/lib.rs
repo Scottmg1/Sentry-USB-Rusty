@@ -465,7 +465,7 @@ pub fn is_active() -> bool {
 fn find_udc() -> Result<String> {
     let udc_dir = Path::new("/sys/class/udc");
     if let Ok(entries) = fs::read_dir(udc_dir) {
-        for entry in entries.flatten() {
+        if let Some(entry) = entries.flatten().next() {
             return Ok(entry.file_name().to_string_lossy().to_string());
         }
     }
