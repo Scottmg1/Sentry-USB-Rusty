@@ -2,6 +2,7 @@
 
 - [Home](Home)
 - [Getting Started](Getting-Started)
+- [Rock 4C+ Setup](Rock-4C-Plus-Setup)
 - [Setup Wizard Guide](Setup-Wizard-Guide)
 - [Drives](Drives)
 - [Tesla BLE Telemetry](Tesla-BLE-Telemetry)
