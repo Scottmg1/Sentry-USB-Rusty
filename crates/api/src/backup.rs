@@ -796,6 +796,14 @@ pub async fn restore_backup(
     }
 
     if !backup.rclone_config.is_empty() {
+        // Establish the /mutable/configs/rclone symlink first so the restore
+        // never recreates a real directory on the read-only root (rclone's
+        // OAuth token refresh must be able to rewrite this file later).
+        // Falls back to the plain directory if the migration is unavailable
+        // (e.g. /mutable not mounted) — better a restored config than none.
+        if let Err(e) = sentryusb_setup::archive::ensure_rclone_config_on_mutable().await {
+            warn!("[backup] rclone config migration failed, restoring in place: {}", e);
+        }
         let _ = std::fs::create_dir_all("/root/.config/rclone");
         match write_with_mode(RCLONE_CONFIG, &backup.rclone_config, 0o600) {
             Ok(()) => info!("[backup] Restored rclone config"),
