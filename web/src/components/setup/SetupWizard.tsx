@@ -302,6 +302,14 @@ export function SetupWizard({ initialData, onClose }: SetupWizardProps) {
   const [saveError, setSaveError] = useState<string | null>(null)
   const [phase, setPhase] = useState<SetupPhase>("wizard")
   const [setupMessage, setSetupMessage] = useState("")
+  // Device IP captured while the server is reachable, offered as a fallback
+  // URL when sentryusb.local stops resolving across mid-setup reboots (mDNS
+  // can be slow to re-announce and some networks/browsers cache the failure).
+  // Kept in sessionStorage so it survives a page reload while the device is
+  // down.
+  const [deviceIp, setDeviceIp] = useState<string | null>(
+    () => sessionStorage.getItem("sentryusb_device_ip"),
+  )
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null)
   // Snapshot of the config as it was when the wizard opened (for detecting destructive changes)
   const originalDataRef = useRef<SetupFormData | undefined>(initialData)
@@ -395,6 +403,26 @@ export function SetupWizard({ initialData, onClose }: SetupWizardProps) {
     })
     return () => { cancelled = true }
   }, [])
+
+  // Capture the device IP whenever the server is reachable so the reboot
+  // waits can suggest it as a fallback URL. Refresh on entering "running"
+  // in case the address changed since mount.
+  useEffect(() => {
+    if (phase !== "wizard" && phase !== "running") return
+    let cancelled = false
+    fetch("/api/status")
+      .then((r) => r.json())
+      .then((data) => {
+        if (cancelled) return
+        const ip = data?.wifi_ip || data?.ether_ip
+        if (ip) {
+          setDeviceIp(ip)
+          sessionStorage.setItem("sentryusb_device_ip", ip)
+        }
+      })
+      .catch(() => { /* device unreachable — keep any cached IP */ })
+    return () => { cancelled = true }
+  }, [phase])
 
   // Poll setup status while running
   useEffect(() => {
@@ -784,8 +812,18 @@ export function SetupWizard({ initialData, onClose }: SetupWizardProps) {
                     Performing final reboot. This page will redirect automatically.
                   </p>
                 )}
+                {(phase === "rebooting" || phase === "finalizing") &&
+                  deviceIp && window.location.hostname !== deviceIp && (
+                  <p className="mt-2 text-xs text-slate-500">
+                    If this page doesn't reconnect, open{" "}
+                    <a href={`http://${deviceIp}`} className="text-blue-400 hover:underline">
+                      http://{deviceIp}
+                    </a>{" "}
+                    in a new tab — sentryusb.local can stop resolving between reboots.
+                  </p>
+                )}
               </div>
-              <SetupProgress phase={phase} />
+              <SetupProgress phase={phase} deviceIp={deviceIp ?? undefined} />
             </>
           ) : phase === "complete" ? (
             <>

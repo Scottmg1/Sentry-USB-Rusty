@@ -12,6 +12,25 @@ The Pi is up but its hostname isn't resolving on your network.
 2.  On Windows, install **[Bonjour Print Services](https://support.apple.com/kb/DL999)** — Windows doesn't ship with mDNS by default.
 3.  Some corporate / mesh / guest WiFi networks block mDNS broadcasts. Try a different network or use the IP.
 
+## sentryusb.local stops resolving during setup
+
+Setup reboots the Pi several times, and each reboot drops the `sentryusb.local` name until mDNS re-announces it — which can take a minute, and some networks/browsers cache the failure longer. The Pi itself is fine and setup keeps running on the device.
+
+**Try:**
+
+1.  Open `http://<ip>` in a new tab instead — the IP is printed at the end of the installer output, and the setup page shows it while waiting for a reboot. You can also find it on your router's admin page.
+2.  The setup page on the IP picks up right where it left off — setup resumes automatically after every reboot, so nothing is lost.
+
+## Setup loops forever on "Shrinking root partition table"
+
+Older versions could get stuck endlessly re-shrinking the root partition when Raspberry Pi OS's own first-boot auto-expand was still active (it re-grew the filesystem after every shrink). This is fixed — re-run the installer to get the latest version:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Sentry-Six/Sentry-USB-Rusty/main/install-pi.sh | bash
+```
+
+If setup now stops with "Root partition could not be shrunk after 3 attempts", re-flash the SD card/SSD with Raspberry Pi Imager (with OS customization disabled) or Balena Etcher and reinstall.
+
 ## Tesla dashcam icon never appears
 
 The car isn't seeing the Pi as a USB drive.

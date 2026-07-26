@@ -74,6 +74,9 @@ Open your browser and go to:
 
 The [Setup Wizard](Setup-Wizard-Guide) will walk you through the rest — picking your archive method, configuring notifications, etc.
 
+> [!TIP]
+> Keep the IP address the installer printed handy. Setup reboots the Pi several times, and `sentryusb.local` can briefly stop resolving after a reboot on some networks — if the page doesn't reconnect, open `http://<ip>` instead and setup picks up right where it left off.
+
 ### 6. Connect to your Tesla
 
 After you finish the Setup Wizard:

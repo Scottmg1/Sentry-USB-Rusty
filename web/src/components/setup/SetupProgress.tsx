@@ -79,9 +79,12 @@ interface PhaseEntry {
 interface SetupProgressProps {
   complete?: boolean
   phase?: SetupPhaseStatus
+  /** Device IP captured while reachable, offered as a fallback URL when
+   *  sentryusb.local stops resolving between setup reboots. */
+  deviceIp?: string
 }
 
-export function SetupProgress({ complete, phase = "running" }: SetupProgressProps) {
+export function SetupProgress({ complete, phase = "running", deviceIp }: SetupProgressProps) {
   const [logLines, setLogLines] = useState<string[]>([])
   const [phases, setPhases] = useState<PhaseEntry[]>([])
   const [stale, setStale] = useState(false)
@@ -266,7 +269,16 @@ export function SetupProgress({ complete, phase = "running" }: SetupProgressProp
           <p className="text-xs text-yellow-300/80">
             No new progress in the last 5 minutes. Setup may be waiting on a slow
             operation (package install, large partition format), or it may be stuck.
-            If this persists, check the system logs or power-cycle the device.
+            {deviceIp && window.location.hostname !== deviceIp && (
+              <>
+                {" "}sentryusb.local can also stop resolving between reboots — try{" "}
+                <a href={`http://${deviceIp}`} className="text-yellow-200 underline">
+                  http://{deviceIp}
+                </a>{" "}
+                in a new tab.
+              </>
+            )}
+            {" "}If this persists, check the system logs or power-cycle the device.
           </p>
         </div>
       )}

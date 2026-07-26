@@ -343,12 +343,27 @@ const SETUP_PHASES_FILE: &str = "/sentryusb/setup-phases.jsonl";
 pub async fn get_setup_phases(
     State(_s): State<AppState>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    let phases: Vec<serde_json::Value> = std::fs::read_to_string(SETUP_PHASES_FILE)
-        .unwrap_or_default()
-        .lines()
-        .filter_map(|l| serde_json::from_str(l).ok())
-        .collect();
+    let phases = dedup_phases(&std::fs::read_to_string(SETUP_PHASES_FILE).unwrap_or_default());
     (StatusCode::OK, Json(serde_json::json!({ "phases": phases })))
+}
+
+/// Parse the phases ledger, keeping only the first occurrence of each phase
+/// id. The ledger is append-only across setup's multiple reboots, so a phase
+/// re-announced on every resume (e.g. `root_shrink`) appears many times —
+/// without this the wizard renders each repeat as a separate step. Matches
+/// the WebSocket path's semantics, where the frontend ignores repeated ids.
+fn dedup_phases(ledger: &str) -> Vec<serde_json::Value> {
+    let mut seen = std::collections::HashSet::new();
+    ledger
+        .lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .filter(|p| {
+            match p.get("id").and_then(|v| v.as_str()) {
+                Some(id) => seen.insert(id.to_string()),
+                None => true,
+            }
+        })
+        .collect()
 }
 
 /// POST /api/setup/run
@@ -721,6 +736,30 @@ mod tests {
     #[test]
     fn parse_rejects_garbage() {
         assert!(SetupFailure::parse("not json at all").is_none());
+    }
+
+    #[test]
+    fn dedup_phases_collapses_repeated_ids_keeping_first() {
+        let ledger = concat!(
+            r#"{"id":"verify","label":"Verifying configuration"}"#, "\n",
+            r#"{"id":"root_shrink","label":"Shrinking root filesystem"}"#, "\n",
+            r#"{"id":"root_shrink","label":"Shrinking root partition table"}"#, "\n",
+            r#"{"id":"root_shrink","label":"Shrinking root partition table"}"#, "\n",
+            r#"{"id":"gadget","label":"USB gadget overlay"}"#, "\n",
+        );
+        let phases = dedup_phases(ledger);
+        assert_eq!(phases.len(), 3);
+        assert_eq!(phases[0]["id"], "verify");
+        assert_eq!(phases[1]["id"], "root_shrink");
+        assert_eq!(phases[1]["label"], "Shrinking root filesystem");
+        assert_eq!(phases[2]["id"], "gadget");
+    }
+
+    #[test]
+    fn dedup_phases_skips_malformed_lines() {
+        let phases = dedup_phases("not json\n{\"id\":\"a\",\"label\":\"A\"}\n");
+        assert_eq!(phases.len(), 1);
+        assert_eq!(phases[0]["id"], "a");
     }
 
     #[test]

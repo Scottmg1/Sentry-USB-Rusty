@@ -137,6 +137,11 @@ pub async fn run_full_setup(emitter: SetupEmitter) -> Result<()> {
     // WiFi regulatory (silent no-op when already set)
     configure_wifi_regulatory(&env, &emitter).await?;
 
+    // Kill Pi OS's firstboot auto-expand BEFORE the first reboot — if left
+    // active it re-grows the root filesystem after the shrink phase and
+    // setup loops forever re-shrinking it.
+    disable_os_auto_expand(&env, &emitter).await?;
+
     // dwc2 USB gadget overlay — reboots if added.
     if configure_dwc2_overlay(&env, &emitter).await? {
         emitter.progress("Rebooting to apply dwc2 overlay change...");
@@ -461,6 +466,26 @@ async fn configure_dwc2_overlay(env: &SetupEnv, emitter: &SetupEmitter) -> Resul
     Ok(true)
 }
 
+/// Minimum unpartitioned space setup needs on the boot disk for the
+/// backingfiles + mutable partitions.
+const MIN_UNPARTITIONED: u64 = 8 * 1024 * 1024 * 1024;
+
+/// Persisted count of initramfs shrink attempts, so a shrink that never
+/// sticks (e.g. the OS re-expands the filesystem every boot) fails with
+/// guidance after a few tries instead of reboot-looping forever.
+const RESIZE_ATTEMPTS_FILE: &str = "/root/RESIZE_ATTEMPTS";
+
+/// Unpartitioned bytes on the given disk, per `sfdisk -F`.
+async fn unpartitioned_bytes(boot_disk: &str) -> u64 {
+    let output = sentryusb_shell::run(
+        "bash", &["-c", &format!(
+            "sfdisk -F '{}' 2>/dev/null | grep -o '[0-9]* bytes' | head -1 | awk '{{print $1}}'",
+            boot_disk
+        )],
+    ).await.unwrap_or_default();
+    output.trim().parse().unwrap_or(0)
+}
+
 /// Check whether the root partition needs shrinking (Pi Imager auto-expand case).
 /// Shrink the partition-table entry of the (already filesystem-shrunk) root
 /// partition down to match its filesystem, freeing the tail of the disk for
@@ -471,7 +496,7 @@ async fn shrink_root_partition_table(
     boot_disk: &str,
     root_part_num: &str,
     emitter: &SetupEmitter,
-) {
+) -> Result<()> {
     emitter.progress("Shrinking root partition table entry to match filesystem...");
     let sector_size = sentryusb_shell::run(
         "bash", &["-c", &format!(
@@ -486,23 +511,26 @@ async fn shrink_root_partition_table(
         )],
     ).await.unwrap_or_default();
     let parts: Vec<&str> = tune2fs_out.trim().lines().collect();
-    if parts.len() == 2 {
-        let block_count: u64 = parts[0].trim().parse().unwrap_or(0);
-        let block_size: u64 = parts[1].trim().parse().unwrap_or(4096);
-        let fs_sectors = block_count * block_size / sector_size;
+    if parts.len() != 2 {
+        bail!("could not read root filesystem geometry from tune2fs: {:?}", tune2fs_out.trim());
+    }
+    let block_count: u64 = parts[0].trim().parse().unwrap_or(0);
+    let block_size: u64 = parts[1].trim().parse().unwrap_or(4096);
+    let fs_sectors = block_count * block_size / sector_size;
 
-        let start_sector = sentryusb_shell::run(
-            "bash", &["-c", &format!("partx --show -g -o START '{}'", root_dev)],
-        ).await.unwrap_or_default().trim().to_string();
+    let start_sector = sentryusb_shell::run(
+        "bash", &["-c", &format!("partx --show -g -o START '{}'", root_dev)],
+    ).await.unwrap_or_default().trim().to_string();
 
-        emitter.progress(&format!("Resizing partition to {} sectors", fs_sectors));
-        let _ = sentryusb_shell::run_with_timeout(
-            Duration::from_secs(30),
-            "bash", &["-c", &format!(
-                "echo '{},{}' | sfdisk --force --no-reread '{}' -N {}",
-                start_sector, fs_sectors, boot_disk, root_part_num
-            )],
-        ).await;
+    emitter.progress(&format!("Resizing partition to {} sectors", fs_sectors));
+    if let Err(e) = sentryusb_shell::run_with_timeout(
+        Duration::from_secs(30),
+        "bash", &["-c", &format!(
+            "echo '{},{}' | sfdisk --force --no-reread '{}' -N {}",
+            start_sector, fs_sectors, boot_disk, root_part_num
+        )],
+    ).await {
+        bail!("sfdisk failed to resize the root partition entry: {}", e);
     }
 
     if Path::new("/sentryusb/config.txt").exists() {
@@ -512,12 +540,21 @@ async fn shrink_root_partition_table(
                 .filter(|l| !l.contains("SENTRYUSB-REMOVE"))
                 .collect::<Vec<_>>().join("\n");
             let _ = std::fs::write("/sentryusb/config.txt", cleaned + "\n");
-            let initrd = format!("initrd.img-{}", std::env::consts::ARCH);
-            let _ = std::fs::remove_file(format!("/boot/{}", initrd));
+            if let Ok(kernel_ver) = sentryusb_shell::run("uname", &["-r"]).await {
+                let initrd = format!("initrd.img-{}", kernel_ver.trim());
+                let _ = std::fs::remove_file(format!("/boot/{}", initrd));
+                let boot_part = std::fs::read_link("/sentryusb")
+                    .map(|p| p.to_string_lossy().to_string())
+                    .unwrap_or_else(|_| "/boot".to_string());
+                if boot_part != "/boot" {
+                    let _ = std::fs::remove_file(format!("{}/{}", boot_part, initrd));
+                }
+            }
         } else {
             let _ = sentryusb_shell::run("update-initramfs", &["-u"]).await;
         }
     }
+    Ok(())
 }
 
 /// Root filesystem size in the disk's hardware sectors (block_count *
@@ -592,11 +629,32 @@ async fn check_root_shrink(env: &SetupEnv, emitter: &SetupEmitter) -> Result<boo
             emitter.progress("Root filesystem resize completed successfully during boot.");
             let _ = std::fs::remove_file(resize_marker);
 
-            shrink_root_partition_table(&root_dev, &boot_disk, &root_part_num, emitter).await;
+            let shrink_res =
+                shrink_root_partition_table(&root_dev, &boot_disk, &root_part_num, emitter).await;
 
-            emitter.progress("Root partition shrink complete, rebooting...");
-            reboot().await;
-            return Ok(true);
+            // Verify the shrink actually freed the space setup needs before
+            // declaring success. If the OS re-expanded the filesystem after
+            // the initramfs shrink (Pi OS firstboot/resize2fs_once
+            // auto-expand, left active by older install-pi.sh versions), the
+            // table shrink above is a full-size no-op — blindly rebooting
+            // here is what caused the historical infinite shrink loop.
+            let freed = unpartitioned_bytes(&boot_disk).await;
+            if shrink_res.is_ok() && freed >= MIN_UNPARTITIONED {
+                let _ = std::fs::remove_file(RESIZE_ATTEMPTS_FILE);
+                emitter.progress("Root partition shrink complete, rebooting...");
+                reboot().await;
+                return Ok(true);
+            }
+
+            if let Err(e) = shrink_res {
+                emitter.progress(&format!("WARNING: Partition table shrink failed: {}", e));
+            }
+            emitter.progress(&format!(
+                "WARNING: Shrink did not free the expected space ({} MB unpartitioned) — the OS may have re-expanded the root filesystem. Retrying...",
+                freed / 1024 / 1024
+            ));
+            // Fall through to the entry gate below, which schedules another
+            // initramfs attempt, bounded by RESIZE_ATTEMPTS_FILE.
 
         } else if result.starts_with("fail:") {
             let _ = std::fs::remove_file(resize_marker);
@@ -611,16 +669,9 @@ async fn check_root_shrink(env: &SetupEnv, emitter: &SetupEmitter) -> Result<boo
         }
     }
 
-    let output = sentryusb_shell::run(
-        "bash", &["-c", &format!(
-            "sfdisk -F '{}' 2>/dev/null | grep -o '[0-9]* bytes' | head -1 | awk '{{print $1}}'",
-            boot_disk
-        )],
-    ).await.unwrap_or_default();
-    let unpart_bytes: u64 = output.trim().parse().unwrap_or(0);
-    let min_space: u64 = 8 * 1024 * 1024 * 1024;
+    let unpart_bytes = unpartitioned_bytes(&boot_disk).await;
 
-    if unpart_bytes >= min_space {
+    if unpart_bytes >= MIN_UNPARTITIONED {
         return Ok(false);
     }
 
@@ -641,13 +692,35 @@ async fn check_root_shrink(env: &SetupEnv, emitter: &SetupEmitter) -> Result<boo
             emitter.begin_phase("root_shrink", "Shrinking root partition table");
             emitter.progress("Filesystem already shrunk but the resize marker was lost (common on DietPi initramfs); finishing the partition-table shrink...");
             let _ = std::fs::remove_file(resize_marker);
-            shrink_root_partition_table(&root_dev, &boot_disk, &root_part_num, emitter).await;
+            if let Err(e) =
+                shrink_root_partition_table(&root_dev, &boot_disk, &root_part_num, emitter).await
+            {
+                emitter.progress(&format!("WARNING: Partition table shrink failed: {}", e));
+            }
+            if unpartitioned_bytes(&boot_disk).await >= MIN_UNPARTITIONED {
+                let _ = std::fs::remove_file(RESIZE_ATTEMPTS_FILE);
+            }
             emitter.progress("Root partition shrink complete, rebooting...");
             reboot().await;
             return Ok(true);
         }
         emitter.progress("FATAL: Previous root shrink attempt failed. Delete /root/RESIZE_ATTEMPTED and try again, or reflash with Balena Etcher.");
         bail!("Previous root shrink attempt failed. Reflash with Balena Etcher instead of Raspberry Pi Imager.");
+    }
+
+    // Bounded retries: if repeated shrink cycles never free the space,
+    // fail with guidance instead of reboot-looping forever.
+    let attempts: u32 = std::fs::read_to_string(RESIZE_ATTEMPTS_FILE)
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(0);
+    if attempts >= 3 {
+        emitter.progress(
+            "FATAL: Root partition could not be shrunk after 3 attempts — something keeps re-expanding the root filesystem. \
+             Re-flash with Raspberry Pi Imager (with OS customization disabled) or Balena Etcher and reinstall, \
+             or delete /root/RESIZE_ATTEMPTS to retry.",
+        );
+        bail!("Root shrink failed after {} attempts", attempts);
     }
 
     emitter.begin_phase("root_shrink", "Shrinking root filesystem");
@@ -699,6 +772,7 @@ async fn check_root_shrink(env: &SetupEnv, emitter: &SetupEmitter) -> Result<boo
     }
 
     let _ = std::fs::write(resize_marker, "");
+    let _ = std::fs::write(RESIZE_ATTEMPTS_FILE, format!("{}\n", attempts + 1));
 
     let kernel_ver = sentryusb_shell::run("uname", &["-r"]).await?.trim().to_string();
     let initrd_name = format!("initrd.img-{}", kernel_ver);
@@ -896,6 +970,67 @@ async fn fix_uas_quirks(env: &SetupEnv, emitter: &SetupEmitter) -> Result<()> {
     Ok(())
 }
 
+/// cmdline.txt tokens Raspberry Pi OS uses to run its firstboot/auto-expand
+/// machinery. Mirrors the sed strip in pi-gen-sources/00-sentryusb-tweaks.
+const AUTO_EXPAND_TOKENS: &[&str] = &[
+    "init=/usr/lib/raspberrypi-sys-mods/firstboot",
+    "systemd.run=/boot/firmware/firstrun.sh",
+    "systemd.run=/boot/firstrun.sh",
+    "systemd.run_success_action=reboot",
+    "systemd.unit=kernel-command-line.target",
+];
+
+/// Remove the Pi OS firstboot/auto-expand tokens from a cmdline string.
+/// Returns the (single-line) cleaned cmdline and whether anything changed.
+fn strip_auto_expand_tokens(cmdline: &str) -> (String, bool) {
+    let mut changed = false;
+    let kept: Vec<&str> = cmdline
+        .split_whitespace()
+        .filter(|tok| {
+            if AUTO_EXPAND_TOKENS.contains(tok) {
+                changed = true;
+                false
+            } else {
+                true
+            }
+        })
+        .collect();
+    (kept.join(" "), changed)
+}
+
+/// Disable Raspberry Pi OS's firstboot auto-expand so it can't re-grow the
+/// root filesystem after the shrink phase. The pi-gen image build strips
+/// these at image time; the install-pi.sh path on a stock Pi Imager flash
+/// keeps them active, which re-expanded the root fs after every initramfs
+/// shrink and caused an infinite shrink-reboot loop. Idempotent; silent
+/// when nothing needed changing. Runs before the first setup reboot.
+async fn disable_os_auto_expand(env: &SetupEnv, emitter: &SetupEmitter) -> Result<()> {
+    let mut changed = false;
+
+    if let Some(cmdline_path) = &env.cmdline_path {
+        if let Ok(content) = std::fs::read_to_string(cmdline_path) {
+            let (cleaned, stripped) = strip_auto_expand_tokens(&content);
+            if stripped {
+                std::fs::write(cmdline_path, format!("{}\n", cleaned))?;
+                changed = true;
+            }
+        }
+    }
+
+    if Path::new("/etc/init.d/resize2fs_once").exists() {
+        let _ = sentryusb_shell::run("systemctl", &["disable", "resize2fs_once"]).await;
+        let _ = sentryusb_shell::run("update-rc.d", &["resize2fs_once", "remove"]).await;
+        let _ = std::fs::remove_file("/etc/init.d/resize2fs_once");
+        changed = true;
+    }
+
+    if changed {
+        emitter.begin_phase("disable_auto_expand", "Disabling OS auto-expand");
+        emitter.progress("Disabled Raspberry Pi OS firstboot auto-expand (would undo the root shrink).");
+    }
+    Ok(())
+}
+
 /// Update the package index. Only announces if we actually need to run apt-get update.
 async fn update_package_index(emitter: &SetupEmitter) -> Result<()> {
     // Quick heuristic: if /var/lib/apt/lists has been touched in the last
@@ -1051,4 +1186,45 @@ async fn initialize_drive_directories() -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::strip_auto_expand_tokens;
+
+    #[test]
+    fn strips_firstboot_init_token() {
+        let cmdline = "console=serial0,115200 console=tty1 root=PARTUUID=abc rootfstype=ext4 fsck.repair=yes rootwait quiet init=/usr/lib/raspberrypi-sys-mods/firstboot";
+        let (cleaned, changed) = strip_auto_expand_tokens(cmdline);
+        assert!(changed);
+        assert!(!cleaned.contains("firstboot"));
+        assert!(cleaned.starts_with("console=serial0,115200"));
+        assert!(cleaned.ends_with("quiet"));
+        assert!(!cleaned.contains('\n'));
+    }
+
+    #[test]
+    fn strips_systemd_run_tokens_mid_line() {
+        let cmdline = "console=tty1 systemd.run=/boot/firstrun.sh systemd.run_success_action=reboot systemd.unit=kernel-command-line.target rootwait\n";
+        let (cleaned, changed) = strip_auto_expand_tokens(cmdline);
+        assert!(changed);
+        assert_eq!(cleaned, "console=tty1 rootwait");
+    }
+
+    #[test]
+    fn untouched_when_no_tokens_present() {
+        let cmdline = "console=tty1 root=PARTUUID=abc rootwait modules-load=dwc2,g_ether";
+        let (cleaned, changed) = strip_auto_expand_tokens(cmdline);
+        assert!(!changed);
+        assert_eq!(cleaned, cmdline);
+    }
+
+    #[test]
+    fn does_not_eat_substring_lookalikes() {
+        // A token that merely contains "firstrun.sh" as a substring must survive.
+        let cmdline = "console=tty1 initcall_blacklist=firstboot rootwait";
+        let (cleaned, changed) = strip_auto_expand_tokens(cmdline);
+        assert!(!changed);
+        assert_eq!(cleaned, cmdline);
+    }
 }

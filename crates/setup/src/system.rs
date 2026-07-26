@@ -43,6 +43,13 @@ pub async fn configure_hostname(env: &SetupEnv, emitter: &SetupEmitter) -> Resul
         hosts
     };
     std::fs::write("/etc/hosts", new_hosts)?;
+
+    // Avahi keeps advertising the old name until restarted, leaving
+    // `<hostname>.local` dead while the IP works (the bash-era
+    // configure_hostname restarted it too).
+    if sentryusb_shell::run("systemctl", &["-q", "is-active", "avahi-daemon"]).await.is_ok() {
+        let _ = sentryusb_shell::run("systemctl", &["restart", "avahi-daemon"]).await;
+    }
     Ok(true)
 }
 
@@ -172,7 +179,15 @@ pub async fn configure_avahi(env: &SetupEnv, emitter: &SetupEmitter) -> Result<b
     let content_matches = existing == desired;
     let mut conf_rewrite = avahi_ipv4_only_rewrite();
 
-    if !needs_install && content_matches && conf_rewrite.is_none() {
+    // Also verify the daemon is actually enabled and running — a masked or
+    // dead avahi with correct config files means .local is silently broken,
+    // and returning early here would never repair it. Falling through
+    // reaches the enable+restart at the end.
+    let daemon_healthy = !needs_install
+        && sentryusb_shell::run("systemctl", &["-q", "is-enabled", "avahi-daemon"]).await.is_ok()
+        && sentryusb_shell::run("systemctl", &["-q", "is-active", "avahi-daemon"]).await.is_ok();
+
+    if !needs_install && content_matches && conf_rewrite.is_none() && daemon_healthy {
         return Ok(false);
     }
 

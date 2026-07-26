@@ -685,6 +685,32 @@ systemctl enable avahi-daemon >/dev/null 2>&1 || true
 systemctl restart avahi-daemon >/dev/null 2>&1 || true
 ok "mDNS active: http://${TARGET_HOSTNAME}.local"
 
+# ── Step 5c: Disable Pi OS auto-expand ─────────────────────────────
+# Raspberry Pi Imager leaves the firstboot/resize2fs_once auto-expand
+# active; it re-grows the root filesystem after setup's shrink phase,
+# which used to trap setup in an infinite shrink-reboot loop. The setup
+# binary also does this, but strip it here as defense in depth.
+
+CMDLINE_FILE=""
+for f in /boot/firmware/cmdline.txt /boot/cmdline.txt; do
+    [ -f "$f" ] && CMDLINE_FILE="$f" && break
+done
+if [ -n "$CMDLINE_FILE" ]; then
+    sed -i \
+        -e 's| systemd\.run=/boot/firmware/firstrun\.sh||g' \
+        -e 's| systemd\.run=/boot/firstrun\.sh||g' \
+        -e 's| systemd\.run_success_action=reboot||g' \
+        -e 's| systemd\.unit=kernel-command-line\.target||g' \
+        -e 's| init=/usr/lib/raspberrypi-sys-mods/firstboot||g' \
+        "$CMDLINE_FILE"
+fi
+if [ -f /etc/init.d/resize2fs_once ]; then
+    systemctl disable resize2fs_once >/dev/null 2>&1 || true
+    update-rc.d resize2fs_once remove >/dev/null 2>&1 || true
+    rm -f /etc/init.d/resize2fs_once
+    ok "Disabled Raspberry Pi OS auto-expand (resize2fs_once)"
+fi
+
 # ── Step 6: Start the Service ──────────────────────────────────────
 
 info "Starting SentryUSB..."
