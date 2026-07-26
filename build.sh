@@ -69,12 +69,12 @@ TARGET="${1:-arm64}"
 
 case "$TARGET" in
     arm64)
-        echo "Building for ARM64 (Pi 3/4/5, Pi Zero 2W 64-bit)..."
+        echo "Building for ARM64 (Pi 3A+/4/5, Pi Zero 2W 64-bit)..."
         cross build --release --target aarch64-unknown-linux-gnu
         BINARY="target/aarch64-unknown-linux-gnu/release/sentryusb"
         ;;
     armv7)
-        echo "Building for ARMv7 (Pi 3 32-bit legacy)..."
+        echo "Building for ARMv7 (Pi 3A+ 32-bit legacy)..."
         cross build --release --target armv7-unknown-linux-gnueabihf
         BINARY="target/armv7-unknown-linux-gnueabihf/release/sentryusb"
         ;;

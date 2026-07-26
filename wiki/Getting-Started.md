@@ -1,6 +1,8 @@
-﻿# Getting Started
+# Getting Started
 
 Total time: roughly **10–15 minutes** of hands-on work, plus the time it takes to download and flash Pi OS.
+
+> **Before you start:** check the [supported boards](Home#what-you-need). Notably, the **Pi 3B/3B+ cannot work at all** (hardware limitation), and a Pi 3A+ needs a USB-A-to-USB-A cable.
 
 > [!NOTE]
 > **There's no prebuilt Sentry USB SD image yet.** To be released.
@@ -58,7 +60,7 @@ Once you're in, run:
 ```bash
 sudo apt update && sudo apt upgrade -y
 sudo -i
-curl -fsSL https://raw.githubusercontent.com/Sentry-Six/Sentry-USB-Rusty/main/install-pi.sh | bash
+curl -fsSL https://usb.sentry-six.com | bash
 ```
 
 > [!IMPORTANT]

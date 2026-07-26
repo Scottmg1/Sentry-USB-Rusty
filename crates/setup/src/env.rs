@@ -10,7 +10,10 @@ use anyhow::Result;
 pub enum PiModel {
     Pi5,
     Pi4,
-    Pi3,
+    /// Pi 3A+ — the only Pi 3 with the SoC USB exposed directly (gadget-capable).
+    Pi3APlus,
+    /// Pi 3B / 3B+ — USB routed through the LAN9514 hub chip; host-only, no OTG.
+    Pi3B,
     PiZero2,
     PiZeroW,
     Pi2,
@@ -34,8 +37,12 @@ impl PiModel {
             PiModel::Pi5
         } else if lower.contains("raspberry pi 4") {
             PiModel::Pi4
+        } else if lower.contains("raspberry pi 3 model a") {
+            // "Raspberry Pi 3 Model A Plus" — direct SoC USB, gadget-capable.
+            PiModel::Pi3APlus
         } else if lower.contains("raspberry pi 3") {
-            PiModel::Pi3
+            // 3B / 3B+ — USB goes through the LAN9514 hub, host-only.
+            PiModel::Pi3B
         } else if lower.contains("raspberry pi zero 2") {
             PiModel::PiZero2
         } else if lower.contains("raspberry pi zero") {
@@ -58,7 +65,7 @@ impl PiModel {
         match self {
             PiModel::Pi5 => "pi5",
             PiModel::Pi4 => "pi4",
-            PiModel::Pi3 => "all", // Pi3 uses global section
+            PiModel::Pi3APlus => "all", // Pi 3A+ uses global section
             PiModel::PiZero2 => "pi02",
             _ => "all",
         }
@@ -68,7 +75,8 @@ impl PiModel {
         match self {
             PiModel::Pi5 => "Raspberry Pi 5",
             PiModel::Pi4 => "Raspberry Pi 4",
-            PiModel::Pi3 => "Raspberry Pi 3",
+            PiModel::Pi3APlus => "Raspberry Pi 3A+",
+            PiModel::Pi3B => "Raspberry Pi 3B/3B+",
             PiModel::PiZero2 => "Raspberry Pi Zero 2 W",
             PiModel::PiZeroW => "Raspberry Pi Zero W",
             PiModel::Pi2 => "Raspberry Pi 2",

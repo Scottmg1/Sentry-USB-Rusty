@@ -1,4 +1,4 @@
-﻿﻿# Troubleshooting
+# Troubleshooting
 
 Most install problems fall into a few buckets. If your issue isn't here, ping **[Discord](https://discord.gg/9QZEzVwdnt)** — answers come fast and we'll add common ones to this page over time.
 
@@ -26,7 +26,7 @@ Setup reboots the Pi several times, and each reboot drops the `sentryusb.local` 
 Older versions could get stuck endlessly re-shrinking the root partition when Raspberry Pi OS's own first-boot auto-expand was still active (it re-grew the filesystem after every shrink). This is fixed — re-run the installer to get the latest version:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/Sentry-Six/Sentry-USB-Rusty/main/install-pi.sh | bash
+curl -fsSL https://usb.sentry-six.com | bash
 ```
 
 If setup now stops with "Root partition could not be shrunk after 3 attempts", re-flash the SD card/SSD with Raspberry Pi Imager (with OS customization disabled) or Balena Etcher and reinstall.
@@ -35,13 +35,16 @@ If setup now stops with "Root partition could not be shrunk after 3 attempts", r
 
 The car isn't seeing the Pi as a USB drive.
 
+> **On a Pi 3B or 3B+, this can never work.** Their USB ports go through a hub chip that strips USB device (OTG) mode — a hardware limitation no setting can fix. Current versions of setup refuse to run on these boards; see the [FAQ](FAQ#can-i-run-it-on-hardware-other-than-a-raspberry-pi) for the supported list.
+
 **Try:**
 
 1.  **Check the cable** — make sure it's a **USB data cable**, not charge-only. The cheap ones bundled with most USB chargers are charge-only.
 2.  On a **Pi Zero 2 W**, connect the Tesla cable to the port labelled **USB**, not **PWR IN**. The `PWR IN` port can power the Pi, but it does not carry the USB data connection the car needs.
-3.  Plug the Pi into a different USB port on the Tesla. Newer cars: glovebox port. Older cars: front console ports.
-4.  Power-cycle the Pi (unplug, wait 5 seconds, plug back in).
-5.  SSH into the Pi and check the main service: `systemctl status sentryusb`. It includes the USB-gadget functionality; there is no separate `sentryusb-gadget` systemd unit.
+3.  On a **Pi 3A+**, the car must be connected to the Pi's USB-A port, which means a **USB-A to USB-A data cable** — an unusual cable most households don't have lying around.
+4.  Plug the Pi into a different USB port on the Tesla. Newer cars: glovebox port. Older cars: front console ports.
+5.  Power-cycle the Pi (unplug, wait 5 seconds, plug back in).
+6.  SSH into the Pi and check the main service: `systemctl status sentryusb`. It includes the USB-gadget functionality; there is no separate `sentryusb-gadget` systemd unit.
 
 ## My clips are being saved, but I can't see or access them.
 

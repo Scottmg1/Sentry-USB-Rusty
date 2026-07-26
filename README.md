@@ -104,8 +104,9 @@ Then open `http://sentryusb.local` in a browser and the setup wizard takes you t
 | Tier | Boards | Notes |
 |------|--------|-------|
 | **Recommended** | Raspberry Pi 4B, Raspberry Pi 5 | USB 2.0 OTG — fastest archiving, smoothest UI |
-| **Tested** | Raspberry Pi Zero 2 W, Raspberry Pi 3 (A+/B/B+) | USB 2.0 OTG — works fine, slower archive speeds |
+| **Tested** | Raspberry Pi Zero 2 W, Raspberry Pi 3A+ | USB 2.0 OTG — works fine, slower archive speeds. Pi 3A+ needs a USB-A-to-USB-A cable |
 | **Community** | Radxa Rock Pi 4C+, Radxa Zero 3W | USB 3.0 OTG — reported working, not officially supported |
+| **Not supported** | Raspberry Pi 3B/3B+, Pi 2, Pi Zero W (v1), Pi 1 | 3B/3B+/2/1: USB goes through a hub chip — host-only, can never appear as a drive to the car. Zero W v1: too slow, build retired |
 
 Plus a **256 GB+ MicroSD card** and a **USB 3.0 data cable** (not charge-only) between the Pi and your Tesla. Use a 3.0 cable even on USB 2.0 boards — it delivers more power and keeps lower-end Pis stable.
 
@@ -146,7 +147,7 @@ rm -rf crates/sentryusb/static && cp -r web/dist crates/sentryusb/static
 # Binaries (aarch64)
 cross build --release --target aarch64-unknown-linux-gnu -p sentryusb
 
-# 32-bit (armhf — Pi 3 with 32-bit Pi OS):
+# 32-bit (armhf — Pi 3A+ with 32-bit Pi OS):
 cross build --release --target armv7-unknown-linux-gnueabihf -p sentryusb
 ```
 
@@ -155,8 +156,8 @@ See [BUILD.md](BUILD.md) for details.
 ### Build a full Pi image (advanced)
 
 ```bash
-./build-image.sh                 # 64-bit image (Pi 3/4/5/Zero 2)
-./build-image.sh --32bit         # 32-bit image (armhf — Pi 3 with 32-bit Pi OS)
+./build-image.sh                 # 64-bit image (Pi 3A+/4/5/Zero 2)
+./build-image.sh --32bit         # 32-bit image (armhf — Pi 3A+ with 32-bit Pi OS)
 ```
 
 The build-image script is for developers and CI; end users should use the curl-one-liner install above.

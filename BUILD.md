@@ -29,12 +29,12 @@ Two binaries ship with the project:
 
 ### Cross-compile for the Pi
 
-64-bit (Pi 3/4/5/Zero 2):
+64-bit (Pi 3A+/4/5/Zero 2):
 ```
 cross build --release --target aarch64-unknown-linux-gnu -p sentryusb
 ```
 
-32-bit (armhf — Pi 3 with 32-bit Pi OS):
+32-bit (armhf — Pi 3A+ with 32-bit Pi OS):
 ```
 cross build --release --target armv7-unknown-linux-gnueabihf -p sentryusb
 ```

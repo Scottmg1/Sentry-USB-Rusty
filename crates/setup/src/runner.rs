@@ -387,7 +387,9 @@ async fn configure_dwc2_overlay(env: &SetupEnv, emitter: &SetupEmitter) -> Resul
     let config = std::fs::read_to_string(&config_path).unwrap_or_default();
     let section = env.pi_model.config_section();
 
-    let overlay_line = if env.pi_model == crate::env::PiModel::Pi3 {
+    // Pi 3A+ has its OTG_ID pin tied to ground, so plain `dtoverlay=dwc2`
+    // comes up host-only — it needs dr_mode=peripheral to act as a gadget.
+    let overlay_line = if env.pi_model == crate::env::PiModel::Pi3APlus {
         "dtoverlay=dwc2,dr_mode=peripheral"
     } else {
         "dtoverlay=dwc2"

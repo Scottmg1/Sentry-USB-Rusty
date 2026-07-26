@@ -1,4 +1,4 @@
-﻿﻿# Frequently Asked Questions (FAQ)
+# Frequently Asked Questions (FAQ)
 
 ## Does this void my Tesla warranty?
 
@@ -43,7 +43,9 @@ To trigger manually, open the web UI and click the **Archive Sync** action at th
 
 ## Can I run it on hardware other than a Raspberry Pi?
 
-Officially supported: Raspberry Pi 4B, Pi 5, Pi Zero 2 W, Pi 3 (A+).
+Officially supported: Raspberry Pi 4B, Pi 5, Pi Zero 2 W, Pi 3A+ (needs a USB-A-to-USB-A cable).
+
+**Not** the Pi 3B or 3B+: their USB ports go through a hub chip that strips USB device (OTG) mode, so they can only act as hosts and can never appear as a drive to the car. This is a hardware limitation — no setting can work around it. The same applies to the Pi 2 and Pi 1, and the original Pi Zero W is too underpowered.
 
 Community-tested: Radxa Rock Pi 4C+, Radxa Zero 3W. These work but we don't actively test on them.
 

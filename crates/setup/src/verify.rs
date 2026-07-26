@@ -86,21 +86,32 @@ pub async fn verify_disk_space(env: &SetupEnv, emitter: &SetupEmitter) -> Result
 fn check_supported_hardware(env: &SetupEnv) -> Result<()> {
     // Not-a-Pi skips the check entirely — matches bash: non-Pi boards
     // (RockPi, Radxa) are handled by other setup paths and aren't our
-    // problem here. Pi 2 has no USB gadget hardware; Pi Zero W (the
-    // original armv6 board) was dropped in 2026 — too underpowered to
-    // run the daemon comfortably, and the armv6 build was retired to
-    // keep release artifact counts manageable.
+    // problem here. Pi 2 has no USB gadget hardware; Pi 3B/3B+ route
+    // all USB through the LAN9514 hub chip, which strips OTG — they can
+    // only ever be USB hosts (per Raspberry Pi's OTG white paper), so
+    // the gadget can never enumerate on the car side. The Pi 3A+ is the
+    // one gadget-capable Pi 3: its single USB-A port comes straight off
+    // the SoC. Pi Zero W (the original armv6 board) was dropped in
+    // 2026 — too underpowered to run the daemon comfortably, and the
+    // armv6 build was retired to keep release artifact counts
+    // manageable.
     match env.pi_model {
-        PiModel::Pi5 | PiModel::Pi4 | PiModel::Pi3 | PiModel::PiZero2 => {
+        PiModel::Pi5 | PiModel::Pi4 | PiModel::Pi3APlus | PiModel::PiZero2 => {
             Ok(())
         }
+        PiModel::Pi3B => bail!(
+            "STOP: unsupported hardware: Raspberry Pi 3B/3B+. \
+             Its USB ports go through a hub chip (LAN9514) and cannot act as a USB \
+             device, so it can never appear as a drive to the car. \
+             Use a Pi 3A+, Pi Zero 2 W, Pi 4, or Pi 5 instead."
+        ),
         PiModel::PiZeroW => bail!(
             "STOP: unsupported hardware: Raspberry Pi Zero W. \
-             SentryUSB requires Pi Zero 2 W or newer (Pi 3, Pi 4, Pi 5)."
+             SentryUSB requires Pi Zero 2 W or newer (Pi 3A+, Pi 4, Pi 5)."
         ),
         PiModel::Pi2 => bail!(
             "STOP: unsupported hardware: Raspberry Pi 2. \
-             (only Pi Zero 2 W, Pi 3, Pi 4, and Pi 5 have the necessary hardware to run SentryUSB)"
+             (only Pi Zero 2 W, Pi 3A+, Pi 4, and Pi 5 have the necessary hardware to run SentryUSB)"
         ),
         PiModel::Rock4CPlus => Ok(()),
         PiModel::Other => {
