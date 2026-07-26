@@ -43,7 +43,7 @@ To trigger manually, open the web UI and click the **Archive Sync** action at th
 
 ## Can I run it on hardware other than a Raspberry Pi?
 
-Officially supported: Raspberry Pi 4B, Pi 5, Pi Zero 2 W, Pi 3 (A+/B/B+).
+Officially supported: Raspberry Pi 4B, Pi 5, Pi Zero 2 W, Pi 3 (A+).
 
 Community-tested: Radxa Rock Pi 4C+, Radxa Zero 3W. These work but we don't actively test on them.
 
