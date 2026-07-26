@@ -1,0 +1,26 @@
+# SentryUSB BLE native-advertising manifest
+# ---------------------------------------------------------------------------
+# Boards listed here have been RF-VERIFIED to advertise their SentryUSB name
+# over the air using bluetoothd's own advertising (no raw-HCI helper needed).
+# A board NOT matched here runs the helper (fail-safe: discoverable > dark).
+#
+# Allow-list, not a chip gate: chip and BlueZ build both fail to classify these
+# boards (the working Pi 5 and helper-needing Pi 4B are the same chip + same
+# bluetoothd binary). Only board model + kernel family separates them.
+#
+# FORMAT:  <model-substring>|<kernel-family-substring>
+#   A board is NATIVE when /proc/device-tree/model contains <model-substring>
+#   AND `uname -r` contains <kernel-family-substring>. Substring (not exact
+#   version) so a kernel point-update on an existing install stays native.
+#   Lines starting with # and blank lines are ignored.
+#
+# Adding a board: RF-confirm on a second BLE receiver that it advertises the
+#   name with the helper OFF, then add its model + kernel-family here.
+#   Never add a bare chip or a family wildcard — that is the original bug.
+
+# Raspberry Pi 5 — rpt BlueZ build; RF-confirmed to advertise the name natively.
+Raspberry Pi 5|+rpt-rpi
+
+# Radxa ZERO 3 (AIC8800) — RF-confirmed native. (Separate AIC8800 dark-after-
+# restart quirk is handled by its own reboot-recovery path, not here.)
+Radxa ZERO 3|vendor-rk35xx

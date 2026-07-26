@@ -1,13 +1,16 @@
 [Unit]
-Description=SentryUSB: legacy LE advertising (Broadcom Pi-family chip workaround)
-After=bluetooth.service sentryusb-ble.service
+Description=SentryUSB: legacy LE advertising (raw-HCI advertiser for helper-mode boards)
+After=bluetooth.service sentryusb-ble.service sentryusb-ble-mode.service
 Wants=bluetooth.service
 BindsTo=sentryusb-ble.service
 
 [Service]
 Type=simple
 ExecStart=/usr/local/bin/sentryusb-ble-adv.sh
-Restart=always
+# on-failure, NOT always: the script exits 0 on native-mode boards (bluetoothd
+# owns advertising there). Restart=always would restart-loop that clean exit
+# every 10s. A crash still restarts; a clean native standdown stays stopped.
+Restart=on-failure
 RestartSec=10
 
 [Install]
