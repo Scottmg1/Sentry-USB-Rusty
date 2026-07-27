@@ -1178,12 +1178,23 @@ class Advertisement(dbus.service.Object):
                 error_handler=on_gatt_err)
 
         def on_reregister_error(error):
+            # A half-registered advert answers AlreadyExists — we ARE advertising.
+            if 'AlreadyExists' in str(error):
+                log.info('Advertisement already registered — treating as success')
+                on_success()
+                return
             if retry_count < max_retries:
                 delay = min(2000 * (2 ** retry_count), 30000)  # exponential backoff, max 30s
                 log.warning(f'Advertisement re-registration failed (attempt {retry_count + 1}/{max_retries + 1}): {error} — retrying in {delay}ms')
                 GLib.timeout_add(delay, self._reregister, retry_count + 1)
             else:
-                log.error(f'Advertisement re-registration failed after {max_retries + 1} attempts: {error} — GATT server still running but Pi is not discoverable')
+                # Keep retrying at 60s — never leave the board undiscoverable
+                # while the daemon lives.
+                if retry_count == max_retries:
+                    log.error(f'Advertisement re-registration failed after {max_retries + 1} attempts: {error} — retrying every 60s until it lands')
+                else:
+                    log.info(f'Advertisement re-registration still failing: {error} — next retry in 60s')
+                GLib.timeout_add(60000, self._reregister, retry_count + 1)
 
         self.ad_manager.RegisterAdvertisement(
             self.get_path(), {},
@@ -1447,14 +1458,6 @@ def enable_controller_advertising(adapter_path, advertise=True):
 def register_ad_cb():
     log.info('Advertisement registered')
 
-def register_ad_error_cb(error):
-    # BCM4345C0 (Rock 4C+): BlueZ uses EXTENDED advertising which this chip
-    # rejects ('Invalid Parameters 0x0d'). Do NOT exit (that tears down GATT
-    # and loops forever); keep GATT up. Legacy btmgmt advertising is enabled
-    # out-of-band by sentryusb-ble-adv.service.
-    log.warning(f'BlueZ advertisement registration failed ({error}); '
-                'using legacy btmgmt advertising instead; GATT stays up.')
-
 def register_app_cb():
     log.info('GATT application registered')
 
@@ -1713,10 +1716,15 @@ def main():
             log.info('Initial advertisement deferred: central connect in flight')
             GLib.timeout_add(1000, register_initial_adv)
             return False
+        def on_initial_error(error):
+            # Transient BlueZ failure at boot must not leave the board dark until
+            # a daemon restart — reuse the Release-path retry machinery.
+            log.warning(f'Initial advertisement registration failed ({error}) — scheduling retries; GATT stays up')
+            GLib.timeout_add(2000, adv._reregister)
         ad_manager.RegisterAdvertisement(
             adv.get_path(), {},
             reply_handler=register_ad_cb,
-            error_handler=register_ad_error_cb)
+            error_handler=on_initial_error)
         return False
     # Helper mode: GATT only — the raw-HCI helper is the sole advertiser.
     if adv_mode == 'native':

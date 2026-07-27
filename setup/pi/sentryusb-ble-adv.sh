@@ -9,6 +9,9 @@
 # local name MUST appear in the scan response (BlueZ doesn't include the
 # name in this path by default, hence the explicit scan-rsp builder below).
 # Fresh flag = a central connect is in flight; don't re-assert advertising then.
+# C locale so [[:space:]] and case classes stay ASCII-only, matching ble.py's
+# ASCII strip (under UTF-8 a NBSP in BLE_ADAPTER would diverge the two parsers).
+export LC_ALL=C
 CONNECTING_FLAG="/tmp/ble_connecting"
 CONNECTING_FLAG_MAX_AGE=15   # seconds; ignore a stale flag a crashed connect left behind
 

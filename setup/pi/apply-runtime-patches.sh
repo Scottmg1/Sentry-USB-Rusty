@@ -98,6 +98,12 @@ apply_ble_nonfatal_adv() {
         log "BLE non-fatal-adv: already patched"
         return 0
     fi
+    # Newer ble.py removed register_ad_error_cb entirely (native mode retries
+    # registration itself) — nothing to patch.
+    if ! grep -q 'def register_ad_error_cb' "$f"; then
+        log "BLE non-fatal-adv: obsolete on this build (retry built in)"
+        return 0
+    fi
 
     # Make root RW for the write (no-op if already RW). Shipped by
     # install-pi.sh; safe to call here.
