@@ -1419,11 +1419,10 @@ def enable_controller_advertising(adapter_path, advertise=True):
             if attempt < 3:
                 time.sleep(1)
         if cleared:
-            log.info(f'Cleared advertising flag on {hci} '
-                     '(helper mode: raw-HCI helper is the sole advertiser)')
+            log.info(f'Cleared global advertising flag on {hci} '
+                     '(D-Bus advert or raw-HCI helper is the sole advertiser)')
         else:
-            log.warning(f'Could not confirm advertising cleared on {hci} — '
-                        'bluetoothd may compete with the raw-HCI helper')
+            log.warning(f'Could not confirm global advertising cleared on {hci}')
 
 
 def register_ad_cb():
@@ -1629,12 +1628,12 @@ def main():
     log.info(f'Using adapter: {adapter_path}')
 
     # Re-enable controller-level flags now that BlueZ is provably up (was a unit
-    # ExecStartPre; moved here so the unit reaches active fast). In helper mode
-    # we set connectable + bondable but NOT advertising — the raw-HCI helper is
-    # the sole advertiser, so bluetoothd advertising here would fight it.
+    # Never set the global mgmt 'advertising' flag: RegisterAdvertisement (native)
+    # or the raw-HCI helper (helper mode) advertises. On legacy-adv chips the flag
+    # truncates the name (crams name+UUID into the 31-byte primary packet).
     adv_mode = ble_adv_mode()
     log.info(f'BLE advertising mode: {adv_mode}')
-    enable_controller_advertising(adapter_path, advertise=(adv_mode == 'native'))
+    enable_controller_advertising(adapter_path, advertise=False)
 
     # Subscribe to BlueZ D-Bus signals so connection events are logged.
     # This makes it possible to see whether iOS actually connects to the Pi
