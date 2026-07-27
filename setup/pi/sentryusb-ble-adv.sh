@@ -15,13 +15,33 @@ CONNECTING_FLAG_MAX_AGE=15   # seconds; ignore a stale flag a crashed connect le
 UUID_LE="9e ca dc 24 0e e5 a9 e0 93 f3 a3 b5 01 00 40 6e"   # 6e400001-b5a3-f393-e0a9-e50e24dcca9e, little-endian
 ADV_DATA="15 02 01 06 11 07 ${UUID_LE} 00 00 00 00 00 00 00 00 00 00 00 00 00"
 
+# Advertise on the adapter GATT uses: BLE_ADAPTER=hciN from sentryusb.conf,
+# default hci0. Normalized like ble.py's read_ble_adapter_from_config (first
+# line wins; "hciN" or bare "N" -> hciN; else hci0).
+_cfg=$(sed -n 's/^[[:space:]]*BLE_ADAPTER[[:space:]]*=[[:space:]]*//p' /root/sentryusb.conf 2>/dev/null | head -1)
+# Match ble.py's value.strip().strip('"').strip("'").strip(): trim edge
+# whitespace, then all edge " then all edge ' (each independently), then edge ws.
+_cfg=${_cfg%"${_cfg##*[![:space:]]}"}
+while case "$_cfg" in \"*) true ;; *) false ;; esac; do _cfg=${_cfg#\"}; done
+while case "$_cfg" in *\") true ;; *) false ;; esac; do _cfg=${_cfg%\"}; done
+while case "$_cfg" in \'*) true ;; *) false ;; esac; do _cfg=${_cfg#\'}; done
+while case "$_cfg" in *\') true ;; *) false ;; esac; do _cfg=${_cfg%\'}; done
+_cfg=${_cfg%"${_cfg##*[![:space:]]}"}   # trailing whitespace
+_cfg=${_cfg#"${_cfg%%[![:space:]]*}"}   # leading whitespace (ble.py's final .strip())
+case "$_cfg" in
+    hci[0-9]*) HCI="$_cfg" ;;
+    [0-9]*)    HCI="hci$_cfg" ;;
+    *)         HCI=hci0 ;;
+esac
+IDX="${HCI#hci}"; case "$IDX" in ''|*[!0-9]*) HCI=hci0; IDX=0 ;; esac
+
 # Scan-response bytes = [len][0x09 Complete Local Name][name…]. Function is
 # defined before the run-guard so it's sourceable for unit-style testing.
 build_scanrsp() {
     local name hex namebytes adlen siglen pad i
     # `printf '' |` closes stdin — under systemd a bare `btmgmt info` busy-loops
     # on /dev/null and returns empty (→ hostname fallback). Closed pipe = EOF.
-    name=$(printf '' | timeout 5 btmgmt info 2>/dev/null | sed -n 's/^[[:space:]]*name[[:space:]]*//p' | head -1)
+    name=$(printf '' | timeout 5 btmgmt --index "$IDX" info 2>/dev/null | sed -n 's/^[[:space:]]*name[[:space:]]*//p' | head -1)
     [ -z "$name" ] && name=$(hostname)
     name=${name:0:29}                                   # scan-rsp budget: 31 - 2 (len+type)
     hex=$(printf '%s' "$name" | od -An -tx1 | tr -d ' \n')
@@ -44,15 +64,15 @@ build_scanrsp() {
 # logging "GATT 147 bond=BOND_NONE" 10s into the attempt.
 assert_raw_adv() {
     local scanrsp; scanrsp=$(build_scanrsp)
-    hcitool -i hci0 cmd 0x08 0x000a 00 >/dev/null 2>&1 || true
-    hcitool -i hci0 cmd 0x08 0x0008 $ADV_DATA >/dev/null 2>&1 || true
+    hcitool -i "$HCI" cmd 0x08 0x000a 00 >/dev/null 2>&1 || true
+    hcitool -i "$HCI" cmd 0x08 0x0008 $ADV_DATA >/dev/null 2>&1 || true
     # build_scanrsp already emits the full 32 bytes (sig-length + 31-byte data,
     # zero-padded) — do NOT append more zeros here or the param exceeds 32.
-    hcitool -i hci0 cmd 0x08 0x0009 $scanrsp >/dev/null 2>&1 || true
-    hcitool -i hci0 cmd 0x08 0x0006 a0 00 a0 00 00 00 00 00 00 00 00 00 00 07 00 >/dev/null 2>&1 || true
+    hcitool -i "$HCI" cmd 0x08 0x0009 $scanrsp >/dev/null 2>&1 || true
+    hcitool -i "$HCI" cmd 0x08 0x0006 a0 00 a0 00 00 00 00 00 00 00 00 00 00 07 00 >/dev/null 2>&1 || true
     # Re-check right before enabling so we never re-arm advertising mid-connect.
     connect_in_flight && return 0
-    hcitool -i hci0 cmd 0x08 0x000a 01 >/dev/null 2>&1 || true
+    hcitool -i "$HCI" cmd 0x08 0x000a 01 >/dev/null 2>&1 || true
 }
 
 # True while a central connect is in flight (flag fresh within max-age).
@@ -74,7 +94,7 @@ connect_in_flight() {
 # while the car link is up left the car link intact). hcitool reports the
 # LOCAL role as "lm PERIPHERAL" (older BlueZ: "lm SLAVE").
 peripheral_link_up() {
-    hcitool con 2>/dev/null | grep -qiE 'lm (PERIPHERAL|SLAVE)'
+    hcitool -i "$HCI" con 2>/dev/null | grep -qiE 'lm (PERIPHERAL|SLAVE)'
 }
 
 # Run the advertising loop ONLY when executed directly (the systemd ExecStart),
@@ -94,8 +114,8 @@ fi
 
 for i in $(seq 1 30); do busctl status org.bluez >/dev/null 2>&1 && break; sleep 1; done
 sleep 3   # let bluetoothd's (failing) ext-adv RegisterAdvertisement settle first
-timeout 5 btmgmt le on >/dev/null 2>&1 || true
-timeout 5 btmgmt connectable on >/dev/null 2>&1 || true
+timeout 5 btmgmt --index "$IDX" le on >/dev/null 2>&1 || true
+timeout 5 btmgmt --index "$IDX" connectable on >/dev/null 2>&1 || true
 while true; do
     # Re-assert while IDLE: skip only while a phone connect is in flight, or a
     # phone is already connected (a PERIPHERAL-role link). Do NOT skip merely
