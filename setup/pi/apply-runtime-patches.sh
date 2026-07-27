@@ -48,31 +48,34 @@ is_rock_4cplus() {
 # kernel logs on first BT probe (e.g. "Bluetooth: hci0: BCM43430B0 (002.001.012)").
 #
 # Currently:
-#   BCM4345C0 — Rock 4C+ (confirmed broken via field evidence)
+#   BCM4345C0 — Rock 4C+ (confirmed broken via field evidence) AND
+#     Raspberry Pi 4 Model B (confirmed broken via btmon trace 2026-07-25:
+#     "Add Extended Advertising Data (0x0055) → Invalid Parameters (0x0d)";
+#     without the helper only LE Set Advertising Parameters + Enable are
+#     issued — no Set Advertising Data (0x0008) — so the Pi advertises an
+#     EMPTY packet and is undiscoverable by name/UUID). Pi 4B's BT loads
+#     firmware brcm/BCM4345C0.raspberrypi,4-model-b.hcd — same silicon.
 #   BCM43430B0 — Pi Zero 2 W (confirmed broken via btmon trace 2026-06-20)
 #   BCM43438 — Pi 3B/3B+, Pi Zero W (same chip family / same firmware tree)
 #
 # DELIBERATELY EXCLUDED until tested:
-#   BCM43455 / CYW43455 — Pi 4 / Pi 5; their modern bluetoothd path is
-#   reported to work fine, and running our raw-HCI helper there would
-#   override their working ext-adv with legacy adv (regression). If a Pi
-#   4/5 user does hit "GATT 147 bond=BOND_NONE" they can opt in with:
+#   BCM43455 / CYW43455 — Pi 5; its modern bluetoothd path is reported to
+#   work fine, and running our raw-HCI helper there would override its
+#   working ext-adv with legacy adv (regression). (Note: Raspberry Pi 4
+#   Model B was previously excluded here on the assumption it uses
+#   BCM43455 — in the field its BT identifies as BCM4345C0 and rejects
+#   ext-adv, so it is now in the broken list above.) If an excluded board
+#   does hit "GATT 147 bond=BOND_NONE" the operator can opt in with:
 #       sudo touch /mutable/force-ble-adv-helper
 #   That sentinel forces install regardless of chip detection. The next OTA
 #   (or `sudo /usr/local/bin/sentryusb-apply-runtime-patches`) lands it.
-is_known_broken_ble_chip() {
-    # Operator override — for chips we haven't detection-listed yet but
-    # field-confirmed need the helper.
-    [ -f /mutable/force-ble-adv-helper ] && { log "BLE adv: /mutable/force-ble-adv-helper present — forcing install"; return 0; }
-    local chips="BCM4345C0\|BCM43430B0\|BCM43438"
-    dmesg 2>/dev/null | grep -qE "hci0: ($chips)" && return 0
-    # dmesg may not retain that line on a long-running box; also check the
-    # board model as a backstop (4C+'s 4345C0 + Zero 2 W's 43430B0 are
-    # board-specific so model match is unambiguous).
-    grep -qai 'rock-4c-plus\|rockpi4c-plus\|ROCK 4C+\|Raspberry Pi Zero 2 W\|Raspberry Pi 3 Model B\|Raspberry Pi Zero W' \
-        /proc/device-tree/model 2>/dev/null && return 0
-    return 1
-}
+# NOTE: the old is_known_broken_ble_chip() gate was removed here. It keyed on
+# the BT chip (BCM4345C0 et al.), which cannot classify these boards — the
+# working Pi 5, the broken 4C+, and the broken Pi 4B are all BCM4345C0. Whether
+# the helper runs is now decided per-boot by the RF-verified native manifest
+# (select-ble-adv-mode.sh + ble-native-manifest); apply_ble_adv_helper below
+# stages the files on every board and the mode marker gates the advertiser.
+# /mutable/force-ble-adv-helper still works — the selector honors it first.
 
 # ── BLE non-fatal-adv patch (all Broadcom Pi-family chips) ──────────────
 #
@@ -195,53 +198,104 @@ apply_eatt_disable() {
 # is only written when missing OR when the on-disk contents differ from the
 # current upstream version.
 #
-# Files installed:
+# Files installed (staged on every board; the mode marker gates the advertiser):
 #   /usr/local/bin/sentryusb-ble-adv.sh
+#   /usr/local/bin/select-ble-adv-mode.sh
+#   /usr/local/share/sentryusb/ble-native-manifest
 #   /etc/systemd/system/sentryusb-ble-adv.service
+#   /etc/systemd/system/sentryusb-ble-mode.service
 #   /etc/udev/rules.d/99-sentryusb-ble-hci.rules
 #   /etc/systemd/system/sentryusb-ble.service.d/wants-bluetooth.conf
+#   /root/bin/sentryusb-ble.py   (re-fetched whole so existing installs converge)
 apply_ble_adv_helper() {
-    # Gate to known-affected chips so Pi 4/5 (where bluetoothd's modern
-    # ext-adv works) don't get the raw-HCI helper overriding their good
-    # advertising. See is_known_broken_ble_chip above for the full list.
-    is_known_broken_ble_chip || { log "BLE adv: chip not in known-broken list — skipping helper install"; return 0; }
+    # No chip gate: stage everything on every board; the boot-time mode marker
+    # (select-ble-adv-mode.sh + ble-native-manifest) picks the advertiser.
     local repo="${REPO:-Sentry-Six/Sentry-USB-Rusty}"
     local base="https://raw.githubusercontent.com/${repo}/main/setup/pi"
-    local changed=0
+    local ble_base="https://raw.githubusercontent.com/${repo}/main/server/ble"
 
-    install_one() {
-        # $1 = source filename, $2 = destination path, $3 = mode
-        local src="$1" dst="$2" mode="$3"
-        local tmp; tmp="$(mktemp)" || { warn "BLE adv: mktemp failed"; return 1; }
-        if ! curl -fsSL --max-time 15 "$base/$src" -o "$tmp" 2>/dev/null; then
-            rm -f "$tmp"
-            warn "BLE adv: failed to fetch $src — leaving any existing copy alone"
-            return 1
-        fi
-        if [ -f "$dst" ] && cmp -s "$tmp" "$dst"; then
-            rm -f "$tmp"
-            return 0  # already up to date
-        fi
-        [ -x /root/bin/remountfs_rw ] && /root/bin/remountfs_rw >/dev/null 2>&1 || true
-        install -m "$mode" "$tmp" "$dst"
-        rm -f "$tmp"
-        changed=1
-        log "BLE adv: installed/refreshed $dst"
-    }
+    # (url, dst, mode) set. ble.py is re-fetched whole (the mode-gating adds
+    # three edit sites the old in-place patcher can't reliably reach; the repo
+    # copy is the source of truth and already carries the non-fatal-adv fix).
+    local specs=(
+        "$base/sentryusb-ble-adv.sh|/usr/local/bin/sentryusb-ble-adv.sh|755"
+        "$base/select-ble-adv-mode.sh|/usr/local/bin/select-ble-adv-mode.sh|755"
+        "$base/ble-native-manifest|/usr/local/share/sentryusb/ble-native-manifest|644"
+        "$base/sentryusb-ble-adv.service|/etc/systemd/system/sentryusb-ble-adv.service|644"
+        "$base/sentryusb-ble-mode.service|/etc/systemd/system/sentryusb-ble-mode.service|644"
+        "$base/99-sentryusb-ble-hci.rules|/etc/udev/rules.d/99-sentryusb-ble-hci.rules|644"
+        "$base/sentryusb-ble-wants-bluetooth.conf|/etc/systemd/system/sentryusb-ble.service.d/wants-bluetooth.conf|644"
+        "$ble_base/sentryusb-ble.py|/root/bin/sentryusb-ble.py|755"
+    )
 
-    install_one sentryusb-ble-adv.sh /usr/local/bin/sentryusb-ble-adv.sh 755 || return 0
-    install_one sentryusb-ble-adv.service /etc/systemd/system/sentryusb-ble-adv.service 644
-    install_one 99-sentryusb-ble-hci.rules /etc/udev/rules.d/99-sentryusb-ble-hci.rules 644
-    mkdir -p /etc/systemd/system/sentryusb-ble.service.d
-    install_one sentryusb-ble-wants-bluetooth.conf \
-                /etc/systemd/system/sentryusb-ble.service.d/wants-bluetooth.conf 644
+    # All-or-nothing: fetch everything to temp first; any fetch failure aborts
+    # untouched (a half-applied set can dark or dual-own the board).
+    local tmpdir; tmpdir="$(mktemp -d)" || { warn "BLE adv: mktemp -d failed"; return 0; }
+    local -a tmps dsts modes
+    local i=0 spec rest dst mode url
+    for spec in "${specs[@]}"; do
+        url="${spec%%|*}"; rest="${spec#*|}"; dst="${rest%%|*}"; mode="${rest##*|}"
+        if ! curl -fsSL --max-time 15 "$url" -o "$tmpdir/$i" 2>/dev/null; then
+            warn "BLE adv: fetch failed for ${url##*/} — aborting BLE update (no partial apply)"
+            rm -rf "$tmpdir"; return 0
+        fi
+        tmps[i]="$tmpdir/$i"; dsts[i]="$dst"; modes[i]="$mode"; i=$((i+1))
+    done
+
+    # Atomic install: back up changed files / track new ones, and on ANY install
+    # failure roll the whole set back (a mixed set would dark/dual-own on reboot).
+    local changed=0 install_failed=0 n=$i
+    [ -x /root/bin/remountfs_rw ] && /root/bin/remountfs_rw >/dev/null 2>&1 || true
+    local -a bak_files new_files
+    for (( i = 0; i < n; i++ )); do
+        [ -f "${dsts[i]}" ] && cmp -s "${tmps[i]}" "${dsts[i]}" && continue
+        if [ -f "${dsts[i]}" ]; then
+            # Back up before changing; if the backup fails, abort before the
+            # install (can't roll back an untracked change).
+            if cp -p "${dsts[i]}" "${dsts[i]}.subak" 2>/dev/null; then
+                bak_files+=("${dsts[i]}")
+            else
+                rm -f "${dsts[i]}.subak" 2>/dev/null
+                install_failed=1
+                warn "BLE adv: could not back up ${dsts[i]} — aborting before install"
+                break
+            fi
+        else
+            new_files+=("${dsts[i]}")
+        fi
+        if install -D -m "${modes[i]}" "${tmps[i]}" "${dsts[i]}"; then
+            changed=1
+            log "BLE adv: installed/refreshed ${dsts[i]}"
+        else
+            install_failed=1
+            warn "BLE adv: install failed for ${dsts[i]}"
+            break
+        fi
+    done
+    rm -rf "$tmpdir"
+
+    if [ "$install_failed" = "1" ]; then
+        warn "BLE adv: install failed — rolling back to the previous consistent set"
+        for f in "${bak_files[@]}"; do mv -f "$f.subak" "$f" 2>/dev/null || true; done
+        for f in "${new_files[@]}"; do rm -f "$f" 2>/dev/null || true; done
+        return 0
+    fi
+    # Success — discard the backups.
+    for f in "${bak_files[@]}"; do rm -f "$f.subak" 2>/dev/null || true; done
 
     if [ "$changed" = "1" ]; then
         systemctl daemon-reload 2>/dev/null || true
         udevadm control --reload-rules 2>/dev/null || true
-        systemctl enable sentryusb-ble-adv.service >/dev/null 2>&1 || true
+        systemctl enable sentryusb-ble-mode.service >/dev/null 2>&1 || true
+        systemctl enable sentryusb-ble-adv.service  >/dev/null 2>&1 || true
+        # ble.py reads the marker once at startup, so restart it on ANY BLE file
+        # change (a manifest/selector-only change can flip the mode).
+        systemctl restart sentryusb-ble-mode.service 2>/dev/null || \
+            /usr/local/bin/select-ble-adv-mode.sh 2>/dev/null || true
+        systemctl reset-failed sentryusb-ble.service 2>/dev/null || true
+        systemctl restart sentryusb-ble.service 2>/dev/null || true
         systemctl restart sentryusb-ble-adv.service 2>/dev/null || true
-        log "BLE adv: service enabled + restarted"
+        log "BLE adv: gate + advertiser refreshed; mode re-selected; daemons restarted"
     else
         log "BLE adv: all files current, nothing to do"
     fi

@@ -18,14 +18,21 @@ ADV_DATA="15 02 01 06 11 07 ${UUID_LE} 00 00 00 00 00 00 00 00 00 00 00 00 00"
 # Scan-response bytes = [len][0x09 Complete Local Name][name…]. Function is
 # defined before the run-guard so it's sourceable for unit-style testing.
 build_scanrsp() {
-    local name hex namebytes len
-    name=$(timeout 5 btmgmt info 2>/dev/null | sed -n 's/^[[:space:]]*name[[:space:]]*//p' | head -1)
+    local name hex namebytes adlen siglen pad i
+    # `printf '' |` closes stdin — under systemd a bare `btmgmt info` busy-loops
+    # on /dev/null and returns empty (→ hostname fallback). Closed pipe = EOF.
+    name=$(printf '' | timeout 5 btmgmt info 2>/dev/null | sed -n 's/^[[:space:]]*name[[:space:]]*//p' | head -1)
     [ -z "$name" ] && name=$(hostname)
     name=${name:0:29}                                   # scan-rsp budget: 31 - 2 (len+type)
     hex=$(printf '%s' "$name" | od -An -tx1 | tr -d ' \n')
     namebytes=$(( ${#hex} / 2 ))
-    len=$(( namebytes + 1 ))                             # +1 for the AD type byte
-    printf '%02x 09 %s' "$len" "$(echo "$hex" | sed 's/../& /g')"
+    adlen=$(( namebytes + 1 ))                           # AD length: type byte + name
+    siglen=$(( adlen + 1 ))                              # significant bytes in the 31-byte field
+    pad=$(( 31 - siglen ))                               # zero-fill the rest of the 31-byte field
+    # LE Set Scan Response Data needs EXACTLY 32 bytes: [siglen][31-byte data].
+    # Zero-pad by name length — a fixed pad overruns and strict controllers reject it.
+    printf '%02x %02x 09 %s' "$siglen" "$adlen" "$(echo "$hex" | sed 's/../& /g')"
+    local i; for (( i = 0; i < pad; i++ )); do printf ' 00'; done
 }
 
 # Program legacy ADV_IND directly via HCI (bypasses BlueZ mgmt):
@@ -39,7 +46,9 @@ assert_raw_adv() {
     local scanrsp; scanrsp=$(build_scanrsp)
     hcitool -i hci0 cmd 0x08 0x000a 00 >/dev/null 2>&1 || true
     hcitool -i hci0 cmd 0x08 0x0008 $ADV_DATA >/dev/null 2>&1 || true
-    hcitool -i hci0 cmd 0x08 0x0009 $scanrsp 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 >/dev/null 2>&1 || true
+    # build_scanrsp already emits the full 32 bytes (sig-length + 31-byte data,
+    # zero-padded) — do NOT append more zeros here or the param exceeds 32.
+    hcitool -i hci0 cmd 0x08 0x0009 $scanrsp >/dev/null 2>&1 || true
     hcitool -i hci0 cmd 0x08 0x0006 a0 00 a0 00 00 00 00 00 00 00 00 00 00 07 00 >/dev/null 2>&1 || true
     # Re-check right before enabling so we never re-arm advertising mid-connect.
     connect_in_flight && return 0
@@ -55,10 +64,32 @@ connect_in_flight() {
     [ "$age" -ge 0 ] && [ "$age" -lt "$CONNECTING_FLAG_MAX_AGE" ]
 }
 
+# True only when a central (a phone) is connected TO us — i.e. we hold a
+# PERIPHERAL-role LE link. The Tesla keep-awake link is the OPPOSITE: the Pi
+# dials out to the car, so it is a CENTRAL-role link. That link must NOT
+# suppress advertising, otherwise the Pi is undiscoverable to the phone the
+# whole time keep-awake holds the car connection (the in-app "connect over
+# Bluetooth" step then fails). The controller does advertising + an outbound
+# central link simultaneously without issue (field-verified: asserting adv
+# while the car link is up left the car link intact). hcitool reports the
+# LOCAL role as "lm PERIPHERAL" (older BlueZ: "lm SLAVE").
+peripheral_link_up() {
+    hcitool con 2>/dev/null | grep -qiE 'lm (PERIPHERAL|SLAVE)'
+}
+
 # Run the advertising loop ONLY when executed directly (the systemd ExecStart),
 # never when sourced — otherwise testing build_scanrsp() would loop forever.
 if [ "${BASH_SOURCE[0]}" != "${0}" ]; then
     return 0 2>/dev/null || exit 0
+fi
+
+# Advertising-mode gate: on boards RF-qualified to advertise natively,
+# bluetoothd owns advertising and this helper must stand down or the two fight
+# over the controller. select-ble-adv-mode.sh writes the marker each boot;
+# absence means "helper" (fail-safe), so a missing marker still advertises.
+if [ "$(cat /run/sentryusb/ble-adv-mode 2>/dev/null)" = "native" ]; then
+    echo "sentryusb-ble-adv: native mode — bluetoothd owns advertising, standing down"
+    exit 0
 fi
 
 for i in $(seq 1 30); do busctl status org.bluez >/dev/null 2>&1 && break; sleep 1; done
@@ -66,8 +97,12 @@ sleep 3   # let bluetoothd's (failing) ext-adv RegisterAdvertisement settle firs
 timeout 5 btmgmt le on >/dev/null 2>&1 || true
 timeout 5 btmgmt connectable on >/dev/null 2>&1 || true
 while true; do
-    # Re-assert only while IDLE and no central connect is in flight.
-    if ! connect_in_flight && ! timeout 3 btmgmt con 2>/dev/null | grep -q 'type LE'; then
+    # Re-assert while IDLE: skip only while a phone connect is in flight, or a
+    # phone is already connected (a PERIPHERAL-role link). Do NOT skip merely
+    # because an LE connection exists — the Tesla keep-awake is a CENTRAL-role
+    # link and must not silence advertising, or the phone can never discover us
+    # while the car is awake.
+    if ! connect_in_flight && ! peripheral_link_up; then
         assert_raw_adv
     fi
     sleep 5

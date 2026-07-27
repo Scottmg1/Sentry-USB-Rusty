@@ -1278,8 +1278,20 @@ def wait_for_adapter(bus, preferred_hci=None, timeout_s=15, poll_interval_s=0.2)
         time.sleep(poll_interval_s)
     return None
 
-def enable_controller_advertising(adapter_path):
-    """Force connectable + bondable + advertising controller flags via btmgmt.
+def ble_adv_mode():
+    """'native' or 'helper' — who owns advertising. Written per boot by
+    select-ble-adv-mode.sh; absent marker => helper (fail-safe)."""
+    try:
+        with open('/run/sentryusb/ble-adv-mode') as f:
+            return 'native' if f.read().strip() == 'native' else 'helper'
+    except Exception:
+        return 'helper'
+
+
+def enable_controller_advertising(adapter_path, advertise=True):
+    """Set connectable + bondable (+ advertising if advertise=True) via btmgmt.
+    advertise=False leaves the global 'advertising' flag OFF so a D-Bus adv or
+    the raw-HCI helper is the sole advertiser.
 
     Kernel mgmt flags persist OFF after some restart paths (crash, manual
     restart, bond-dir reset). On Broadcom (BCM4345, BCM43436) the calls
@@ -1305,7 +1317,8 @@ def enable_controller_advertising(adapter_path):
         return
 
     base_cmd = ['btmgmt', '--index', idx]
-    required = ('connectable', 'bondable', 'advertising')
+    required = ('connectable', 'bondable', 'advertising') if advertise \
+        else ('connectable', 'bondable')
 
     def current_flags(timeout=3):
         try:
@@ -1384,7 +1397,33 @@ def enable_controller_advertising(adapter_path):
     if missing:
         log.warning(f'Controller flags incomplete on {hci}: missing {sorted(missing)}')
     else:
-        log.info(f'Controller flags fully set on {hci}: connectable + bondable + advertising')
+        log.info(f'Controller flags fully set on {hci}: {" + ".join(required)}')
+
+    # advertise=False: actively CLEAR the global 'advertising' flag (a leftover
+    # one — pre-OTA daemon, force-native->helper flip — would compete with the
+    # advertiser). Issue "advertising off" unconditionally (idempotent); a read
+    # returns empty on mgmt timeout, so only a NON-EMPTY read lacking it confirms.
+    if not advertise:
+        cleared = False
+        for attempt in range(1, 4):
+            try:
+                subprocess.run(base_cmd + ['advertising', 'off'], timeout=5,
+                               capture_output=True, check=False,
+                               stdin=subprocess.PIPE)
+            except Exception as e:
+                log.warning(f'btmgmt advertising off attempt {attempt}/3: {e}')
+            flags = current_flags()
+            if flags and 'advertising' not in flags:
+                cleared = True
+                break
+            if attempt < 3:
+                time.sleep(1)
+        if cleared:
+            log.info(f'Cleared advertising flag on {hci} '
+                     '(helper mode: raw-HCI helper is the sole advertiser)')
+        else:
+            log.warning(f'Could not confirm advertising cleared on {hci} — '
+                        'bluetoothd may compete with the raw-HCI helper')
 
 
 def register_ad_cb():
@@ -1589,9 +1628,13 @@ def main():
 
     log.info(f'Using adapter: {adapter_path}')
 
-    # Re-enable controller-level advertising now that BlueZ is provably up
-    # (was a unit ExecStartPre; moved here so the unit reaches active fast).
-    enable_controller_advertising(adapter_path)
+    # Re-enable controller-level flags now that BlueZ is provably up (was a unit
+    # ExecStartPre; moved here so the unit reaches active fast). In helper mode
+    # we set connectable + bondable but NOT advertising — the raw-HCI helper is
+    # the sole advertiser, so bluetoothd advertising here would fight it.
+    adv_mode = ble_adv_mode()
+    log.info(f'BLE advertising mode: {adv_mode}')
+    enable_controller_advertising(adapter_path, advertise=(adv_mode == 'native'))
 
     # Subscribe to BlueZ D-Bus signals so connection events are logged.
     # This makes it possible to see whether iOS actually connects to the Pi
@@ -1657,7 +1700,12 @@ def main():
             reply_handler=register_ad_cb,
             error_handler=register_ad_error_cb)
         return False
-    register_initial_adv()
+    # Helper mode: GATT only — the raw-HCI helper is the sole advertiser.
+    if adv_mode == 'native':
+        register_initial_adv()
+    else:
+        log.info('BLE adv mode=helper: not registering a BlueZ advertisement '
+                 '(sentryusb-ble-adv.sh is the sole advertiser); GATT stays up')
 
     log.info(f'SentryUSB BLE peripheral started: {ble_name}')
     log.info(f'WiFi Setup Service: {WIFI_SERVICE_UUID}')
