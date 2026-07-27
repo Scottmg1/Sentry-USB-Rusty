@@ -1211,21 +1211,28 @@ def read_ble_adapter_from_config():
                     continue
                 key, _, value = line.partition('=')
                 if key.strip() == 'BLE_ADAPTER':
-                    val = value.strip().strip('"').strip("'")
-                    return val if val else None
+                    # Strip only ASCII whitespace to match the shell's C-locale
+                    # [[:space:]]; a unicode space (e.g. NBSP) then survives,
+                    # fails the hci/digit test, and falls to the hci0 default.
+                    _ws = ' \t\n\r\f\v'
+                    val = value.strip(_ws).strip('"').strip("'").strip(_ws)
+                    # ASCII-only so a unicode digit can't diverge the two.
+                    if val[:3] == 'hci' and val[3:].isascii() and val[3:].isdigit():
+                        return val
+                    if val.isascii() and val.isdigit():
+                        return 'hci' + val
+                    return None
     except (IOError, OSError):
         pass
     return None
 
 
-def find_adapter(bus, preferred_hci=None):
-    """Find a Bluetooth adapter that supports LE.
-
-    If `preferred_hci` (e.g. 'hci1') is set and that adapter exists
-    and supports LE, returns it. Otherwise falls back to the first
-    LE-capable adapter found. The fallback path means that if an
-    external dongle is unplugged after being configured, we don't
-    crash — we just quietly use the onboard radio instead.
+def find_adapter(bus, preferred_hci=None, allow_fallback=True):
+    """Find an LE-capable adapter. With preferred_hci set: return it if present;
+    else allow_fallback=True uses the first LE adapter (dongle unplugged, don't
+    crash), allow_fallback=False returns None so the caller waits for it. The
+    wait avoids splitting GATT from the raw-HCI helper (which pins the configured
+    adapter) across radios.
     """
     remote_om = dbus.Interface(
         bus.get_object(BLUEZ_SERVICE, '/'), DBUS_OM_IFACE)
@@ -1238,11 +1245,19 @@ def find_adapter(bus, preferred_hci=None):
         wanted = f'/org/bluez/{preferred_hci}'
         if wanted in le_paths:
             return wanted
+        if not allow_fallback:
+            return None
         log.warning(
             f'Preferred BLE adapter {preferred_hci} not found among '
             f'{[p.rsplit("/", 1)[-1] for p in le_paths]} — falling back'
         )
-    return le_paths[0] if le_paths else None
+        return le_paths[0] if le_paths else None
+    # No preference (unset or unparseable -> None): prefer hci0 deterministically
+    # so it matches the shell helper's hci0 default; a garbage config on a
+    # multi-radio board can't pin GATT to a different radio than the helper.
+    if not le_paths:
+        return None
+    return '/org/bluez/hci0' if '/org/bluez/hci0' in le_paths else le_paths[0]
 
 
 def wait_for_adapter(bus, preferred_hci=None, timeout_s=15, poll_interval_s=0.2):
@@ -1265,7 +1280,9 @@ def wait_for_adapter(bus, preferred_hci=None, timeout_s=15, poll_interval_s=0.2)
     last_log = 0.0
     while time.time() < deadline:
         try:
-            path = find_adapter(bus, preferred_hci=preferred_hci)
+            # Wait for the configured adapter (no fallback) so a late-enumerating
+            # dongle is used, not hci0.
+            path = find_adapter(bus, preferred_hci=preferred_hci, allow_fallback=False)
         except dbus.exceptions.DBusException:
             # org.bluez not on the bus yet — BlueZ still coming up.
             path = None
@@ -1276,6 +1293,8 @@ def wait_for_adapter(bus, preferred_hci=None, timeout_s=15, poll_interval_s=0.2)
             log.info(f'Waiting for BlueZ adapter... ({remaining}s remaining)')
             last_log = time.time()
         time.sleep(poll_interval_s)
+    # Timed out: return None (main exits -> systemd re-waits) rather than use a
+    # different adapter than configured. Onboard returned inside the loop already.
     return None
 
 def ble_adv_mode():
