@@ -756,6 +756,53 @@ function prunefile {
   mv /tmp/prune_tmp.$$ "$1"
 }
 
+# Classify list entries the stat pass could not read: only entries whose
+# source is provably gone are written to $2. Any ambiguous error (EIO,
+# ESTALE, permission, mount outage) is left out so it stays counted.
+function classify_missing_entries () {
+  local -r listfile="$1"
+  local -r outfile="$2"
+  local -r root="$3"
+  local entry err target snap
+  true > "$outfile"
+  while IFS= read -r entry
+  do
+    [ -n "$entry" ] || continue
+    # Readable again since the batch pass: nothing to drop.
+    err=$(stat -L --format='%s' "${root}/${entry}" 2>&1 >/dev/null) && continue
+    case "$err" in
+      *"No such file or directory"*) ;;
+      *) continue ;;
+    esac
+    target=""
+    if [ -L "${root}/${entry}" ]
+    then
+      target=$(readlink "${root}/${entry}" || true)
+    fi
+    case "$target" in
+      /backingfiles/snapshots/snap-*|/tmp/snapshots/snap-*)
+        snap=${target#/backingfiles/snapshots/}
+        snap=${snap#/tmp/snapshots/}
+        snap=${snap%%/*}
+        if [ ! -d "/backingfiles/snapshots/${snap}" ]
+        then
+          # A missing snapshot only proves absence when the snapshots
+          # directory itself is readable (i.e. /backingfiles is mounted).
+          if [ -d /backingfiles/snapshots ]
+          then
+            echo "$entry" >> "$outfile"
+          fi
+        elif [ -d "/backingfiles/snapshots/${snap}/mnt/TeslaCam" ]
+        then
+          # Snapshot present and mounted, so the clip itself is gone
+          # (e.g. the car moved it into an event folder).
+          echo "$entry" >> "$outfile"
+        fi
+        ;;
+    esac
+  done < "$listfile"
+}
+
 function intersect {
   sortfile "$1"
   sortfile "$2"
@@ -981,9 +1028,9 @@ function archive_teslacam_clips () {
   # a crafted filename on the cam volume would have been EXECUTED.
   # `-d '\n'` keeps each line one path; broken symlinks just drop out
   # (stat errors to /dev/null), matching the old find -L behavior.
-  # The same stat pass also records every readable entry, so entries whose
-  # source is gone (dangling symlinks into deleted snapshots) can be
-  # dropped from the pending count below.
+  # The same stat pass also records every readable entry; the unreadable
+  # remainder is re-checked one by one below, since a failed stat alone
+  # does not prove the source is gone.
   local -r presentlist=/tmp/present_files
   if [ -s "${sentrylist}" ]
   then
@@ -1000,13 +1047,24 @@ function archive_teslacam_clips () {
   # remove the short files from the list of files to be archived
   prunefile "${sentrylist}" "${ignorelist}"
 
-  # Drop entries whose source no longer exists: rsync --ignore-missing-args
+  # Drop entries whose source is PROVABLY gone: rsync --ignore-missing-args
   # skips them silently, so counting them reports files that will never
-  # move (e.g. clips the car relocated into an event folder).
-  local stale_count
+  # move (e.g. clips the car relocated into an event folder). Entries that
+  # merely failed to stat stay counted — under-counting hides real work.
+  local -r missinglist=/tmp/missing_files
+  local -r absentlist=/tmp/absent_files
+  cp "${sentrylist}" "${missinglist}"
+  prunefile "${missinglist}" "${presentlist}"
+  true > "${absentlist}"
+  if [ -s "${missinglist}" ]
+  then
+    classify_missing_entries "${missinglist}" "${absentlist}" "${overlaymerged}"
+  fi
+  local stale_count unknown_count
   stale_count=$(wc -l < "${sentrylist}")
-  intersect "${sentrylist}" "${presentlist}"
+  prunefile "${sentrylist}" "${absentlist}"
   stale_count=$((stale_count - $(wc -l < "${sentrylist}")))
+  unknown_count=$(($(wc -l < "${missinglist}") - $(wc -l < "${absentlist}")))
 
   # apply custom removals/additions
   filterfile "${sentrylist}"
@@ -1027,6 +1085,10 @@ function archive_teslacam_clips () {
   if [ "$stale_count" -gt 0 ]
   then
     log "Ignoring $stale_count stale list entry(s) whose source files no longer exist"
+  fi
+  if [ "$unknown_count" -gt 0 ]
+  then
+    log "Keeping $unknown_count list entry(s) counted: source status could not be determined"
   fi
 
   local archive_success=true

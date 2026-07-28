@@ -305,41 +305,71 @@ pub async fn release_snapshot(snap_name: &str) -> Result<()> {
     Ok(())
 }
 
-/// Remove `/mutable/TeslaCam` symlinks targeting `snap_name` — the stored
-/// target string only, like bash `find -lname "*/NAME/*" -delete`. Never
-/// resolves a link, so autofs is never triggered.
+/// Remove `/mutable/TeslaCam` symlinks targeting `snap_name`. Matches the
+/// stored target string only — never resolves a link, so autofs is never
+/// triggered.
 fn prune_links_into(snap_name: &str) -> usize {
-    let needle = format!("/{}/", snap_name);
-    prune_farm_links(Path::new(TESLACAM), &|_, target| target.contains(&needle), false)
+    let snapshots = Path::new(SNAPSHOTS_DIR);
+    let autofs = Path::new(AUTOFS_SNAPSHOTS);
+    // Producer-shaped targets only, same predicate as the sweep: a bare
+    // substring match also deletes foreign links that merely happen to
+    // carry the released snapshot's name in their path.
+    let dead =
+        |_: &Path, target: &str| owned_snap_component(target, snapshots, autofs) == Some(snap_name);
+    let (removed, aborted) =
+        prune_farm_links(Path::new(TESLACAM), &dead, &backingfiles_mounted, false);
+    if aborted {
+        warn!("{} unmounted during prune of {}", BACKINGFILES, snap_name);
+    }
+    removed
+}
+
+/// Guard both prune paths re-check: the snapshots filesystem must stay
+/// mounted for the whole walk, or every remaining link looks dead.
+fn backingfiles_mounted() -> bool {
+    is_mounted(Path::new(BACKINGFILES))
 }
 
 /// Walk the farm (depth-capped), delete symlinks whose stored target `dead` matches,
 /// then remove dirs the deletion emptied, never the top-level category dirs.
-/// `dead` also gets the link path for re-verify; `dry_run` counts only.
-fn prune_farm_links(farm: &Path, dead: &dyn Fn(&Path, &str) -> bool, dry_run: bool) -> usize {
+/// `guard` re-checked per dir aborts the walk; returns `(removed, aborted)`.
+fn prune_farm_links(
+    farm: &Path,
+    dead: &dyn Fn(&Path, &str) -> bool,
+    guard: &dyn Fn() -> bool,
+    dry_run: bool,
+) -> (usize, bool) {
     fn walk(
         dir: &Path,
         depth: u8,
         dead: &dyn Fn(&Path, &str) -> bool,
+        guard: &dyn Fn() -> bool,
         dry_run: bool,
         removed: &mut usize,
-    ) {
+    ) -> bool {
         if depth > 4 {
-            return;
+            return true;
         }
-        let Ok(entries) = std::fs::read_dir(dir) else { return };
+        if !guard() {
+            return false;
+        }
+        let Ok(entries) = std::fs::read_dir(dir) else { return true };
         for entry in entries.flatten() {
             let path = entry.path();
             let Ok(ftype) = entry.file_type() else { continue };
             if ftype.is_symlink() {
-                if let Ok(target) = std::fs::read_link(&path)
-                    && dead(&path, &target.to_string_lossy())
-                    && (dry_run || std::fs::remove_file(&path).is_ok())
-                {
-                    *removed += 1;
+                if let Ok(target) = std::fs::read_link(&path) {
+                    let target = target.to_string_lossy().to_string();
+                    if dead(&path, &target)
+                        && (dry_run || unlink_if_still_dead(&path, &target, dead))
+                    {
+                        *removed += 1;
+                    }
                 }
             } else if ftype.is_dir() {
-                walk(&path, depth + 1, dead, dry_run, removed);
+                if !walk(&path, depth + 1, dead, guard, dry_run, removed) {
+                    return false;
+                }
                 // depth >= 1 here means `path` sits at farm depth >= 2
                 // (date/event dirs); rmdir fails harmlessly if non-empty.
                 if !dry_run && depth >= 1 {
@@ -347,10 +377,20 @@ fn prune_farm_links(farm: &Path, dead: &dyn Fn(&Path, &str) -> bool, dry_run: bo
                 }
             }
         }
+        true
     }
     let mut removed = 0;
-    walk(farm, 0, dead, dry_run, &mut removed);
-    removed
+    let completed = walk(farm, 0, dead, guard, dry_run, &mut removed);
+    (removed, !completed)
+}
+
+/// Re-read the link and re-run `dead` right before unlinking, so a link a
+/// concurrent relink turned live survives. Residual window: the unlink is
+/// path-based, so a relink between this readlink and it still loses.
+fn unlink_if_still_dead(link: &Path, target: &str, dead: &dyn Fn(&Path, &str) -> bool) -> bool {
+    let Ok(fresh) = std::fs::read_link(link) else { return false };
+    let fresh = fresh.to_string_lossy().to_string();
+    fresh == target && dead(link, &fresh) && std::fs::remove_file(link).is_ok()
 }
 
 /// Delete farm symlinks whose target's `snap-NNNNNN` component no longer exists
@@ -376,15 +416,18 @@ pub fn sweep_dangling_links(dry_run: bool) -> Result<usize> {
         Path::new(TESLACAM),
         Path::new(SNAPSHOTS_DIR),
         Path::new(AUTOFS_SNAPSHOTS),
+        &backingfiles_mounted,
         dry_run,
     )
 }
 
-/// [`sweep_dangling_links`] over explicit roots (testable).
+/// [`sweep_dangling_links`] over explicit roots (testable). `guard` is
+/// re-checked throughout the walk; a false reading aborts it.
 fn sweep_dangling_links_in(
     farm: &Path,
     snapshots: &Path,
     autofs: &Path,
+    guard: &dyn Fn() -> bool,
     dry_run: bool,
 ) -> Result<usize> {
     // Refuse to judge links when no snapshots are visible at all: an
@@ -399,20 +442,41 @@ fn sweep_dangling_links_in(
     if !any_snap {
         bail!("no snapshots visible under {} — sweep skipped", snapshots.display());
     }
-    let dead = |link: &Path, target: &str| {
-        let Some(name) = owned_snap_component(target, snapshots, autofs) else {
-            return false; // not a link this codebase minted — never touch
-        };
-        if snapshots.join(name).is_dir() {
-            return false;
-        }
-        // Nothing locks out a concurrent snapshot create/relink, so re-read
-        // the link and re-check its snapshot right before unlinking: a link
-        // that turned valid since the walk read it must survive.
-        std::fs::read_link(link).is_ok_and(|t| t.to_string_lossy() == target)
-            && !snapshots.join(name).is_dir()
+    let dead = |_: &Path, target: &str| {
+        // Only links this codebase minted, and only when their snapshot is
+        // provably gone — an unreadable snapshots dir proves nothing.
+        owned_snap_component(target, snapshots, autofs)
+            .is_some_and(|name| matches!(snapshot_state(snapshots, name), SnapState::Gone))
     };
-    Ok(prune_farm_links(farm, &dead, dry_run))
+    let (removed, aborted) = prune_farm_links(farm, &dead, guard, dry_run);
+    if aborted {
+        bail!("mount state changed mid-sweep — aborted after {} link(s)", removed);
+    }
+    Ok(removed)
+}
+
+/// Whether a snapshot dir is present, provably gone, or undeterminable.
+enum SnapState {
+    Live,
+    Gone,
+    Unknown,
+}
+
+/// Classify `snapshots/<name>`. I/O errors other than NotFound — and a
+/// NotFound under an unreadable snapshots dir — are Unknown, never Gone.
+fn snapshot_state(snapshots: &Path, name: &str) -> SnapState {
+    match std::fs::metadata(snapshots.join(name)) {
+        Ok(md) if md.is_dir() => SnapState::Live,
+        Ok(_) => SnapState::Gone,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            if std::fs::metadata(snapshots).is_ok_and(|m| m.is_dir()) {
+                SnapState::Gone
+            } else {
+                SnapState::Unknown
+            }
+        }
+        Err(_) => SnapState::Unknown,
+    }
 }
 
 /// Snapshot name of a target in the two shapes this file's linkers mint:
@@ -444,16 +508,15 @@ fn owned_snap_component<'a>(target: &'a str, snapshots: &Path, autofs: &Path) ->
     parts.next().is_some().then_some(name)
 }
 
-/// True when `path` is a mount point. /proc/mounts is authoritative (a bind
-/// mount shares its parent's device); the st_dev comparison only covers a
-/// missing /proc.
+/// True when `path` is a mount point. A readable /proc/mounts is the whole
+/// answer — no entry means NOT mounted. The st_dev comparison runs only
+/// when /proc/mounts is unreadable (a symlink across fs also trips it).
 fn is_mounted(path: &Path) -> bool {
     let want = path.to_string_lossy();
-    if std::fs::read_to_string("/proc/mounts")
-        .map(|m| m.lines().any(|l| l.split_whitespace().nth(1) == Some(want.as_ref())))
-        .unwrap_or(false)
-    {
-        return true;
+    if let Ok(mounts) = std::fs::read_to_string("/proc/mounts") {
+        return mounts
+            .lines()
+            .any(|l| l.split_whitespace().nth(1) == Some(want.as_ref()));
     }
     #[cfg(unix)]
     {
@@ -857,7 +920,7 @@ pub fn backfill_gapfill_links() -> Result<()> {
         return Ok(());
     }
     let gapfill = load_gapfill_stamps();
-    let (made, skipped_dead) =
+    let (made, skipped_dead, retry) =
         backfill_gapfill_links_in(
             Path::new(TESLACAM),
             Path::new(SNAPSHOTS_DIR),
@@ -865,29 +928,34 @@ pub fn backfill_gapfill_links() -> Result<()> {
             &gapfill,
         );
     // Written AFTER the walk so a crash mid-pass re-runs it next snapshot.
-    std::fs::write(GAPFILL_APPLIED_MARKER, &manifest_body)?;
-    if made > 0 || skipped_dead > 0 {
+    // Withheld while any source was undeterminable: the manifest is the
+    // only retry trigger, so marking now would drop it permanently.
+    if retry == 0 {
+        std::fs::write(GAPFILL_APPLIED_MARKER, &manifest_body)?;
+    }
+    if made > 0 || skipped_dead > 0 || retry > 0 {
         info!(
-            "gap-fill backfill: created {} RecentClips link(s) for manifest clips ({} dead-target source(s) skipped)",
-            made, skipped_dead
+            "gap-fill backfill: created {} RecentClips link(s) for manifest clips ({} dead-target source(s) skipped, {} deferred to next pass)",
+            made, skipped_dead, retry
         );
     }
     Ok(())
 }
 
-/// [`backfill_gapfill_links`] over explicit roots (testable).
-/// Returns `(links created, dead-target sources skipped)`.
+/// [`backfill_gapfill_links`] over explicit roots (testable). Returns
+/// `(links created, dead-target sources skipped, sources needing retry)`.
 fn backfill_gapfill_links_in(
     teslacam: &Path,
     snapshots: &Path,
     autofs: &Path,
     gapfill: &HashSet<String>,
-) -> (usize, usize) {
+) -> (usize, usize, usize) {
     if gapfill.is_empty() {
-        return (0, 0);
+        return (0, 0, 0);
     }
     let mut made = 0usize;
     let mut skipped_dead = 0usize;
+    let mut retry = 0usize;
     for sub in ["SavedClips", "SentryClips"] {
         let Ok(events) = std::fs::read_dir(teslacam.join(sub)) else {
             continue;
@@ -903,13 +971,14 @@ fn backfill_gapfill_links_in(
                     {
                         BackfillOutcome::Made => made += 1,
                         BackfillOutcome::DeadTarget => skipped_dead += 1,
+                        BackfillOutcome::Retry => retry += 1,
                         BackfillOutcome::Skipped => {}
                     }
                 }
             }
         }
     }
-    (made, skipped_dead)
+    (made, skipped_dead, retry)
 }
 
 /// What [`backfill_recent_link`] did with one event-tree entry.
@@ -918,6 +987,9 @@ enum BackfillOutcome {
     /// Source link's target snapshot is gone — creating the cross-link
     /// would mint a permanently dangling entry.
     DeadTarget,
+    /// Undeterminable source or a failed symlink: leave the manifest
+    /// unapplied so a later pass reprocesses this entry.
+    Retry,
     Skipped,
 }
 
@@ -961,10 +1033,11 @@ fn backfill_recent_link(
     // The source link may itself be dangling (its snapshot already
     // released); copying its target would mint a born-dead link. Checked
     // by snapshot-dir name only — never resolved, so autofs stays idle.
-    if owned_snap_component(&target, snapshots, autofs)
-        .is_some_and(|s| !snapshots.join(s).is_dir())
-    {
-        return BackfillOutcome::DeadTarget;
+    match owned_snap_component(&target, snapshots, autofs).map(|s| snapshot_state(snapshots, s)) {
+        Some(SnapState::Gone) => return BackfillOutcome::DeadTarget,
+        // A transient unmount or metadata error is not proof of release.
+        Some(SnapState::Unknown) => return BackfillOutcome::Retry,
+        Some(SnapState::Live) | None => {}
     }
     let _ = std::fs::create_dir_all(&recents);
     #[cfg(unix)]
@@ -972,7 +1045,7 @@ fn backfill_recent_link(
         if std::os::unix::fs::symlink(&target, &link).is_ok() {
             BackfillOutcome::Made
         } else {
-            BackfillOutcome::Skipped
+            BackfillOutcome::Retry
         }
     }
     #[cfg(not(unix))]
@@ -1329,7 +1402,7 @@ mod tests {
 
         assert_eq!(
             backfill_gapfill_links_in(teslacam, &snaps, &autofs, &gapfill),
-            (1, 1),
+            (1, 1, 0),
         );
 
         // The missing manifest clip gained a link with the event link's target.
@@ -1360,7 +1433,7 @@ mod tests {
         // Empty manifest: no-op even with clips present.
         assert_eq!(
             backfill_gapfill_links_in(teslacam, &snaps, &autofs, &HashSet::new()),
-            (0, 0),
+            (0, 0, 0),
         );
     }
 
@@ -1561,8 +1634,8 @@ mod tests {
         let farm = tmp.path();
         let (dead508, live600, evt_dead) = build_farm(farm, "/backingfiles/snapshots");
 
-        let removed = prune_farm_links(farm, &|_, t| t.contains("/snap-000508/"), false);
-        assert_eq!(removed, 2);
+        let removed = prune_farm_links(farm, &|_, t| t.contains("/snap-000508/"), &|| true, false);
+        assert_eq!(removed, (2, false));
         assert!(std::fs::symlink_metadata(&dead508).is_err());
         assert!(std::fs::symlink_metadata(&evt_dead).is_err());
         assert!(std::fs::symlink_metadata(&live600).is_ok(), "non-matching link must survive");
@@ -1598,11 +1671,11 @@ mod tests {
             spared.push(p);
         }
 
-        let counted = sweep_dangling_links_in(&farm, &snaps, &autofs, true).unwrap();
+        let counted = sweep_dangling_links_in(&farm, &snaps, &autofs, &|| true, true).unwrap();
         assert_eq!(counted, 2, "dry run must count without deleting");
         assert!(std::fs::symlink_metadata(&dead508).is_ok());
 
-        let removed = sweep_dangling_links_in(&farm, &snaps, &autofs, false).unwrap();
+        let removed = sweep_dangling_links_in(&farm, &snaps, &autofs, &|| true, false).unwrap();
         assert_eq!(removed, 2);
         assert!(std::fs::symlink_metadata(&dead508).is_err());
         assert!(std::fs::symlink_metadata(&evt_dead).is_err());
@@ -1625,8 +1698,58 @@ mod tests {
         // A concurrent snapshot reusing slot 508 recreates the dir; the
         // per-link re-check must then leave its links alone.
         std::fs::create_dir_all(snaps.join("snap-000508")).unwrap();
-        assert_eq!(sweep_dangling_links_in(&farm, &snaps, &autofs, false).unwrap(), 0);
+        assert_eq!(sweep_dangling_links_in(&farm, &snaps, &autofs, &|| true, false).unwrap(), 0);
         assert!(std::fs::symlink_metadata(&dead508).is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sweep_aborts_when_the_mount_guard_flips() {
+        let tmp = tempfile::tempdir().unwrap();
+        let farm = tmp.path().join("TeslaCam");
+        let snaps = tmp.path().join("snapshots");
+        let autofs = tmp.path().join("autofs");
+        std::fs::create_dir_all(snaps.join("snap-000600")).unwrap();
+        let (dead508, ..) = build_farm(&farm, snaps.to_str().unwrap());
+
+        let err = sweep_dangling_links_in(&farm, &snaps, &autofs, &|| false, false).unwrap_err();
+        assert!(err.to_string().contains("mount state changed"));
+        assert!(std::fs::symlink_metadata(&dead508).is_ok());
+    }
+
+    /// An unreadable snapshots dir makes every source undeterminable: the
+    /// backfill must defer them, never treat them as released.
+    #[cfg(unix)]
+    #[test]
+    fn backfill_defers_sources_it_cannot_verify() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let teslacam = tmp.path();
+        let snaps = tmp.path().join("gone-snapshots");
+        let autofs = tmp.path().join("autofs");
+        let evt = teslacam.join("SavedClips/2026-07-15_04-59-30");
+        std::fs::create_dir_all(&evt).unwrap();
+        symlink(
+            format!(
+                "{}/snap-000005/mnt/TeslaCam/SavedClips/2026-07-15_04-59-30/2026-07-15_04-50-00-front.mp4",
+                snaps.display()
+            ),
+            evt.join("2026-07-15_04-50-00-front.mp4"),
+        )
+        .unwrap();
+
+        let gapfill: HashSet<String> = ["2026-07-15_04-50-00".to_string()].into_iter().collect();
+        assert_eq!(
+            backfill_gapfill_links_in(teslacam, &snaps, &autofs, &gapfill),
+            (0, 0, 1),
+        );
+        assert!(
+            std::fs::symlink_metadata(
+                teslacam.join("RecentClips/2026-07-15/2026-07-15_04-50-00-front.mp4")
+            )
+            .is_err(),
+        );
     }
 
     #[cfg(unix)]
@@ -1641,7 +1764,7 @@ mod tests {
         // Empty snapshots dir looks like an unmounted /backingfiles: bail,
         // delete nothing.
         let autofs = tmp.path().join("autofs");
-        assert!(sweep_dangling_links_in(&farm, &snaps, &autofs, false).is_err());
+        assert!(sweep_dangling_links_in(&farm, &snaps, &autofs, &|| true, false).is_err());
         assert!(std::fs::symlink_metadata(&dead508).is_ok());
     }
 }
