@@ -981,16 +981,32 @@ function archive_teslacam_clips () {
   # a crafted filename on the cam volume would have been EXECUTED.
   # `-d '\n'` keeps each line one path; broken symlinks just drop out
   # (stat errors to /dev/null), matching the old find -L behavior.
+  # The same stat pass also records every readable entry, so entries whose
+  # source is gone (dangling symlinks into deleted snapshots) can be
+  # dropped from the pending count below.
+  local -r presentlist=/tmp/present_files
   if [ -s "${sentrylist}" ]
   then
     (cd "$overlaymerged"; xargs -a "${sentrylist}" -d '\n' stat -L --format='%s %n' 2>/dev/null) \
-      | awk '$1 < 100000 { sub(/^[0-9]+ /, ""); if (/\.mp4$/) print }' > "${ignorelist}"
+      | awk -v ignore="${ignorelist}" -v present="${presentlist}" '
+          BEGIN { printf "" > ignore; printf "" > present }
+          { line = $0; sub(/^[0-9]+ /, "", line); print line > present
+            if ($1 < 100000 && line ~ /\.mp4$/) print line > ignore }'
   else
     true > "${ignorelist}"
+    true > "${presentlist}"
   fi
 
   # remove the short files from the list of files to be archived
   prunefile "${sentrylist}" "${ignorelist}"
+
+  # Drop entries whose source no longer exists: rsync --ignore-missing-args
+  # skips them silently, so counting them reports files that will never
+  # move (e.g. clips the car relocated into an event folder).
+  local stale_count
+  stale_count=$(wc -l < "${sentrylist}")
+  intersect "${sentrylist}" "${presentlist}"
+  stale_count=$((stale_count - $(wc -l < "${sentrylist}")))
 
   # apply custom removals/additions
   filterfile "${sentrylist}"
@@ -1008,6 +1024,10 @@ function archive_teslacam_clips () {
 
   log "There are $event_count event folder(s) with $sentry_count file(s) and $trackmode_count track mode file(s) to move." \
       " $ignore_count short recording(s) will be skipped."
+  if [ "$stale_count" -gt 0 ]
+  then
+    log "Ignoring $stale_count stale list entry(s) whose source files no longer exist"
+  fi
 
   local archive_success=true
   if [[ "$total_count" -gt 0 ]]
