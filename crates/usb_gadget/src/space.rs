@@ -10,6 +10,10 @@ const MIN_FREE_PCT: f64 = 5.0; // Minimum free space percentage before cleanup
 
 /// Check if free space is below the threshold and release old snapshots if needed.
 pub async fn manage_free_space() -> Result<()> {
+    // Held across the whole release loop, matching manage_free_space.sh; the
+    // releases below therefore use the already-locked entry point.
+    let _lock = super::snapshot::lock_snapshots_dir()?;
+
     let (total, free) = get_space(BACKINGFILES)?;
     if total == 0 {
         return Ok(());
@@ -32,7 +36,7 @@ pub async fn manage_free_space() -> Result<()> {
 
     // Release oldest snapshots first until we're above the threshold
     for snap in &snapshots {
-        if let Err(e) = super::snapshot::release_snapshot(snap).await {
+        if let Err(e) = super::snapshot::release_snapshot_locked(snap).await {
             warn!("Failed to release {}: {}", snap, e);
             continue;
         }
