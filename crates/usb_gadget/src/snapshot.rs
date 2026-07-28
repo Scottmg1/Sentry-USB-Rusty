@@ -866,25 +866,37 @@ pub fn backfill_gapfill_links() -> Result<()> {
         return Ok(());
     }
     let gapfill = load_gapfill_stamps();
-    let made = backfill_gapfill_links_in(Path::new(TESLACAM), &gapfill);
+    let (made, skipped_dead) =
+        backfill_gapfill_links_in(
+            Path::new(TESLACAM),
+            Path::new(SNAPSHOTS_DIR),
+            Path::new(AUTOFS_SNAPSHOTS),
+            &gapfill,
+        );
     // Written AFTER the walk so a crash mid-pass re-runs it next snapshot.
     std::fs::write(GAPFILL_APPLIED_MARKER, &manifest_body)?;
-    if made > 0 {
+    if made > 0 || skipped_dead > 0 {
         info!(
-            "gap-fill backfill: created {} RecentClips link(s) for manifest clips",
-            made
+            "gap-fill backfill: created {} RecentClips link(s) for manifest clips ({} dead-target source(s) skipped)",
+            made, skipped_dead
         );
     }
     Ok(())
 }
 
-/// [`backfill_gapfill_links`] over an explicit TeslaCam root (testable).
-/// Returns how many links were created.
-fn backfill_gapfill_links_in(teslacam: &Path, gapfill: &HashSet<String>) -> usize {
+/// [`backfill_gapfill_links`] over explicit roots (testable).
+/// Returns `(links created, dead-target sources skipped)`.
+fn backfill_gapfill_links_in(
+    teslacam: &Path,
+    snapshots: &Path,
+    autofs: &Path,
+    gapfill: &HashSet<String>,
+) -> (usize, usize) {
     if gapfill.is_empty() {
-        return 0;
+        return (0, 0);
     }
     let mut made = 0usize;
+    let mut skipped_dead = 0usize;
     for sub in ["SavedClips", "SentryClips"] {
         let Ok(events) = std::fs::read_dir(teslacam.join(sub)) else {
             continue;
@@ -896,14 +908,26 @@ fn backfill_gapfill_links_in(teslacam: &Path, gapfill: &HashSet<String>) -> usiz
             }
             if let Ok(clips) = std::fs::read_dir(&evt_path) {
                 for clip in clips.flatten() {
-                    if backfill_recent_link(teslacam, &clip.path(), gapfill) {
-                        made += 1;
+                    match backfill_recent_link(teslacam, snapshots, autofs, &clip.path(), gapfill)
+                    {
+                        BackfillOutcome::Made => made += 1,
+                        BackfillOutcome::DeadTarget => skipped_dead += 1,
+                        BackfillOutcome::Skipped => {}
                     }
                 }
             }
         }
     }
-    made
+    (made, skipped_dead)
+}
+
+/// What [`backfill_recent_link`] did with one event-tree entry.
+enum BackfillOutcome {
+    Made,
+    /// Source link's target snapshot is gone — creating the cross-link
+    /// would mint a permanently dangling entry.
+    DeadTarget,
+    Skipped,
 }
 
 /// Create the `RecentClips/<date>/` link for one event-tree entry IFF its
@@ -911,24 +935,30 @@ fn backfill_gapfill_links_in(teslacam: &Path, gapfill: &HashSet<String>) -> usiz
 /// link shape as [`maybe_gapfill_recent_link`], but sourced from the
 /// already-built event link instead of a snapshot mount.
 #[cfg_attr(not(unix), allow(unused_variables))]
-fn backfill_recent_link(teslacam: &Path, clip: &Path, gapfill: &HashSet<String>) -> bool {
+fn backfill_recent_link(
+    teslacam: &Path,
+    snapshots: &Path,
+    autofs: &Path,
+    clip: &Path,
+    gapfill: &HashSet<String>,
+) -> BackfillOutcome {
     let filename = match clip.file_name().map(|s| s.to_string_lossy().to_string()) {
         Some(f) => f,
-        None => return false,
+        None => return BackfillOutcome::Skipped,
     };
     let stamp = match clip_stamp(&filename) {
         Some(s) => s,
-        None => return false,
+        None => return BackfillOutcome::Skipped,
     };
     if !gapfill.contains(stamp) {
-        return false;
+        return BackfillOutcome::Skipped;
     }
     let recents = teslacam.join("RecentClips").join(&filename[..10]);
     let link = recents.join(&filename);
     // Never clobber: an existing entry is either genuine continuous
     // footage or a cross-link a snapshot pass already created.
     if std::fs::symlink_metadata(&link).is_ok() {
-        return false;
+        return BackfillOutcome::Skipped;
     }
     // The event entry is itself a symlink into <snapdir>/mnt/...; reuse
     // its stored target. A plain file (shouldn't occur in this tree)
@@ -937,13 +967,25 @@ fn backfill_recent_link(teslacam: &Path, clip: &Path, gapfill: &HashSet<String>)
         Ok(t) => t.to_string_lossy().to_string(),
         Err(_) => clip.to_string_lossy().to_string(),
     };
+    // The source link may itself be dangling (its snapshot already
+    // released); copying its target would mint a born-dead link. Checked
+    // by snapshot-dir name only — never resolved, so autofs stays idle.
+    if owned_snap_component(&target, snapshots, autofs)
+        .is_some_and(|s| !snapshots.join(s).is_dir())
+    {
+        return BackfillOutcome::DeadTarget;
+    }
     let _ = std::fs::create_dir_all(&recents);
     #[cfg(unix)]
     {
-        std::os::unix::fs::symlink(&target, &link).is_ok()
+        if std::os::unix::fs::symlink(&target, &link).is_ok() {
+            BackfillOutcome::Made
+        } else {
+            BackfillOutcome::Skipped
+        }
     }
     #[cfg(not(unix))]
-    false
+    BackfillOutcome::Skipped
 }
 
 /// One-time cleanup mirroring the bash `purge_event_links_from_recentclips`.
@@ -1239,8 +1281,8 @@ mod tests {
     /// Backfill creates a RecentClips link for a manifest clip that only
     /// exists in the (already-linked) event tree, reusing the event
     /// link's stored target; non-manifest clips are ignored and existing
-    /// RecentClips entries are never clobbered. Targets are dangling on
-    /// purpose — the pass reads link strings, never the files behind them.
+    /// RecentClips entries are never clobbered. The pass reads link
+    /// strings, never the files behind them.
     #[cfg(unix)]
     #[test]
     fn backfill_creates_missing_manifest_links_only() {
@@ -1248,22 +1290,39 @@ mod tests {
         use tempfile::TempDir;
 
         let root = TempDir::new().unwrap();
-        let teslacam = root.path();
+        let teslacam = root.path().join("TeslaCam");
+        let teslacam = teslacam.as_path();
+        let snaps = root.path().join("snapshots");
+        let autofs = root.path().join("autofs");
+        std::fs::create_dir_all(snaps.join("snap-000005")).unwrap();
         let evt = teslacam.join("SavedClips/2026-07-15_04-59-30");
         std::fs::create_dir_all(&evt).unwrap();
 
-        let target_a = "/backingfiles/snapshots/snap-000005/mnt/TeslaCam/SavedClips/2026-07-15_04-59-30/2026-07-15_04-50-00-front.mp4";
-        symlink(target_a, evt.join("2026-07-15_04-50-00-front.mp4")).unwrap();
+        let clip_target = |snap: &str, stamp: &str| {
+            format!(
+                "{}/{snap}/mnt/TeslaCam/SavedClips/2026-07-15_04-59-30/{stamp}-front.mp4",
+                snaps.display()
+            )
+        };
+        let target_a = clip_target("snap-000005", "2026-07-15_04-50-00");
+        symlink(&target_a, evt.join("2026-07-15_04-50-00-front.mp4")).unwrap();
         // In the manifest but already cross-linked → must not be clobbered.
         symlink(
-            "/backingfiles/snapshots/snap-000005/mnt/TeslaCam/SavedClips/2026-07-15_04-59-30/2026-07-15_04-55-00-front.mp4",
+            clip_target("snap-000005", "2026-07-15_04-55-00"),
             evt.join("2026-07-15_04-55-00-front.mp4"),
         )
         .unwrap();
         // Not in the manifest → must stay out of RecentClips.
         symlink(
-            "/backingfiles/snapshots/snap-000005/mnt/TeslaCam/SavedClips/2026-07-15_04-59-30/2026-07-15_04-58-00-front.mp4",
+            clip_target("snap-000005", "2026-07-15_04-58-00"),
             evt.join("2026-07-15_04-58-00-front.mp4"),
+        )
+        .unwrap();
+        // In the manifest, but its snapshot is already released: copying
+        // this target would mint a born-dead RecentClips link.
+        symlink(
+            clip_target("snap-000004", "2026-07-15_04-52-00"),
+            evt.join("2026-07-15_04-52-00-front.mp4"),
         )
         .unwrap();
 
@@ -1275,14 +1334,23 @@ mod tests {
         let mut gapfill = HashSet::new();
         gapfill.insert("2026-07-15_04-50-00".to_string());
         gapfill.insert("2026-07-15_04-55-00".to_string());
+        gapfill.insert("2026-07-15_04-52-00".to_string());
 
-        assert_eq!(backfill_gapfill_links_in(teslacam, &gapfill), 1);
+        assert_eq!(
+            backfill_gapfill_links_in(teslacam, &snaps, &autofs, &gapfill),
+            (1, 1),
+        );
 
         // The missing manifest clip gained a link with the event link's target.
         let made = day.join("2026-07-15_04-50-00-front.mp4");
         assert_eq!(
             std::fs::read_link(&made).unwrap().to_string_lossy(),
             target_a
+        );
+        // The released-snapshot source was skipped, not propagated.
+        assert!(
+            std::fs::symlink_metadata(day.join("2026-07-15_04-52-00-front.mp4")).is_err(),
+            "must not mint a link into a released snapshot",
         );
         // Existing entry untouched.
         assert_eq!(
@@ -1294,9 +1362,15 @@ mod tests {
             std::fs::symlink_metadata(day.join("2026-07-15_04-58-00-front.mp4")).is_err()
         );
         // Idempotent: second run creates nothing.
-        assert_eq!(backfill_gapfill_links_in(teslacam, &gapfill), 0);
+        assert_eq!(
+            backfill_gapfill_links_in(teslacam, &snaps, &autofs, &gapfill).0,
+            0,
+        );
         // Empty manifest: no-op even with clips present.
-        assert_eq!(backfill_gapfill_links_in(teslacam, &HashSet::new()), 0);
+        assert_eq!(
+            backfill_gapfill_links_in(teslacam, &snaps, &autofs, &HashSet::new()),
+            (0, 0),
+        );
     }
 
     /// The purge keys off each symlink's stored target: links into
