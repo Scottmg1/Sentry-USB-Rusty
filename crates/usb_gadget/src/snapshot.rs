@@ -294,10 +294,9 @@ pub async fn release_snapshot(snap_name: &str) -> Result<()> {
     }
 
     std::fs::remove_dir_all(&snap_dir)?;
-    // Parity with bash release_snapshot.sh: drop every /mutable/TeslaCam
-    // symlink whose stored target points into this snapshot, then prune
-    // event/date dirs the removal emptied. Skipping this leaks broken links
-    // that inflate the archive pending count and clutter the Viewer.
+    // Parity with bash release_snapshot.sh: drop every /mutable/TeslaCam symlink
+    // whose stored target points into this snapshot, then prune event/date dirs the
+    // removal emptied. Skipping it leaks broken links into the pending count.
     let pruned = prune_links_into(&name);
     if pruned > 0 {
         info!("Pruned {} TeslaCam link(s) into {}", pruned, name);
@@ -314,12 +313,9 @@ fn prune_links_into(snap_name: &str) -> usize {
     prune_farm_links(Path::new(TESLACAM), &|_, target| target.contains(&needle), false)
 }
 
-/// Walk the farm (depth-capped), delete symlinks whose stored target `dead`
-/// matches, then remove dirs the deletion emptied — but never the top-level
-/// category dirs (bash used `find -mindepth 2`). `dry_run` counts only.
-///
-/// `dead` also receives the link's own path so a caller can re-verify at
-/// decision time (the call sits immediately before the unlink).
+/// Walk the farm (depth-capped), delete symlinks whose stored target `dead` matches,
+/// then remove dirs the deletion emptied, never the top-level category dirs.
+/// `dead` also gets the link path for re-verify; `dry_run` counts only.
 fn prune_farm_links(farm: &Path, dead: &dyn Fn(&Path, &str) -> bool, dry_run: bool) -> usize {
     fn walk(
         dir: &Path,
@@ -357,11 +353,9 @@ fn prune_farm_links(farm: &Path, dead: &dyn Fn(&Path, &str) -> bool, dry_run: bo
     removed
 }
 
-/// Delete farm symlinks whose target's `snap-NNNNNN` component no longer
-/// exists under the snapshots dir — cleanup for links leaked by releases
-/// that skipped the purge. String + directory-existence checks only; the
-/// link itself is never resolved. Returns how many were (or with `dry_run`,
-/// would be) removed.
+/// Delete farm symlinks whose target's `snap-NNNNNN` component no longer exists
+/// under the snapshots dir. String + directory-existence checks only; the link is
+/// never resolved. Returns how many were (with `dry_run`, would be) removed.
 pub fn sweep_dangling_links(dry_run: bool) -> Result<usize> {
     // A stale snap-* dir left on the root fs under an unmounted (or
     // mid-remount, see storage_repair) /backingfiles would satisfy every
@@ -421,12 +415,9 @@ fn sweep_dangling_links_in(
     Ok(prune_farm_links(farm, &dead, dry_run))
 }
 
-/// Snapshot name of a target in one of the two shapes the linkers in this
-/// file actually mint: `<snapshots>/snap-NNNNNN/mnt/<file…>` (retargeted
-/// clip links) and `<autofs>/snap-NNNNNN/<file…>` (un-retargeted TrackMode
-/// links). Everything else — including a merely-similar path, a foreign
-/// root, or a bare `snap-NNNNNN` filename — yields None so the sweep leaves
-/// it alone.
+/// Snapshot name of a target in the two shapes this file's linkers mint:
+/// `<snapshots>/snap-NNNNNN/mnt/<file…>` and `<autofs>/snap-NNNNNN/<file…>`.
+/// Anything else yields None so the sweep leaves it alone.
 fn owned_snap_component<'a>(target: &'a str, snapshots: &Path, autofs: &Path) -> Option<&'a str> {
     // Absolute and lexically clean only: `..`, `.` or `//` can walk a
     // producer-looking prefix back out to an unrelated file.

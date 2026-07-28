@@ -295,10 +295,9 @@ async fn main() {
     // preference). Detects a /backingfiles that failed to mount at boot
     // and runs the guarded xfs_repair ladder; see api::storage_repair.
     sentryusb_api::storage_repair::spawn_boot_check(hub.clone());
-    // Boot-time sweep of TeslaCam symlinks orphaned by past snapshot
-    // releases that skipped the link purge. Delayed off the boot path;
-    // internally guarded (snapshots visible, dir flock, no archive overlay)
-    // and idempotent, so a skipped run just retries next boot.
+    // Boot-time sweep of TeslaCam symlinks orphaned by releases that skipped the
+    // link purge. Delayed off the boot path; internally guarded and idempotent,
+    // so a skipped run just retries next boot.
     tokio::spawn(async {
         tokio::time::sleep(std::time::Duration::from_secs(60)).await;
         match tokio::task::spawn_blocking(|| {
