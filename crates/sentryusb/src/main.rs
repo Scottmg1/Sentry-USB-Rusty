@@ -88,6 +88,12 @@ enum SnapshotAction {
         /// Snapshot name passed through by the `release_snapshot.sh` wrapper.
         name: String,
     },
+    /// Delete /mutable/TeslaCam symlinks into snapshots that no longer exist.
+    Sweep {
+        /// Count what would be removed without deleting anything.
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -289,6 +295,23 @@ async fn main() {
     // preference). Detects a /backingfiles that failed to mount at boot
     // and runs the guarded xfs_repair ladder; see api::storage_repair.
     sentryusb_api::storage_repair::spawn_boot_check(hub.clone());
+    // Boot-time sweep of TeslaCam symlinks orphaned by past snapshot
+    // releases that skipped the link purge. Delayed off the boot path;
+    // internally guarded (snapshots visible, dir flock, no archive overlay)
+    // and idempotent, so a skipped run just retries next boot.
+    tokio::spawn(async {
+        tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+        match tokio::task::spawn_blocking(|| {
+            sentryusb_gadget::snapshot::sweep_dangling_links(false)
+        })
+        .await
+        {
+            Ok(Ok(0)) => {}
+            Ok(Ok(n)) => tracing::info!("Dangling-link sweep removed {} stale TeslaCam link(s)", n),
+            Ok(Err(e)) => tracing::info!("Dangling-link sweep skipped: {}", e),
+            Err(e) => tracing::warn!("Dangling-link sweep task failed: {}", e),
+        }
+    });
     phase!("startup_tasks_spawned");
 
     // Build the API router
@@ -492,6 +515,26 @@ async fn run_snapshot(action: SnapshotAction) -> i32 {
                 Ok(()) => 0,
                 Err(e) => {
                     eprintln!("snapshot release {}: {}", name, e);
+                    1
+                }
+            }
+        }
+        SnapshotAction::Sweep { dry_run } => {
+            let result = tokio::task::spawn_blocking(move || {
+                sentryusb_gadget::snapshot::sweep_dangling_links(dry_run)
+            })
+            .await;
+            match result {
+                Ok(Ok(n)) => {
+                    println!("{} dangling link(s) {}", n, if dry_run { "found" } else { "removed" });
+                    0
+                }
+                Ok(Err(e)) => {
+                    eprintln!("snapshot sweep: {}", e);
+                    1
+                }
+                Err(e) => {
+                    eprintln!("snapshot sweep task panicked: {}", e);
                     1
                 }
             }

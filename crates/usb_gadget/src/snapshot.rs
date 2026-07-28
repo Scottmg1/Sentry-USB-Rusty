@@ -287,8 +287,129 @@ pub async fn release_snapshot(snap_name: &str) -> Result<()> {
     }
 
     std::fs::remove_dir_all(&snap_dir)?;
+    // Parity with bash release_snapshot.sh: drop every /mutable/TeslaCam
+    // symlink whose stored target points into this snapshot, then prune
+    // event/date dirs the removal emptied. Skipping this leaks broken links
+    // that inflate the archive pending count and clutter the Viewer.
+    let pruned = prune_links_into(&name);
+    if pruned > 0 {
+        info!("Pruned {} TeslaCam link(s) into {}", pruned, name);
+    }
     info!("Released snapshot: {}", name);
     Ok(())
+}
+
+/// Remove `/mutable/TeslaCam` symlinks targeting `snap_name` — the stored
+/// target string only, like bash `find -lname "*/NAME/*" -delete`. Never
+/// resolves a link, so autofs is never triggered.
+fn prune_links_into(snap_name: &str) -> usize {
+    let needle = format!("/{}/", snap_name);
+    prune_farm_links(Path::new(TESLACAM), &|target| target.contains(&needle), false)
+}
+
+/// Walk the farm (depth-capped), delete symlinks whose stored target `dead`
+/// matches, then remove dirs the deletion emptied — but never the top-level
+/// category dirs (bash used `find -mindepth 2`). `dry_run` counts only.
+fn prune_farm_links(farm: &Path, dead: &dyn Fn(&str) -> bool, dry_run: bool) -> usize {
+    fn walk(dir: &Path, depth: u8, dead: &dyn Fn(&str) -> bool, dry_run: bool, removed: &mut usize) {
+        if depth > 4 {
+            return;
+        }
+        let Ok(entries) = std::fs::read_dir(dir) else { return };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Ok(ftype) = entry.file_type() else { continue };
+            if ftype.is_symlink() {
+                if let Ok(target) = std::fs::read_link(&path)
+                    && dead(&target.to_string_lossy())
+                    && (dry_run || std::fs::remove_file(&path).is_ok())
+                {
+                    *removed += 1;
+                }
+            } else if ftype.is_dir() {
+                walk(&path, depth + 1, dead, dry_run, removed);
+                // depth >= 1 here means `path` sits at farm depth >= 2
+                // (date/event dirs); rmdir fails harmlessly if non-empty.
+                if !dry_run && depth >= 1 {
+                    let _ = std::fs::remove_dir(&path);
+                }
+            }
+        }
+    }
+    let mut removed = 0;
+    walk(farm, 0, dead, dry_run, &mut removed);
+    removed
+}
+
+/// Delete farm symlinks whose target's `snap-NNNNNN` component no longer
+/// exists under the snapshots dir — cleanup for links leaked by releases
+/// that skipped the purge. String + directory-existence checks only; the
+/// link itself is never resolved. Returns how many were (or with `dry_run`,
+/// would be) removed.
+pub fn sweep_dangling_links(dry_run: bool) -> Result<usize> {
+    // Same flock bash holds on the snapshots dir (make_snapshot.sh,
+    // manage_free_space.sh): the sweep can't interleave with snapshot
+    // creation, slot reuse, or a low-space release.
+    let _lock = lock_snapshots_dir()?;
+    // A mounted archive overlay reads the farm as its lower dir; changing
+    // the lower under an active overlay is undefined. Skip and retry later.
+    if archive_overlay_active() {
+        bail!("archive overlay is mounted — sweep skipped");
+    }
+    sweep_dangling_links_in(Path::new(TESLACAM), Path::new(SNAPSHOTS_DIR), dry_run)
+}
+
+/// [`sweep_dangling_links`] over explicit roots (testable).
+fn sweep_dangling_links_in(farm: &Path, snapshots: &Path, dry_run: bool) -> Result<usize> {
+    // Refuse to judge links when no snapshots are visible at all: an
+    // unmounted /backingfiles would make every farm link look dead.
+    let any_snap = std::fs::read_dir(snapshots)
+        .map(|entries| {
+            entries.flatten().any(|e| {
+                e.file_name().to_string_lossy().starts_with("snap-") && e.path().is_dir()
+            })
+        })
+        .unwrap_or(false);
+    if !any_snap {
+        bail!("no snapshots visible under {} — sweep skipped", snapshots.display());
+    }
+    let dead = |target: &str| match snap_component(target) {
+        Some(name) => !snapshots.join(name).is_dir(),
+        None => false, // not snapshot-backed — never touch
+    };
+    Ok(prune_farm_links(farm, &dead, dry_run))
+}
+
+/// First path component of `target` that is exactly `snap-<digits>`.
+fn snap_component(target: &str) -> Option<&str> {
+    target.split('/').find(|c| {
+        c.strip_prefix("snap-")
+            .is_some_and(|d| !d.is_empty() && d.bytes().all(|b| b.is_ascii_digit()))
+    })
+}
+
+/// Advisory flock on the snapshots dir — the same lock `flock(1)` takes for
+/// bash make_snapshot.sh / manage_free_space.sh. Bounded wait, then bails.
+fn lock_snapshots_dir() -> Result<std::fs::File> {
+    let file = std::fs::File::open(SNAPSHOTS_DIR)?;
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        if crate::cycle_lock::try_flock_exclusive(&file)? {
+            return Ok(file);
+        }
+        if std::time::Instant::now() >= deadline {
+            bail!("snapshots dir lock busy — sweep skipped");
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+}
+
+/// True while archiveloop's archive overlay (lower = the TeslaCam farm) is
+/// mounted at /tmp/cam/merged.
+fn archive_overlay_active() -> bool {
+    std::fs::read_to_string("/proc/mounts")
+        .map(|m| m.lines().any(|l| l.split_whitespace().nth(1) == Some("/tmp/cam/merged")))
+        .unwrap_or(false)
 }
 
 /// List all snapshots.
@@ -1225,5 +1346,90 @@ mod tests {
             std::fs::symlink_metadata(&stray).is_err(),
             "ordinary event cross-link must still be purged",
         );
+    }
+
+    #[test]
+    fn snap_component_extracts_exact_names_only() {
+        assert_eq!(
+            snap_component("/backingfiles/snapshots/snap-000508/mnt/TeslaCam/x.mp4"),
+            Some("snap-000508"),
+        );
+        assert_eq!(snap_component("/tmp/snapshots/snap-000042/TeslaTrackMode/l.mp4"), Some("snap-000042"));
+        assert_eq!(snap_component("/backingfiles/snapshots/snap-000508.bak/x"), None);
+        assert_eq!(snap_component("/mutable/TeslaCam/RecentClips/a.mp4"), None);
+        assert_eq!(snap_component("snap-/x"), None);
+    }
+
+    #[cfg(unix)]
+    fn build_farm(farm: &std::path::Path) -> (std::path::PathBuf, std::path::PathBuf, std::path::PathBuf) {
+        use std::os::unix::fs::symlink;
+        let day = farm.join("RecentClips/2026-06-27");
+        let evt = farm.join("SentryClips/2026-06-27_13-16-28");
+        std::fs::create_dir_all(&day).unwrap();
+        std::fs::create_dir_all(&evt).unwrap();
+        let dead508 = day.join("a-front.mp4");
+        symlink("/backingfiles/snapshots/snap-000508/mnt/TeslaCam/RecentClips/a-front.mp4", &dead508).unwrap();
+        let live600 = day.join("b-front.mp4");
+        symlink("/backingfiles/snapshots/snap-000600/mnt/TeslaCam/RecentClips/b-front.mp4", &live600).unwrap();
+        let evt_dead = evt.join("c-back.mp4");
+        symlink("/backingfiles/snapshots/snap-000508/mnt/TeslaCam/SentryClips/2026-06-27_13-16-28/c-back.mp4", &evt_dead).unwrap();
+        (dead508, live600, evt_dead)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prune_farm_links_matches_target_string_and_prunes_emptied_dirs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let farm = tmp.path();
+        let (dead508, live600, evt_dead) = build_farm(farm);
+
+        let removed = prune_farm_links(farm, &|t| t.contains("/snap-000508/"), false);
+        assert_eq!(removed, 2);
+        assert!(std::fs::symlink_metadata(&dead508).is_err());
+        assert!(std::fs::symlink_metadata(&evt_dead).is_err());
+        assert!(std::fs::symlink_metadata(&live600).is_ok(), "non-matching link must survive");
+        // Emptied event dir pruned; category dirs and non-empty day dir kept.
+        assert!(!farm.join("SentryClips/2026-06-27_13-16-28").exists());
+        assert!(farm.join("SentryClips").exists());
+        assert!(farm.join("RecentClips/2026-06-27").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sweep_removes_only_links_into_missing_snapshots() {
+        let tmp = tempfile::tempdir().unwrap();
+        let farm = tmp.path().join("TeslaCam");
+        let snaps = tmp.path().join("snapshots");
+        std::fs::create_dir_all(snaps.join("snap-000600")).unwrap();
+        let (dead508, live600, evt_dead) = build_farm(&farm);
+        // Non-snapshot-backed link must never be touched.
+        let foreign = farm.join("RecentClips/2026-06-27/d-front.mp4");
+        std::os::unix::fs::symlink("/somewhere/else/d-front.mp4", &foreign).unwrap();
+
+        let counted = sweep_dangling_links_in(&farm, &snaps, true).unwrap();
+        assert_eq!(counted, 2, "dry run must count without deleting");
+        assert!(std::fs::symlink_metadata(&dead508).is_ok());
+
+        let removed = sweep_dangling_links_in(&farm, &snaps, false).unwrap();
+        assert_eq!(removed, 2);
+        assert!(std::fs::symlink_metadata(&dead508).is_err());
+        assert!(std::fs::symlink_metadata(&evt_dead).is_err());
+        assert!(std::fs::symlink_metadata(&live600).is_ok());
+        assert!(std::fs::symlink_metadata(&foreign).is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sweep_bails_when_no_snapshots_visible() {
+        let tmp = tempfile::tempdir().unwrap();
+        let farm = tmp.path().join("TeslaCam");
+        let snaps = tmp.path().join("snapshots");
+        std::fs::create_dir_all(&snaps).unwrap();
+        let (dead508, ..) = build_farm(&farm);
+
+        // Empty snapshots dir looks like an unmounted /backingfiles: bail,
+        // delete nothing.
+        assert!(sweep_dangling_links_in(&farm, &snaps, false).is_err());
+        assert!(std::fs::symlink_metadata(&dead508).is_ok());
     }
 }

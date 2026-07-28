@@ -65,7 +65,7 @@ fn acquire_path(path: &Path, timeout: Duration) -> io::Result<CycleGuard> {
 }
 
 #[cfg(unix)]
-fn try_flock_exclusive(file: &File) -> io::Result<bool> {
+pub(crate) fn try_flock_exclusive(file: &File) -> io::Result<bool> {
     use std::os::unix::io::AsRawFd;
     // Same primitive as shell `flock`: the lock lives on the open file
     // description, so it also excludes other threads of this process and
@@ -82,7 +82,7 @@ fn try_flock_exclusive(file: &File) -> io::Result<bool> {
 }
 
 #[cfg(not(unix))]
-fn try_flock_exclusive(_file: &File) -> io::Result<bool> {
+pub(crate) fn try_flock_exclusive(_file: &File) -> io::Result<bool> {
     Ok(true) // no archiveloop to race on non-unix dev hosts
 }
 
