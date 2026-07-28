@@ -765,13 +765,19 @@ function classify_missing_entries () {
   local -r root="$3"
   local entry err target snap
   true > "$outfile"
+  # A stale directory under an unmounted /backingfiles would look like proof
+  # that every snapshot is gone, suppressing the whole backlog. Without a
+  # proven mount, drop nothing.
+  findmnt --mountpoint /backingfiles > /dev/null 2>&1 || return 0
   while IFS= read -r entry
   do
     [ -n "$entry" ] || continue
     # Readable again since the batch pass: nothing to drop.
-    err=$(stat -L --format='%s' "${root}/${entry}" 2>&1 >/dev/null) && continue
-    case "$err" in
-      *"No such file or directory"*) ;;
+    err=$(LC_ALL=C stat -L --format='%s' "${root}/${entry}" 2>&1 >/dev/null) && continue
+    # stat prints "stat: cannot stat '<path>': <errno>"; keep only the text
+    # after the last ": " so a path containing an errno phrase cannot match.
+    case "${err##*: }" in
+      "No such file or directory"*) ;;
       *) continue ;;
     esac
     target=""
@@ -786,12 +792,8 @@ function classify_missing_entries () {
         snap=${snap%%/*}
         if [ ! -d "/backingfiles/snapshots/${snap}" ]
         then
-          # A missing snapshot only proves absence when the snapshots
-          # directory itself is readable (i.e. /backingfiles is mounted).
-          if [ -d /backingfiles/snapshots ]
-          then
-            echo "$entry" >> "$outfile"
-          fi
+          # The mount is proven above, so an absent snapshot dir is real.
+          echo "$entry" >> "$outfile"
         elif [ -d "/backingfiles/snapshots/${snap}/mnt/TeslaCam" ]
         then
           # Snapshot present and mounted, so the clip itself is gone

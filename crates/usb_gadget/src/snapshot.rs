@@ -109,7 +109,9 @@ fn clip_stamp(name: &str) -> Option<&str> {
 /// is byte-equivalent to the previous one (in which case we delete the
 /// reflink to avoid accumulating identical copies).
 pub async fn make_snapshot(skip_fsck: bool) -> Result<Option<String>> {
-    let _ = std::fs::create_dir_all(SNAPSHOTS_DIR);
+    // Serializes against the sweep and the other producers; nothing below
+    // re-acquires it.
+    let _lock = lock_snapshots_dir()?;
 
     if !Path::new(CAM_DISK).exists() {
         bail!("cam disk image not found at {}", CAM_DISK);
@@ -278,6 +280,13 @@ fn normalize_snap_name(input: &str) -> Option<String> {
 /// Release (delete) a snapshot. Accepts a bare `snap-NNNNNN` name or a full
 /// path under the snapshots dir (see [`normalize_snap_name`]).
 pub async fn release_snapshot(snap_name: &str) -> Result<()> {
+    let _lock = lock_snapshots_dir()?;
+    release_snapshot_locked(snap_name).await
+}
+
+/// Body of [`release_snapshot`] for callers already holding the snapshots-dir
+/// lock — taking it a second time in-process would deadlock against itself.
+pub(crate) async fn release_snapshot_locked(snap_name: &str) -> Result<()> {
     let name = match normalize_snap_name(snap_name) {
         Some(n) => n,
         None => bail!("invalid snapshot name: {}", snap_name),
@@ -311,17 +320,21 @@ pub async fn release_snapshot(snap_name: &str) -> Result<()> {
 fn prune_links_into(snap_name: &str) -> usize {
     let snapshots = Path::new(SNAPSHOTS_DIR);
     let autofs = Path::new(AUTOFS_SNAPSHOTS);
-    // Producer-shaped targets only, same predicate as the sweep: a bare
-    // substring match also deletes foreign links that merely happen to
-    // carry the released snapshot's name in their path.
-    let dead =
-        |_: &Path, target: &str| owned_snap_component(target, snapshots, autofs) == Some(snap_name);
+    let dead = |_: &Path, target: &str| released_link_is_dead(target, snap_name, snapshots, autofs);
     let (removed, aborted) =
         prune_farm_links(Path::new(TESLACAM), &dead, &backingfiles_mounted, false);
     if aborted {
         warn!("{} unmounted during prune of {}", BACKINGFILES, snap_name);
     }
     removed
+}
+
+/// Release-prune predicate. Producer-shaped targets naming `snap_name` only —
+/// a bare substring match would also delete foreign links — and only while
+/// that snapshot is provably gone, so links into a reused slot survive.
+fn released_link_is_dead(target: &str, snap_name: &str, snapshots: &Path, autofs: &Path) -> bool {
+    owned_snap_component(target, snapshots, autofs) == Some(snap_name)
+        && matches!(snapshot_state(snapshots, snap_name), SnapState::Gone)
 }
 
 /// Guard both prune paths re-check: the snapshots filesystem must stay
@@ -403,9 +416,8 @@ pub fn sweep_dangling_links(dry_run: bool) -> Result<usize> {
     if !is_mounted(Path::new(BACKINGFILES)) {
         bail!("{} is not a mount point — sweep skipped", BACKINGFILES);
     }
-    // Same flock bash holds on the snapshots dir (make_snapshot.sh,
-    // manage_free_space.sh). The Rust make/release/free-space paths do NOT
-    // yet take it, so the per-link re-verify below carries the real safety.
+    // Same flock the bash and Rust producers hold, so no producer can relink
+    // between this walk's re-verify and its unlink.
     let _lock = lock_snapshots_dir()?;
     // A mounted archive overlay reads the farm as its lower dir; changing
     // the lower under an active overlay is undefined. Skip and retry later.
@@ -510,7 +522,7 @@ fn owned_snap_component<'a>(target: &'a str, snapshots: &Path, autofs: &Path) ->
 
 /// True when `path` is a mount point. A readable /proc/mounts is the whole
 /// answer — no entry means NOT mounted. The st_dev comparison runs only
-/// when /proc/mounts is unreadable (a symlink across fs also trips it).
+/// when /proc/mounts is unreadable.
 fn is_mounted(path: &Path) -> bool {
     let want = path.to_string_lossy();
     if let Ok(mounts) = std::fs::read_to_string("/proc/mounts") {
@@ -521,9 +533,14 @@ fn is_mounted(path: &Path) -> bool {
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
-        let (Ok(md), Some(parent)) = (std::fs::metadata(path), path.parent()) else {
+        // symlink_metadata, not metadata: a symlinked path lands on another
+        // device and would read as mounted while nothing is mounted here.
+        let (Ok(md), Some(parent)) = (std::fs::symlink_metadata(path), path.parent()) else {
             return false;
         };
+        if md.file_type().is_symlink() {
+            return false;
+        }
         std::fs::metadata(parent).is_ok_and(|p| p.dev() != md.dev())
     }
     #[cfg(not(unix))]
@@ -531,8 +548,10 @@ fn is_mounted(path: &Path) -> bool {
 }
 
 /// Advisory flock on the snapshots dir — the same lock `flock(1)` takes for
-/// bash make_snapshot.sh / manage_free_space.sh. Bounded wait, then bails.
-fn lock_snapshots_dir() -> Result<std::fs::File> {
+/// bash make_snapshot.sh / manage_free_space.sh, so every producer and the
+/// sweep serialize on one lock. Bounded wait, then bails without acting.
+pub(crate) fn lock_snapshots_dir() -> Result<std::fs::File> {
+    let _ = std::fs::create_dir_all(SNAPSHOTS_DIR);
     let file = std::fs::File::open(SNAPSHOTS_DIR)?;
     let deadline = std::time::Instant::now() + Duration::from_secs(30);
     loop {
@@ -540,7 +559,7 @@ fn lock_snapshots_dir() -> Result<std::fs::File> {
             return Ok(file);
         }
         if std::time::Instant::now() >= deadline {
-            bail!("snapshots dir lock busy — sweep skipped");
+            bail!("snapshots dir lock busy — skipped");
         }
         std::thread::sleep(Duration::from_millis(250));
     }
@@ -1700,6 +1719,47 @@ mod tests {
         std::fs::create_dir_all(snaps.join("snap-000508")).unwrap();
         assert_eq!(sweep_dangling_links_in(&farm, &snaps, &autofs, &|| true, false).unwrap(), 0);
         assert!(std::fs::symlink_metadata(&dead508).is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn release_prune_spares_links_into_a_reused_snapshot_slot() {
+        let tmp = tempfile::tempdir().unwrap();
+        let farm = tmp.path().join("TeslaCam");
+        let snaps = tmp.path().join("snapshots");
+        let autofs = tmp.path().join("autofs");
+        std::fs::create_dir_all(snaps.join("snap-000600")).unwrap();
+        let (dead508, live600, evt_dead) = build_farm(&farm, snaps.to_str().unwrap());
+        let dead = |_: &std::path::Path, t: &str| {
+            released_link_is_dead(t, "snap-000508", &snaps, &autofs)
+        };
+
+        // Slot 508 stays released: both its links go, the other survives.
+        let (removed, aborted) = prune_farm_links(&farm, &dead, &|| true, false);
+        assert_eq!((removed, aborted), (2, false));
+        assert!(std::fs::symlink_metadata(&dead508).is_err());
+        assert!(std::fs::symlink_metadata(&evt_dead).is_err());
+        assert!(std::fs::symlink_metadata(&live600).is_ok());
+
+        // A new snapshot reuses slot 508 partway through the walk; every link
+        // the prune has not yet reached must survive.
+        let farm2 = tmp.path().join("TeslaCam2");
+        let (dead508, _, evt_dead) = build_farm(&farm2, snaps.to_str().unwrap());
+        let calls = std::cell::Cell::new(0);
+        let guard = || {
+            calls.set(calls.get() + 1);
+            if calls.get() == 4 {
+                std::fs::create_dir_all(snaps.join("snap-000508")).unwrap();
+            }
+            true
+        };
+        let (removed, aborted) = prune_farm_links(&farm2, &dead, &guard, false);
+        assert_eq!((removed, aborted), (1, false), "only the pre-recreate dir may be pruned");
+        let survivors = [&dead508, &evt_dead]
+            .iter()
+            .filter(|p| std::fs::symlink_metadata(p).is_ok())
+            .count();
+        assert_eq!(survivors, 1, "the reused slot's remaining link must survive");
     }
 
     #[cfg(unix)]
