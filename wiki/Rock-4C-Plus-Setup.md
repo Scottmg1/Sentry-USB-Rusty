@@ -37,7 +37,7 @@ Wiring:
 
 ### 1. Flash the image
 
-Flash the DietPi Rock 4C+ image to your SD card using your preferred flashing tool (Raspberry Pi Imager, balenaEtcher, etc.).
+Download the DietPi image from [dietpi.com](https://dietpi.com/#download) — select **Radxa** → **ROCK 4** → **Rock 4C Plus**. Flash it to your SD card using your preferred flashing tool (Raspberry Pi Imager, balenaEtcher, etc.).
 
 ### 2. Configure WiFi and user (before first boot)
 
@@ -56,9 +56,13 @@ Boot the board, find its IP on your router, and SSH in:
 ssh root@<ip>
 ```
 
-### 4. Install the dwc3 USB gadget overlay (required)
+### 4. Run the installer
 
-The OTG port defaults to **host mode**. Sentry USB needs it in **peripheral mode** to present as a USB mass-storage device the Tesla can read. This requires a device-tree overlay.
+Continue from [Getting Started: SSH in and install](Getting-Started#4-ssh-in-and-install) to run the Sentry USB installer. Return here after the installer finishes.
+
+### 5. Replace the dwc3 USB gadget overlay (required)
+
+The OTG port defaults to **host mode**. Sentry USB needs it in **peripheral mode** to present as a USB mass-storage device the Tesla can read. The installer created a minimal overlay — replace it with the full one below.
 
 > Run these steps as root (`sudo -i`).
 
@@ -68,7 +72,7 @@ The OTG port defaults to **host mode**. Sentry USB needs it in **peripheral mode
 apt install -y device-tree-compiler
 ```
 
-**Write the overlay source:**
+**Overwrite the overlay source:**
 
 ```bash
 cat > /boot/overlay-user/sentryusb-dwc3-hs.dts << 'EOF'
@@ -96,7 +100,7 @@ cat > /boot/overlay-user/sentryusb-dwc3-hs.dts << 'EOF'
 EOF
 ```
 
-**Compile and register:**
+**Compile:**
 
 ```bash
 dtc -@ -I dts -O dtb -o /boot/overlay-user/sentryusb-dwc3-hs.dtbo /boot/overlay-user/sentryusb-dwc3-hs.dts
@@ -112,13 +116,15 @@ user_overlays=sentryusb-dwc3-hs
 
 If it's missing or has a different value, edit `/boot/dietpiEnv.txt` and set `user_overlays=sentryusb-dwc3-hs`.
 
+### 6. Reboot and finish setup
+
 **Reboot:**
 
 ```bash
 reboot
 ```
 
-After reboot, continue from [Getting Started: SSH in and install](Getting-Started#4-ssh-in-and-install).
+After reboot, continue from [Getting Started: Open the web UI](Getting-Started#5-open-the-web-ui) to finish setup in the web UI.
 
 ## Armbian
 
