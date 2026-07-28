@@ -818,9 +818,13 @@ function classify_missing_entries () {
           echo "$entry" >> "$outfile"
         elif [ -d "/backingfiles/snapshots/${snap}/mnt/TeslaCam" ]
         then
-          # Snapshot present and mounted, so the clip itself is gone
-          # (e.g. the car moved it into an event folder).
-          echo "$entry" >> "$outfile"
+          # That probe triggers the autofs mount, so the first stat may have
+          # failed only because it had not mounted yet. Re-stat the clip and
+          # drop it only if it is still absent.
+          err=$(LC_ALL=C stat -L --format='%s' "${root}/${entry}" 2>&1 >/dev/null) && continue
+          case "${err##*: }" in
+            "No such file or directory"*) echo "$entry" >> "$outfile" ;;
+          esac
         fi
         ;;
     esac
