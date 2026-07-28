@@ -324,7 +324,10 @@ fn prune_links_into(snap_name: &str) -> usize {
     let (removed, aborted) =
         prune_farm_links(Path::new(TESLACAM), &dead, &backingfiles_mounted, false);
     if aborted {
-        warn!("{} unmounted during prune of {}", BACKINGFILES, snap_name);
+        warn!(
+            "{} unmounted during prune of {} — aborted after {} link(s)",
+            BACKINGFILES, snap_name, removed
+        );
     }
     removed
 }
@@ -345,7 +348,8 @@ fn backingfiles_mounted() -> bool {
 
 /// Walk the farm (depth-capped), delete symlinks whose stored target `dead` matches,
 /// then remove dirs the deletion emptied, never the top-level category dirs.
-/// `guard` re-checked per dir aborts the walk; returns `(removed, aborted)`.
+/// `guard` re-checked per dir AND immediately before each unlink aborts the
+/// walk outright; returns `(removed, aborted)`.
 fn prune_farm_links(
     farm: &Path,
     dead: &dyn Fn(&Path, &str) -> bool,
@@ -373,10 +377,16 @@ fn prune_farm_links(
             if ftype.is_symlink() {
                 if let Ok(target) = std::fs::read_link(&path) {
                     let target = target.to_string_lossy().to_string();
-                    if dead(&path, &target)
-                        && (dry_run || unlink_if_still_dead(&path, &target, dead))
-                    {
-                        *removed += 1;
+                    if dead(&path, &target) {
+                        // `dead` reads the snapshots dir, so an unmount since the
+                        // last check turns a healthy link into a false positive.
+                        // Re-prove immediately before acting on this one link.
+                        if !guard() {
+                            return false;
+                        }
+                        if dry_run || unlink_if_still_dead(&path, &target, dead) {
+                            *removed += 1;
+                        }
                     }
                 }
             } else if ftype.is_dir() {
@@ -1745,10 +1755,11 @@ mod tests {
         // the prune has not yet reached must survive.
         let farm2 = tmp.path().join("TeslaCam2");
         let (dead508, _, evt_dead) = build_farm(&farm2, snaps.to_str().unwrap());
-        let calls = std::cell::Cell::new(0);
+        let recreated = std::cell::Cell::new(false);
         let guard = || {
-            calls.set(calls.get() + 1);
-            if calls.get() == 4 {
+            let pruned = std::fs::symlink_metadata(&dead508).is_err()
+                || std::fs::symlink_metadata(&evt_dead).is_err();
+            if pruned && !recreated.replace(true) {
                 std::fs::create_dir_all(snaps.join("snap-000508")).unwrap();
             }
             true
@@ -1775,6 +1786,45 @@ mod tests {
         let err = sweep_dangling_links_in(&farm, &snaps, &autofs, &|| false, false).unwrap_err();
         assert!(err.to_string().contains("mount state changed"));
         assert!(std::fs::symlink_metadata(&dead508).is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sweep_aborts_before_the_next_unlink_when_the_mount_drops_mid_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let farm = tmp.path().join("TeslaCam");
+        let snaps = tmp.path().join("snapshots");
+        let autofs = tmp.path().join("autofs");
+        std::fs::create_dir_all(snaps.join("snap-000600")).unwrap();
+        let (dead508, live600, evt_dead) = build_farm(&farm, snaps.to_str().unwrap());
+
+        // Second dead link in the SAME directory as dead508: a guard checked
+        // only once per directory would delete both.
+        let sibling = farm.join("RecentClips/2026-06-27/z-front.mp4");
+        std::os::unix::fs::symlink(
+            format!("{}/snap-000508/mnt/TeslaCam/RecentClips/z-front.mp4", snaps.display()),
+            &sibling,
+        )
+        .unwrap();
+
+        // /backingfiles goes away the instant the first unlink lands.
+        let dropped = std::cell::Cell::new(false);
+        let deleted = |p: &std::path::Path| std::fs::symlink_metadata(p).is_err();
+        let guard = || {
+            if deleted(&dead508) || deleted(&sibling) || deleted(&evt_dead) {
+                dropped.set(true);
+            }
+            !dropped.get()
+        };
+
+        let err = sweep_dangling_links_in(&farm, &snaps, &autofs, &guard, false).unwrap_err();
+        assert!(err.to_string().contains("aborted after 1 link(s)"), "{err}");
+        let survivors = [&dead508, &sibling, &evt_dead]
+            .iter()
+            .filter(|p| std::fs::symlink_metadata(p).is_ok())
+            .count();
+        assert_eq!(survivors, 2, "the sweep must stop at the first dropped mount");
+        assert!(std::fs::symlink_metadata(&live600).is_ok());
     }
 
     /// An unreadable snapshots dir makes every source undeterminable: the

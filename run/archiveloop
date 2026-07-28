@@ -756,6 +756,18 @@ function prunefile {
   mv /tmp/prune_tmp.$$ "$1"
 }
 
+# True while /backingfiles is a mount point. One fork-free read so the loop
+# below can re-prove the mount cheaply. Only the mountpoint field can be a
+# space-delimited path (/proc escapes spaces); unreadable proves nothing.
+function backingfiles_is_mounted () {
+  local mounts
+  mounts=$(</proc/self/mounts) || return 1
+  case "$mounts" in
+    *" /backingfiles "*) return 0 ;;
+  esac
+  return 1
+}
+
 # Classify list entries the stat pass could not read: only entries whose
 # source is provably gone are written to $2. Any ambiguous error (EIO,
 # ESTALE, permission, mount outage) is left out so it stays counted.
@@ -764,14 +776,24 @@ function classify_missing_entries () {
   local -r outfile="$2"
   local -r root="$3"
   local entry err target snap
+  local checked=0
   true > "$outfile"
   # A stale directory under an unmounted /backingfiles would look like proof
   # that every snapshot is gone, suppressing the whole backlog. Without a
   # proven mount, drop nothing.
-  findmnt --mountpoint /backingfiles > /dev/null 2>&1 || return 0
+  backingfiles_is_mounted || return 0
   while IFS= read -r entry
   do
     [ -n "$entry" ] || continue
+    # Re-prove the mount every 32 entries: an unmount part-way through would
+    # make every later entry look absent. The outage may predate any entry
+    # already classified, so discard the whole run rather than trust it.
+    checked=$((checked + 1))
+    if [ $((checked % 32)) -eq 0 ] && ! backingfiles_is_mounted
+    then
+      true > "$outfile"
+      return 0
+    fi
     # Readable again since the batch pass: nothing to drop.
     err=$(LC_ALL=C stat -L --format='%s' "${root}/${entry}" 2>&1 >/dev/null) && continue
     # stat prints "stat: cannot stat '<path>': <errno>"; keep only the text
@@ -803,6 +825,11 @@ function classify_missing_entries () {
         ;;
     esac
   done < "$listfile"
+  # Final batch: without this an unmount in the last <32 entries goes unseen.
+  if ! backingfiles_is_mounted
+  then
+    true > "$outfile"
+  fi
 }
 
 function intersect {
