@@ -1788,11 +1788,15 @@ fn build_fsd_analytics(summaries: &[DriveSummary], period: &str) -> FsdAnalytics
     // Filter drives in period. Imported drives (tessie, teslascope, …)
     // are excluded from FSD analytics entirely — their autopilot data is
     // inferred or absent, not dashcam SEI telemetry, so mixing them
-    // would dilute the score.
+    // would dilute the score. Summon drives are excluded too (mirrors
+    // Sentry-Drive's aggregate builder): driverless with autopilot_state
+    // unset, they'd otherwise read as fake "0% FSD" drives — dragging
+    // down the score and padding the per-drive disengagement averages
+    // with trips no human (or FSD) ever drove.
     let period_drives: Vec<&DriveSummary> = summaries
         .iter()
         .filter(|d| {
-            if is_imported(&d.source) {
+            if is_imported(&d.source) || d.summon {
                 return false;
             }
             if let Some(ps) = period_start {
@@ -4618,5 +4622,59 @@ mod tests {
             "without per-run maxima the whole-clip 5.4 m/s must reject the summon"
         );
         assert!(!drives[1].summon);
+    }
+
+    #[test]
+    fn summon_drives_do_not_count_toward_fsd_analytics() {
+        // A 100%-FSD commute in the morning, a detected summon in the
+        // evening. The summon is driverless with autopilot_state unset,
+        // so counting it would read as a fake "0% FSD" drive — the
+        // score must stay 100%, the per-drive averages must not gain a
+        // phantom denominator, and the summon's distance must stay out
+        // of the analytics totals (mirrors Sentry-Drive's aggregate
+        // builder; top-line drive totals elsewhere still include it).
+        let mut fsd_commute = summon_summary(
+            "2026-07-15/2026-07-15_08-00-00-front.mp4",
+            &[(1, 1800)],
+            &[],
+            Some(20.0),
+        );
+        fsd_commute.aggregates.distance_m = 9850.0;
+        fsd_commute.aggregates.fsd_distance_m = 9850.0;
+        fsd_commute.aggregates.fsd_engaged_ms = 300_000;
+        fsd_commute.aggregates.fsd_disengagements = 1;
+
+        let mut summon_a = summon_summary(
+            "2026-07-15/2026-07-15_20-49-54-front.mp4",
+            &[(GEAR_PARK, 60), (1, 1726)],
+            &[(0, 27), (3, 123), (0, 17), (1, 873), (0, 746)],
+            Some(2.7),
+        );
+        summon_a.aggregates.distance_m = 100.0;
+        let mut summon_b = summon_summary(
+            "2026-07-15/2026-07-15_20-50-43-front.mp4",
+            &[(1, 500), (GEAR_PARK, 53)],
+            &[(0, 471), (3, 82)],
+            Some(2.7),
+        );
+        summon_b.aggregates.distance_m = 50.0;
+
+        let drives =
+            group_summaries_fast(&[fsd_commute, summon_a, summon_b], &HashMap::new());
+        assert_eq!(drives.len(), 2);
+        assert!(!drives[0].summon);
+        assert_eq!(drives[0].fsd_percent, 100.0);
+        assert!(drives[1].summon, "precondition: the evening drive is a summon");
+        assert!(drives[1].distance_km > 0.0, "precondition: it carries distance");
+
+        let fsd = build_fsd_analytics(&drives, "all");
+        assert_eq!(fsd.total_drives, 1, "summon drive must not count");
+        assert_eq!(fsd.fsd_percent, 100.0, "score undiluted by the summon's distance");
+        assert_eq!(fsd.total_distance_km, 9.85, "summon distance stays out of analytics");
+        assert_eq!(
+            fsd.avg_disengagements_per_drive, 1.0,
+            "per-drive averages must not gain a phantom summon denominator"
+        );
+        assert_eq!(fsd.best_day_percent, 100.0);
     }
 }

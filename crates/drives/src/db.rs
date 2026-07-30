@@ -1848,9 +1848,13 @@ fn compute_drive_caches(inputs: DriveCacheInputs) -> Result<DriveCacheArtifacts>
     // (tessie, teslascope, future importers) is imported data with fuzzy
     // or absent per-point autopilot telemetry — counted in totals, never
     // in FSD analytics. Matches Sentry-Drive's isImportedSource rule.
+    // Summon drives are likewise totals-only (mirrors Sentry-Drive's
+    // aggregate builder): autopilot_state stays unset while the car
+    // drives itself, so counting them would dilute the FSD score with
+    // fake "0% FSD" drives.
     let sei_drives: Vec<_> = drives
         .iter()
-        .filter(|d| !matches!(d.source.as_deref(), Some(s) if s != "sei"))
+        .filter(|d| !matches!(d.source.as_deref(), Some(s) if s != "sei") && !d.summon)
         .collect();
     let sei_total_km: f64 = sei_drives.iter().map(|d| d.distance_km).sum();
     let fsd_distance_km: f64 = sei_drives.iter().map(|d| d.fsd_distance_km).sum();
