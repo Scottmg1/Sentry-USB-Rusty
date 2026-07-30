@@ -81,7 +81,16 @@ use rusqlite::{params, Connection, OptionalExtension};
 /// v14 -> v15: add clip-boundary state columns to `routes`
 /// (V15_ROUTE_BOUNDARY_COLUMNS) so FSD disengagements and accel pushes
 /// resolve across clip seams in the drive grouper.
-pub const CURRENT_SCHEMA_VERSION: i32 = 15;
+///
+/// v15 -> v16: add `flag_runs_blob` (per-frame SEI blinker/brake/accel
+/// flag RLE in RAW frame space — the summon detector's evidence) and
+/// `sei_speed_abs_max` (max |SEI speed| per clip; the locked
+/// `max_speed_mps` drops negative Reverse samples, so a reverse-only
+/// summon crawl would read 0) to `routes`. Both nullable — rows written
+/// before flag extraction stay NULL, which the summon detector reads as
+/// "unverifiable, not summon". No backfill: flags can only come from
+/// re-extracting the MP4's SEI stream, not from stored deduped arrays.
+pub const CURRENT_SCHEMA_VERSION: i32 = 16;
 
 /// v1 DDL. Each statement is idempotent (`IF NOT EXISTS`) so `migrate()`
 /// is safe on every startup. Column shapes and names match Go exactly â€”
@@ -340,6 +349,14 @@ pub const V15_ROUTE_BOUNDARY_COLUMNS: &[(&str, &str)] = &[
     ("ap_at_start", "INTEGER"),
 ];
 
+/// v16 summon-evidence columns on `routes` (see `CURRENT_SCHEMA_VERSION`
+/// docs). `flag_runs_blob` follows the `gear_runs_blob` wire shape
+/// (1-byte flags + LE i32 frames per run).
+pub const V16_ROUTE_FLAG_COLUMNS: &[(&str, &str)] = &[
+    ("flag_runs_blob", "BLOB"),
+    ("sei_speed_abs_max", "REAL"),
+];
+
 /// v9 rollups on `routes`. Odometer start/end let the UI show a
 /// per-trip mileage delta that's more accurate than GPS distance
 /// (GPS over-estimates curves, drops in tunnels, can drift).
@@ -484,6 +501,7 @@ pub fn migrate(conn: &Connection) -> Result<()> {
         .chain(V9_ROUTE_COLUMNS.iter())
         .chain(V10_ROUTE_COLUMNS.iter())
         .chain(V15_ROUTE_BOUNDARY_COLUMNS.iter())
+        .chain(V16_ROUTE_FLAG_COLUMNS.iter())
     {
         if existing.contains(*name) {
             continue;
@@ -682,7 +700,7 @@ mod tests {
         migrate(&conn).unwrap();
         assert_eq!(
             meta_get(&conn, "schema_version").unwrap().as_deref(),
-            Some("15"),
+            Some("16"),
         );
         assert!(meta_get(&conn, "created_at").unwrap().is_some());
     }
@@ -720,7 +738,7 @@ mod tests {
         }
         assert_eq!(
             meta_get(&conn, "schema_version").unwrap().as_deref(),
-            Some("15")
+            Some("16")
         );
     }
 
@@ -752,7 +770,7 @@ mod tests {
         }
         assert_eq!(
             meta_get(&conn, "schema_version").unwrap().as_deref(),
-            Some("15")
+            Some("16")
         );
     }
 
@@ -786,7 +804,7 @@ mod tests {
         }
         assert_eq!(
             meta_get(&conn, "schema_version").unwrap().as_deref(),
-            Some("15")
+            Some("16")
         );
     }
 
@@ -893,7 +911,7 @@ mod tests {
         assert!(surviving_processed.starts_with("RecentClips/"));
         assert_eq!(
             meta_get(&conn, "schema_version").unwrap().as_deref(),
-            Some("15")
+            Some("16")
         );
     }
 
@@ -944,7 +962,7 @@ mod tests {
         assert_eq!(count_routes(&conn), 1, "fresh-DB seed must not run v5 cleanup");
         assert_eq!(
             meta_get(&conn, "schema_version").unwrap().as_deref(),
-            Some("15")
+            Some("16")
         );
     }
 
@@ -997,7 +1015,7 @@ mod tests {
         assert_eq!(table_exists, 1, "v6 must create telemetry_samples");
         assert_eq!(
             meta_get(&conn, "schema_version").unwrap().as_deref(),
-            Some("15")
+            Some("16")
         );
     }
 
@@ -1034,7 +1052,45 @@ mod tests {
         }
         assert_eq!(
             meta_get(&conn, "schema_version").unwrap().as_deref(),
-            Some("15")
+            Some("16")
+        );
+    }
+
+    #[test]
+    fn migrate_from_v15_adds_v16_flag_columns() {
+        // Stand up a v15 DB (everything but the v16 flag columns) and
+        // confirm migrate adds them.
+        let conn = open();
+        for stmt in V1_SCHEMA {
+            conn.execute(stmt, []).unwrap();
+        }
+        for stmt in V6_NEW_TABLES {
+            conn.execute(stmt, []).unwrap();
+        }
+        for (name, typ) in V2_ROUTE_AGGREGATE_COLUMNS
+            .iter()
+            .chain(V3_ROUTE_CLOUD_COLUMNS.iter())
+            .chain(V4_ROUTE_TESSIE_COLUMNS.iter())
+            .chain(V6_ROUTE_TELEMETRY_COLUMNS.iter())
+            .chain(V7_ROUTE_TPMS_COLUMNS.iter())
+            .chain(V9_ROUTE_COLUMNS.iter())
+            .chain(V10_ROUTE_COLUMNS.iter())
+            .chain(V15_ROUTE_BOUNDARY_COLUMNS.iter())
+        {
+            conn.execute(&format!("ALTER TABLE routes ADD COLUMN {} {}", name, typ), [])
+                .unwrap();
+        }
+        meta_set(&conn, "schema_version", "15").unwrap();
+
+        migrate(&conn).unwrap();
+
+        let cols = list_route_columns(&conn).unwrap();
+        for (name, _) in V16_ROUTE_FLAG_COLUMNS {
+            assert!(cols.contains(*name), "routes.{} missing after v16", name);
+        }
+        assert_eq!(
+            meta_get(&conn, "schema_version").unwrap().as_deref(),
+            Some("16")
         );
     }
 
@@ -1077,7 +1133,7 @@ mod tests {
         }
         assert_eq!(
             meta_get(&conn, "schema_version").unwrap().as_deref(),
-            Some("15")
+            Some("16")
         );
     }
 

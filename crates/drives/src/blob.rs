@@ -14,7 +14,7 @@
 
 use anyhow::{bail, Result};
 
-use crate::types::{GearRun, GpsPoint};
+use crate::types::{FlagRun, GearRun, GpsPoint};
 
 // -----------------------------------------------------------------------------
 // Points: [f64; 2] per point (16 bytes)
@@ -145,6 +145,44 @@ pub fn decode_gear_runs(buf: Option<&[u8]>) -> Result<Option<Vec<GearRun>>> {
     Ok(Some(out))
 }
 
+// -----------------------------------------------------------------------------
+// FlagRuns: 1-byte flags + 4-byte i32 frames per run (same wire shape as
+// GearRuns)
+// -----------------------------------------------------------------------------
+
+const FLAG_RUN_STRIDE: usize = 5; // u8 + i32
+
+pub fn encode_flag_runs(runs: Option<&[FlagRun]>) -> Option<Vec<u8>> {
+    let runs = runs?;
+    let mut buf = Vec::with_capacity(runs.len() * FLAG_RUN_STRIDE);
+    for r in runs {
+        buf.push(r.flags);
+        let frames = r.frames as i32;
+        buf.extend_from_slice(&frames.to_le_bytes());
+    }
+    Some(buf)
+}
+
+pub fn decode_flag_runs(buf: Option<&[u8]>) -> Result<Option<Vec<FlagRun>>> {
+    let Some(buf) = buf else { return Ok(None) };
+    if buf.len() % FLAG_RUN_STRIDE != 0 {
+        bail!(
+            "decode_flag_runs: length {} not a multiple of {}",
+            buf.len(),
+            FLAG_RUN_STRIDE
+        );
+    }
+    let n = buf.len() / FLAG_RUN_STRIDE;
+    let mut out = Vec::with_capacity(n);
+    for i in 0..n {
+        let off = i * FLAG_RUN_STRIDE;
+        let flags = buf[off];
+        let frames = i32::from_le_bytes(buf[off + 1..off + 5].try_into().unwrap()) as u32;
+        out.push(FlagRun { flags, frames });
+    }
+    Ok(Some(out))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -175,6 +213,8 @@ mod tests {
         assert!(decode_f32s(None).unwrap().is_none());
         assert!(encode_gear_runs(None).is_none());
         assert!(decode_gear_runs(None).unwrap().is_none());
+        assert!(encode_flag_runs(None).is_none());
+        assert!(decode_flag_runs(None).unwrap().is_none());
     }
 
     #[test]
@@ -220,6 +260,26 @@ mod tests {
             assert_eq!(a.gear, b.gear);
             assert_eq!(a.frames, b.frames);
         }
+    }
+
+    #[test]
+    fn roundtrip_flag_runs() {
+        let runs = vec![
+            FlagRun { flags: 0, frames: 27 },
+            FlagRun { flags: 3, frames: 123 },
+            FlagRun { flags: 1, frames: 873 },
+            FlagRun { flags: 8, frames: 36 },
+        ];
+        let buf = encode_flag_runs(Some(&runs)).unwrap();
+        assert_eq!(buf.len(), runs.len() * FLAG_RUN_STRIDE);
+        let back = decode_flag_runs(Some(&buf)).unwrap().unwrap();
+        assert_eq!(back, runs);
+    }
+
+    #[test]
+    fn decode_flag_runs_rejects_misaligned_input() {
+        let buf = vec![0u8; 6];
+        assert!(decode_flag_runs(Some(&buf)).is_err());
     }
 
     #[test]

@@ -89,6 +89,33 @@ pub struct GearRun {
     pub frames: u32,
 }
 
+// -----------------------------------------------------------------------------
+// Per-frame SEI flag bits (SeiMetadata fields 7/8/9, plus the derived accel
+// bit). Mirrors Sentry-Drive's drive-calc.cjs FLAG_* constants exactly.
+// -----------------------------------------------------------------------------
+
+/// blinker_on_left (steady switch state, not lamp flash).
+pub const FLAG_BLINKER_LEFT: u8 = 1;
+/// blinker_on_right.
+pub const FLAG_BLINKER_RIGHT: u8 = 2;
+/// brake_applied (pedal-only; summon's own braking never sets it).
+pub const FLAG_BRAKE: u8 = 4;
+/// accelerator_pedal_position > 0 (human-only input).
+pub const FLAG_ACCEL: u8 = 8;
+
+/// A contiguous run of a single per-frame SEI flag byte.
+///
+/// Carried per clip as `flagRuns`: an RLE over RAW SEI frame indices —
+/// the same frame space as `gearRuns`, deliberately computed BEFORE GPS
+/// point dedup. A stationary car with hazards on produces few unique GPS
+/// points, and the summon detector needs those frames, not the survivors.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FlagRun {
+    pub flags: u8,
+    pub frames: u32,
+}
+
 /// A single clip's extracted route data (stored in SQLite).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -110,6 +137,11 @@ pub struct Route {
     pub raw_frame_count: u32,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub gear_runs: Vec<GearRun>,
+    /// Per-frame SEI flag RLE in RAW frame space (see [`FlagRun`]). Absent
+    /// on routes written before flag extraction existed — the summon
+    /// detector treats such drives as unverifiable, never as summon.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub flag_runs: Vec<FlagRun>,
     /// Provenance: "sei" (native dashcam) or "tessie" (imported from Tessie).
     /// Absent / null defaults to "sei" for backwards compatibility.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -163,6 +195,8 @@ pub struct Route {
 }
 
 fn u32_is_zero(n: &u32) -> bool { *n == 0 }
+
+fn bool_is_false(b: &bool) -> bool { !*b }
 
 /// One telemetry temperature sample inside a clip's 60s window —
 /// uploaded with the route blob so the cloud can chart the drive's
@@ -235,6 +269,11 @@ pub struct Drive {
     pub tacc_distance_mi: f64,
     // Assisted aggregate
     pub assisted_percent: f64,
+    /// Summon / Smart Summon drive (see `grouper::detect_summon`).
+    /// Emitted only when true, matching Sentry-Drive's
+    /// `...(summon ? { summon: true } : {})`.
+    #[serde(default, skip_serializing_if = "bool_is_false")]
+    pub summon: bool,
     // Provenance
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,
@@ -284,6 +323,11 @@ pub struct DriveSummary {
     pub tacc_distance_mi: f64,
     // Assisted aggregate
     pub assisted_percent: f64,
+    /// Summon / Smart Summon drive (see `grouper::detect_summon`).
+    /// Emitted only when true, matching Sentry-Drive's
+    /// `...(summon ? { summon: true } : {})`.
+    #[serde(default, skip_serializing_if = "bool_is_false")]
+    pub summon: bool,
     // ── v6 BLE telemetry rollup ────────────────────────────────────────
     // Aggregated across the drive's clips from `telemetry_samples`.
     // All optional — pre-telemetry drives, drives that never crossed a
@@ -431,6 +475,7 @@ pub struct ExtractedGps {
     pub raw_park_count: u32,
     pub raw_frame_count: u32,
     pub gear_runs: Vec<GearRun>,
+    pub flag_runs: Vec<FlagRun>,
 }
 
 /// Processing progress status.
@@ -510,6 +555,14 @@ pub struct RouteAggregates {
     pub start_lng: Option<f64>,
     pub end_lat: Option<f64>,
     pub end_lng: Option<f64>,
+    /// v16: max **absolute** SEI speed (m/s) across the clip's samples,
+    /// `None` when the clip has no SEI speed channel. The locked
+    /// `max_speed_mps` drops negative (Reverse) samples; summon detection
+    /// needs the magnitude — a reverse-only summon crawl would otherwise
+    /// read 0 m/s and fail the `> 0` gate. Also distinguishes SEI from
+    /// GPS-derived speed, which jitters past walking pace on a car that
+    /// barely moved (mirrors Sentry-Drive's `hasSeiSpeeds` gate).
+    pub sei_speed_abs_max: Option<f64>,
 }
 
 /// Per-clip telemetry rollup populated from `telemetry_samples` rows
@@ -560,6 +613,10 @@ pub struct RouteSummary {
     pub raw_park_count: u32,
     pub raw_frame_count: u32,
     pub gear_runs: Vec<GearRun>,
+    /// Raw-frame-space SEI flag RLE (see [`FlagRun`]). Empty on rows
+    /// written before flag extraction — those drives are summon-
+    /// unverifiable by definition.
+    pub flag_runs: Vec<FlagRun>,
     pub aggregates: RouteAggregates,
     /// Provenance carried through for grouping: "sei" or "tessie".
     pub source: Option<String>,

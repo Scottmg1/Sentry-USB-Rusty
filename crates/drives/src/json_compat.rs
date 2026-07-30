@@ -26,9 +26,9 @@ use rusqlite::{params, Connection};
 use tracing::{debug, info, warn};
 
 use crate::aggregate::compute_route_aggregates;
-use crate::blob::{decode_f32s, decode_gear_runs, decode_points, decode_u8s};
+use crate::blob::{decode_f32s, decode_flag_runs, decode_gear_runs, decode_points, decode_u8s};
 use crate::db::normalize_path;
-use crate::types::{GearRun, GpsPoint, Route};
+use crate::types::{FlagRun, GearRun, GpsPoint, Route};
 
 /// Minimum existing-route count before the shrink guard applies. Below
 /// this, allow any import — tiny DBs don't need corruption protection
@@ -481,6 +481,14 @@ fn insert_imported_route(
     let sb = crate::blob::encode_f32s(Some(&r.speeds));
     let acb = crate::blob::encode_f32s(Some(&r.accel_positions));
     let rb = crate::blob::encode_gear_runs(Some(&r.gear_runs));
+    // Absent flagRuns (pre-flags Sentry-Drive exports, Tessie imports)
+    // stores NULL — the summon detector must see "no evidence", not an
+    // empty-but-present run list.
+    let fb = if r.flag_runs.is_empty() {
+        None
+    } else {
+        crate::blob::encode_flag_runs(Some(&r.flag_runs))
+    };
 
     let first_lat: Option<f64> = r.points.first().map(|p| p[0]);
     let first_lon: Option<f64> = r.points.first().map(|p| p[1]);
@@ -516,7 +524,8 @@ fn insert_imported_route(
             odometer_mi_start, odometer_mi_end,
             location_name_start, location_name_end,
             fsd_pend_ms_end, park_ms_start, fsd_at_end, fsd_accel_pushes_early,
-            ap_at_start)
+            ap_at_start,
+            flag_runs_blob, sei_speed_abs_max)
          VALUES(
             ?1, ?2, ?3, ?4, ?5,
             NULL, NULL, ?6, ?7, ?8,
@@ -530,7 +539,8 @@ fn insert_imported_route(
             ?36, ?37, ?38, ?39, ?40, ?41,
             ?42, ?43, ?44, ?45,
             ?46, ?47, ?48, ?49,
-            ?50, ?51, ?52, ?53, ?54)
+            ?50, ?51, ?52, ?53, ?54,
+            ?55, ?56)
          ON CONFLICT(file) DO UPDATE SET
             date_dir            = excluded.date_dir,
             point_count         = excluded.point_count,
@@ -584,7 +594,9 @@ fn insert_imported_route(
             park_ms_start       = excluded.park_ms_start,
             fsd_at_end          = excluded.fsd_at_end,
             fsd_accel_pushes_early = excluded.fsd_accel_pushes_early,
-            ap_at_start         = excluded.ap_at_start",
+            ap_at_start         = excluded.ap_at_start,
+            flag_runs_blob      = excluded.flag_runs_blob,
+            sei_speed_abs_max   = excluded.sei_speed_abs_max",
         params![
             norm, r.date, r.points.len() as i64, r.raw_park_count as i64, r.raw_frame_count as i64,
             a.distance_m, first_lat, first_lon,
@@ -603,6 +615,7 @@ fn insert_imported_route(
             r.location_name_start, r.location_name_end,
             a.fsd_pend_ms_end, a.park_ms_start, a.fsd_at_end as i64, a.fsd_accel_pushes_early,
             a.ap_at_start,
+            fb, a.sei_speed_abs_max,
         ],
     )?;
     Ok(())
@@ -841,7 +854,8 @@ impl<'a> serde::Serialize for RouteStream<'a> {
                         hvac_runtime_s,
                         tire_fl_psi, tire_fr_psi, tire_rl_psi, tire_rr_psi,
                         odometer_mi_start, odometer_mi_end,
-                        location_name_start, location_name_end
+                        location_name_start, location_name_end,
+                        flag_runs_blob
                  FROM routes
                  ORDER BY file",
             )
@@ -983,6 +997,10 @@ impl<'a> serde::Serialize for RouteStream<'a> {
                 *self.error.borrow_mut() = Some(e);
                 S::Error::custom("col location_name_end")
             })?;
+            let fb: Option<Vec<u8>> = row.get(27).map_err(|e| {
+                *self.error.borrow_mut() = Some(e);
+                S::Error::custom("col flag_runs_blob")
+            })?;
 
             let points: Vec<GpsPoint> = decode_points(pb.as_deref())
                 .map_err(|e| S::Error::custom(format!("decode points {}: {}", file, e)))?
@@ -998,6 +1016,9 @@ impl<'a> serde::Serialize for RouteStream<'a> {
             let gear_runs: Vec<GearRun> = decode_gear_runs(rb.as_deref())
                 .map_err(|e| S::Error::custom(format!("decode gear_runs {}: {}", file, e)))?
                 .unwrap_or_default();
+            let flag_runs: Vec<FlagRun> = decode_flag_runs(fb.as_deref())
+                .map_err(|e| S::Error::custom(format!("decode flag_runs {}: {}", file, e)))?
+                .unwrap_or_default();
 
             let route = Route {
                 file,
@@ -1010,6 +1031,7 @@ impl<'a> serde::Serialize for RouteStream<'a> {
                 raw_park_count,
                 raw_frame_count,
                 gear_runs,
+                flag_runs,
                 source,
                 external_signature,
                 tessie_autopilot_percent,
@@ -1116,8 +1138,9 @@ impl<'a> serde::Serialize for TelemetrySampleStream<'a> {
 
 #[cfg(test)]
 mod streaming_export_tests {
+    use super::{export_json, import_json};
     use crate::db::DriveStore;
-    use crate::types::{GearRun, GpsPoint, StoreData};
+    use crate::types::{FlagRun, GearRun, GpsPoint, StoreData};
 
     /// The streaming exporter must produce byte-for-byte parseable JSON
     /// that deserializes back into the same `StoreData` the importer
@@ -1140,6 +1163,7 @@ mod streaming_export_tests {
                 0,
                 2,
                 &[GearRun { gear: 4, frames: 2 }],
+                &[FlagRun { flags: 3, frames: 1 }, FlagRun { flags: 0, frames: 1 }],
             )
             .unwrap();
 
@@ -1156,9 +1180,62 @@ mod streaming_export_tests {
         assert_eq!(data.routes[0].gear_states, vec![4, 4]);
         assert_eq!(data.routes[0].autopilot_states, vec![1, 1]);
         assert_eq!(data.routes[0].speeds, vec![25.0, 26.0]);
+        assert_eq!(
+            data.routes[0].flag_runs,
+            vec![FlagRun { flags: 3, frames: 1 }, FlagRun { flags: 0, frames: 1 }],
+        );
+        // Wire shape matches Sentry-Drive's flagRuns exactly.
+        let raw_str = String::from_utf8(raw.clone()).unwrap();
+        assert!(
+            raw_str.contains(r#""flagRuns":[{"flags":3,"frames":1},{"flags":0,"frames":1}]"#),
+            "export json: {raw_str}"
+        );
         assert_eq!(data.processed_files, vec!["2025-01-15/clip.mp4"]);
 
         let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn flag_runs_round_trip_import_then_export() {
+        // A Sentry-Drive-authored drive-data.json with flagRuns must
+        // import into SQLite and re-export byte-equal on that field —
+        // and a route WITHOUT flagRuns must stay absent (unverifiable),
+        // not become an empty array.
+        let json = r#"{"processedFiles":["2026-07-15/2026-07-15_20-50-43-front.mp4","2026-07-15/2026-07-15_20-51-44-front.mp4"],"routes":[
+            {"file":"2026-07-15/2026-07-15_20-50-43-front.mp4","date":"2026-07-15","points":[[37.0,-122.0],[37.0001,-122.0]],"gearStates":"AQE=","autopilotStates":"AAA=","speeds":[1.5,2.7],"accelPositions":[0.0,0.0],"rawParkCount":53,"rawFrameCount":553,"gearRuns":[{"gear":1,"frames":500},{"gear":0,"frames":53}],"flagRuns":[{"flags":0,"frames":471},{"flags":3,"frames":82}]},
+            {"file":"2026-07-15/2026-07-15_20-51-44-front.mp4","date":"2026-07-15","points":[[37.0,-122.0],[37.0001,-122.0]],"gearStates":"AQE=","autopilotStates":"AAA=","speeds":[1.5,2.7],"accelPositions":[0.0,0.0],"rawParkCount":0,"rawFrameCount":600,"gearRuns":[{"gear":1,"frames":600}]}
+        ],"driveTags":{}}"#;
+        let path = std::env::temp_dir().join(format!(
+            "sentryusb-flagruns-roundtrip-{}.json",
+            std::process::id()
+        ));
+        std::fs::write(&path, json).unwrap();
+
+        let mut conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::schema::migrate(&conn).unwrap();
+        import_json(&mut conn, path.to_str().unwrap(), |_| {}).unwrap();
+
+        let mut out: Vec<u8> = Vec::new();
+        export_json(&conn, &mut out).unwrap();
+        let data: crate::types::StoreData = serde_json::from_slice(&out).unwrap();
+        assert_eq!(data.routes.len(), 2);
+        assert_eq!(
+            data.routes[0].flag_runs,
+            vec![FlagRun { flags: 0, frames: 471 }, FlagRun { flags: 3, frames: 82 }],
+        );
+        assert!(
+            data.routes[1].flag_runs.is_empty(),
+            "route without flagRuns must stay unverifiable"
+        );
+        let out_str = String::from_utf8(out).unwrap();
+        assert!(
+            out_str.contains(r#""flagRuns":[{"flags":0,"frames":471},{"flags":3,"frames":82}]"#),
+            "export: {out_str}"
+        );
+        // Absent stays absent for the second route — count the key.
+        assert_eq!(out_str.matches(r#""flagRuns""#).count(), 1);
+
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
@@ -1210,6 +1287,7 @@ mod streaming_export_tests {
                 0,
                 2,
                 &[GearRun { gear: 4, frames: 2 }],
+                &[FlagRun { flags: 3, frames: 1 }, FlagRun { flags: 0, frames: 1 }],
             )
             .unwrap();
         store.export_json_to_file(&json_str).unwrap();
@@ -1548,7 +1626,7 @@ mod full_db_export_tests {
         let store = DriveStore::open_memory().unwrap();
         let pts: Vec<GpsPoint> = vec![[37.7749, -122.4194], [37.7750, -122.4195]];
         store
-            .add_route("2025-01-15/clip.mp4", "2025-01-15", &pts, &[4, 4], &[1, 1], &[25.0, 26.0], &[0.5, 0.6], 0, 2, &[])
+            .add_route("2025-01-15/clip.mp4", "2025-01-15", &pts, &[4, 4], &[1, 1], &[25.0, 26.0], &[0.5, 0.6], 0, 2, &[], &[])
             .unwrap();
         store.with_locked_conn(|conn| seed_telemetry(conn));
         store
@@ -1716,7 +1794,7 @@ mod full_db_export_tests {
         let store = DriveStore::open_memory().unwrap();
         let pts: Vec<GpsPoint> = vec![[37.7749, -122.4194]];
         store
-            .add_route("2025-01-15/clip.mp4", "2025-01-15", &pts, &[4], &[1], &[25.0], &[0.5], 0, 1, &[])
+            .add_route("2025-01-15/clip.mp4", "2025-01-15", &pts, &[4], &[1], &[25.0], &[0.5], 0, 1, &[], &[])
             .unwrap();
         let path = tmp_json("omit");
         let path_str = path.to_string_lossy().to_string();

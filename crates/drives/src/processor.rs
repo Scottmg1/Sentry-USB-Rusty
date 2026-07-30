@@ -287,6 +287,7 @@ impl Processor {
                         gps.raw_park_count,
                         gps.raw_frame_count,
                         &gps.gear_runs,
+                        &gps.flag_runs,
                     ) {
                         Ok(()) => routes_found += 1,
                         Err(e) => {
