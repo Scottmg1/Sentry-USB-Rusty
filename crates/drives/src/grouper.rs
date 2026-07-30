@@ -1026,8 +1026,9 @@ fn split_clip_at_park_gaps(clip: &TimedRoute) -> Vec<ClipSegment> {
                     // Sentry-Drive's `{...clip}` sub-segment spread) —
                     // flag runs live in RAW frame space, so slicing
                     // them to the segment would corrupt the frame
-                    // indexing.
+                    // indexing. Same for the per-gear-run maxima.
                     flag_runs: clip.route.flag_runs.clone(),
+                    gear_run_speed_max: clip.route.gear_run_speed_max.clone(),
                     source: clip.route.source.clone(),
                     external_signature: clip.route.external_signature.clone(),
                     tessie_autopilot_percent: clip.route.tessie_autopilot_percent,
@@ -2803,7 +2804,17 @@ fn build_summary_from_aggregates(
     let mut has_sei_speeds = false;
     let mut summon_max_speed: f64 = 0.0;
     for clip in clips {
-        if let Some(m) = clip.summary.aggregates.sei_speed_abs_max {
+        // Segment-scoped max |SEI| when the v16 per-gear-run maxima are
+        // present — park splits land on gear-run boundaries, so the runs
+        // overlapping this sub-clip's frame range cover it exactly. This
+        // is what keeps a summon crawl's speed evidence clean when the
+        // human drives off seconds later IN THE SAME CLIP (real case:
+        // 2026-07-27 20:04). Rows without the column (pre-v16, imports)
+        // fall back to the whole-clip abs max — conservative: a shared
+        // clip then over-reports the summon segment's speed and the
+        // drive simply stays unflagged until reprocessed.
+        let seg_max = segment_abs_speed_max(clip).or(clip.summary.aggregates.sei_speed_abs_max);
+        if let Some(m) = seg_max {
             if m > 0.0 {
                 has_sei_speeds = true;
             }
@@ -2812,6 +2823,43 @@ fn build_summary_from_aggregates(
             }
         }
     }
+    /// Max |SEI speed| over the gear runs overlapping this sub-clip's
+    /// `[start_frame, end_frame)` range, from the v16 per-gear-run
+    /// maxima. `None` when the column is absent or doesn't match the
+    /// gear runs (pre-v16 rows, imports, corrupt pairing) — callers
+    /// fall back to the clip-level abs max.
+    fn segment_abs_speed_max(c: &SubClipSummary) -> Option<f64> {
+        let runs = &c.summary.gear_runs;
+        let maxes = &c.summary.gear_run_speed_max;
+        if runs.is_empty() || maxes.len() != runs.len() {
+            return None;
+        }
+        // Whole-clip wraps of gear-less rows carry the total_frames=1
+        // sentinel; runs being non-empty means real bounds here, but
+        // keep the sentinel path meaning "whole clip" regardless.
+        let (s, e) = if c.total_frames > 1 {
+            (c.start_frame, c.end_frame)
+        } else {
+            (0, u32::MAX)
+        };
+        let mut frame = 0u32;
+        let mut best = 0.0f64;
+        for (run, &m) in runs.iter().zip(maxes.iter()) {
+            let (rs, re) = (frame, frame + run.frames);
+            frame = re;
+            if re <= s {
+                continue;
+            }
+            if rs >= e {
+                break;
+            }
+            if (m as f64) > best {
+                best = m as f64;
+            }
+        }
+        Some(best)
+    }
+
     let summon_evidence: Vec<SummonClipEvidence> = clips
         .iter()
         .map(|c| {
@@ -3231,6 +3279,7 @@ mod tests {
             raw_frame_count: 0,
             gear_runs: Vec::new(),
             flag_runs: Vec::new(),
+            gear_run_speed_max: Vec::new(),
             aggregates: a1,
             source: None,
             external_signature: None,
@@ -3243,6 +3292,7 @@ mod tests {
             raw_frame_count: 0,
             gear_runs: Vec::new(),
             flag_runs: Vec::new(),
+            gear_run_speed_max: Vec::new(),
             aggregates: a2,
             source: None,
             external_signature: None,
@@ -3275,6 +3325,7 @@ mod tests {
             raw_frame_count: 60,
             gear_runs: vec![GearRun { gear: 1, frames: 60 }],
             flag_runs: Vec::new(),
+            gear_run_speed_max: Vec::new(),
             aggregates: RouteAggregates::default(),
             source: None,
             external_signature: None,
@@ -3296,6 +3347,7 @@ mod tests {
             raw_frame_count: runs.iter().map(|(_, f)| *f).sum(),
             gear_runs: runs.iter().map(|(g, f)| GearRun { gear: *g, frames: *f }).collect(),
             flag_runs: Vec::new(),
+            gear_run_speed_max: Vec::new(),
             aggregates: a,
             source: None,
             external_signature: None,
@@ -3719,6 +3771,7 @@ mod tests {
             raw_frame_count: 60,
             gear_runs: vec![GearRun { gear: 1, frames: 60 }],
             flag_runs: Vec::new(),
+            gear_run_speed_max: Vec::new(),
             aggregates: RouteAggregates::default(),
             source: None,
             external_signature: None,
@@ -3966,6 +4019,7 @@ mod tests {
             raw_frame_count: 60,
             gear_runs: vec![GearRun { gear: 1, frames: 60 }],
             flag_runs: Vec::new(),
+            gear_run_speed_max: Vec::new(),
             aggregates: RouteAggregates::default(),
             source: None,
             external_signature: None,
@@ -3978,6 +4032,7 @@ mod tests {
             raw_frame_count: 60,
             gear_runs: vec![GearRun { gear: GEAR_PARK, frames: 60 }],
             flag_runs: Vec::new(),
+            gear_run_speed_max: Vec::new(),
             aggregates: RouteAggregates::default(),
             source: None,
             external_signature: None,
@@ -4024,6 +4079,7 @@ mod tests {
             raw_frame_count: 60,
             gear_runs: vec![GearRun { gear: 1, frames: 60 }],
             flag_runs: Vec::new(),
+            gear_run_speed_max: Vec::new(),
             aggregates: RouteAggregates::default(),
             source: None,
             external_signature: None,
@@ -4363,6 +4419,7 @@ mod tests {
             raw_frame_count: gear_runs.iter().map(|(_, f)| *f).sum(),
             gear_runs: gear_runs.iter().map(|&(gear, frames)| GearRun { gear, frames }).collect(),
             flag_runs: fr(flag_runs),
+            gear_run_speed_max: Vec::new(),
             aggregates,
             source: None,
             external_signature: None,
@@ -4484,5 +4541,82 @@ mod tests {
         assert_eq!(drives.len(), 2, "park gap must split summon from the next drive");
         assert!(drives[0].summon, "the summon drive keeps its flag");
         assert!(!drives[1].summon, "the human drive must not inherit it");
+    }
+
+    /// `summon_summary` variant carrying the v16 per-gear-run |SEI|
+    /// maxima — the segment-scoped speed evidence path.
+    fn summon_summary_with_run_speeds(
+        file: &str,
+        gear_runs: &[(u8, u32)],
+        flag_runs: &[(u8, u32)],
+        run_speed_max: &[f32],
+        sei_speed_abs_max: Option<f64>,
+    ) -> RouteSummary {
+        assert_eq!(run_speed_max.len(), gear_runs.len(), "fixture: one max per gear run");
+        let mut s = summon_summary(file, gear_runs, flag_runs, sei_speed_abs_max);
+        s.gear_run_speed_max = run_speed_max.to_vec();
+        s
+    }
+
+    #[test]
+    fn summon_reverse_summon_ending_seconds_before_human_drives_off_splits_and_flags() {
+        // Real 2026-07-27 20:04 shape (ported from Sentry-Drive
+        // grouper.test.js). Clip A: hazards in P, P→R under hazards
+        // (leading P too short to split), backs out, shifts D, creeps
+        // toward the user. Clip B: creep finishes, hazards through the
+        // stop and D→P, ~3 s of Park, then the human gets in (brake,
+        // accel) and drives off. The mid-clip park must split the summon
+        // into its own drive; pedal input stays outside the summon
+        // segment's frame range — and so does the human's SPEED: clip
+        // B's whole-clip abs max is 5.4 m/s (over the 3.5 cap), but the
+        // v16 per-gear-run maxima scope the summon segment to its own
+        // 0.3 m/s crawl.
+        let clip_a = summon_summary_with_run_speeds(
+            "2026-07-27/2026-07-27_20-04-00-front.mp4",
+            &[(GEAR_PARK, 46), (2 /* GEAR_REVERSE */, 727), (1, 917)],
+            &[(0, 11), (3, 113), (0, 394), (2, 256), (0, 301), (2, 615)],
+            &[0.0, 2.0, 2.0],
+            Some(2.0),
+        );
+        let clip_b = summon_summary_with_run_speeds(
+            "2026-07-27/2026-07-27_20-04-46-front.mp4",
+            &[(1, 120), (GEAR_PARK, 84), (1, 1469)],
+            &[(2, 81), (3, 89), (4, 70), (0, 200), (8, 690), (0, 112), (1, 431)],
+            &[0.3, 0.0, 5.4],
+            Some(5.4),
+        );
+        let drives = group_summaries_fast(&[clip_a, clip_b], &HashMap::new());
+        assert_eq!(drives.len(), 2, "mid-clip park must split the summon from the departure");
+        assert!(
+            drives[0].summon,
+            "summon keeps its flag despite sharing clip B with 5.4 m/s driving"
+        );
+        assert!(!drives[1].summon, "the human drive after the park is not summon");
+    }
+
+    #[test]
+    fn summon_whole_clip_abs_max_fallback_stays_conservative_on_shared_clip() {
+        // The same 07-27 drive WITHOUT per-run maxima (pre-v16 row,
+        // import): the fallback sees clip B's whole-clip 5.4 m/s and
+        // must reject rather than guess — no flag beats a wrong flag.
+        let clip_a = summon_summary(
+            "2026-07-27/2026-07-27_20-04-00-front.mp4",
+            &[(GEAR_PARK, 46), (2, 727), (1, 917)],
+            &[(0, 11), (3, 113), (0, 394), (2, 256), (0, 301), (2, 615)],
+            Some(2.0),
+        );
+        let clip_b = summon_summary(
+            "2026-07-27/2026-07-27_20-04-46-front.mp4",
+            &[(1, 120), (GEAR_PARK, 84), (1, 1469)],
+            &[(2, 81), (3, 89), (4, 70), (0, 200), (8, 690), (0, 112), (1, 431)],
+            Some(5.4),
+        );
+        let drives = group_summaries_fast(&[clip_a, clip_b], &HashMap::new());
+        assert_eq!(drives.len(), 2);
+        assert!(
+            !drives[0].summon,
+            "without per-run maxima the whole-clip 5.4 m/s must reject the summon"
+        );
+        assert!(!drives[1].summon);
     }
 }

@@ -73,6 +73,7 @@ fn assemble_extracted(
     let raw_park_count = gears.iter().filter(|&&g| g == GEAR_PARK).count() as u32;
     let gear_runs = compute_gear_runs(&gears);
     let flag_runs = compute_flag_runs(&flags);
+    let gear_run_speed_max = compute_gear_run_speed_max(&gear_runs, &speeds);
 
     // Deduplicate consecutive identical GPS points
     dedup_consecutive(&mut points, &mut gears, &mut ap_states, &mut speeds, &mut accel_positions);
@@ -87,7 +88,33 @@ fn assemble_extracted(
         raw_frame_count,
         gear_runs,
         flag_runs,
+        gear_run_speed_max,
     }
+}
+
+/// Max |SEI speed| inside each gear run, in the same raw kept-frame
+/// space as the runs themselves (SEI speed is signed — negative in
+/// Reverse). Park splits always land on gear-run boundaries, so this
+/// gives the summary-path summon detector exact per-segment speed
+/// evidence: a summon crawl that shares a clip with the human driving
+/// off seconds later keeps its own max instead of inheriting the whole
+/// clip's. Same 100 m/s sanity cap as the clip-level abs max.
+fn compute_gear_run_speed_max(gear_runs: &[GearRun], speeds: &[f32]) -> Vec<f32> {
+    let mut out = Vec::with_capacity(gear_runs.len());
+    let mut frame = 0usize;
+    for run in gear_runs {
+        let end = (frame + run.frames as usize).min(speeds.len());
+        let mut max_abs = 0.0f32;
+        for &s in &speeds[frame.min(end)..end] {
+            let a = s.abs();
+            if a < 100.0 && a > max_abs {
+                max_abs = a;
+            }
+        }
+        out.push(max_abs);
+        frame = end;
+    }
+    out
 }
 
 /// Extract raw (non-deduplicated) GPS data from a Tesla dashcam MP4 file.
@@ -546,6 +573,7 @@ impl ExtractedGps {
             raw_frame_count: 0,
             gear_runs: Vec::new(),
             flag_runs: Vec::new(),
+            gear_run_speed_max: Vec::new(),
         }
     }
 }
@@ -662,11 +690,16 @@ mod tests {
         gears.resize(moving + stopped_drive, GEAR_DRIVE);
         gears.resize(moving + stopped_drive + parked, GEAR_PARK);
         let n = points.len();
+        // Crawl speed while in Drive (negative — this clip shape also
+        // covers Reverse semantics), zero once parked: the per-gear-run
+        // maxima must be |v| per run, not whole-clip.
+        let mut speeds = vec![-2.13f32; moving + stopped_drive];
+        speeds.resize(n, 0.0);
         let out = assemble_extracted(
             points,
             gears,
             vec![0; n],
-            vec![0.0; n],
+            speeds,
             vec![0.0; n],
             flags,
         );
@@ -692,6 +725,12 @@ mod tests {
                 FlagRun { flags: 3, frames: 106 },
             ]
         );
+        // Per-gear-run |SEI| maxima, parallel to gear_runs: the Drive
+        // run keeps its 2.13 m/s crawl (absolute — the samples are
+        // negative), the Park run reads 0.
+        assert_eq!(out.gear_run_speed_max.len(), out.gear_runs.len());
+        assert!((out.gear_run_speed_max[0] - 2.13).abs() < 1e-6);
+        assert_eq!(out.gear_run_speed_max[1], 0.0);
         // Dedup still applies to the point-domain arrays.
         assert_eq!(out.points.len(), moving);
         assert_eq!(out.gear_states.len(), moving);
