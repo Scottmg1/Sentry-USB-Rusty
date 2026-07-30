@@ -114,6 +114,17 @@ pub const FLAG_ACCEL: u8 = 8;
 pub struct FlagRun {
     pub flags: u8,
     pub frames: u32,
+    /// Max |SEI speed| (m/s, 1 decimal) within this run's frames —
+    /// frame-space speed evidence for the summon detector. The park
+    /// splitter's fraction→point slice overshoots on deduped points, so
+    /// a summon segment's *stats* can inherit the following drive's
+    /// speed samples (observed live 2026-07-27 00:34: a 6 mph summon
+    /// read 9 mph); per-run maxima confine the speed gate to the
+    /// segment's own frames. `None` on runs written before this
+    /// evidence existed — the detector then falls back to drive stats.
+    /// Mirrors Sentry-Drive's `computeFlagRuns(flags, speeds)`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_mps: Option<f64>,
 }
 
 /// A single clip's extracted route data (stored in SQLite).
@@ -142,16 +153,6 @@ pub struct Route {
     /// detector treats such drives as unverifiable, never as summon.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub flag_runs: Vec<FlagRun>,
-    /// v16: max |SEI speed| (m/s) inside each gear run, parallel to
-    /// `gear_runs`. Park splits always land on gear-run boundaries, so a
-    /// split segment's true max speed is the max over its runs — this is
-    /// what lets a summon crawl that shares a clip with fast human
-    /// driving keep its own speed evidence (real case: 2026-07-27 20:04,
-    /// summon ends and the human drives off seconds later in the same
-    /// clip). Empty when unknown (pre-v16 rows, imports); consumers fall
-    /// back to the clip-level `sei_speed_abs_max`.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub gear_run_speed_max: Vec<f32>,
     /// Provenance: "sei" (native dashcam) or "tessie" (imported from Tessie).
     /// Absent / null defaults to "sei" for backwards compatibility.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -486,7 +487,6 @@ pub struct ExtractedGps {
     pub raw_frame_count: u32,
     pub gear_runs: Vec<GearRun>,
     pub flag_runs: Vec<FlagRun>,
-    pub gear_run_speed_max: Vec<f32>,
 }
 
 /// Processing progress status.
@@ -628,10 +628,6 @@ pub struct RouteSummary {
     /// written before flag extraction — those drives are summon-
     /// unverifiable by definition.
     pub flag_runs: Vec<FlagRun>,
-    /// v16: per-gear-run max |SEI speed| (see [`Route::gear_run_speed_max`]).
-    /// Empty when unknown; summon evidence then falls back to the
-    /// clip-level `sei_speed_abs_max`.
-    pub gear_run_speed_max: Vec<f32>,
     pub aggregates: RouteAggregates,
     /// Provenance carried through for grouping: "sei" or "tessie".
     pub source: Option<String>,

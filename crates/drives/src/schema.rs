@@ -83,18 +83,15 @@ use rusqlite::{params, Connection, OptionalExtension};
 /// resolve across clip seams in the drive grouper.
 ///
 /// v15 -> v16: add `flag_runs_blob` (per-frame SEI blinker/brake/accel
-/// flag RLE in RAW frame space — the summon detector's evidence),
-/// `sei_speed_abs_max` (max |SEI speed| per clip; the locked
+/// flag RLE in RAW frame space, each run carrying its max |SEI speed| —
+/// the summon detector's evidence, frame-accurate for the speed gate)
+/// and `sei_speed_abs_max` (max |SEI speed| per clip; the locked
 /// `max_speed_mps` drops negative Reverse samples, so a reverse-only
-/// summon crawl would read 0), and `gear_run_speed_blob` (max |SEI
-/// speed| per gear run, f32 LE array parallel to `gear_runs_blob` —
-/// park splits land on gear-run boundaries, so this scopes summon speed
-/// evidence to the split segment when a summon shares a clip with the
-/// human driving off) to `routes`. All nullable — rows written before
-/// flag extraction stay NULL, which the summon detector reads as
-/// "unverifiable, not summon". No backfill: flags and per-run speeds
-/// can only come from re-extracting the MP4's SEI stream, not from
-/// stored deduped arrays.
+/// summon crawl would read 0 — feeds the detector's legacy fallback) to
+/// `routes`. Both nullable — rows written before flag extraction stay
+/// NULL, which the summon detector reads as "unverifiable, not summon".
+/// No backfill: flags and per-run speeds can only come from
+/// re-extracting the MP4's SEI stream, not from stored deduped arrays.
 pub const CURRENT_SCHEMA_VERSION: i32 = 16;
 
 /// v1 DDL. Each statement is idempotent (`IF NOT EXISTS`) so `migrate()`
@@ -355,13 +352,12 @@ pub const V15_ROUTE_BOUNDARY_COLUMNS: &[(&str, &str)] = &[
 ];
 
 /// v16 summon-evidence columns on `routes` (see `CURRENT_SCHEMA_VERSION`
-/// docs). `flag_runs_blob` follows the `gear_runs_blob` wire shape
-/// (1-byte flags + LE i32 frames per run); `gear_run_speed_blob` is a
-/// plain f32 LE array with one entry per gear run.
+/// docs). `flag_runs_blob` extends the `gear_runs_blob` wire shape with
+/// a per-run speed max (1-byte flags + LE i32 frames + LE f32 max |SEI
+/// speed| per run; NaN = max unknown).
 pub const V16_ROUTE_FLAG_COLUMNS: &[(&str, &str)] = &[
     ("flag_runs_blob", "BLOB"),
     ("sei_speed_abs_max", "REAL"),
-    ("gear_run_speed_blob", "BLOB"),
 ];
 
 /// v9 rollups on `routes`. Odometer start/end let the UI show a

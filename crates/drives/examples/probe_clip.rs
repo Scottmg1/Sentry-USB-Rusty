@@ -32,11 +32,7 @@ fn main() -> anyhow::Result<()> {
         let gears: Vec<String> = gps
             .gear_runs
             .iter()
-            .enumerate()
-            .map(|(i, r)| {
-                let max = gps.gear_run_speed_max.get(i).copied().unwrap_or(0.0);
-                format!("{} x{} (|v|max {max:.2})", gear_name(r.gear), r.frames)
-            })
+            .map(|r| format!("{} x{}", gear_name(r.gear), r.frames))
             .collect();
         println!("  gearRuns:  [{}]", gears.join(", "));
         // Flag bits: 1=blinker L, 2=blinker R, 4=brake, 8=accel — shown
@@ -44,7 +40,10 @@ fn main() -> anyhow::Result<()> {
         let flags: Vec<String> = gps
             .flag_runs
             .iter()
-            .map(|r| format!("{:04b} x{}", r.flags, r.frames))
+            .map(|r| {
+                let max = r.max_mps.unwrap_or(f64::NAN);
+                format!("{:04b} x{} (|v|max {max:.1})", r.flags, r.frames)
+            })
             .collect();
         println!("  flagRuns (ABRL bits): [{}]", flags.join(", "));
         let max_abs = gps.speeds.iter().fold(0.0f32, |m, s| m.max(s.abs()));

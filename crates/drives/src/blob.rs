@@ -146,11 +146,12 @@ pub fn decode_gear_runs(buf: Option<&[u8]>) -> Result<Option<Vec<GearRun>>> {
 }
 
 // -----------------------------------------------------------------------------
-// FlagRuns: 1-byte flags + 4-byte i32 frames per run (same wire shape as
-// GearRuns)
+// FlagRuns: 1-byte flags + 4-byte i32 frames + 4-byte f32 max_mps per run
+// (gear-run wire shape plus the per-run |SEI speed| max; NaN encodes an
+// absent max_mps so legacy no-speed runs survive the round-trip as None)
 // -----------------------------------------------------------------------------
 
-const FLAG_RUN_STRIDE: usize = 5; // u8 + i32
+const FLAG_RUN_STRIDE: usize = 9; // u8 + i32 + f32
 
 pub fn encode_flag_runs(runs: Option<&[FlagRun]>) -> Option<Vec<u8>> {
     let runs = runs?;
@@ -159,6 +160,8 @@ pub fn encode_flag_runs(runs: Option<&[FlagRun]>) -> Option<Vec<u8>> {
         buf.push(r.flags);
         let frames = r.frames as i32;
         buf.extend_from_slice(&frames.to_le_bytes());
+        let max = r.max_mps.map(|m| m as f32).unwrap_or(f32::NAN);
+        buf.extend_from_slice(&max.to_le_bytes());
     }
     Some(buf)
 }
@@ -178,7 +181,16 @@ pub fn decode_flag_runs(buf: Option<&[u8]>) -> Result<Option<Vec<FlagRun>>> {
         let off = i * FLAG_RUN_STRIDE;
         let flags = buf[off];
         let frames = i32::from_le_bytes(buf[off + 1..off + 5].try_into().unwrap()) as u32;
-        out.push(FlagRun { flags, frames });
+        let max_raw = f32::from_le_bytes(buf[off + 5..off + 9].try_into().unwrap());
+        // Values are 1-decimal by contract (computeFlagRuns rounds); re-round
+        // after the f32 round-trip so 2.7 comes back as exactly 2.7, not
+        // 2.700000047… — the JSON export must match Sentry-Drive's digits.
+        let max_mps = if max_raw.is_finite() {
+            Some(((max_raw as f64) * 10.0).round() / 10.0)
+        } else {
+            None
+        };
+        out.push(FlagRun { flags, frames, max_mps });
     }
     Ok(Some(out))
 }
@@ -264,11 +276,14 @@ mod tests {
 
     #[test]
     fn roundtrip_flag_runs() {
+        // Mixed per-run max_mps states: known 1-decimal values must come
+        // back exact (decode re-rounds after the f32 leg), zero stays a
+        // real Some(0.0), and None survives via the NaN sentinel.
         let runs = vec![
-            FlagRun { flags: 0, frames: 27 },
-            FlagRun { flags: 3, frames: 123 },
-            FlagRun { flags: 1, frames: 873 },
-            FlagRun { flags: 8, frames: 36 },
+            FlagRun { flags: 0, frames: 27, max_mps: Some(0.0) },
+            FlagRun { flags: 3, frames: 123, max_mps: Some(2.7) },
+            FlagRun { flags: 1, frames: 873, max_mps: None },
+            FlagRun { flags: 8, frames: 36, max_mps: Some(4.7) },
         ];
         let buf = encode_flag_runs(Some(&runs)).unwrap();
         assert_eq!(buf.len(), runs.len() * FLAG_RUN_STRIDE);

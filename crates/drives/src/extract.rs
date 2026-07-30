@@ -72,8 +72,7 @@ fn assemble_extracted(
     let raw_frame_count = gears.len() as u32;
     let raw_park_count = gears.iter().filter(|&&g| g == GEAR_PARK).count() as u32;
     let gear_runs = compute_gear_runs(&gears);
-    let flag_runs = compute_flag_runs(&flags);
-    let gear_run_speed_max = compute_gear_run_speed_max(&gear_runs, &speeds);
+    let flag_runs = compute_flag_runs(&flags, Some(&speeds));
 
     // Deduplicate consecutive identical GPS points
     dedup_consecutive(&mut points, &mut gears, &mut ap_states, &mut speeds, &mut accel_positions);
@@ -88,33 +87,7 @@ fn assemble_extracted(
         raw_frame_count,
         gear_runs,
         flag_runs,
-        gear_run_speed_max,
     }
-}
-
-/// Max |SEI speed| inside each gear run, in the same raw kept-frame
-/// space as the runs themselves (SEI speed is signed — negative in
-/// Reverse). Park splits always land on gear-run boundaries, so this
-/// gives the summary-path summon detector exact per-segment speed
-/// evidence: a summon crawl that shares a clip with the human driving
-/// off seconds later keeps its own max instead of inheriting the whole
-/// clip's. Same 100 m/s sanity cap as the clip-level abs max.
-fn compute_gear_run_speed_max(gear_runs: &[GearRun], speeds: &[f32]) -> Vec<f32> {
-    let mut out = Vec::with_capacity(gear_runs.len());
-    let mut frame = 0usize;
-    for run in gear_runs {
-        let end = (frame + run.frames as usize).min(speeds.len());
-        let mut max_abs = 0.0f32;
-        for &s in &speeds[frame.min(end)..end] {
-            let a = s.abs();
-            if a < 100.0 && a > max_abs {
-                max_abs = a;
-            }
-        }
-        out.push(max_abs);
-        frame = end;
-    }
-    out
 }
 
 /// Extract raw (non-deduplicated) GPS data from a Tesla dashcam MP4 file.
@@ -530,31 +503,55 @@ fn compute_gear_runs(gears: &[u8]) -> Vec<GearRun> {
 
 /// RLE the per-frame SEI flag bytes (blinkers/brake/accel bits) over RAW
 /// frame indices — the same frame space as gear runs. Mirrors
-/// Sentry-Drive's `computeFlagRuns` (drive-calc.cjs).
-fn compute_flag_runs(flags: &[u8]) -> Vec<FlagRun> {
+/// Sentry-Drive's `computeFlagRuns(flags, speeds)` (drive-calc.cjs).
+///
+/// When `speeds` is given, each run carries `max_mps` — the max |SEI
+/// speed| within its frames, rounded to 0.1 (SEI speed is signed;
+/// Reverse counts via magnitude). This is the summon detector's
+/// frame-space speed evidence: the park splitter's fraction→point slice
+/// overshoots on deduped points, so a summon segment's stats can
+/// inherit the following drive's speed samples — per-run maxima confine
+/// the gate to the segment's own frames.
+fn compute_flag_runs(flags: &[u8], speeds: Option<&[f32]>) -> Vec<FlagRun> {
     if flags.is_empty() {
         return Vec::new();
     }
 
+    let r1 = |v: f64| (v * 10.0).round() / 10.0;
+    let speed_at = |i: usize| -> f64 {
+        speeds
+            .and_then(|s| s.get(i))
+            .map(|&v| (v as f64).abs())
+            .unwrap_or(0.0)
+    };
+
     let mut runs = Vec::new();
     let mut current_flags = flags[0];
     let mut count: u32 = 1;
+    let mut max_abs = speed_at(0);
 
-    for &f in &flags[1..] {
+    for (i, &f) in flags.iter().enumerate().skip(1) {
         if f == current_flags {
             count += 1;
+            let a = speed_at(i);
+            if a > max_abs {
+                max_abs = a;
+            }
         } else {
             runs.push(FlagRun {
                 flags: current_flags,
                 frames: count,
+                max_mps: speeds.map(|_| r1(max_abs)),
             });
             current_flags = f;
             count = 1;
+            max_abs = speed_at(i);
         }
     }
     runs.push(FlagRun {
         flags: current_flags,
         frames: count,
+        max_mps: speeds.map(|_| r1(max_abs)),
     });
 
     runs
@@ -573,7 +570,6 @@ impl ExtractedGps {
             raw_frame_count: 0,
             gear_runs: Vec::new(),
             flag_runs: Vec::new(),
-            gear_run_speed_max: Vec::new(),
         }
     }
 }
@@ -645,23 +641,41 @@ mod tests {
     fn test_compute_flag_runs() {
         // Mirrors Sentry-Drive drive-calc.test.js "computeFlagRuns RLEs
         // raw frames and round-trips totals".
-        assert!(compute_flag_runs(&[]).is_empty());
-        let runs = compute_flag_runs(&[0, 0, 3, 3, 3, 1, 0]);
+        assert!(compute_flag_runs(&[], None).is_empty());
+        let runs = compute_flag_runs(&[0, 0, 3, 3, 3, 1, 0], None);
         assert_eq!(
             runs,
             vec![
-                FlagRun { flags: 0, frames: 2 },
-                FlagRun { flags: 3, frames: 3 },
-                FlagRun { flags: 1, frames: 1 },
-                FlagRun { flags: 0, frames: 1 },
+                FlagRun { flags: 0, frames: 2, max_mps: None },
+                FlagRun { flags: 3, frames: 3, max_mps: None },
+                FlagRun { flags: 1, frames: 1, max_mps: None },
+                FlagRun { flags: 0, frames: 1, max_mps: None },
             ]
         );
         // Run totals must reconstruct the frame count — the summon
         // detector's segment bounds depend on flagRuns living in raw
         // frame space.
         let flags = [0u8, 8, 8, 4, 0, 0, 3, 3, 2, 1];
-        let total: u32 = compute_flag_runs(&flags).iter().map(|r| r.frames).sum();
+        let total: u32 = compute_flag_runs(&flags, None).iter().map(|r| r.frames).sum();
         assert_eq!(total as usize, flags.len());
+    }
+
+    #[test]
+    fn test_compute_flag_runs_carries_per_run_max_speed() {
+        // Mirrors drive-calc.test.js "computeFlagRuns carries per-run
+        // max |SEI speed| when speeds are given".
+        let flags = [0u8, 0, 3, 3, 8, 8, 8];
+        let speeds = [0.0f32, -1.5, 0.4, 0.26, 2.0, 4.73, 3.1];
+        assert_eq!(
+            compute_flag_runs(&flags, Some(&speeds)),
+            vec![
+                // reverse counts via magnitude
+                FlagRun { flags: 0, frames: 2, max_mps: Some(1.5) },
+                FlagRun { flags: 3, frames: 2, max_mps: Some(0.4) },
+                // rounded to 0.1
+                FlagRun { flags: 8, frames: 3, max_mps: Some(4.7) },
+            ]
+        );
     }
 
     #[test]
@@ -691,8 +705,8 @@ mod tests {
         gears.resize(moving + stopped_drive + parked, GEAR_PARK);
         let n = points.len();
         // Crawl speed while in Drive (negative — this clip shape also
-        // covers Reverse semantics), zero once parked: the per-gear-run
-        // maxima must be |v| per run, not whole-clip.
+        // covers Reverse semantics), zero once parked: per-run maxima
+        // must be |v| within the run's own frames, not whole-clip.
         let mut speeds = vec![-2.13f32; moving + stopped_drive];
         speeds.resize(n, 0.0);
         let out = assemble_extracted(
@@ -715,22 +729,18 @@ mod tests {
         assert_eq!(out.gear_runs[1].frames, 53);
         let gear_total: u32 = out.gear_runs.iter().map(|r| r.frames).sum();
         assert_eq!(gear_total, out.raw_frame_count);
-        // Flag runs live in the same raw frame space.
+        // Flag runs live in the same raw frame space, each carrying its
+        // own max |SEI speed| (the -2.13 m/s crawl reads 2.1 absolute,
+        // rounded to 0.1 — Sentry-Drive's r1).
         let flag_total: u32 = out.flag_runs.iter().map(|r| r.frames).sum();
         assert_eq!(flag_total, out.raw_frame_count);
         assert_eq!(
             out.flag_runs,
             vec![
-                FlagRun { flags: 0, frames: 447 },
-                FlagRun { flags: 3, frames: 106 },
+                FlagRun { flags: 0, frames: 447, max_mps: Some(2.1) },
+                FlagRun { flags: 3, frames: 106, max_mps: Some(2.1) },
             ]
         );
-        // Per-gear-run |SEI| maxima, parallel to gear_runs: the Drive
-        // run keeps its 2.13 m/s crawl (absolute — the samples are
-        // negative), the Park run reads 0.
-        assert_eq!(out.gear_run_speed_max.len(), out.gear_runs.len());
-        assert!((out.gear_run_speed_max[0] - 2.13).abs() < 1e-6);
-        assert_eq!(out.gear_run_speed_max[1], 0.0);
         // Dedup still applies to the point-domain arrays.
         assert_eq!(out.points.len(), moving);
         assert_eq!(out.gear_states.len(), moving);
