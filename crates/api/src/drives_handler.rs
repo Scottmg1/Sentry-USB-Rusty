@@ -311,28 +311,21 @@ fn single_drive_blocking(
 pub async fn all_routes(
     State(state): State<AppState>,
     Query(q): Query<AllRoutesQuery>,
-) -> (StatusCode, Json<serde_json::Value>) {
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
     let max_points = q.max_points.unwrap_or(500).clamp(2, 2000);
-    // Decodes every route's point BLOBs and downsamples each polyline —
-    // proportional to the whole drive history. Off the reactor so the map
-    // overview can't freeze the live connection.
+    // Cached; a miss runs the grouper over all routes, so keep it off the reactor.
     let store = state.drives.store.clone();
-    let result = tokio::task::spawn_blocking(move || {
-        // get_routes hands the grouper an owned Vec so it can consume the
-        // routes in place — the previous borrow forced a full clone of the
-        // point-heavy set, doubling peak memory on the heaviest endpoint.
-        store.get_routes().map(|routes| grouper::route_overviews(routes, max_points))
-    })
-    .await;
-    match result {
-        Ok(Ok(overviews)) => (
-            StatusCode::OK,
-            Json(serde_json::to_value(overviews).unwrap_or_default()),
-        ),
-        Ok(Err(e)) => crate::json_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
-        Err(e) => {
-            crate::json_error(StatusCode::INTERNAL_SERVER_ERROR, &format!("routes task: {}", e))
+    match tokio::task::spawn_blocking(move || store.get_cached_route_overviews_json(max_points)).await {
+        Ok(Ok(json)) => cached_json_response(json),
+        Ok(Err(e)) => {
+            crate::json_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()).into_response()
         }
+        Err(e) => crate::json_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("routes task: {}", e),
+        )
+        .into_response(),
     }
 }
 

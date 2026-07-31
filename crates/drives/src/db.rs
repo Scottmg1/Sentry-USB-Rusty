@@ -7,7 +7,7 @@
 
 use std::path::Path;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension, ToSql};
@@ -192,6 +192,18 @@ pub struct DriveStore {
     /// fresh cache without recomputing. Lock order: this is always taken
     /// BEFORE `conn` and never while holding it — deadlock-free.
     rebuild_lock: Mutex<()>,
+    /// Cached `/api/drives/routes` overview JSON; rebuilt lazily on the first
+    /// request after a route mutation.
+    route_overview_cache: Mutex<Option<RouteOverviewCache>>,
+    /// Bumped on every route mutation. New mutation paths must bump it too.
+    route_overview_gen: AtomicU64,
+}
+
+/// Valid while `generation` and `max_points` match the request.
+struct RouteOverviewCache {
+    generation: u64,
+    max_points: usize,
+    json: String,
 }
 
 impl DriveStore {
@@ -223,6 +235,8 @@ impl DriveStore {
             processed_count: AtomicI64::new(0),
             drive_cache_dirty: AtomicBool::new(true),
             rebuild_lock: Mutex::new(()),
+            route_overview_cache: Mutex::new(None),
+            route_overview_gen: AtomicU64::new(0),
         };
 
         store.load_locked(IMPORT_SOURCE_CANDIDATES)?;
@@ -243,6 +257,8 @@ impl DriveStore {
             processed_count: AtomicI64::new(0),
             drive_cache_dirty: AtomicBool::new(false),
             rebuild_lock: Mutex::new(()),
+            route_overview_cache: Mutex::new(None),
+            route_overview_gen: AtomicU64::new(0),
         };
         // Still run migrate + backfill so tests exercise the real schema.
         let guard = store.conn.lock().unwrap();
@@ -432,6 +448,10 @@ impl DriveStore {
             }
         }
         self.drive_cache_dirty.store(false, Ordering::Release);
+        // load() re-imports/re-migrates route rows; drop the lazy route
+        // overview cache so the next request recomputes.
+        self.route_overview_gen.fetch_add(1, Ordering::Release);
+        *self.route_overview_cache.lock().unwrap() = None;
         self.refresh_counts()?;
         Ok(())
     }
@@ -572,6 +592,7 @@ impl DriveStore {
         tx.commit()?;
         drop(conn);
         self.drive_cache_dirty.store(true, Ordering::Release);
+        self.route_overview_gen.fetch_add(1, Ordering::Release);
         self.processed_count
             .fetch_add(pf_inserted as i64, Ordering::Relaxed);
         self.route_count.fetch_add(route_inserted, Ordering::Relaxed);
@@ -728,6 +749,7 @@ impl DriveStore {
         let _ = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)");
         drop(conn);
         self.drive_cache_dirty.store(true, Ordering::Release);
+        self.route_overview_gen.fetch_add(1, Ordering::Release);
         self.refresh_counts()?;
         Ok(())
     }
@@ -803,6 +825,7 @@ impl DriveStore {
         }
         tx.commit()?;
         self.drive_cache_dirty.store(true, Ordering::Release);
+        self.route_overview_gen.fetch_add(1, Ordering::Release);
         Ok(())
     }
 
@@ -1191,6 +1214,7 @@ impl DriveStore {
         }
         drop(conn);
         self.drive_cache_dirty.store(true, Ordering::Release);
+        self.route_overview_gen.fetch_add(1, Ordering::Release);
         self.refresh_counts()?;
         Ok(())
     }
@@ -1240,6 +1264,7 @@ impl DriveStore {
         let _ = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)");
         drop(conn);
         self.drive_cache_dirty.store(true, Ordering::Release);
+        self.route_overview_gen.fetch_add(1, Ordering::Release);
         self.route_count.fetch_sub(deleted as i64, Ordering::Relaxed);
         self.processed_count
             .fetch_sub(deleted_processed as i64, Ordering::Relaxed);
@@ -1286,6 +1311,7 @@ impl DriveStore {
             s
         };
         self.drive_cache_dirty.store(true, Ordering::Release);
+        self.route_overview_gen.fetch_add(1, Ordering::Release);
         self.refresh_counts()?;
         let after = self.route_count.load(Ordering::Relaxed);
         info!(
@@ -1563,6 +1589,31 @@ impl DriveStore {
         self.rebuild_caches_off_lock(force)?;
         let conn = self.conn.lock().unwrap();
         Ok(schema::meta_get(&conn, "drive_list_cache")?.unwrap_or_else(|| "[]".to_string()))
+    }
+
+    /// Serve `/api/drives/routes` map-overview JSON from an in-memory cache;
+    /// recompute (full grouper) only after a route mutation.
+    pub fn get_cached_route_overviews_json(&self, max_points: usize) -> Result<String> {
+        // Read generation before routes: a mutation in between just forces one
+        // extra recompute next time, never a stale serve.
+        let generation = self.route_overview_gen.load(Ordering::Acquire);
+        {
+            let cache = self.route_overview_cache.lock().unwrap();
+            if let Some(c) = cache.as_ref() {
+                if c.generation == generation && c.max_points == max_points {
+                    return Ok(c.json.clone());
+                }
+            }
+        }
+        let routes = {
+            let conn = self.conn.lock().unwrap();
+            select_all_routes(&conn)?
+        };
+        let overviews = crate::grouper::route_overviews(routes, max_points);
+        let json = serde_json::to_string(&overviews).unwrap_or_else(|_| "[]".to_string());
+        let mut cache = self.route_overview_cache.lock().unwrap();
+        *cache = Some(RouteOverviewCache { generation, max_points, json: json.clone() });
+        Ok(json)
     }
 
     /// Return the pre-computed drive stats as a JSON string. `processed_count`
@@ -2730,6 +2781,50 @@ mod tests {
         assert_eq!(routes[0].accel_positions, vec![0.5, 0.6]);
         assert_eq!(routes[0].raw_frame_count, 2);
         assert_eq!(routes[0].gear_runs.len(), 1);
+    }
+
+    #[test]
+    fn route_overview_cache_matches_live_and_invalidates_on_mutation() {
+        let store = DriveStore::open_memory().unwrap();
+        let add = |file: &str, lat: f64| {
+            store
+                .add_route(
+                    file,
+                    "2025-01-15",
+                    &vec![[lat, -122.4194], [lat + 0.001, -122.4195]],
+                    &[4, 4],
+                    &[1, 1],
+                    &[25.0, 26.0],
+                    &[0.5, 0.6],
+                    0,
+                    2,
+                    &[GearRun { gear: 4, frames: 2 }],
+                )
+                .unwrap();
+        };
+
+        add("2025-01-15/2025-01-15_10-00-00-front.mp4", 37.7749);
+        // Cache == live output.
+        let live1 = serde_json::to_string(&crate::grouper::route_overviews(
+            store.get_routes().unwrap(),
+            20,
+        ))
+        .unwrap();
+        let cached1 = store.get_cached_route_overviews_json(20).unwrap();
+        assert_eq!(cached1, live1, "cache must equal live output");
+        // Hit.
+        assert_eq!(store.get_cached_route_overviews_json(20).unwrap(), live1);
+
+        // Mutation invalidates.
+        add("2025-01-15/2025-01-15_11-00-00-front.mp4", 40.0000);
+        let live2 = serde_json::to_string(&crate::grouper::route_overviews(
+            store.get_routes().unwrap(),
+            20,
+        ))
+        .unwrap();
+        let cached2 = store.get_cached_route_overviews_json(20).unwrap();
+        assert_ne!(cached2, cached1, "cache must refresh after a new route");
+        assert_eq!(cached2, live2, "refreshed cache must equal live output");
     }
 
     #[test]
