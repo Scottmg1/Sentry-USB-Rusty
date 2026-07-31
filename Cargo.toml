@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/sentryusb",
     "crates/config",
+    "crates/vehicle_profile",
     "crates/shell",
     "crates/ws",
     "crates/drives",

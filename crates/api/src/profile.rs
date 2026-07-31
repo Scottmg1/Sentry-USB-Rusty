@@ -1,0 +1,26 @@
+//! Active vehicle profile as a client needs it: identity (so SC knows this is
+//! a Tesla/SentryUSB box vs a GM/Dash-USB one), camera set + playback grid for
+//! the viewer, and the filename pattern for client-side grouping. Same shape
+//! the Dash-USB sibling serves at `/api/profile`.
+
+use axum::http::StatusCode;
+use axum::Json;
+
+use sentryusb_vehicle_profile::Profile;
+
+pub async fn get_profile() -> (StatusCode, Json<serde_json::Value>) {
+    let p = Profile::active();
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "id": p.profile.id,
+            "display_name": p.profile.display_name,
+            "brand": p.profile.brand,
+            "cameras": p.cameras,
+            "grid": p.viewer.grid,
+            "filename_regex": p.recording.filename_regex,
+            "segment_seconds": p.recording.segment_seconds,
+            "rolling_window_minutes": p.recording.rolling_window_minutes,
+        })),
+    )
+}
