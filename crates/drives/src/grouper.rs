@@ -1262,6 +1262,10 @@ pub(crate) fn detect_summon(
         }
         speed_mps = max_speed_mps;
     }
+    // `!(x > 0.0)` rather than `x <= 0.0`: NaN fails both comparisons, so
+    // the negated form rejects a NaN speed while `<=` would admit it —
+    // same semantics as Sentry-Drive's `!(speedMps > 0)`.
+    #[allow(clippy::neg_cmp_op_on_partial_ord)]
     if !(speed_mps > 0.0) || speed_mps > SUMMON_MAX_SPEED_MPS {
         return false;
     }

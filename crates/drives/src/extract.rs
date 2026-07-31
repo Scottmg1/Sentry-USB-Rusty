@@ -165,11 +165,11 @@ fn find_mdat_box(f: &mut File) -> Result<(u64, u64)> {
 /// bytes — encoded video) are skipped with `seek_relative`, which discards
 /// the buffer only when the skip lands outside it, so large video frames
 /// don't get pulled into memory.
-fn extract_from_mdat(
-    f: &mut File,
-    offset: u64,
-    size: u64,
-) -> Result<(Vec<GpsPoint>, Vec<u8>, Vec<u8>, Vec<f32>, Vec<f32>, Vec<u8>)> {
+/// Raw per-frame arrays out of the SEI scan, 1:1 with SEI frames:
+/// (points, gears, autopilot states, speeds, accel positions, flag bytes).
+type RawFrameArrays = (Vec<GpsPoint>, Vec<u8>, Vec<u8>, Vec<f32>, Vec<f32>, Vec<u8>);
+
+fn extract_from_mdat(f: &mut File, offset: u64, size: u64) -> Result<RawFrameArrays> {
     use std::io::BufReader;
     const BUF_SIZE: u64 = 64 * 1024;
 
