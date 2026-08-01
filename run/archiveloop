@@ -324,10 +324,18 @@ function connect_usb_drives_to_host_locked() {
 function away_mode_active () {
   local flag="/mutable/sentryusb_away_mode.json"
   [ -f "$flag" ] || return 1
-  # The Go server updates remaining_sec in the flag file every 30s,
-  # so this works reliably regardless of whether the Pi has an RTC.
+  # Automatic (geofence) mode: the flag file's existence IS the away
+  # decision — the server writes it on leaving home and removes it on
+  # arrival. There is no timer, so there is no remaining_sec to check.
+  if grep -q '"mode":[[:space:]]*"auto"' "$flag" 2>/dev/null; then
+    return 0
+  fi
+  # Manual timer: the server refreshes remaining_sec every 30s, so this
+  # works with or without an RTC. Tolerate pretty-printed JSON — the Rust
+  # server writes the flag with to_vec_pretty ("remaining_sec": 300), whose
+  # space after the colon the old compact-JSON grep silently never matched.
   local remaining
-  remaining=$(grep -o '"remaining_sec":[0-9]*' "$flag" | cut -d: -f2)
+  remaining=$(grep -o '"remaining_sec":[[:space:]]*[0-9]*' "$flag" | grep -o '[0-9]*$')
   [ -n "$remaining" ] && [ "$remaining" -gt 0 ] 2>/dev/null
 }
 
