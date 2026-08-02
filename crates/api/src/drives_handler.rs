@@ -281,6 +281,10 @@ fn single_drive_blocking(
                 drive.tacc_distance_km = s.tacc_distance_km;
                 drive.tacc_distance_mi = s.tacc_distance_mi;
                 drive.assisted_percent = s.assisted_percent;
+                // Summon is only decided on the summary path — it needs
+                // the park-split segment frame bounds that the full-BLOB
+                // rebuild above doesn't carry.
+                drive.summon = s.summon;
             }
             (
                 StatusCode::OK,

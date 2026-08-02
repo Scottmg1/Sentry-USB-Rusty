@@ -278,8 +278,9 @@ fn backfill_one_batch(conn: &mut Connection) -> Result<i64> {
                 park_ms_start        = ?20,
                 fsd_at_end           = ?21,
                 fsd_accel_pushes_early = ?22,
-                ap_at_start          = ?23
-             WHERE file = ?24",
+                ap_at_start          = ?23,
+                sei_speed_abs_max    = ?24
+             WHERE file = ?25",
         )?;
         for (file, a) in &decoded {
             stmt.execute(params![
@@ -306,6 +307,7 @@ fn backfill_one_batch(conn: &mut Connection) -> Result<i64> {
                 a.fsd_at_end as i64,
                 a.fsd_accel_pushes_early,
                 a.ap_at_start,
+                a.sei_speed_abs_max,
                 file,
             ])
             .with_context(|| format!("update {}", file))?;

@@ -49,6 +49,8 @@ export interface DriveSummary {
   source?: string
   externalSignature?: string
   tessieAutopilotPercent?: number
+  /** Detected Summon / Smart Summon drive — present only when true. */
+  summon?: boolean
 }
 
 export interface FsdEvent {
