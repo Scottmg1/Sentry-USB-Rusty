@@ -27,6 +27,7 @@ pub fn build_router(state: AppState) -> Router {
         // Status & config
         .route("/api/status", get(crate::status::get_status))
         .route("/api/status/storage", get(crate::status::get_storage_breakdown))
+        .route("/api/profile", get(crate::profile::get_profile))
         .route("/api/config", get(crate::status::get_config))
         .route("/api/wifi", get(crate::status::get_wifi_config))
         // Auth
