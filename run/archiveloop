@@ -272,6 +272,18 @@ function sync_disk_media_to_host () {
 # cam_disk.bin mounted for a sync (two writers on one block device —
 # filesystem corruption, car stops recording).
 GADGET_CYCLE_LOCK=/tmp/sentryusb_gadget_cycle.lock
+# Shared with snapshot creation/release while changing the snapshot link farm.
+SNAPSHOT_LOCK_DIR=/backingfiles/snapshots
+# Contains a digest of host media inventory after a successful full connect.
+# Its own mtime is irrelevant, so NTP clock steps cannot make clean media dirty.
+CAM_MEDIA_SYNC_STAMP=/tmp/sentryusb_cam_media_sync_stamp
+CAM_MEDIA_WATCH_PATHS=(
+  /mutable/Wraps
+  /mutable/LicensePlate
+)
+# Durable: cleanup still owed after a real archive (or short recordings) so
+# zero-clip skips cannot permanently drop free-space work across restarts.
+CAM_CLEANUP_PENDING=/mutable/sentryusb_cam_cleanup_pending
 
 # Run "$@" holding the gadget-cycle lock. Single definition so the fd
 # number and lock path can never drift between call sites — a mismatch
@@ -307,6 +319,7 @@ function connect_usb_drives_to_host_locked() {
   local port="${SENTRYUSB_PORT:-80}"
   curl -sf -X POST "http://127.0.0.1:${port}/api/lockchime/randomize-on-connect" > /dev/null 2>&1 || true
   sync_user_media_to_cam
+  record_cam_media_sync_success || log "ERROR: failed to record synced user-media inventory"
   # Pre-trigger autofs mounts for media directories while disk images
   # are free (before the gadget takes over). This ensures the web UI
   # can display Music/LightShow/Boombox files immediately after boot.
@@ -319,6 +332,122 @@ function connect_usb_drives_to_host_locked() {
   fi
   log "Connected usb to host."
   sleep 5
+}
+
+# Inventory digest of watched host media: relative path, type, size, mtime.
+# The digest value is stable across wall-clock corrections because comparison
+# does not use the state file's own timestamp.
+function host_cam_media_generation () {
+  local root manifest digest any=false
+  manifest=$(mktemp) || { printf 'none\n'; return 0; }
+
+  for root in "${CAM_MEDIA_WATCH_PATHS[@]}"
+  do
+    if [ -d "$root" ]
+    then
+      any=true
+      printf 'root:%s\n' "$root" >> "$manifest"
+      find "$root" \( -type f -o -type l -o -type d \) \
+        -printf '%P\t%y\t%s\t%T@\n' 2>/dev/null \
+        | LC_ALL=C sort >> "$manifest" || true
+    elif [ -e "$root" ]
+    then
+      any=true
+      find "$root" -maxdepth 0 \
+        -printf 'file:%p\t%y\t%s\t%T@\n' 2>/dev/null >> "$manifest" || true
+    fi
+  done
+
+  if [ "$any" != true ]
+  then
+    rm -f "$manifest"
+    printf 'none\n'
+    return 0
+  fi
+  digest=$(sha256sum "$manifest" 2>/dev/null | awk '{print $1}')
+  rm -f "$manifest"
+  if [ -n "$digest" ]
+  then
+    printf '%s\n' "$digest"
+  else
+    printf 'none\n'
+  fi
+}
+
+function record_cam_media_sync_success () {
+  local generation tmp
+  generation=$(host_cam_media_generation)
+  tmp="${CAM_MEDIA_SYNC_STAMP}.new"
+  if printf '%s\n' "$generation" > "$tmp" && mv "$tmp" "$CAM_MEDIA_SYNC_STAMP"
+  then
+    return 0
+  fi
+  rm -f "$tmp"
+  return 1
+}
+
+# Clock-independent dirty check for Wraps/LicensePlate. LockChime is owned by
+# the Rust API's immediate cam cycle on activate/clear.
+function cam_user_media_may_need_sync () {
+  local current recorded
+  current=$(host_cam_media_generation)
+
+  if [ -r "$CAM_MEDIA_SYNC_STAMP" ]
+  then
+    read -r recorded < "$CAM_MEDIA_SYNC_STAMP" || return 0
+    if [ "$current" != "$recorded" ]
+    then
+      return 0
+    fi
+  elif [ "$current" != "none" ]
+  then
+    return 0
+  fi
+  return 1
+}
+
+# Idempotent reconnect: full connect only when inactive or host media dirty.
+# Unlike connect_usb_drives_to_host, does not cycle a healthy presentation.
+function ensure_usb_drives_connected () {
+  with_gadget_lock ensure_usb_drives_connected_locked
+}
+
+function ensure_usb_drives_connected_locked () {
+  if cam_user_media_may_need_sync
+  then
+    log "User media changed; cycling gadget once to sync cam image"
+    connect_usb_drives_to_host_locked
+  elif ! usb_gadget_is_active
+  then
+    log "USB gadget inactive; synchronising and re-presenting once"
+    connect_usb_drives_to_host_locked
+  else
+    log "USB gadget already active; skipping redundant reconnect"
+  fi
+}
+
+function mark_cam_cleanup_pending () {
+  local parent tmp
+  parent=${CAM_CLEANUP_PENDING%/*}
+  tmp="${CAM_CLEANUP_PENDING}.new"
+  if ! printf 'pending\n' > "$tmp"
+  then
+    log "ERROR: could not write cam-cleanup pending marker"
+    return 1
+  fi
+  if ! mv "$tmp" "$CAM_CLEANUP_PENDING"
+  then
+    rm -f "$tmp"
+    log "ERROR: could not publish cam-cleanup pending marker"
+    return 1
+  fi
+  sync -f "$parent" >> "$LOG_FILE" 2>&1 || true
+}
+
+function clear_cam_cleanup_pending () {
+  [ -e "$CAM_CLEANUP_PENDING" ] || return 0
+  rm -f "$CAM_CLEANUP_PENDING" || true
+  sync -f "${CAM_CLEANUP_PENDING%/*}" >> "$LOG_FILE" 2>&1 || true
 }
 
 function away_mode_active () {
@@ -672,14 +801,15 @@ function usb_gadget_is_active () {
 }
 
 function check_if_usb_gadget_is_mounted () {
+  # Idle recovery only: do not cycle for pending media while the gadget is up
+  # (would thrash Travel Mode / stay-connected paths).
   if usb_gadget_is_active
   then
     return
   fi
 
   log "USB Gadget not mounted. Fixing files and remounting..."
-  disconnect_usb_drives_from_host
-  connect_usb_drives_to_host
+  ensure_usb_drives_connected || log "ERROR: failed to recover inactive USB gadget"
 }
 
 function trim_free_space() {
@@ -900,7 +1030,8 @@ function clean_cam_mount {
 
   if [ "$mode" = "freespace" ]
   then
-    if [ -e /tmp/last_clean_time ]
+    # Durable cleanup obligations must not be suppressed by the throttle.
+    if [ ! -e "$CAM_CLEANUP_PENDING" ] && [ -e /tmp/last_clean_time ]
     then
       read -r -d . last < /tmp/last_clean_time
       read -r -d . now < /proc/uptime
@@ -921,7 +1052,7 @@ function clean_cam_mount {
   find "${CAM_MOUNT}" \( \( -type f -name FSCK\*.REC \) -o \( -type f -name "*~[0-9].MP4" \) \) -print0 | xargs -0 rm -rf
 
   # Delete short recordings
-  (cd "${CAM_MOUNT}"; find . -type f -name \*.mp4 -size -100000c -printf '%P\n' ) | xargs rm -rf
+  find "${CAM_MOUNT}" -type f -name \*.mp4 -size -100000c -delete
 
   if [ "$mode" = "freespace" ]
   then
@@ -959,6 +1090,62 @@ function clean_cam_mount {
   unmount_cam_file
 
   log "done cleaning cam mount"
+  if [ "$mode" = "freespace" ]
+  then
+    clear_cam_cleanup_pending
+  fi
+}
+
+# Retire snapshot-farm links for short recordings only after live-image
+# cleanup succeeds. The immutable snapshot itself remains available.
+function retire_short_recording_links_locked () {
+
+  local ignorelist="$1"
+  local index_root="$2"
+  local path link size
+  local -i retired=0
+
+  while IFS= read -r path
+  do
+    link="$index_root/$path"
+    if [ -L "$link" ] &&
+       size=$(stat -Lc '%s' -- "$link" 2>/dev/null) &&
+       [ "$size" -lt 100000 ]
+    then
+      if rm -f -- "$link"
+      then
+        retired=$((retired + 1))
+      else
+        log "ERROR: failed to retire cleaned short recording link $link"
+        return 1
+      fi
+    fi
+  done < "$ignorelist"
+
+  find "$index_root/RecentClips" "$index_root/SavedClips" \
+    "$index_root/SentryClips" "$index_root/TeslaTrackMode" \
+    -mindepth 1 -depth -type d -empty -delete 2>/dev/null || true
+
+  if [ "$retired" -gt 0 ]
+  then
+    log "Retired $retired cleaned short recording link(s) from snapshot index"
+  fi
+}
+
+function retire_short_recording_links () {
+
+  local ignorelist="$1"
+  local index_root="${2:-/mutable/TeslaCam}"
+
+  [ -s "$ignorelist" ] || return 0
+  (
+    if ! flock -x -w 30 9
+    then
+      log "ERROR: snapshot lock busy; short recording links remain pending"
+      exit 1
+    fi
+    retire_short_recording_links_locked "$ignorelist" "$index_root"
+  ) 9< "$SNAPSHOT_LOCK_DIR"
 }
 
 # Directory structure car uses:
@@ -1257,6 +1444,14 @@ function archive_teslacam_clips () {
       fi
     done < ${sentrylist}
 
+    # Cleanup still owed after files left the overlay (even if the car leaves
+    # before free-space cleanup). Publish before the durable ledger so a
+    # power cut cannot leave archived clips on cam with no cleanup obligation.
+    if [ "$sentry_archived" -gt 0 ] || [ "$trackmode_archived" -gt 0 ]
+    then
+      mark_cam_cleanup_pending || true
+    fi
+
     # copy the list of archived files back to /mutable if it has changed
     if ! diff -q -N "${sentrylist_archived}" "${sentrylist_previously_archived}" > /dev/null
     then
@@ -1324,14 +1519,36 @@ function archive_teslacam_clips () {
     then
       if travel_mode_active; then
         log "Travel Mode: deferring freespace cleanup to keep the USB gadget connected to the car"
-      else
+        if [ "$total_count" -gt 0 ] || [ "$ignore_count" -gt 0 ]
+        then
+          mark_cam_cleanup_pending || true
+        fi
+      elif [ -e "$CAM_CLEANUP_PENDING" ]; then
+        log "Completing deferred cam cleanup"
         clean_cam_mount freespace
+        retire_short_recording_links "$ignorelist" "$overlaylower" || log "ERROR: failed to retire cleaned short recording links"
+      elif [ "$total_count" -eq 0 ] && [ "$ignore_count" -eq 0 ]; then
+        # Zero-clip home archives used to always clean+reconnect, thrashing USB.
+        log "No archive or maintenance candidates; leaving USB gadget connected"
+      else
+        if [ "$total_count" -eq 0 ]; then
+          log "$ignore_count short recording(s) require cam cleanup"
+        else
+          log "Archived files require cam cleanup"
+        fi
+        mark_cam_cleanup_pending || true
+        clean_cam_mount freespace
+        retire_short_recording_links "$ignorelist" "$overlaylower" || log "ERROR: failed to retire cleaned short recording links"
       fi
     else
       log "Skipping cleaning step after archive error"
     fi
   else
     log "Archive not reachable, assuming user drove away, skipping cleaning step"
+    if [ "$archive_success" = "true" ] && { [ "$total_count" -gt 0 ] || [ "$ignore_count" -gt 0 ]; }
+    then
+      mark_cam_cleanup_pending || true
+    fi
   fi
 
   # Report the real outcome so archive_clips can propagate failure to the
@@ -1500,13 +1717,17 @@ function archive_clips () {
 
   touch /tmp/flag_post_archive  #Set post-archive flag for optional temperature logging
   clear_archive_status
-  # Reconnect cam drive before post-archive processing.
-  # Processing reads local snapshots, not the cam disk — the car can resume
-  # recording immediately instead of waiting for processing to finish.
-  # In Travel Mode the gadget was never disconnected (cleanup was deferred),
-  # so skip the reconnect cycle to avoid interrupting the car's recording.
-  if ! travel_mode_active; then
-    connect_usb_drives_to_host
+  # Reconnect only when cleanup/music left the gadget down or host media is
+  # dirty. Processing reads local snapshots — leave an active gadget alone.
+  if travel_mode_active; then
+    if ! usb_gadget_is_active; then
+      log "Travel Mode: USB gadget inactive; restoring presentation once"
+      ensure_usb_drives_connected || log "ERROR: failed to restore USB gadget in Travel Mode"
+    else
+      log "Travel Mode: USB gadget already active; skipping reconnect"
+    fi
+  else
+    ensure_usb_drives_connected || log "ERROR: failed to ensure USB gadget after archive"
   fi
   /root/bin/post-archive-process.sh || log "ERROR: post-archive-process.sh failed (exit $?)"
   cloud_upload_step
@@ -1989,7 +2210,13 @@ else
   if has_cam_disk
   then
     # always remove files that fsck recoverd
-    clean_cam_mount boot
+    if [ -e "$CAM_CLEANUP_PENDING" ]
+    then
+      log "Completing cam cleanup deferred from an interrupted archive"
+      clean_cam_mount freespace || log "ERROR: boot cam cleanup (freespace) failed"
+    else
+      clean_cam_mount boot || log "ERROR: boot cam cleanup failed"
+    fi
   fi
 
   # Present the drive to the car BEFORE the boot snapshot. The snapshot is
@@ -1998,7 +2225,7 @@ else
   # ~50 extra seconds without a drive on every power-on. The lock chime is
   # synced inside connect (before enable), so the car still sees a single
   # plug-in with everything already in place.
-  connect_usb_drives_to_host
+  connect_usb_drives_to_host || log "ERROR: boot USB connect failed"
 
   if has_cam_disk
   then
@@ -2046,11 +2273,9 @@ then
 
   doubleblink
 
-  # Skip the gadget cycle if the user drove away during archive — the gadget
-  # is still presented to the car and re-cycling it would interrupt recording.
-  # In Travel Mode the gadget was never disconnected, so skip the cycle too.
+  # archive_clips already ensured when needed; do not force another full cycle.
   if archive_is_reachable && ! travel_mode_active; then
-    connect_usb_drives_to_host
+    ensure_usb_drives_connected || log "ERROR: failed to ensure USB gadget after archive cycle"
   fi
 
   if travel_mode_active; then
@@ -2104,11 +2329,8 @@ do
 
   doubleblink
 
-  # Skip the gadget cycle if the user drove away during archive — the gadget
-  # is still presented to the car and re-cycling it would interrupt recording.
-  # In Travel Mode the gadget was never disconnected, so skip the cycle too.
   if archive_is_reachable && ! travel_mode_active; then
-    connect_usb_drives_to_host
+    ensure_usb_drives_connected || log "ERROR: failed to ensure USB gadget after archive cycle"
   fi
 
   if travel_mode_active; then
