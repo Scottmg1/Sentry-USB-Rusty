@@ -862,6 +862,37 @@ RCLONEREACH_EOF
     log "rclone-watchdog: archive scripts refreshed (probe ARCHIVE_SERVER, scoped kill)"
 }
 
+# ── Rock 4C+ WiFi NVRAM: remove the TX-collapsing AP6256 relink ──────────
+# The old 4C+ installer symlinked the board WiFi NVRAM to nvram_ap6256.txt,
+# which collapses TX to ~6 Mbit/s (sole TX-power source, no txcap_blob).
+# Remove it → driver falls back to the generic brcmfmac43455-sdio.txt. Heals
+# existing boxes on OTA (reboots on completion). BT coexistence is the .hcd
+# patch, not this.
+apply_4cplus_wifi_nvram_fix() {
+    is_rock_4cplus || return 0
+    local brcm=/lib/firmware/brcm
+    local link="$brcm/brcmfmac43455-sdio.radxa,rock-4c-plus.txt"
+    # Only our exact relink (symlink -> nvram_ap6256.txt); leave anything else alone.
+    [ -L "$link" ] || { log "4c+ wifi nvram: no board relink — generic in use"; return 0; }
+    if [ "$(basename "$(readlink "$link")")" != "nvram_ap6256.txt" ]; then
+        log "4c+ wifi nvram: board .txt not the AP6256 relink — leaving as-is"
+        return 0
+    fi
+    # Re-lock only if we unlocked (leave root as found).
+    local ro_before=no
+    findmnt -no OPTIONS / 2>/dev/null | grep -qE '(^|,)ro(,|$)' && ro_before=yes
+    [ -x /root/bin/remountfs_rw ] && /root/bin/remountfs_rw >/dev/null 2>&1 || true
+    if rm -f "$link" 2>/dev/null; then
+        log "4c+ wifi nvram: removed AP6256 relink → generic fallback (REBOOT to apply)"
+    else
+        err "4c+ wifi nvram: could not remove $link (read-only fs? check remountfs_rw)"
+    fi
+    if [ "$ro_before" = yes ]; then
+        sync
+        mount -o remount,ro / 2>/dev/null || true
+    fi
+}
+
 # ── Run all patches ─────────────────────────────────────────────────────
 
 apply_ble_nonfatal_adv
@@ -871,6 +902,7 @@ apply_backingfiles_bfq
 apply_hardware_watchdog
 apply_archive_mount_lock_scripts
 apply_rfkill_unblock_wifi
+apply_4cplus_wifi_nvram_fix
 apply_rclone_config_mutable_migration
 apply_rclone_watchdog_fix
 

@@ -513,17 +513,9 @@ DTS
         warn "BCM4345C0 .hcd not found — 'apt install --reinstall armbian-firmware', then"
         warn "symlink BCM4345C0.radxa,rock-4c-plus.hcd → the generic BCM4345C0 .hcd."
     fi
-    if [ -e "$BRCM/nvram_ap6256.txt" ]; then
-        ln -sf nvram_ap6256.txt "$BRCM/brcmfmac43455-sdio.radxa,rock-4c-plus.txt"
-        [ -e "$BRCM/brcmfmac43455-sdio.bin" ] && \
-            ln -sf brcmfmac43455-sdio.bin "$BRCM/brcmfmac43455-sdio.radxa,rock-4c-plus.bin"
-        [ -e "$BRCM/brcmfmac43455-sdio.clm_blob" ] && \
-            ln -sf brcmfmac43455-sdio.clm_blob "$BRCM/brcmfmac43455-sdio.radxa,rock-4c-plus.clm_blob"
-        ok "WiFi nvram → nvram_ap6256.txt (AP6256 calibration) — WiFi now survives BT"
-        NEEDS_REBOOT=1
-    else
-        warn "nvram_ap6256.txt not found — WiFi may be unstable with BT (generic calibration)."
-    fi
+    # No WiFi NVRAM relink: nvram_ap6256.txt collapses 4C+ TX to ~6 Mbit/s
+    # (sole TX-power source, no txcap_blob). Driver falls back to the generic
+    # brcmfmac43455-sdio.txt. BT coexistence is the .hcd patch above, not this.
 
     # 4. (Recommended) OpenSSH instead of Dropbear — Dropbear ships no SFTP
     #    subsystem, so scp/sftp to the Pi fail.
