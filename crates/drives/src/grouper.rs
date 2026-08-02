@@ -59,6 +59,33 @@ pub(crate) const GAP_FILL_MIN_SPEED_MPS: f32 = 0.5;
 /// Minimum Park duration (seconds) that ends the current drive within a clip.
 const PARK_GAP_SECONDS: f64 = 2.0;
 
+/// Nominal clip container length (ms) — the recorder splits all clips at
+/// one-minute boundaries. Frame→time math against a clip's raw frame
+/// count uses this span (the last clip of a session can carry far fewer
+/// real frames than the container claims; those frames are real data).
+const CLIP_DURATION_MS: i64 = 60_000;
+
+// Summon detection thresholds — mirror Sentry-Drive's drive-calc.cjs
+// exactly (locked there by drive-calc.test.js), verified against real
+// Actually Smart Summon footage (2026-07-15 20:49/20:50): hazards = both
+// blinker bits in the SAME run, held 1-4 s spanning BOTH gear
+// transitions; accel/brake stay 0 the whole drive; autopilot_state stays
+// 0 during summon, so it plays no part here. Speed cap: Tesla limits
+// summon to ~6 mph on older firmware and 8 mph (3.58 m/s) on newer cars
+// — 4.5 m/s (10.1 mph) gives the 8 mph ceiling the same headroom the
+// previous 3.5 gate gave the 6 mph one (observed ASS peak on the 6 mph
+// firmware: 2.7 m/s).
+
+/// SEI max speed (m/s) above which a drive cannot be a summon.
+const SUMMON_MAX_SPEED_MPS: f64 = 4.5;
+
+/// Hazards must appear within this many seconds of the drive's start and
+/// end (in frames-of-clip terms — see `detect_summon`).
+const SUMMON_BOOKEND_SECONDS: f64 = 10.0;
+
+/// Max summon drive duration (10 minutes).
+const SUMMON_MAX_DURATION_MS: i64 = 10 * 60 * 1000;
+
 // ---------------------------------------------------------------------------
 // Public API
 //
@@ -998,6 +1025,12 @@ fn split_clip_at_park_gaps(clip: &TimedRoute) -> Vec<ClipSegment> {
                     raw_park_count: 0,
                     raw_frame_count: 0,
                     gear_runs: Vec::new(),
+                    // Parent's full-clip flag RLE rides along (mirrors
+                    // Sentry-Drive's `{...clip}` sub-segment spread) —
+                    // flag runs live in RAW frame space, so slicing
+                    // them to the segment would corrupt the frame
+                    // indexing.
+                    flag_runs: clip.route.flag_runs.clone(),
                     source: clip.route.source.clone(),
                     external_signature: clip.route.external_signature.clone(),
                     tessie_autopilot_percent: clip.route.tessie_autopilot_percent,
@@ -1088,6 +1121,189 @@ fn clip_is_mostly_parked_legacy(clip: &TimedRoute) -> bool {
         .filter(|&&g| g == GEAR_PARK)
         .count();
     park_count > clip.route.gear_states.len() / 2
+}
+
+// ---------------------------------------------------------------------------
+// Summon detection
+//
+// Port of Sentry-Drive's flagRunsOverlap / detectSummon (drive-calc.cjs).
+// Evidence lives in RAW SEI frame space (flag_runs + park-split segment
+// bounds), so it is immune to GPS dedup and to the fraction-based
+// frame→point index mapping the splitter uses.
+// ---------------------------------------------------------------------------
+
+/// Per-clip summon evidence, one entry per clip of the drive in drive
+/// order. `[start_frame, end_frame)` bounds the drive's segment of that
+/// clip in raw SEI frame space (the full clip when the park splitter
+/// left it whole).
+pub(crate) struct SummonClipEvidence<'a> {
+    pub flag_runs: &'a [FlagRun],
+    pub start_frame: u32,
+    pub end_frame: u32,
+    pub total_frames: u32,
+}
+
+/// True when any flag run overlapping `[from_frame, to_frame)` carries
+/// `mask` bits: all of them when `require_all` (hazards = left AND right
+/// in the SAME run), any of them otherwise (pedal input = brake OR
+/// accel).
+pub(crate) fn flag_runs_overlap(
+    runs: &[FlagRun],
+    from_frame: u32,
+    to_frame: u32,
+    mask: u8,
+    require_all: bool,
+) -> bool {
+    let mut frame: u32 = 0;
+    for run in runs {
+        let start = frame;
+        let end = frame + run.frames;
+        frame = end;
+        if end <= from_frame {
+            continue;
+        }
+        if start >= to_frame {
+            break;
+        }
+        let bits = run.flags & mask;
+        if require_all {
+            if bits == mask {
+                return true;
+            }
+        } else if bits != 0 {
+            return true;
+        }
+    }
+    false
+}
+
+/// Frame-space max |SEI speed| over the flag runs overlapping a
+/// segment's `[start_frame, end_frame)` — `None` when any overlapping
+/// run predates per-run speed evidence (pre-`max_mps` extraction), so
+/// callers can fall back. Mirrors Sentry-Drive's `segmentMaxSpeed`.
+fn segment_max_speed(c: &SummonClipEvidence) -> Option<f64> {
+    let mut frame: u32 = 0;
+    let mut max = 0.0f64;
+    for run in c.flag_runs {
+        let start = frame;
+        let end = frame + run.frames;
+        frame = end;
+        if end <= c.start_frame {
+            continue;
+        }
+        if start >= c.end_frame {
+            break;
+        }
+        let m = run.max_mps.filter(|m| m.is_finite())?;
+        if m > max {
+            max = m;
+        }
+    }
+    Some(max)
+}
+
+/// Detect a Summon / Smart Summon drive from per-clip SEI flag evidence.
+///
+/// The verified signature: hazards within the opening seconds of the
+/// first segment AND the closing seconds of the last, no pedal input
+/// anywhere in between, and the whole drive at parking-lot speed. A
+/// driverless car is the only thing that satisfies all three at once — a
+/// human repositioning with hazards on still touches a pedal or exceeds
+/// the summon speed cap.
+///
+/// Speed gate, frame-accurate when possible: per-run `max_mps` evidence
+/// is immune to the dedup point-slice overshoot that can leak the
+/// following drive's speed into a summon segment's stats. Legacy
+/// evidence (no `max_mps`) falls back to `max_speed_mps` — the max
+/// **absolute** SEI speed (Reverse reports negative) — and there
+/// GPS-derived speeds are still untrustworthy at summon magnitudes, so
+/// `has_sei_speeds` is required.
+pub(crate) fn detect_summon(
+    clips: &[SummonClipEvidence],
+    max_speed_mps: f64,
+    duration_ms: i64,
+    has_sei_speeds: bool,
+) -> bool {
+    if clips.is_empty() {
+        return false;
+    }
+    if !(duration_ms > 0) || duration_ms > SUMMON_MAX_DURATION_MS {
+        return false;
+    }
+
+    // Every clip needs flag evidence — a single pre-flags clip (older
+    // extraction, or routes written by a tool that hasn't ported
+    // flagRuns yet) makes the drive unverifiable, and unverifiable must
+    // mean "not summon".
+    for c in clips {
+        if c.flag_runs.is_empty() || c.total_frames == 0 || c.end_frame <= c.start_frame {
+            return false;
+        }
+    }
+
+    let mut speed_mps = 0.0f64;
+    let mut frame_accurate = true;
+    for c in clips {
+        match segment_max_speed(c) {
+            None => {
+                frame_accurate = false;
+                break;
+            }
+            Some(m) => {
+                if m > speed_mps {
+                    speed_mps = m;
+                }
+            }
+        }
+    }
+    if !frame_accurate {
+        if !has_sei_speeds {
+            return false;
+        }
+        speed_mps = max_speed_mps;
+    }
+    // `!(x > 0.0)` rather than `x <= 0.0`: NaN fails both comparisons, so
+    // the negated form rejects a NaN speed while `<=` would admit it —
+    // same semantics as Sentry-Drive's `!(speedMps > 0)`.
+    #[allow(clippy::neg_cmp_op_on_partial_ord)]
+    if !(speed_mps > 0.0) || speed_mps > SUMMON_MAX_SPEED_MPS {
+        return false;
+    }
+
+    const HAZARD: u8 = FLAG_BLINKER_LEFT | FLAG_BLINKER_RIGHT;
+    const PEDAL: u8 = FLAG_BRAKE | FLAG_ACCEL;
+
+    for c in clips {
+        if flag_runs_overlap(c.flag_runs, c.start_frame, c.end_frame, PEDAL, false) {
+            return false;
+        }
+    }
+
+    // Seconds→frames via the clip's own frame density, so variable SEI
+    // rates (and short final clips) keep the window at real seconds.
+    let bookend_frames = |c: &SummonClipEvidence| -> u32 {
+        (((c.total_frames as f64 * SUMMON_BOOKEND_SECONDS * 1000.0)
+            / CLIP_DURATION_MS as f64)
+            .ceil() as u32)
+            .max(1)
+    };
+    let first = &clips[0];
+    let last = &clips[clips.len() - 1];
+    let hazard_at_start = flag_runs_overlap(
+        first.flag_runs,
+        first.start_frame,
+        first.end_frame.min(first.start_frame + bookend_frames(first)),
+        HAZARD,
+        true,
+    );
+    let hazard_at_end = flag_runs_overlap(
+        last.flag_runs,
+        last.start_frame.max(last.end_frame.saturating_sub(bookend_frames(last))),
+        last.end_frame,
+        HAZARD,
+        true,
+    );
+    hazard_at_start && hazard_at_end
 }
 
 // ---------------------------------------------------------------------------
@@ -1500,6 +1716,12 @@ fn build_drive_stats(
         tacc_distance_km: round2(tacc_distance_m / 1000.0),
         tacc_distance_mi: round2(tacc_distance_m / calc::M_PER_MILE),
         assisted_percent,
+        // Summon is decided on the summary path, which carries the
+        // park-split segment frame bounds this full-Route path lacks
+        // (build_single_drive_from_clips receives whole clips). The
+        // single-drive API handler overlays the canonical summary value,
+        // exactly like the headline percentages above it.
+        summon: false,
         source: first_clip.route.source.clone(),
         external_signature: first_clip.route.external_signature.clone(),
         tessie_autopilot_percent: first_clip.route.tessie_autopilot_percent,
@@ -1618,11 +1840,15 @@ fn build_fsd_analytics(summaries: &[DriveSummary], period: &str) -> FsdAnalytics
     // Filter drives in period. Imported drives (tessie, teslascope, …)
     // are excluded from FSD analytics entirely — their autopilot data is
     // inferred or absent, not dashcam SEI telemetry, so mixing them
-    // would dilute the score.
+    // would dilute the score. Summon drives are excluded too (mirrors
+    // Sentry-Drive's aggregate builder): driverless with autopilot_state
+    // unset, they'd otherwise read as fake "0% FSD" drives — dragging
+    // down the score and padding the per-drive disengagement averages
+    // with trips no human (or FSD) ever drove.
     let period_drives: Vec<&DriveSummary> = summaries
         .iter()
         .filter(|d| {
-            if is_imported(&d.source) {
+            if is_imported(&d.source) || d.summon {
                 return false;
             }
             if let Some(ps) = period_start {
@@ -2621,6 +2847,69 @@ fn build_summary_from_aggregates(
     // ── v6 BLE telemetry rollup across this drive's unique clips ──
     let telemetry = roll_up_telemetry(clips);
 
+    // ── Summon detection ──
+    // Mirrors Sentry-Drive buildDriveStats: evidence is each clip's
+    // flag_runs plus its park-split segment bounds — raw SEI frame
+    // space, immune to GPS dedup. Clips without flag_runs (pre-flags
+    // extractions, imports) make the drive unverifiable and
+    // detect_summon returns false. The speed gate is frame-accurate
+    // inside detect_summon via per-run `max_mps`; these clip-level
+    // values only feed its legacy fallback (rows extracted before
+    // per-run maxima existed). There the v16 sei_speed_abs_max column is
+    // used because the locked max_speed_mps drops negative (Reverse)
+    // SEI samples — a reverse-only summon would read 0 — and can't
+    // distinguish GPS-derived speed, which jitters past walking pace on
+    // a car that barely moved. A whole-clip abs max over-reports a
+    // shared clip's summon segment — conservative: the drive stays
+    // unflagged until reprocessed.
+    let mut has_sei_speeds = false;
+    let mut summon_max_speed: f64 = 0.0;
+    for clip in clips {
+        if let Some(m) = clip.summary.aggregates.sei_speed_abs_max {
+            if m > 0.0 {
+                has_sei_speeds = true;
+            }
+            if m > summon_max_speed {
+                summon_max_speed = m;
+            }
+        }
+    }
+
+    let summon_evidence: Vec<SummonClipEvidence> = clips
+        .iter()
+        .map(|c| {
+            if c.total_frames > 1 {
+                SummonClipEvidence {
+                    flag_runs: &c.summary.flag_runs,
+                    start_frame: c.start_frame,
+                    end_frame: c.end_frame,
+                    total_frames: c.total_frames,
+                }
+            } else {
+                // Whole-clip wrap of a row without gear data carries the
+                // total_frames=1 sentinel; fall back to raw_frame_count,
+                // then to the flag-run sum (Sentry-Drive's evidence
+                // fallback order).
+                let mut total = c.summary.raw_frame_count;
+                if total == 0 {
+                    total = c.summary.flag_runs.iter().map(|r| r.frames).sum();
+                }
+                SummonClipEvidence {
+                    flag_runs: &c.summary.flag_runs,
+                    start_frame: 0,
+                    end_frame: total,
+                    total_frames: total,
+                }
+            }
+        })
+        .collect();
+    let summon = detect_summon(
+        &summon_evidence,
+        if has_sei_speeds { summon_max_speed } else { 0.0 },
+        duration_ms,
+        has_sei_speeds,
+    );
+
     let start_time_str = start_time.format("%Y-%m-%dT%H:%M:%S").to_string();
     let drive_tags = tags.get(&start_time_str).cloned().unwrap_or_default();
 
@@ -2658,6 +2947,7 @@ fn build_summary_from_aggregates(
         tacc_distance_km: round2(tacc_dist_m / 1000.0),
         tacc_distance_mi: round2(tacc_dist_m / calc::M_PER_MILE),
         assisted_percent,
+        summon,
         battery_pct_start: telemetry.battery_pct_start,
         battery_pct_end: telemetry.battery_pct_end,
         battery_pct_used: telemetry.battery_pct_used,
@@ -3003,6 +3293,7 @@ mod tests {
             raw_park_count: 0,
             raw_frame_count: 0,
             gear_runs: Vec::new(),
+            flag_runs: Vec::new(),
             aggregates: a1,
             source: None,
             external_signature: None,
@@ -3014,6 +3305,7 @@ mod tests {
             raw_park_count: 0,
             raw_frame_count: 0,
             gear_runs: Vec::new(),
+            flag_runs: Vec::new(),
             aggregates: a2,
             source: None,
             external_signature: None,
@@ -3045,6 +3337,7 @@ mod tests {
             raw_park_count: 0,
             raw_frame_count: 60,
             gear_runs: vec![GearRun { gear: 1, frames: 60 }],
+            flag_runs: Vec::new(),
             aggregates: RouteAggregates::default(),
             source: None,
             external_signature: None,
@@ -3065,6 +3358,7 @@ mod tests {
             raw_park_count: runs.iter().filter(|(g, _)| *g == GEAR_PARK).map(|(_, f)| f).sum(),
             raw_frame_count: runs.iter().map(|(_, f)| *f).sum(),
             gear_runs: runs.iter().map(|(g, f)| GearRun { gear: *g, frames: *f }).collect(),
+            flag_runs: Vec::new(),
             aggregates: a,
             source: None,
             external_signature: None,
@@ -3487,6 +3781,7 @@ mod tests {
             raw_park_count: 0,
             raw_frame_count: 60,
             gear_runs: vec![GearRun { gear: 1, frames: 60 }],
+            flag_runs: Vec::new(),
             aggregates: RouteAggregates::default(),
             source: None,
             external_signature: None,
@@ -3733,6 +4028,7 @@ mod tests {
             raw_park_count: 0,
             raw_frame_count: 60,
             gear_runs: vec![GearRun { gear: 1, frames: 60 }],
+            flag_runs: Vec::new(),
             aggregates: RouteAggregates::default(),
             source: None,
             external_signature: None,
@@ -3744,6 +4040,7 @@ mod tests {
             raw_park_count: 60,
             raw_frame_count: 60,
             gear_runs: vec![GearRun { gear: GEAR_PARK, frames: 60 }],
+            flag_runs: Vec::new(),
             aggregates: RouteAggregates::default(),
             source: None,
             external_signature: None,
@@ -3789,6 +4086,7 @@ mod tests {
             raw_park_count: 0,
             raw_frame_count: 60,
             gear_runs: vec![GearRun { gear: 1, frames: 60 }],
+            flag_runs: Vec::new(),
             aggregates: RouteAggregates::default(),
             source: None,
             external_signature: None,
@@ -3942,5 +4240,572 @@ mod tests {
         assert_eq!(r.hvac_runtime_s, Some(30), "dedupe: hvac counted once, not twice");
         assert_eq!(r.battery_pct_start, Some(70.0));
         assert_eq!(r.battery_pct_end, Some(69.0));
+    }
+
+    // ── Summon detection ─────────────────────────────────────────────
+    // Test vectors ported from Sentry-Drive's drive-calc.test.js
+    // ("Summon detection" section) and grouper.test.js ("summon:"
+    // tests). Fixtures mirror real probed footage: the 2026-07-15
+    // Actually Smart Summon (two clips, ~29.9 fps) and the 2026-07-28
+    // human parking-lot reposition that superficially matches summon on
+    // gear/speed but fails every no-human tell.
+
+    // Legacy-shape runs (no per-run max_mps) — these exercise the
+    // detector's stats-fallback speed path, mirroring Drive's fixtures.
+    fn fr(pairs: &[(u8, u32)]) -> Vec<FlagRun> {
+        pairs
+            .iter()
+            .map(|&(flags, frames)| FlagRun { flags, frames, max_mps: None })
+            .collect()
+    }
+
+    // Modern-shape runs carrying max_mps — the frame-accurate speed path.
+    fn frm(triples: &[(u8, u32, f64)]) -> Vec<FlagRun> {
+        triples
+            .iter()
+            .map(|&(flags, frames, m)| FlagRun { flags, frames, max_mps: Some(m) })
+            .collect()
+    }
+
+    fn ev(runs: &[FlagRun], start: u32, end: u32, total: u32) -> SummonClipEvidence<'_> {
+        SummonClipEvidence {
+            flag_runs: runs,
+            start_frame: start,
+            end_frame: end,
+            total_frames: total,
+        }
+    }
+
+    // Probe shape of 2026-07-15_20-49-54 (start clip): hazards through
+    // the P→D shift, a 29 s left-signal run while maneuvering, no pedal
+    // bits anywhere.
+    fn ass_start_runs() -> Vec<FlagRun> {
+        fr(&[(0, 27), (3, 123), (0, 17), (1, 873), (0, 746)])
+    }
+
+    // Probe shape of 2026-07-15_20-50-43 (end clip): hazards through the
+    // stop and D→P shift at the tail.
+    fn ass_end_runs() -> Vec<FlagRun> {
+        fr(&[(0, 471), (3, 82)])
+    }
+
+    const ASS_MAX_SPEED: f64 = 2.7;
+    const ASS_DURATION_MS: i64 = 78_000;
+
+    #[test]
+    fn summon_flag_constants_and_thresholds_are_locked() {
+        assert_eq!(FLAG_BLINKER_LEFT, 1);
+        assert_eq!(FLAG_BLINKER_RIGHT, 2);
+        assert_eq!(FLAG_BRAKE, 4);
+        assert_eq!(FLAG_ACCEL, 8);
+        // 8 mph newer-car summon cap + margin.
+        assert_eq!(SUMMON_MAX_SPEED_MPS, 4.5);
+        assert_eq!(SUMMON_BOOKEND_SECONDS, 10.0);
+        assert_eq!(SUMMON_MAX_DURATION_MS, 600_000);
+        assert_eq!(CLIP_DURATION_MS, 60_000);
+    }
+
+    #[test]
+    fn flag_runs_overlap_require_all_needs_both_bits_in_same_run() {
+        const HAZARD: u8 = FLAG_BLINKER_LEFT | FLAG_BLINKER_RIGHT;
+        // Hazards: one run carrying both bits.
+        assert!(flag_runs_overlap(&fr(&[(3, 10)]), 0, 10, HAZARD, true));
+        // A left-only run followed by a right-only run must NOT read as
+        // hazards…
+        let alternating = fr(&[(1, 10), (2, 10)]);
+        assert!(!flag_runs_overlap(&alternating, 0, 20, HAZARD, true));
+        // …but require_all=false (any-bit) sees them.
+        assert!(flag_runs_overlap(&alternating, 0, 20, HAZARD, false));
+    }
+
+    #[test]
+    fn flag_runs_overlap_honors_from_to_frame_bounds() {
+        let runs = fr(&[
+            (3, 60),   // frames 0-59
+            (0, 540),  // frames 60-599
+            (3, 60),   // frames 600-659
+            (0, 1140), // frames 660-1799
+        ]);
+        assert!(flag_runs_overlap(&runs, 0, 60, 3, true));
+        assert!(!flag_runs_overlap(&runs, 60, 600, 3, true));
+        // Run ending exactly at `from` is outside the window…
+        assert!(!flag_runs_overlap(&runs, 660, 1800, 3, true));
+        // …and a window ending exactly at a run start excludes it too.
+        assert!(!flag_runs_overlap(&runs, 360, 600, 3, true));
+        assert!(flag_runs_overlap(&runs, 360, 601, 3, true));
+    }
+
+    #[test]
+    fn detect_summon_real_ass_two_clip_shape_is_summon() {
+        let (start, end) = (ass_start_runs(), ass_end_runs());
+        let clips = vec![ev(&start, 0, 1786, 1786), ev(&end, 0, 553, 553)];
+        assert!(detect_summon(&clips, ASS_MAX_SPEED, ASS_DURATION_MS, true));
+    }
+
+    #[test]
+    fn detect_summon_single_clip_dumb_summon_shape_is_summon() {
+        let runs = fr(&[(3, 90), (0, 300), (3, 60)]);
+        let clips = vec![ev(&runs, 0, 450, 450)];
+        assert!(detect_summon(&clips, 1.0, 15_000, true));
+    }
+
+    #[test]
+    fn detect_summon_pedal_input_anywhere_disqualifies() {
+        // 2026-07-28_21-05-46 shape: brake to shift, accel to creep, no
+        // hazards.
+        let human = fr(&[(0, 1200), (4, 12), (8, 230), (4, 40), (0, 674)]);
+        let clips = vec![ev(&human, 0, 2156, 2156)];
+        assert!(!detect_summon(&clips, 1.3, 10_000, true));
+        // Even WITH hazard bookends, a single accel frame anywhere kills
+        // it.
+        let hazards_but_pedal = fr(&[(3, 90), (0, 100), (8, 1), (0, 199), (3, 60)]);
+        let clips = vec![ev(&hazards_but_pedal, 0, 450, 450)];
+        assert!(!detect_summon(&clips, 1.0, 15_000, true));
+    }
+
+    #[test]
+    fn detect_summon_hazards_must_bookend_both_ends() {
+        let start = ass_start_runs();
+        let no_hazard_end = fr(&[(0, 553)]);
+        let clips = vec![ev(&start, 0, 1786, 1786), ev(&no_hazard_end, 0, 553, 553)];
+        assert!(!detect_summon(&clips, ASS_MAX_SPEED, ASS_DURATION_MS, true));
+    }
+
+    #[test]
+    fn detect_summon_individual_turn_signals_never_read_as_hazards() {
+        let runs = fr(&[
+            (1, 90),  // left only at start
+            (0, 300),
+            (2, 60),  // right only at end
+        ]);
+        let clips = vec![ev(&runs, 0, 450, 450)];
+        assert!(!detect_summon(&clips, 1.0, 15_000, true));
+    }
+
+    #[test]
+    fn detect_summon_speed_duration_and_sei_speed_gates() {
+        let (start, end) = (ass_start_runs(), ass_end_runs());
+        let clips = vec![ev(&start, 0, 1786, 1786), ev(&end, 0, 553, 553)];
+        assert!(!detect_summon(&clips, 5.0, ASS_DURATION_MS, true));
+        assert!(!detect_summon(&clips, 0.0, ASS_DURATION_MS, true));
+        assert!(!detect_summon(&clips, ASS_MAX_SPEED, 601_000, true));
+        assert!(!detect_summon(&clips, ASS_MAX_SPEED, ASS_DURATION_MS, false));
+    }
+
+    #[test]
+    fn detect_summon_any_clip_without_flag_runs_makes_drive_unverifiable() {
+        let start = ass_start_runs();
+        let legacy: Vec<FlagRun> = Vec::new();
+        let clips = vec![ev(&start, 0, 1786, 1786), ev(&legacy, 0, 553, 553)];
+        assert!(!detect_summon(&clips, ASS_MAX_SPEED, ASS_DURATION_MS, true));
+        assert!(!detect_summon(&[], ASS_MAX_SPEED, ASS_DURATION_MS, true));
+    }
+
+    #[test]
+    fn detect_summon_park_split_segment_bounds_gate_the_bookend_windows() {
+        // Full clip has hazards at frames 0-59 and 600-659; a 2 s park
+        // gap split the clip at frame 660. The FIRST segment sees both
+        // hazard windows; the SECOND segment (frames 660+) contains none
+        // and must not inherit them.
+        let runs = fr(&[(3, 60), (0, 540), (3, 60), (0, 1140)]);
+        let first = vec![ev(&runs, 0, 660, 1800)];
+        let second = vec![ev(&runs, 660, 1800, 1800)];
+        assert!(detect_summon(&first, 1.5, 22_000, true));
+        assert!(!detect_summon(&second, 1.5, 22_000, true));
+    }
+
+    #[test]
+    fn segment_max_speed_frame_space_max_over_segment_null_on_legacy_runs() {
+        // Ported from drive-calc.test.js "segmentMaxSpeed: frame-space
+        // max over the segment, null on legacy runs".
+        let runs = frm(&[(3, 100, 0.5), (0, 400, 2.7), (8, 500, 4.7)]);
+        // Segment covering only the first two runs never sees the fast
+        // run.
+        assert_eq!(segment_max_speed(&ev(&runs, 0, 500, 1000)), Some(2.7));
+        // Full clip includes it.
+        assert_eq!(segment_max_speed(&ev(&runs, 0, 1000, 1000)), Some(4.7));
+        // A run merely straddling the segment boundary still
+        // contributes.
+        assert_eq!(segment_max_speed(&ev(&runs, 450, 550, 1000)), Some(4.7));
+        // Any overlapping run without max_mps makes the answer
+        // unknowable.
+        let legacy = vec![
+            FlagRun { flags: 3, frames: 100, max_mps: None },
+            FlagRun { flags: 0, frames: 100, max_mps: Some(1.0) },
+        ];
+        assert_eq!(segment_max_speed(&ev(&legacy, 0, 200, 200)), None);
+        // …but only if it actually overlaps.
+        assert_eq!(segment_max_speed(&ev(&legacy, 100, 200, 200)), Some(1.0));
+    }
+
+    #[test]
+    fn detect_summon_frame_space_speed_evidence_overrides_polluted_drive_stats() {
+        // Ported from drive-calc.test.js. Real 2026-07-27 00:34 failure:
+        // the park splitter's fraction→point slice overshoots on deduped
+        // points, so the summon drive's stats inherited the following
+        // drive's 4.05 m/s samples. Per-run max_mps confines the gate to
+        // the summon's own frames.
+        let clip_a_runs = frm(&[(0, 7, 0.0), (3, 144, 0.1), (0, 766, 2.7)]);
+        let clip_b_runs = frm(&[
+            (0, 143, 2.7),
+            (3, 219, 2.6),
+            (0, 105, 2.0),
+            (3, 191, 1.8),
+            (4, 50, 0.0),
+            (0, 10, 0.0),
+            (8, 521, 4.7),
+            (0, 16, 4.0),
+            (8, 545, 4.7),
+            (0, 55, 1.0),
+        ]);
+        let clips = vec![
+            ev(&clip_a_runs, 0, 917, 917),
+            ev(&clip_b_runs, 0, 579, 1855),
+        ];
+        // Polluted stats say 4.05 m/s — over the cap — yet the drive is
+        // summon.
+        assert!(detect_summon(&clips, 4.05, 42_000, true));
+        // The inverse guard: fast frames INSIDE the segment still reject
+        // on speed alone (hazard bookends present, zero pedal bits),
+        // even when the sliced stats happen to look slow.
+        let fast_no_pedals = frm(&[(3, 100, 0.5), (0, 700, 4.7), (3, 100, 0.3)]);
+        let fast_clips = vec![ev(&fast_no_pedals, 0, 900, 900)];
+        assert!(!detect_summon(&fast_clips, 2.0, 42_000, true));
+    }
+
+    // ── End-to-end through the summary grouper (grouper.test.js port) ──
+
+    /// RouteSummary with the raw-frame RLEs + SEI abs-max speed the way
+    /// the v16 extractor writes them: flag totals match gear totals
+    /// exactly (same raw SEI frame sequence). Takes prebuilt flag runs
+    /// so fixtures can be legacy-shape (`fr`, stats-fallback speed path)
+    /// or modern (`frm`, frame-accurate per-run maxima).
+    fn summon_summary_runs(
+        file: &str,
+        gear_runs: &[(u8, u32)],
+        flag_runs: Vec<FlagRun>,
+        sei_speed_abs_max: Option<f64>,
+    ) -> RouteSummary {
+        let aggregates = RouteAggregates {
+            sei_speed_abs_max,
+            ..Default::default()
+        };
+        RouteSummary {
+            file: file.to_string(),
+            date: "2026-07-15".to_string(),
+            raw_park_count: gear_runs
+                .iter()
+                .filter(|(g, _)| *g == GEAR_PARK)
+                .map(|(_, f)| f)
+                .sum(),
+            raw_frame_count: gear_runs.iter().map(|(_, f)| *f).sum(),
+            gear_runs: gear_runs.iter().map(|&(gear, frames)| GearRun { gear, frames }).collect(),
+            flag_runs,
+            aggregates,
+            source: None,
+            external_signature: None,
+            telemetry: Default::default(),
+        }
+    }
+
+    fn summon_summary(
+        file: &str,
+        gear_runs: &[(u8, u32)],
+        flag_runs: &[(u8, u32)],
+        sei_speed_abs_max: Option<f64>,
+    ) -> RouteSummary {
+        summon_summary_runs(file, gear_runs, fr(flag_runs), sei_speed_abs_max)
+    }
+
+    #[test]
+    fn summon_hazard_bookended_pedal_free_crawl_across_two_clips_is_flagged() {
+        // The real 2026-07-15 ASS shape: leading Park trimmed by the
+        // splitter on clip A, trailing Park on clip B (the run the
+        // pre-fix extractor dropped — without it these clips fuse with
+        // the following drive and the flag is lost).
+        let clip_a = summon_summary(
+            "2026-07-15/2026-07-15_20-49-54-front.mp4",
+            &[(GEAR_PARK, 60), (1, 1726)],
+            &[(0, 27), (3, 123), (0, 17), (1, 873), (0, 746)],
+            Some(2.7),
+        );
+        let clip_b = summon_summary(
+            "2026-07-15/2026-07-15_20-50-43-front.mp4",
+            &[(1, 500), (GEAR_PARK, 53)],
+            &[(0, 471), (3, 82)],
+            Some(2.7),
+        );
+        let drives = group_summaries_fast(&[clip_a, clip_b], &HashMap::new());
+        assert_eq!(drives.len(), 1);
+        assert!(drives[0].summon);
+        // Serialized shape matches Sentry-Drive: key present iff true.
+        let json = serde_json::to_string(&drives[0]).unwrap();
+        assert!(json.contains(r#""summon":true"#), "json: {json}");
+    }
+
+    #[test]
+    fn summon_missing_flag_runs_or_pedal_input_never_flags() {
+        // Same drive shape without flag evidence (pre-flags extraction)
+        // — the summary must omit the flag entirely rather than guess.
+        let bare_a = summon_summary(
+            "2026-07-15/2026-07-15_20-49-54-front.mp4",
+            &[(GEAR_PARK, 60), (1, 1726)],
+            &[],
+            Some(2.7),
+        );
+        let bare_b = summon_summary(
+            "2026-07-15/2026-07-15_20-50-43-front.mp4",
+            &[(1, 500), (GEAR_PARK, 53)],
+            &[],
+            Some(2.7),
+        );
+        let bare_drives = group_summaries_fast(&[bare_a, bare_b], &HashMap::new());
+        assert_eq!(bare_drives.len(), 1);
+        assert!(!bare_drives[0].summon);
+        let json = serde_json::to_string(&bare_drives[0]).unwrap();
+        assert!(!json.contains("summon"), "false must serialize as absent: {json}");
+
+        // Hazard bookends but a human touched the accelerator mid-drive.
+        let pedal_clip = summon_summary(
+            "2026-07-16/2026-07-16_09-00-00-front.mp4",
+            &[(GEAR_PARK, 60), (1, 1726)],
+            &[(3, 150), (0, 800), (8, 36), (0, 718), (3, 82)],
+            Some(2.0),
+        );
+        let pedal_drives = group_summaries_fast(&[pedal_clip], &HashMap::new());
+        assert_eq!(pedal_drives.len(), 1);
+        assert!(!pedal_drives[0].summon);
+    }
+
+    #[test]
+    fn summon_reverse_only_negative_sei_speeds_is_flagged() {
+        // Backing out of a garage: P → R → P with hazard bookends.
+        // Reverse gear reports NEGATIVE SEI speeds, which the locked
+        // display stats drop (stored max_speed_mps stays 0) — the
+        // detector must still see the movement via the v16 abs-max
+        // column.
+        let clip = summon_summary(
+            "2026-07-20/2026-07-20_09-00-00-front.mp4",
+            &[(GEAR_PARK, 90), (2 /* GEAR_REVERSE */, 300), (GEAR_PARK, 60)],
+            &[(3, 120), (0, 240), (3, 90)],
+            Some(1.5),
+        );
+        assert_eq!(
+            clip.aggregates.max_speed_mps, 0.0,
+            "precondition: locked stats dropped the negative samples"
+        );
+        let drives = group_summaries_fast(&[clip], &HashMap::new());
+        assert_eq!(drives.len(), 1);
+        assert!(drives[0].summon);
+    }
+
+    #[test]
+    fn summon_trailing_park_run_isolates_summon_from_following_drive() {
+        // The bug this whole change fixes, end-to-end: with the trailing
+        // Park run present on 20-50-43, the splitter ends the summon
+        // there and a drive starting two minutes later stays separate;
+        // both classify correctly. (Pre-fix, gearRuns=[Drive] fused all
+        // three clips into one 4-minute drive → no summon flag.)
+        let clip_a = summon_summary(
+            "2026-07-15/2026-07-15_20-49-54-front.mp4",
+            &[(GEAR_PARK, 60), (1, 1726)],
+            &[(0, 27), (3, 123), (0, 17), (1, 873), (0, 746)],
+            Some(2.7),
+        );
+        let clip_b = summon_summary(
+            "2026-07-15/2026-07-15_20-50-43-front.mp4",
+            &[(1, 500), (GEAR_PARK, 53)],
+            &[(0, 471), (3, 82)],
+            Some(2.7),
+        );
+        // Human drive 2 minutes later: no hazards, pedal input, normal
+        // speed.
+        let clip_c = summon_summary(
+            "2026-07-15/2026-07-15_20-52-45-front.mp4",
+            &[(1, 1790)],
+            &[(8, 900), (4, 90), (8, 800)],
+            Some(12.0),
+        );
+        let drives =
+            group_summaries_fast(&[clip_a, clip_b, clip_c], &HashMap::new());
+        assert_eq!(drives.len(), 2, "park gap must split summon from the next drive");
+        assert!(drives[0].summon, "the summon drive keeps its flag");
+        assert!(!drives[1].summon, "the human drive must not inherit it");
+    }
+
+    #[test]
+    fn summon_reverse_summon_ending_seconds_before_human_drives_off_splits_and_flags() {
+        // Real 2026-07-27 20:04 shape (ported from Sentry-Drive
+        // grouper.test.js). Clip A: hazards in P, P→R under hazards
+        // (leading P too short to split), backs out, shifts D, creeps
+        // toward the user. Clip B: creep finishes, hazards through the
+        // stop and D→P, ~3 s of Park, then the human gets in (brake,
+        // accel) and drives off. The mid-clip park must split the summon
+        // into its own drive; pedal input stays outside the summon
+        // segment's frame range — and so does the human's SPEED: clip
+        // B's whole-clip abs max is 5.4 m/s (over the cap), but the
+        // per-run maxima scope the summon segment to its own crawl.
+        let clip_a = summon_summary_runs(
+            "2026-07-27/2026-07-27_20-04-00-front.mp4",
+            &[(GEAR_PARK, 46), (2 /* GEAR_REVERSE */, 727), (1, 917)],
+            frm(&[
+                (0, 11, 0.0),
+                (3, 113, 0.1),  // hazards spanning P→R
+                (0, 394, 2.0),
+                (2, 256, 2.0),  // right signal while maneuvering
+                (0, 301, 1.5),
+                (2, 615, 2.0),
+            ]),
+            Some(2.0),
+        );
+        let clip_b = summon_summary_runs(
+            "2026-07-27/2026-07-27_20-04-46-front.mp4",
+            &[(1, 120), (GEAR_PARK, 84), (1, 1469)],
+            frm(&[
+                (2, 81, 0.3),
+                (3, 89, 0.3),   // hazards through the stop and D→P
+                (4, 70, 0.0),   // human brake to shift (after the park)
+                (0, 200, 0.0),
+                (8, 690, 5.4),  // human accelerator
+                (0, 112, 4.0),
+                (1, 431, 5.4),
+            ]),
+            Some(5.4),
+        );
+        let drives = group_summaries_fast(&[clip_a, clip_b], &HashMap::new());
+        assert_eq!(drives.len(), 2, "mid-clip park must split the summon from the departure");
+        assert!(
+            drives[0].summon,
+            "summon keeps its flag despite sharing clip B with 5.4 m/s driving"
+        );
+        assert!(!drives[1].summon, "the human drive after the park is not summon");
+    }
+
+    #[test]
+    fn summon_point_slice_speed_pollution_does_not_reject_frame_slow_summon() {
+        // Real 2026-07-27 00:34 failure shape (ported from Sentry-Drive
+        // grouper.test.js). In Drive, the park splitter's fraction→point
+        // slice overshoots on deduped points and the summon's STATS
+        // inherit the following drive's fast samples (a 6 mph summon
+        // read 9 mph). Rusty's summary path has no point slices, but the
+        // equivalent pollution exists: clip B's whole-clip abs max
+        // (4.7 m/s, over the 4.5 gate) is the only clip-level speed —
+        // per-run maxMps must confine the gate to the summon's own
+        // frames ([0, 579) of clip B: 2.7 max) and flag the drive.
+        let clip_a = summon_summary_runs(
+            "2026-07-27/2026-07-27_00-34-31-front.mp4",
+            &[(GEAR_PARK, 68), (2 /* GEAR_REVERSE */, 538), (1, 311)],
+            frm(&[
+                (0, 7, 0.0),
+                (3, 144, 0.1),  // hazards spanning P→R
+                (0, 766, 2.7),
+            ]),
+            Some(2.7),
+        );
+        let clip_b = summon_summary_runs(
+            "2026-07-27/2026-07-27_00-34-59-front.mp4",
+            &[(1, 579), (GEAR_PARK, 114), (1, 1162)],
+            frm(&[
+                (0, 143, 2.7),
+                (3, 219, 2.6),  // hazard stop
+                (0, 105, 2.0),
+                (3, 191, 1.8),  // hazards through D→P
+                (4, 50, 0.0),   // human brake (after the park)
+                (0, 10, 0.0),
+                (8, 521, 4.7),  // human accelerator
+                (0, 16, 4.0),
+                (8, 545, 4.7),
+                (0, 55, 1.0),
+            ]),
+            Some(4.7),
+        );
+        let drives = group_summaries_fast(&[clip_a, clip_b], &HashMap::new());
+        assert_eq!(drives.len(), 2);
+        assert!(
+            drives[0].summon,
+            "frame-space speed evidence must override the polluted clip-level max"
+        );
+        assert!(!drives[1].summon, "the human drive after the park is not summon");
+    }
+
+    #[test]
+    fn summon_whole_clip_abs_max_fallback_stays_conservative_on_shared_clip() {
+        // The same 07-27 20:04 drive WITHOUT per-run maxima (pre-maxMps
+        // row, import): the fallback sees clip B's whole-clip 5.4 m/s
+        // and must reject rather than guess — no flag beats a wrong
+        // flag.
+        let clip_a = summon_summary(
+            "2026-07-27/2026-07-27_20-04-00-front.mp4",
+            &[(GEAR_PARK, 46), (2, 727), (1, 917)],
+            &[(0, 11), (3, 113), (0, 394), (2, 256), (0, 301), (2, 615)],
+            Some(2.0),
+        );
+        let clip_b = summon_summary(
+            "2026-07-27/2026-07-27_20-04-46-front.mp4",
+            &[(1, 120), (GEAR_PARK, 84), (1, 1469)],
+            &[(2, 81), (3, 89), (4, 70), (0, 200), (8, 690), (0, 112), (1, 431)],
+            Some(5.4),
+        );
+        let drives = group_summaries_fast(&[clip_a, clip_b], &HashMap::new());
+        assert_eq!(drives.len(), 2);
+        assert!(
+            !drives[0].summon,
+            "without per-run maxima the whole-clip 5.4 m/s must reject the summon"
+        );
+        assert!(!drives[1].summon);
+    }
+
+    #[test]
+    fn summon_drives_do_not_count_toward_fsd_analytics() {
+        // A 100%-FSD commute in the morning, a detected summon in the
+        // evening. The summon is driverless with autopilot_state unset,
+        // so counting it would read as a fake "0% FSD" drive — the
+        // score must stay 100%, the per-drive averages must not gain a
+        // phantom denominator, and the summon's distance must stay out
+        // of the analytics totals (mirrors Sentry-Drive's aggregate
+        // builder; top-line drive totals elsewhere still include it).
+        let mut fsd_commute = summon_summary(
+            "2026-07-15/2026-07-15_08-00-00-front.mp4",
+            &[(1, 1800)],
+            &[],
+            Some(20.0),
+        );
+        fsd_commute.aggregates.distance_m = 9850.0;
+        fsd_commute.aggregates.fsd_distance_m = 9850.0;
+        fsd_commute.aggregates.fsd_engaged_ms = 300_000;
+        fsd_commute.aggregates.fsd_disengagements = 1;
+
+        let mut summon_a = summon_summary(
+            "2026-07-15/2026-07-15_20-49-54-front.mp4",
+            &[(GEAR_PARK, 60), (1, 1726)],
+            &[(0, 27), (3, 123), (0, 17), (1, 873), (0, 746)],
+            Some(2.7),
+        );
+        summon_a.aggregates.distance_m = 100.0;
+        let mut summon_b = summon_summary(
+            "2026-07-15/2026-07-15_20-50-43-front.mp4",
+            &[(1, 500), (GEAR_PARK, 53)],
+            &[(0, 471), (3, 82)],
+            Some(2.7),
+        );
+        summon_b.aggregates.distance_m = 50.0;
+
+        let drives =
+            group_summaries_fast(&[fsd_commute, summon_a, summon_b], &HashMap::new());
+        assert_eq!(drives.len(), 2);
+        assert!(!drives[0].summon);
+        assert_eq!(drives[0].fsd_percent, 100.0);
+        assert!(drives[1].summon, "precondition: the evening drive is a summon");
+        assert!(drives[1].distance_km > 0.0, "precondition: it carries distance");
+
+        let fsd = build_fsd_analytics(&drives, "all");
+        assert_eq!(fsd.total_drives, 1, "summon drive must not count");
+        assert_eq!(fsd.fsd_percent, 100.0, "score undiluted by the summon's distance");
+        assert_eq!(fsd.total_distance_km, 9.85, "summon distance stays out of analytics");
+        assert_eq!(
+            fsd.avg_disengagements_per_drive, 1.0,
+            "per-drive averages must not gain a phantom summon denominator"
+        );
+        assert_eq!(fsd.best_day_percent, 100.0);
     }
 }

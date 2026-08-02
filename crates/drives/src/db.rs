@@ -31,12 +31,12 @@ use tracing::{info, warn};
 use crate::aggregate::compute_route_aggregates;
 use crate::backfill::backfill_route_aggregates;
 use crate::blob::{
-    decode_f32s, decode_gear_runs, decode_points, decode_u8s, encode_f32s, encode_gear_runs,
-    encode_points, encode_u8s,
+    decode_f32s, decode_flag_runs, decode_gear_runs, decode_points, decode_u8s, encode_f32s,
+    encode_flag_runs, encode_gear_runs, encode_points, encode_u8s,
 };
 use crate::schema::{self, meta_get, meta_set};
 use crate::syncguard::{self, check_sync_size_guard, read_sync_cache, write_sync_cache};
-use crate::types::{GearRun, GpsPoint, Route, RouteAggregates, RouteSummary, StoreData};
+use crate::types::{FlagRun, GearRun, GpsPoint, Route, RouteAggregates, RouteSummary, StoreData};
 
 /// Default SQLite DB path on the Pi.
 pub const DEFAULT_DATA_PATH: &str = "/backingfiles/drive-data.db";
@@ -508,6 +508,7 @@ impl DriveStore {
         raw_park_count: u32,
         raw_frame_count: u32,
         gear_runs: &[GearRun],
+        flag_runs: &[FlagRun],
     ) -> Result<()> {
         let norm = normalize_path(relative_path);
         let now = now_unix();
@@ -533,6 +534,7 @@ impl DriveStore {
                 raw_park_count,
                 raw_frame_count,
                 gear_runs: gear_runs.to_vec(),
+                flag_runs: flag_runs.to_vec(),
                 source: None,
                 external_signature: None,
                 tessie_autopilot_percent: None,
@@ -1844,9 +1846,13 @@ fn compute_drive_caches(inputs: DriveCacheInputs) -> Result<DriveCacheArtifacts>
     // (tessie, teslascope, future importers) is imported data with fuzzy
     // or absent per-point autopilot telemetry — counted in totals, never
     // in FSD analytics. Matches Sentry-Drive's isImportedSource rule.
+    // Summon drives are likewise totals-only (mirrors Sentry-Drive's
+    // aggregate builder): autopilot_state stays unset while the car
+    // drives itself, so counting them would dilute the FSD score with
+    // fake "0% FSD" drives.
     let sei_drives: Vec<_> = drives
         .iter()
-        .filter(|d| !matches!(d.source.as_deref(), Some(s) if s != "sei"))
+        .filter(|d| !matches!(d.source.as_deref(), Some(s) if s != "sei") && !d.summon)
         .collect();
     let sei_total_km: f64 = sei_drives.iter().map(|d| d.distance_km).sum();
     let fsd_distance_km: f64 = sei_drives.iter().map(|d| d.fsd_distance_km).sum();
@@ -2009,6 +2015,13 @@ fn insert_or_update_route(
     let sb = encode_f32s(Some(&r.speeds));
     let acb = encode_f32s(Some(&r.accel_positions));
     let rb = encode_gear_runs(Some(&r.gear_runs));
+    // Empty flag_runs stores NULL, not a zero-length blob — "no flag
+    // evidence" must survive the round-trip as absence.
+    let fb = if r.flag_runs.is_empty() {
+        None
+    } else {
+        encode_flag_runs(Some(&r.flag_runs))
+    };
 
     let first_lat: Option<f64> = r.points.first().map(|p| p[0]);
     let first_lon: Option<f64> = r.points.first().map(|p| p[1]);
@@ -2044,7 +2057,8 @@ fn insert_or_update_route(
             odometer_mi_start, odometer_mi_end,
             location_name_start, location_name_end,
             fsd_pend_ms_end, park_ms_start, fsd_at_end, fsd_accel_pushes_early,
-            ap_at_start)
+            ap_at_start,
+            flag_runs_blob, sei_speed_abs_max)
          VALUES(
             ?1, ?2, ?3, ?4, ?5,
             NULL, NULL, ?6, ?7, ?8,
@@ -2058,7 +2072,8 @@ fn insert_or_update_route(
             ?36, ?37, ?38, ?39, ?40, ?41,
             ?42, ?43, ?44, ?45,
             ?46, ?47, ?48, ?49,
-            ?50, ?51, ?52, ?53, ?54)
+            ?50, ?51, ?52, ?53, ?54,
+            ?55, ?56)
          ON CONFLICT(file) DO UPDATE SET
             date_dir            = excluded.date_dir,
             point_count         = excluded.point_count,
@@ -2112,7 +2127,9 @@ fn insert_or_update_route(
             park_ms_start       = excluded.park_ms_start,
             fsd_at_end          = excluded.fsd_at_end,
             fsd_accel_pushes_early = excluded.fsd_accel_pushes_early,
-            ap_at_start         = excluded.ap_at_start",
+            ap_at_start         = excluded.ap_at_start,
+            flag_runs_blob      = excluded.flag_runs_blob,
+            sei_speed_abs_max   = excluded.sei_speed_abs_max",
         params![
             norm_file,
             &r.date,
@@ -2168,6 +2185,8 @@ fn insert_or_update_route(
             a.fsd_at_end as i64,
             a.fsd_accel_pushes_early,
             a.ap_at_start,
+            fb,
+            a.sei_speed_abs_max,
         ],
     )?;
     Ok(())
@@ -2185,7 +2204,8 @@ fn select_all_routes(conn: &Connection) -> Result<Vec<Route>> {
                 hvac_runtime_s,
                 tire_fl_psi, tire_fr_psi, tire_rl_psi, tire_rr_psi,
                 odometer_mi_start, odometer_mi_end,
-                location_name_start, location_name_end
+                location_name_start, location_name_end,
+                flag_runs_blob
          FROM routes
          ORDER BY file",
     )?;
@@ -2217,7 +2237,8 @@ fn select_routes_by_files(conn: &Connection, files: &[&str]) -> Result<Vec<Route
                 hvac_runtime_s,
                 tire_fl_psi, tire_fr_psi, tire_rl_psi, tire_rr_psi,
                 odometer_mi_start, odometer_mi_end,
-                location_name_start, location_name_end
+                location_name_start, location_name_end,
+                flag_runs_blob
          FROM routes
          WHERE file IN ({})
          ORDER BY file",
@@ -2257,6 +2278,8 @@ type RouteRow = (
     Option<f64>, Option<f64>, Option<f64>, Option<f64>,
     Option<f64>, Option<f64>,
     Option<String>, Option<String>,
+    // v16 flag_runs_blob — appended last to keep prior indices stable.
+    Option<Vec<u8>>,
 );
 
 /// Shared row mapper for the two route SELECTs above. The column order
@@ -2290,6 +2313,7 @@ fn route_row_mapper(row: &rusqlite::Row<'_>) -> rusqlite::Result<RouteRow> {
         row.get::<_, Option<f64>>(24)?,
         row.get::<_, Option<String>>(25)?,
         row.get::<_, Option<String>>(26)?,
+        row.get::<_, Option<Vec<u8>>>(27)?,
     ))
 }
 
@@ -2305,6 +2329,7 @@ fn build_route_from_row(r: RouteRow) -> Result<Route> {
         tire_fl_psi, tire_fr_psi, tire_rl_psi, tire_rr_psi,
         odometer_mi_start, odometer_mi_end,
         location_name_start, location_name_end,
+        fb,
     ) = r;
     let points = decode_points(pb.as_deref())
         .with_context(|| format!("decode points {}", file))?
@@ -2320,9 +2345,13 @@ fn build_route_from_row(r: RouteRow) -> Result<Route> {
     let gear_runs = decode_gear_runs(rb.as_deref())
         .with_context(|| format!("decode gear_runs {}", file))?
         .unwrap_or_default();
+    let flag_runs = decode_flag_runs(fb.as_deref())
+        .with_context(|| format!("decode flag_runs {}", file))?
+        .unwrap_or_default();
     Ok(Route {
         file, date, points, gear_states, autopilot_states,
         speeds, accel_positions, raw_park_count, raw_frame_count, gear_runs,
+        flag_runs,
         source, external_signature, tessie_autopilot_percent,
         battery_pct_start, battery_pct_end,
         interior_temp_min, interior_temp_max, exterior_temp_avg,
@@ -2355,7 +2384,8 @@ fn select_all_route_summaries(conn: &Connection) -> Result<Vec<RouteSummary>> {
                 odometer_mi_start, odometer_mi_end,
                 location_name_start, location_name_end,
                 fsd_pend_ms_end, park_ms_start, fsd_at_end, fsd_accel_pushes_early,
-                ap_at_start
+                ap_at_start,
+                flag_runs_blob, sei_speed_abs_max
          FROM routes
          ORDER BY file",
     )?;
@@ -2421,6 +2451,11 @@ fn select_all_route_summaries(conn: &Connection) -> Result<Vec<RouteSummary>> {
                 row.get::<_, Option<i64>>(42)?,
                 row.get::<_, Option<i64>>(43)?,
             ),
+            // v16 summon evidence
+            (
+                row.get::<_, Option<Vec<u8>>>(44)?,
+                row.get::<_, Option<f64>>(45)?,
+            ),
         ))
     })?;
 
@@ -2462,10 +2497,14 @@ fn select_all_route_summaries(conn: &Connection) -> Result<Vec<RouteSummary>> {
             (odometer_mi_start, odometer_mi_end),
             (location_name_start, location_name_end),
             (fsd_pend_ms_end, park_ms_start, fsd_at_end, fsd_accel_pushes_early, ap_at_start),
+            (fb, sei_speed_abs_max),
         ) = r?;
 
         let gear_runs = decode_gear_runs(rb.as_deref())
             .with_context(|| format!("decode gear_runs {}", file))?
+            .unwrap_or_default();
+        let flag_runs = decode_flag_runs(fb.as_deref())
+            .with_context(|| format!("decode flag_runs {}", file))?
             .unwrap_or_default();
 
         out.push(RouteSummary {
@@ -2474,6 +2513,7 @@ fn select_all_route_summaries(conn: &Connection) -> Result<Vec<RouteSummary>> {
             raw_park_count,
             raw_frame_count,
             gear_runs,
+            flag_runs,
             aggregates: RouteAggregates {
                 distance_m: distance_m.unwrap_or(0.0),
                 max_speed_mps: max_speed_mps.unwrap_or(0.0),
@@ -2498,6 +2538,7 @@ fn select_all_route_summaries(conn: &Connection) -> Result<Vec<RouteSummary>> {
                 start_lng: start_lon,
                 end_lat,
                 end_lng: end_lon,
+                sei_speed_abs_max,
             },
             source,
             external_signature,
@@ -2719,6 +2760,10 @@ mod tests {
                 0,
                 2,
                 &[GearRun { gear: 4, frames: 2 }],
+                &[
+                    FlagRun { flags: 3, frames: 1, max_mps: Some(25.0) },
+                    FlagRun { flags: 0, frames: 1, max_mps: None },
+                ],
             )
             .unwrap();
         let routes = store.get_routes().unwrap();
@@ -2730,6 +2775,24 @@ mod tests {
         assert_eq!(routes[0].accel_positions, vec![0.5, 0.6]);
         assert_eq!(routes[0].raw_frame_count, 2);
         assert_eq!(routes[0].gear_runs.len(), 1);
+        // Per-run max_mps round-trips through the blob, including the
+        // NaN-encoded None on legacy runs.
+        assert_eq!(
+            routes[0].flag_runs,
+            vec![
+                FlagRun { flags: 3, frames: 1, max_mps: Some(25.0) },
+                FlagRun { flags: 0, frames: 1, max_mps: None },
+            ],
+        );
+        // The summary path carries the same flag evidence + the v16
+        // SEI abs-max column populated by compute_route_aggregates.
+        store
+            .with_route_summaries(|summaries| {
+                assert_eq!(summaries.len(), 1);
+                assert_eq!(summaries[0].flag_runs, routes[0].flag_runs);
+                assert_eq!(summaries[0].aggregates.sei_speed_abs_max, Some(26.0));
+            })
+            .unwrap();
     }
 
     #[test]
@@ -2751,7 +2814,7 @@ mod tests {
         let store = DriveStore::open(&path_str).unwrap();
         let pts: Vec<GpsPoint> = vec![[37.7749, -122.4194], [37.7760, -122.4180]];
         store
-            .add_route("a/2025-02-02_09-00-00-front.mp4", "a", &pts, &[4, 4], &[0, 0], &[15.0, 16.0], &[0.0, 0.0], 0, 2, &[])
+            .add_route("a/2025-02-02_09-00-00-front.mp4", "a", &pts, &[4, 4], &[0, 0], &[15.0, 16.0], &[0.0, 0.0], 0, 2, &[], &[])
             .unwrap();
         let json = store.get_cached_drives_json().unwrap();
         assert!(json.contains("2025-02-02"), "file-backed rebuild should serve the drive: {json}");
@@ -2768,7 +2831,7 @@ mod tests {
         let store = DriveStore::open_memory().unwrap();
         let pts: Vec<GpsPoint> = vec![[37.7749, -122.4194], [37.7760, -122.4180]];
         store
-            .add_route("a/2025-01-01_10-00-00-front.mp4", "a", &pts, &[4, 4], &[0, 0], &[20.0, 21.0], &[0.0, 0.0], 0, 2, &[])
+            .add_route("a/2025-01-01_10-00-00-front.mp4", "a", &pts, &[4, 4], &[0, 0], &[20.0, 21.0], &[0.0, 0.0], 0, 2, &[], &[])
             .unwrap();
         // add_route marked the cache dirty; the getter must rebuild via the
         // off-lock path and serve a list containing the new drive.
@@ -2779,7 +2842,7 @@ mod tests {
         // A further mutation re-dirties; the next read rebuilds again and
         // reflects it (second route is 2.5h later — a separate drive).
         store
-            .add_route("a/2025-01-01_12-30-00-front.mp4", "a", &pts, &[4, 4], &[0, 0], &[20.0, 21.0], &[0.0, 0.0], 0, 2, &[])
+            .add_route("a/2025-01-01_12-30-00-front.mp4", "a", &pts, &[4, 4], &[0, 0], &[20.0, 21.0], &[0.0, 0.0], 0, 2, &[], &[])
             .unwrap();
         assert!(store.drive_cache_dirty.load(Ordering::Acquire));
         let json2 = store.get_cached_drives_json().unwrap();
@@ -2802,7 +2865,7 @@ mod tests {
         let store = DriveStore::open_memory().unwrap();
         let pts: Vec<GpsPoint> = vec![[37.7749, -122.4194], [37.7760, -122.4180]];
         store
-            .add_route("a.mp4", "2025-01-01", &pts, &[4, 4], &[1, 1], &[20.0, 21.0], &[0.0, 0.0], 0, 2, &[])
+            .add_route("a.mp4", "2025-01-01", &pts, &[4, 4], &[1, 1], &[20.0, 21.0], &[0.0, 0.0], 0, 2, &[], &[])
             .unwrap();
 
         {
@@ -2854,6 +2917,7 @@ mod tests {
                 0,
                 2,
                 &[GearRun { gear: GEAR_DRIVE, frames: 2 }],
+                &[],
             )
             .unwrap();
 
@@ -2873,6 +2937,7 @@ mod tests {
                 60,
                 60,
                 &[GearRun { gear: GEAR_PARK, frames: 60 }],
+                &[],
             )
             .unwrap();
 
@@ -2889,6 +2954,7 @@ mod tests {
                 0,
                 2,
                 &[GearRun { gear: GEAR_DRIVE, frames: 2 }],
+                &[],
             )
             .unwrap();
 
@@ -2911,7 +2977,7 @@ mod tests {
         let speeds = vec![10.0f32; n];
         let accel = vec![0.0f32; n];
         store
-            .add_route(file, "2025-01-01", &pts, &gears, &ap, &speeds, &accel, 0, 61, &[])
+            .add_route(file, "2025-01-01", &pts, &gears, &ap, &speeds, &accel, 0, 61, &[], &[])
             .unwrap();
     }
 
@@ -3016,7 +3082,7 @@ mod tests {
         let speeds = vec![10.0f32; n];
         let accel = vec![0.0f32; n];
         store
-            .add_route(file, "2025-01-01", &pts, &gears, &ap, &speeds, &accel, 0, 61, &[])
+            .add_route(file, "2025-01-01", &pts, &gears, &ap, &speeds, &accel, 0, 61, &[], &[])
             .unwrap();
     }
 
@@ -3098,7 +3164,7 @@ mod tests {
         let store = DriveStore::open_memory().unwrap();
         let pts: Vec<GpsPoint> = vec![[37.7749, -122.4194], [37.7760, -122.4180]];
         store
-            .add_route("2025-01-01/2025-01-01_10-00-00-front.mp4", "2025-01-01", &pts, &[4, 4], &[1, 1], &[20.0, 21.0], &[0.0, 0.0], 0, 2, &[])
+            .add_route("2025-01-01/2025-01-01_10-00-00-front.mp4", "2025-01-01", &pts, &[4, 4], &[1, 1], &[20.0, 21.0], &[0.0, 0.0], 0, 2, &[], &[])
             .unwrap();
         // Plant an absurd stored distance and bake it INTO the caches —
         // this is the old-formula world the gate exists to replace.
@@ -3170,14 +3236,14 @@ mod tests {
         store
             .add_route(
                 "RecentClips/2026-06-07/c-front.mp4", "2026-06-07", &pts,
-                &[4, 4], &[1, 1], &[20.0, 21.0], &[0.0, 0.0], 0, 2, &[],
+                &[4, 4], &[1, 1], &[20.0, 21.0], &[0.0, 0.0], 0, 2, &[], &[],
             )
             .unwrap();
         // Sentry-Drive-style import of the same clip (Windows separators).
         store
             .add_route(
                 "2026-06-07\\c-front.mp4", "2026-06-07", &pts,
-                &[4, 4], &[1, 1], &[20.0, 21.0], &[0.0, 0.0], 0, 2, &[],
+                &[4, 4], &[1, 1], &[20.0, 21.0], &[0.0, 0.0], 0, 2, &[], &[],
             )
             .unwrap();
 
@@ -3216,7 +3282,7 @@ mod tests {
         store
             .add_route(
                 "2026-06-07/dup-front.mp4", "2026-06-07", &pts2,
-                &[4, 4], &[1, 1], &[20.0, 21.0], &[0.0, 0.0], 0, 2, &[],
+                &[4, 4], &[1, 1], &[20.0, 21.0], &[0.0, 0.0], 0, 2, &[], &[],
             )
             .unwrap();
         // Native copy of the same clip (3 points), a lone native row, and a
@@ -3231,7 +3297,7 @@ mod tests {
             store
                 .add_route(
                     tmp, "2026-06-07", pts,
-                    &[4, 4], &[1, 1], &[20.0, 21.0], &[0.0, 0.0], 0, 2, &[],
+                    &[4, 4], &[1, 1], &[20.0, 21.0], &[0.0, 0.0], 0, 2, &[], &[],
                 )
                 .unwrap();
             let conn = store.conn.lock().unwrap();
@@ -3293,7 +3359,7 @@ mod tests {
         let pts: Vec<GpsPoint> = vec![[37.7749, -122.4194], [37.7750, -122.4194]];
         store
             .add_route(
-                "a.mp4", "2025-01-01", &pts, &[], &[], &[], &[], 0, 2, &[],
+                "a.mp4", "2025-01-01", &pts, &[], &[], &[], &[], 0, 2, &[], &[],
             )
             .unwrap();
         let out = store.with_route_summaries(|s| s.to_vec()).unwrap();
@@ -3429,6 +3495,7 @@ mod tests {
                 0,
                 2,
                 &[GearRun { gear: 4, frames: 2 }],
+                &[],
             )
             .unwrap();
 
@@ -3544,7 +3611,7 @@ mod tests {
     fn add_test_route(store: &DriveStore, name: &str) {
         let pts: Vec<GpsPoint> = vec![[37.7749, -122.4194], [37.7750, -122.4195]];
         store
-            .add_route(name, "2025-01-15", &pts, &[4, 4], &[1, 1], &[25.0, 26.0], &[0.5, 0.6], 0, 2, &[])
+            .add_route(name, "2025-01-15", &pts, &[4, 4], &[1, 1], &[25.0, 26.0], &[0.5, 0.6], 0, 2, &[], &[])
             .unwrap();
     }
 

@@ -64,6 +64,13 @@ export function computeFilteredStats(
       tessieCount += 1
       continue
     }
+    // Summon drives count in the top-line totals but never in FSD
+    // analytics (matches the backend filters and Sentry-Drive's
+    // aggregate builder): the car drives itself with autopilot_state
+    // unset, so they'd dilute the score as fake "0% FSD" drives.
+    if (d.summon) {
+      continue
+    }
     // Every FSD/AP-attributed metric is SEI-only. Imported autopilot
     // distance/time fields carry *inferred* numbers (not from dashcam
     // SEI telemetry), so summing them into the numerator while the
