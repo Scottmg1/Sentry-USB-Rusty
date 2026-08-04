@@ -1,6 +1,7 @@
 import { useEffect, useState, type ReactNode } from "react"
 import { LocationOnIcon, ProgressActivityIcon } from "@/components/icons"
 import { cn } from "@/lib/utils"
+import { normalizeLon } from "@/lib/geo"
 import { KeepAccessoryMap } from "@/components/settings/KeepAccessoryMap"
 
 export interface HomeGeofenceValues {
@@ -12,6 +13,11 @@ export interface HomeGeofenceValues {
 const RADIUS_PRESETS = [50, 100, 200, 500]
 const RADIUS_MIN = 20
 const RADIUS_MAX = 2000
+
+function formatCoords(lat: number | null, lon: number | null): string {
+  if (lat == null || lon == null) return ""
+  return `${lat.toFixed(5)}, ${normalizeLon(lon).toFixed(5)}`
+}
 
 /**
  * Shared home-geofence editor: interactive map (pin + radius circle), a
@@ -61,6 +67,35 @@ export function HomeGeofencePicker({
     if (clamped !== values.radiusM) onChange({ radiusM: clamped })
   }
 
+  // Manual "lat, lon" entry — the map requires scrolling/zooming to find a
+  // pin-accurate spot, which is slow with no street labels. Same free-typing
+  // + commit-on-blur/Enter pattern as the radius field above.
+  const [coordText, setCoordText] = useState(() => formatCoords(values.homeLat, values.homeLon))
+  const [coordError, setCoordError] = useState<string | null>(null)
+  useEffect(() => {
+    setCoordText(formatCoords(values.homeLat, values.homeLon))
+  }, [values.homeLat, values.homeLon])
+
+  function commitCoords() {
+    const trimmed = coordText.trim()
+    if (trimmed === "") {
+      setCoordError(null)
+      setCoordText(formatCoords(values.homeLat, values.homeLon)) // revert to last good
+      return
+    }
+    const parts = trimmed.split(",")
+    const lat = parts.length === 2 ? Number(parts[0].trim()) : NaN
+    const lon = parts.length === 2 ? Number(parts[1].trim()) : NaN
+    if (!Number.isFinite(lat) || !Number.isFinite(lon) || Math.abs(lat) > 90) {
+      setCoordError(
+        'Couldn\'t parse that — enter as "latitude, longitude" (e.g. 30.2248202, -97.6221229).',
+      )
+      return
+    }
+    setCoordError(null)
+    onChange({ homeLat: lat, homeLon: normalizeLon(lon) })
+  }
+
   async function useCurrent() {
     if (!onUseCurrentLocation) return
     setLocating(true)
@@ -78,8 +113,6 @@ export function HomeGeofencePicker({
       setLocating(false)
     }
   }
-
-  const haveHome = values.homeLat != null && values.homeLon != null
 
   return (
     <div className="space-y-3 rounded-lg border border-white/5 bg-white/[0.02] p-3">
@@ -108,15 +141,39 @@ export function HomeGeofencePicker({
         onPlace={(la, lo) => onChange({ homeLat: la, homeLon: lo })}
       />
       {mapHint && <p className="text-xs text-slate-600">{mapHint}</p>}
-      {haveHome ? (
-        <p className="text-xs text-slate-400">
-          📍 {values.homeLat!.toFixed(5)}, {values.homeLon!.toFixed(5)}
+
+      {/* Manual coordinate entry — faster than hunting for a spot on an
+          unlabeled map, and the only option where GPS ("Use current
+          location") isn't available. */}
+      <div>
+        <label className="mb-1 block text-xs font-medium text-slate-400">
+          Coordinates
+        </label>
+        <input
+          type="text"
+          inputMode="text"
+          autoComplete="off"
+          spellCheck={false}
+          value={coordText}
+          onChange={(e) => setCoordText(e.target.value)}
+          onBlur={commitCoords}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") (e.target as HTMLInputElement).blur()
+          }}
+          placeholder="30.2248202, -97.6221229"
+          className="w-full rounded-lg border border-white/10 bg-white/5 px-3 py-2 text-sm text-slate-100 outline-none transition placeholder:text-slate-600 focus:border-blue-500/50 focus:ring-1 focus:ring-blue-500/25"
+        />
+        <p className="mt-1 text-xs text-slate-600">
+          Latitude, longitude — north &amp; east are positive, south &amp; west are negative.
         </p>
-      ) : (
+        {coordError && <p className="mt-1 text-xs text-red-400">{coordError}</p>}
+      </div>
+      {!coordError && values.homeLat == null && (
         <p className="text-xs text-amber-400/80">
-          No home set — tap the map to drop your home pin.
+          No home set — tap the map or enter coordinates above to drop your home pin.
         </p>
       )}
+
       {locError && <p className="text-xs text-red-400">{locError}</p>}
       {saveError && <p className="text-xs text-red-400">{saveError}</p>}
 

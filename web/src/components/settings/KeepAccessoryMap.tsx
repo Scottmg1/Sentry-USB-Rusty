@@ -3,7 +3,10 @@ import L from "leaflet"
 import "leaflet/dist/leaflet.css"
 import { normalizeLon } from "@/lib/geo"
 
-const TILES = "https://{s}.basemaps.cartocdn.com/dark_nolabels/{z}/{x}/{y}{r}.png"
+// `dark_all` (not `dark_nolabels`) so street names, place names, and
+// landmarks render — without them there's no way to judge whether the
+// pin actually sits on the right spot.
+const TILES = "https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png"
 
 // Simple CSS pin (a divIcon) — avoids Leaflet's default-marker image URLs,
 // which break under bundlers. Draggable.
