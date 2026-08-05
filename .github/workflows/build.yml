@@ -365,6 +365,6 @@ jobs:
         with:
           files: release/*
           generate_release_notes: true
-          # Tags such as v3.16.0-rc.1 are published as GitHub pre-releases;
-          # stable vX.Y.Z tags remain normal releases.
-          prerelease: ${{ contains(github.ref_name, '-') }}
+          # Hyphenated tags are pre-releases by convention. The repository owner
+          # can also nominate one exact stable-looking tag as a pre-release.
+          prerelease: ${{ contains(github.ref_name, '-') || vars.SENTRYUSB_PRERELEASE_TAG == github.ref_name }}
