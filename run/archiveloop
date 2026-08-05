@@ -205,15 +205,15 @@ function sync_user_media_to_cam () {
         sync_ok=false
       fi
     fi
-    # Sync LockChime.wav to the root of the cam drive so Tesla reads it via USB.
-    # Active chime is tracked via /mutable/LockChime/.active_name (directory-based library).
+    # Sync custom chime targets to the root of the cam drive so Tesla reads
+    # them via USB. The staged files include the user's applied volume gain.
     _active_chime_name=""
     if [ -f "/mutable/LockChime/.active_name" ]; then
       _active_chime_name=$(tr -d '\n\r' < "/mutable/LockChime/.active_name")
     fi
-    if [ -n "$_active_chime_name" ] && [ -f "/mutable/LockChime/$_active_chime_name" ]
+    if [ -n "$_active_chime_name" ] && [ -f "/mutable/LockChime.wav" ]
     then
-      if cp -f "/mutable/LockChime/$_active_chime_name" "$CAM_MOUNT/LockChime.wav"; then
+      if cp -f "/mutable/LockChime.wav" "$CAM_MOUNT/LockChime.wav"; then
         log "Synced LockChime.wav ($_active_chime_name) to cam drive"
       else
         log "Failed to sync LockChime.wav to cam drive"
@@ -221,6 +221,22 @@ function sync_user_media_to_cam () {
     else
       # No active lock chime — remove from cam drive if present
       rm -f "$CAM_MOUNT/LockChime.wav" 2>/dev/null || true
+    fi
+
+    _ass_chime_name=""
+    if [ -f "/mutable/LockChime/.ass_active_name" ]; then
+      _ass_chime_name=$(tr -d '\n\r' < "/mutable/LockChime/.ass_active_name")
+    fi
+    if [ -n "$_ass_chime_name" ] && [ -f "/mutable/ASSChime.wav" ]
+    then
+      if cp -f "/mutable/ASSChime.wav" "$CAM_MOUNT/ASSChime.wav"; then
+        log "Synced ASSChime.wav ($_ass_chime_name) to cam drive"
+      else
+        log "Failed to sync ASSChime.wav to cam drive"
+      fi
+    else
+      # No active Summon completion chime — remove it from the cam drive.
+      rm -f "$CAM_MOUNT/ASSChime.wav" 2>/dev/null || true
     fi
     unmount_mount_point "$CAM_MOUNT"
     log "Done syncing user media."

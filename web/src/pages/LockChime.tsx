@@ -44,7 +44,12 @@ interface ListResponse {
   active_name: string
   active_set: boolean
   active_gain_applied?: number
+  ass_active_name: string
+  ass_active_set: boolean
+  ass_active_gain_applied?: number
 }
+
+type ChimeTarget = "lock" | "summon"
 
 interface RandomConfig {
   enabled: boolean
@@ -235,7 +240,7 @@ export default function LockChime({ adminPasscode }: { adminPasscode: string | n
         <div className="rounded-xl border border-amber-500/20 bg-amber-500/[0.06] p-3 flex items-start gap-3">
           <Unplug className="h-4 w-4 shrink-0 mt-0.5 text-amber-400" />
           <p className="text-xs text-amber-200/80 leading-relaxed">
-            Changing or clearing the active lock chime requires a brief USB disconnect (~5 seconds).
+            Changing or clearing an active chime requires a brief USB disconnect (~5 seconds).
             Tesla will temporarily lose access to the drives during this time.
           </p>
         </div>
@@ -313,19 +318,23 @@ function MyLibraryTab({ volume }: { volume: number }) {
   const [sounds, setSounds] = useState<SoundEntry[]>([])
   const [activeName, setActiveName] = useState("")
   const [activeSet, setActiveSet] = useState(false)
+  const [assActiveName, setAssActiveName] = useState("")
+  const [assActiveSet, setAssActiveSet] = useState(false)
   const [loading, setLoading] = useState(true)
   const [playingName, setPlayingName] = useState<string | null>(null)
   const [uploadDragging, setUploadDragging] = useState(false)
   const [uploading, setUploading] = useState(false)
-  const [activating, setActivating] = useState<string | null>(null)
+  const [activating, setActivating] = useState<{ name: string; target: ChimeTarget } | null>(null)
   const [deleting, setDeleting] = useState<string | null>(null)
   const [clearing, setClearing] = useState(false)
+  const [clearingAss, setClearingAss] = useState(false)
   const [deleteConfirm, setDeleteConfirm] = useState<string | null>(null)
   const [libPage, setLibPage] = useState(1)
   const [pendingFile, setPendingFile] = useState<File | null>(null)
   const [pendingName, setPendingName] = useState("")
   const [gains, setGains] = useState<Record<string, number>>({})
   const [activeGainApplied, setActiveGainApplied] = useState(0)
+  const [assActiveGainApplied, setAssActiveGainApplied] = useState(0)
   const [volumeOpen, setVolumeOpen] = useState<string | null>(null)
   const [savingVolume, setSavingVolume] = useState(false)
   const volumeSaveTimer = useRef<number | null>(null)
@@ -364,6 +373,9 @@ function MyLibraryTab({ volume }: { volume: number }) {
       setActiveName(data.active_name ?? "")
       setActiveSet(data.active_set ?? false)
       setActiveGainApplied(data.active_gain_applied ?? 0)
+      setAssActiveName(data.ass_active_name ?? "")
+      setAssActiveSet(data.ass_active_set ?? false)
+      setAssActiveGainApplied(data.ass_active_gain_applied ?? 0)
       setGains(Object.fromEntries((data.sounds ?? []).map((s) => [s.name, s.gain_db ?? 0])))
     } catch {
       showToast("Failed to load sounds", "error")
@@ -524,16 +536,18 @@ function MyLibraryTab({ volume }: { volume: number }) {
     }
   }
 
-  async function handleActivate(name: string) {
-    setActivating(name)
+  async function handleActivate(name: string, target: ChimeTarget = "lock") {
+    setActivating({ name, target })
     try {
-      const res = await fetch(`${API_BASE}/lockchime/activate/${encodeURIComponent(name)}`, { method: "POST" })
+      const endpoint = target === "summon" ? "activate-ass" : "activate"
+      const res = await fetch(`${API_BASE}/lockchime/${endpoint}/${encodeURIComponent(name)}`, { method: "POST" })
       const data = await res.json().catch(() => ({}))
       if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`)
+      const targetLabel = target === "summon" ? "ASS chime" : "lock chime"
       showToast(
         data.usb_rebound
-          ? `"${name}" activated — USB re-enumerated, Tesla will use the new sound`
-          : `"${name}" is now your active lock sound`,
+          ? `"${name}" set as the ${targetLabel} — USB re-enumerated`
+          : `"${name}" is now your active ${targetLabel}`,
         "success"
       )
       await fetchSounds()
@@ -544,20 +558,24 @@ function MyLibraryTab({ volume }: { volume: number }) {
     }
   }
 
-  async function handleClear() {
-    setClearing(true)
+  async function handleClear(target: ChimeTarget = "lock") {
+    const isSummon = target === "summon"
+    if (isSummon) setClearingAss(true)
+    else setClearing(true)
     try {
-      const res = await fetch(`${API_BASE}/lockchime/clear-active`, { method: "POST" })
+      const endpoint = isSummon ? "clear-ass-active" : "clear-active"
+      const res = await fetch(`${API_BASE}/lockchime/${endpoint}`, { method: "POST" })
       if (!res.ok) {
         const data = await res.json().catch(() => ({}))
         throw new Error(data.error || `HTTP ${res.status}`)
       }
-      showToast("Active lock sound cleared", "success")
+      showToast(isSummon ? "Active ASS chime cleared" : "Active Lock Chime cleared", "success")
       await fetchSounds()
     } catch (e: unknown) {
       showToast(e instanceof Error ? e.message : "Failed to clear", "error")
     } finally {
-      setClearing(false)
+      if (isSummon) setClearingAss(false)
+      else setClearing(false)
     }
   }
 
@@ -624,39 +642,67 @@ function MyLibraryTab({ volume }: { volume: number }) {
 
   return (
     <div className="space-y-5">
-      {/* Active Sound Banner */}
-      <div
-        className={`rounded-xl border p-4 flex items-center justify-between gap-4 ${
-          activeSet ? "border-violet-500/30 bg-violet-500/[0.08]" : "border-white/10 bg-white/[0.03]"
-        }`}
-      >
-        <div className="flex items-center gap-3 min-w-0">
-          <div className={`flex h-9 w-9 shrink-0 items-center justify-center rounded-lg ${
-            activeSet ? "bg-violet-500/20" : "bg-white/5"
-          }`}>
-            <Volume2 className={`h-4.5 w-4.5 ${activeSet ? "text-violet-400" : "text-slate-600"}`} />
+      {/* Active chime assignments */}
+      <div className="grid gap-3">
+        <div
+          className={`rounded-xl border p-4 flex items-center justify-between gap-4 ${
+            activeSet ? "border-violet-500/30 bg-violet-500/[0.08]" : "border-white/10 bg-white/[0.03]"
+          }`}
+        >
+          <div className="flex items-center gap-3 min-w-0">
+            <div className={`flex h-9 w-9 shrink-0 items-center justify-center rounded-lg ${
+              activeSet ? "bg-violet-500/20" : "bg-white/5"
+            }`}>
+              <Volume2 className={`h-4.5 w-4.5 ${activeSet ? "text-violet-400" : "text-slate-600"}`} />
+            </div>
+            <div className="min-w-0">
+              <p className="text-sm font-medium text-slate-200">Active Lock Chime</p>
+              <p className="text-xs text-slate-400 truncate">
+                {activeSet && activeName ? activeName : "Tesla default"}
+              </p>
+            </div>
           </div>
-          <div className="min-w-0">
-            <p className="text-sm font-medium text-slate-200">
-              {activeSet ? "Active lock sound" : "No lock sound set"}
-            </p>
-            {activeSet && activeName ? (
-              <p className="text-xs text-slate-400 truncate">{activeName}</p>
-            ) : !activeSet ? (
-              <p className="text-xs text-slate-500">Tesla will use its default chime</p>
-            ) : null}
-          </div>
+          {activeSet && (
+            <button
+              onClick={() => handleClear("lock")}
+              disabled={clearing}
+              className="shrink-0 flex items-center gap-1.5 rounded-lg border border-white/10 px-3 py-1.5 text-xs text-slate-400 transition-colors hover:border-red-500/40 hover:text-red-400 disabled:opacity-50"
+            >
+              <X className="h-3.5 w-3.5" />
+              {clearing ? "Clearing..." : "Clear"}
+            </button>
+          )}
         </div>
-        {activeSet && (
-          <button
-            onClick={handleClear}
-            disabled={clearing}
-            className="shrink-0 flex items-center gap-1.5 rounded-lg border border-white/10 px-3 py-1.5 text-xs text-slate-400 transition-colors hover:border-red-500/40 hover:text-red-400 disabled:opacity-50"
-          >
-            <X className="h-3.5 w-3.5" />
-            {clearing ? "Clearing..." : "Clear"}
-          </button>
-        )}
+
+        <div
+          className={`rounded-xl border p-4 flex items-center justify-between gap-4 ${
+            assActiveSet ? "border-emerald-500/30 bg-emerald-500/[0.08]" : "border-white/10 bg-white/[0.03]"
+          }`}
+        >
+          <div className="flex items-center gap-3 min-w-0">
+            <div className={`flex h-9 w-9 shrink-0 items-center justify-center rounded-lg ${
+              assActiveSet ? "bg-emerald-500/20" : "bg-white/5"
+            }`}>
+              <Zap className={`h-4.5 w-4.5 ${assActiveSet ? "text-emerald-400" : "text-slate-600"}`} />
+            </div>
+            <div className="min-w-0">
+              <p className="text-sm font-medium text-slate-200">Active ASS Chime</p>
+              <p className="text-xs text-slate-400 truncate">
+                {assActiveSet && assActiveName ? assActiveName : "Not configured"}
+              </p>
+            </div>
+          </div>
+          {assActiveSet && (
+            <button
+              onClick={() => handleClear("summon")}
+              disabled={clearingAss}
+              className="shrink-0 flex items-center gap-1.5 rounded-lg border border-white/10 px-3 py-1.5 text-xs text-slate-400 transition-colors hover:border-red-500/40 hover:text-red-400 disabled:opacity-50"
+            >
+              <X className="h-3.5 w-3.5" />
+              {clearingAss ? "Clearing..." : "Clear"}
+            </button>
+          )}
+        </div>
       </div>
 
       {/* Sound library */}
@@ -693,23 +739,29 @@ function MyLibraryTab({ volume }: { volume: number }) {
                 {pageSounds.map((sound) => {
                   const isPlaying = playingName === sound.name
                   const isActive = activeSet && activeName === sound.name
-                  const isActivating = activating === sound.name
+                  const isAssActive = assActiveSet && assActiveName === sound.name
+                  const isActivatingLock = activating?.name === sound.name && activating.target === "lock"
+                  const isActivatingAss = activating?.name === sound.name && activating.target === "summon"
                   const isDeleting = deleting === sound.name
                   const gainDb = gains[sound.name] ?? sound.gain_db ?? 0
-                  const needsReapply = isActive && gainDb !== activeGainApplied
+                  const lockNeedsReapply = isActive && gainDb !== activeGainApplied
+                  const assNeedsReapply = isAssActive && gainDb !== assActiveGainApplied
+                  const needsReapply = lockNeedsReapply || assNeedsReapply
 
                   return (
                     <div
                       key={sound.name}
                       className={`group rounded-xl border transition-colors ${
-                        isActive
+                        isActive || isAssActive
                           ? needsReapply
                             ? "border-amber-500/40 bg-amber-500/[0.06]"
-                            : "border-violet-500/40 bg-violet-500/[0.08]"
+                            : isActive
+                              ? "border-violet-500/40 bg-violet-500/[0.08]"
+                              : "border-emerald-500/40 bg-emerald-500/[0.08]"
                           : "border-white/10 bg-white/[0.02] hover:bg-white/[0.04]"
                       }`}
                     >
-                      <div className="flex items-center gap-3 px-4 py-3">
+                      <div className="flex flex-wrap items-center gap-3 px-4 py-3">
                       <button
                         // False positive: togglePlay touches audio refs but
                         // only runs on click, never during render.
@@ -730,36 +782,59 @@ function MyLibraryTab({ volume }: { volume: number }) {
                         <p className="text-xs text-slate-500">{formatSize(sound.size)}</p>
                       </div>
 
-                      {isActive && !needsReapply && (
+                      {isActive && !lockNeedsReapply && (
                         <span className="shrink-0 flex items-center gap-1 rounded-full bg-violet-500/20 px-2 py-0.5 text-xs font-medium text-violet-300">
                           <CheckCircle2 className="h-3 w-3" />
-                          Active
+                          Lock
                         </span>
                       )}
 
-                      {needsReapply && (
-                        <>
-                          <span className="shrink-0 flex items-center gap-1 rounded-full bg-amber-500/20 px-2 py-0.5 text-xs font-medium text-amber-300">
-                            <AlertTriangle className="h-3 w-3" />
-                            Volume changed
-                          </span>
-                          <button
-                            onClick={() => handleActivate(sound.name)}
-                            disabled={savingVolume || isActivating || isDeleting}
-                            className="shrink-0 rounded-lg border border-amber-500/40 px-3 py-1.5 text-xs font-medium text-amber-300 transition-colors hover:bg-amber-500/10 disabled:opacity-50"
-                          >
-                            {isActivating ? "Applying..." : "Re-apply"}
-                          </button>
-                        </>
+                      {isAssActive && !assNeedsReapply && (
+                        <span className="shrink-0 flex items-center gap-1 rounded-full bg-emerald-500/20 px-2 py-0.5 text-xs font-medium text-emerald-300">
+                          <CheckCircle2 className="h-3 w-3" />
+                          ASS
+                        </span>
+                      )}
+
+                      {lockNeedsReapply && (
+                        <button
+                          onClick={() => handleActivate(sound.name, "lock")}
+                          disabled={savingVolume || isActivatingLock || isDeleting}
+                          className="shrink-0 flex items-center gap-1 rounded-lg border border-amber-500/40 px-3 py-1.5 text-xs font-medium text-amber-300 transition-colors hover:bg-amber-500/10 disabled:opacity-50"
+                        >
+                          <AlertTriangle className="h-3 w-3" />
+                          {isActivatingLock ? "Applying..." : "Apply Lock"}
+                        </button>
+                      )}
+
+                      {assNeedsReapply && (
+                        <button
+                          onClick={() => handleActivate(sound.name, "summon")}
+                          disabled={savingVolume || isActivatingAss || isDeleting}
+                          className="shrink-0 flex items-center gap-1 rounded-lg border border-amber-500/40 px-3 py-1.5 text-xs font-medium text-amber-300 transition-colors hover:bg-amber-500/10 disabled:opacity-50"
+                        >
+                          <AlertTriangle className="h-3 w-3" />
+                          {isActivatingAss ? "Applying..." : "Apply ASS"}
+                        </button>
                       )}
 
                       {!isActive && (
                         <button
-                          onClick={() => handleActivate(sound.name)}
-                          disabled={isActivating || isDeleting}
+                          onClick={() => handleActivate(sound.name, "lock")}
+                          disabled={isActivatingLock || isDeleting}
                           className="shrink-0 rounded-lg border border-white/10 px-3 py-1.5 text-xs text-slate-400 transition-colors hover:border-violet-500/40 hover:text-violet-300 disabled:opacity-50"
                         >
-                          {isActivating ? "Setting..." : "Set Active"}
+                          {isActivatingLock ? "Setting..." : "Set Lock"}
+                        </button>
+                      )}
+
+                      {!isAssActive && (
+                        <button
+                          onClick={() => handleActivate(sound.name, "summon")}
+                          disabled={isActivatingAss || isDeleting}
+                          className="shrink-0 rounded-lg border border-white/10 px-3 py-1.5 text-xs text-slate-400 transition-colors hover:border-emerald-500/40 hover:text-emerald-300 disabled:opacity-50"
+                        >
+                          {isActivatingAss ? "Setting..." : "Set ASS"}
                         </button>
                       )}
 
@@ -1285,8 +1360,9 @@ function MyLibraryTab({ volume }: { volume: number }) {
       <div className="flex items-start gap-3 rounded-xl border border-white/10 bg-white/[0.02] p-4">
         <AlertCircle className="mt-0.5 h-4 w-4 shrink-0 text-slate-500" />
         <p className="text-xs text-slate-500 leading-relaxed">
-          Tesla reads <code className="text-slate-400">LockChime.wav</code> from the root of the USB drive.
-          Only one lock sound can be active at a time. Tesla supports WAV format only, max {MAX_DURATION_SECONDS} seconds.
+          Tesla reads <code className="text-slate-400">LockChime.wav</code> and <code className="text-slate-400">ASSChime.wav</code> from the root of the USB drive.
+          The Summon completion sound requires Actually Smart Summon and a Pedestrian Warning System; select USB under the vehicle's Completion Sound setting.
+          Each assignment is independent. Tesla supports WAV format only, max {MAX_DURATION_SECONDS} seconds.
           Random mode selects from your library automatically — "On Connect" works on all Pis,
           "Scheduled" requires a Pi with a real-time clock (RTC), and
           "Smart" uses BLE to only change while parked (requires RTC + BLE pairing).

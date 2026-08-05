@@ -20,12 +20,15 @@ use crate::router::AppState;
 
 pub(crate) const LOCK_CHIME_DIR: &str = "/mutable/LockChime";
 const LOCK_CHIME_TARGET: &str = "/mutable/LockChime.wav";
+const ASS_CHIME_TARGET: &str = "/mutable/ASSChime.wav";
 pub(crate) const LOCK_CHIME_MAX_BYTES: usize = 1 * 1024 * 1024;
 pub(crate) const LOCK_CHIME_MAX_SECONDS: f64 = 5.0;
 const LOCK_CHIME_CONFIG_FILE: &str = "/mutable/LockChime/.random_config.json";
 const LOCK_CHIME_ACTIVE_FILE: &str = "/mutable/LockChime/.active_name";
+const ASS_CHIME_ACTIVE_FILE: &str = "/mutable/LockChime/.ass_active_name";
 const LOCK_CHIME_VOLUMES_FILE: &str = "/mutable/LockChime/.volumes.json";
 const LOCK_CHIME_ACTIVE_GAIN_FILE: &str = "/mutable/LockChime/.active_gain";
+const ASS_CHIME_ACTIVE_GAIN_FILE: &str = "/mutable/LockChime/.ass_active_gain";
 pub(crate) const LOCK_CHIME_GAIN_MIN_DB: f32 = -12.0;
 pub(crate) const LOCK_CHIME_GAIN_MAX_DB: f32 = 12.0;
 const CAM_DISK_IMAGE: &str = "/backingfiles/cam_disk.bin";
@@ -188,10 +191,13 @@ fn is_mount_point_active(mount_point: &str) -> bool {
 // Cam disk sync operations
 // ---------------------------------------------------------------------------
 
-async fn copy_lock_chime_to_cam_mount() -> Result<(), String> {
-    let data = match std::fs::read(LOCK_CHIME_TARGET) {
+async fn copy_chime_to_cam_mount(
+    staged_target: &'static str,
+    usb_filename: &'static str,
+) -> Result<(), String> {
+    let data = match std::fs::read(staged_target) {
         Ok(d) => d,
-        Err(_) => return Ok(()), // No staged LockChime.wav -- nothing to copy
+        Err(_) => return Ok(()),
     };
 
     if !Path::new(CAM_DISK_IMAGE).exists() {
@@ -208,7 +214,7 @@ async fn copy_lock_chime_to_cam_mount() -> Result<(), String> {
         .await
         .map_err(|e| format!("mount cam disk: {}", e))?;
 
-    let cam_target = PathBuf::from(CAM_MOUNT_POINT).join("LockChime.wav");
+    let cam_target = PathBuf::from(CAM_MOUNT_POINT).join(usb_filename);
     // write_chime_file_atomic ends in a full-system `sync` — seconds on
     // a busy SD card — so keep it off the async workers.
     let data_len = data.len();
@@ -223,14 +229,17 @@ async fn copy_lock_chime_to_cam_mount() -> Result<(), String> {
     }
 
     if let Err(e) = write_err {
-        return Err(format!("write LockChime.wav to cam disk: {}", e));
+        return Err(format!("write {} to cam disk: {}", usb_filename, e));
     }
 
-    info!("lockchime: synced LockChime.wav to cam disk ({} bytes)", data_len);
+    info!("lockchime: synced {} to cam disk ({} bytes)", usb_filename, data_len);
     Ok(())
 }
 
-async fn sync_lock_chime_to_cam_disk() -> Result<(), String> {
+async fn sync_chime_to_cam_disk(
+    staged_target: &'static str,
+    usb_filename: &'static str,
+) -> Result<(), String> {
     // The flock keeps archiveloop's gadget cycles (and its stall watchdog)
     // out of our disable→mount→write→umount→enable window; without it a
     // watchdog recovery can re-present cam_disk.bin to the car while we
@@ -252,21 +261,21 @@ async fn sync_lock_chime_to_cam_disk() -> Result<(), String> {
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
 
-    let copy_err = copy_lock_chime_to_cam_mount().await;
+    let copy_err = copy_chime_to_cam_mount(staged_target, usb_filename).await;
 
     if gadget_was_active {
         if let Err(e) = gadget_enable().await {
             info!("lockchime: gadget enable failed: {}", e);
             return Err(format!("re-enable gadget: {}", e));
         }
-        info!("lockchime: USB gadget re-enabled -- Tesla will read the new lock sound");
+        info!("lockchime: USB gadget re-enabled -- Tesla will read the new {}", usb_filename);
     }
 
     copy_err
 }
 
-async fn clear_lock_chime_from_cam_disk() -> Result<(), String> {
-    // Same flock-then-mutex order as sync_lock_chime_to_cam_disk.
+async fn clear_chimes_from_cam_disk(usb_filenames: Vec<&'static str>) -> Result<(), String> {
+    // Same flock-then-mutex order as sync_chime_to_cam_disk.
     let _cycle = acquire_gadget_cycle_lock().await?;
     let _guard = CAM_DISK_MU.lock().await;
 
@@ -292,8 +301,10 @@ async fn clear_lock_chime_from_cam_disk() -> Result<(), String> {
         return Err(format!("mount cam disk: {}", e));
     }
 
-    let cam_target = PathBuf::from(CAM_MOUNT_POINT).join("LockChime.wav");
-    let _ = std::fs::remove_file(&cam_target);
+    for usb_filename in &usb_filenames {
+        let cam_target = PathBuf::from(CAM_MOUNT_POINT).join(usb_filename);
+        let _ = std::fs::remove_file(&cam_target);
+    }
     // Async `sync` — the blocking std variant stalls a runtime worker
     // for however long the kernel takes to flush every filesystem.
     let _ = sentryusb_shell::run_with_timeout(Duration::from_secs(60), "sync", &[]).await;
@@ -310,7 +321,7 @@ async fn clear_lock_chime_from_cam_disk() -> Result<(), String> {
         }
     }
 
-    info!("lockchime: cleared LockChime.wav from cam disk");
+    info!("lockchime: cleared {} from cam disk", usb_filenames.join(", "));
     Ok(())
 }
 
@@ -645,6 +656,17 @@ fn write_active_gain(db: f32) {
     let _ = std::fs::write(LOCK_CHIME_ACTIVE_GAIN_FILE, format!("{db}"));
 }
 
+fn read_ass_active_gain() -> f32 {
+    match std::fs::read_to_string(ASS_CHIME_ACTIVE_GAIN_FILE) {
+        Ok(s) => parse_active_gain(&s),
+        Err(_) => 0.0,
+    }
+}
+
+fn write_ass_active_gain(db: f32) {
+    let _ = std::fs::write(ASS_CHIME_ACTIVE_GAIN_FILE, format!("{db}"));
+}
+
 // ---------------------------------------------------------------------------
 // Random config
 // ---------------------------------------------------------------------------
@@ -949,7 +971,7 @@ async fn lock_chime_scheduler_loop() {
                 .unwrap_or_default();
             if !chosen.is_empty() {
                 lock_chime_log(&format!("{} mode -- changed lock chime to {:?}", cfg.mode, chosen));
-                match sync_lock_chime_to_cam_disk().await {
+                match sync_chime_to_cam_disk(LOCK_CHIME_TARGET, "LockChime.wav").await {
                     Ok(()) => {
                         lock_chime_log(&format!(
                             "{} mode -- cam disk sync OK, Tesla will use new sound",
@@ -1010,6 +1032,10 @@ pub async fn list(State(_s): State<AppState>) -> (StatusCode, Json<serde_json::V
         .unwrap_or_default()
         .trim()
         .to_string();
+    let ass_active_name = std::fs::read_to_string(ASS_CHIME_ACTIVE_FILE)
+        .unwrap_or_default()
+        .trim()
+        .to_string();
 
     let volumes = load_volumes();
 
@@ -1032,6 +1058,7 @@ pub async fn list(State(_s): State<AppState>) -> (StatusCode, Json<serde_json::V
     }
 
     let active_set = Path::new(LOCK_CHIME_TARGET).exists();
+    let ass_active_set = Path::new(ASS_CHIME_TARGET).exists();
 
     (
         StatusCode::OK,
@@ -1040,6 +1067,9 @@ pub async fn list(State(_s): State<AppState>) -> (StatusCode, Json<serde_json::V
             "active_name": active_name,
             "active_set": active_set,
             "active_gain_applied": read_active_gain(),
+            "ass_active_name": ass_active_name,
+            "ass_active_set": ass_active_set,
+            "ass_active_gain_applied": read_ass_active_gain(),
         })),
     )
 }
@@ -1186,8 +1216,68 @@ pub async fn activate(
 
     // Sync to cam disk in background
     tokio::spawn(async {
-        if let Err(e) = sync_lock_chime_to_cam_disk().await {
+        if let Err(e) = sync_chime_to_cam_disk(LOCK_CHIME_TARGET, "LockChime.wav").await {
             info!("lockchime: cam disk sync failed after activate: {}", e);
+        }
+    });
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "success": true,
+            "active": filename,
+            "usb_rebound": true,
+        })),
+    )
+}
+
+/// POST /api/lockchime/activate-ass/{filename}
+pub async fn activate_ass(
+    State(_s): State<AppState>,
+    AxumPath(filename): AxumPath<String>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    if !is_valid_lock_chime_file(&filename) {
+        return crate::json_error(StatusCode::BAD_REQUEST, "Invalid filename");
+    }
+
+    let src_path = PathBuf::from(LOCK_CHIME_DIR).join(&filename);
+    let clean_src = src_path.canonicalize().unwrap_or_else(|_| src_path.clone());
+    let clean_str = clean_src.to_string_lossy();
+    if !clean_str.starts_with(LOCK_CHIME_DIR) && !src_path.starts_with(LOCK_CHIME_DIR) {
+        return crate::json_error(StatusCode::BAD_REQUEST, "Invalid filename");
+    }
+    if !src_path.exists() {
+        return crate::json_error(StatusCode::NOT_FOUND, "Sound file not found");
+    }
+
+    let data = match std::fs::read(&src_path) {
+        Ok(d) => d,
+        Err(_) => {
+            return crate::json_error(StatusCode::INTERNAL_SERVER_ERROR, "Failed to read source file");
+        }
+    };
+
+    let gain_db = gain_for(&filename);
+    let write_ok = tokio::task::spawn_blocking(move || {
+        let processed = apply_gain_db(&data, gain_db);
+        write_chime_file_atomic(ASS_CHIME_TARGET, &processed)
+    })
+    .await
+    .map(|r| r.is_ok())
+    .unwrap_or(false);
+    if !write_ok {
+        return crate::json_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Failed to activate Actually Smart Summon sound",
+        );
+    }
+
+    let _ = std::fs::write(ASS_CHIME_ACTIVE_FILE, &filename);
+    write_ass_active_gain(gain_db);
+
+    tokio::spawn(async {
+        if let Err(e) = sync_chime_to_cam_disk(ASS_CHIME_TARGET, "ASSChime.wav").await {
+            info!("lockchime: cam disk sync failed after ASS activate: {}", e);
         }
     });
 
@@ -1216,8 +1306,33 @@ pub async fn clear_active(
 
     // Clear from cam disk in background
     tokio::spawn(async {
-        if let Err(e) = clear_lock_chime_from_cam_disk().await {
+        if let Err(e) = clear_chimes_from_cam_disk(vec!["LockChime.wav"]).await {
             info!("lockchime: cam disk clear failed: {}", e);
+        }
+    });
+
+    crate::json_ok()
+}
+
+/// POST /api/lockchime/clear-ass-active
+pub async fn clear_ass_active(
+    State(_s): State<AppState>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    if let Err(e) = std::fs::remove_file(ASS_CHIME_TARGET) {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            return crate::json_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Failed to clear Actually Smart Summon sound",
+            );
+        }
+    }
+    let _ = std::fs::remove_file(ASS_CHIME_ACTIVE_FILE);
+    let _ = std::fs::remove_file(ASS_CHIME_ACTIVE_GAIN_FILE);
+    let _ = sentryusb_shell::run_with_timeout(Duration::from_secs(60), "sync", &[]).await;
+
+    tokio::spawn(async {
+        if let Err(e) = clear_chimes_from_cam_disk(vec!["ASSChime.wav"]).await {
+            info!("lockchime: cam disk ASS clear failed: {}", e);
         }
     });
 
@@ -1253,19 +1368,38 @@ pub async fn delete_chime(
 
     remove_volume_entry(&filename);
 
-    // If the deleted file was the active chime, clear it
-    if let Ok(data) = std::fs::read_to_string(LOCK_CHIME_ACTIVE_FILE) {
-        if data.trim() == filename {
-            let _ = std::fs::remove_file(LOCK_CHIME_TARGET);
-            let _ = std::fs::remove_file(LOCK_CHIME_ACTIVE_FILE);
-            let _ = std::fs::remove_file(LOCK_CHIME_ACTIVE_GAIN_FILE);
-            let _ = sentryusb_shell::run_with_timeout(Duration::from_secs(60), "sync", &[]).await;
-            tokio::spawn(async {
-                if let Err(e) = clear_lock_chime_from_cam_disk().await {
-                    info!("lockchime: cam disk clear after delete failed: {}", e);
-                }
-            });
+    // Clear either USB assignment if it referred to the deleted library sound.
+    let was_lock_active = std::fs::read_to_string(LOCK_CHIME_ACTIVE_FILE)
+        .map(|data| data.trim() == filename)
+        .unwrap_or(false);
+    let was_ass_active = std::fs::read_to_string(ASS_CHIME_ACTIVE_FILE)
+        .map(|data| data.trim() == filename)
+        .unwrap_or(false);
+
+    if was_lock_active {
+        let _ = std::fs::remove_file(LOCK_CHIME_TARGET);
+        let _ = std::fs::remove_file(LOCK_CHIME_ACTIVE_FILE);
+        let _ = std::fs::remove_file(LOCK_CHIME_ACTIVE_GAIN_FILE);
+    }
+    if was_ass_active {
+        let _ = std::fs::remove_file(ASS_CHIME_TARGET);
+        let _ = std::fs::remove_file(ASS_CHIME_ACTIVE_FILE);
+        let _ = std::fs::remove_file(ASS_CHIME_ACTIVE_GAIN_FILE);
+    }
+    if was_lock_active || was_ass_active {
+        let _ = sentryusb_shell::run_with_timeout(Duration::from_secs(60), "sync", &[]).await;
+        let mut usb_filenames = Vec::new();
+        if was_lock_active {
+            usb_filenames.push("LockChime.wav");
         }
+        if was_ass_active {
+            usb_filenames.push("ASSChime.wav");
+        }
+        tokio::spawn(async move {
+            if let Err(e) = clear_chimes_from_cam_disk(usb_filenames).await {
+                info!("lockchime: cam disk clear after delete failed: {}", e);
+            }
+        });
     }
 
     crate::json_ok()
@@ -1423,7 +1557,7 @@ pub async fn randomize(
 
     // Sync to cam disk in background
     tokio::spawn(async {
-        match sync_lock_chime_to_cam_disk().await {
+        match sync_chime_to_cam_disk(LOCK_CHIME_TARGET, "LockChime.wav").await {
             Ok(()) => lock_chime_log("manual randomize -- cam disk sync OK"),
             Err(e) => {
                 info!("lockchime: cam disk sync failed after manual randomize: {}", e);
