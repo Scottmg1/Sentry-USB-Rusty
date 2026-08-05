@@ -1106,9 +1106,8 @@ const INSTALL_BEACON_MARKER: &str = "/mutable/.beaconed";
 /// carries `{current_version, update_available, new_version, arch, model}`.
 /// A device fingerprint is included **only** if the user has explicitly
 /// opted in via the `analytics_opt_in` preference (set by the setup wizard
-/// or Settings → Privacy). This is the GDPR Art. 6(1)(a) consent gate —
-/// without an opt-in, the backend treats the call as an opted-out heartbeat
-/// (no DB row, IP-rate-limited).
+/// or Settings → System). Without an opt-in, the backend treats the call as
+/// an opted-out heartbeat (no DB row, IP-rate-limited).
 ///
 /// Best-effort — errors are logged, never surfaced to the caller.
 pub async fn send_telemetry(current: &str, update_available: bool, new_version: &str) {
@@ -1156,11 +1155,10 @@ pub async fn send_telemetry(current: &str, update_available: bool, new_version: 
     }
 }
 
-/// Fire the anonymous install beacon exactly once per install. The beacon
-/// POSTs an **empty body** to `/sentryusb/install-beacon` — no fingerprint,
-/// no identifier, nothing. The backend just increments a daily counter.
-/// This is what gives us gross-install volume independent of the opt-in
-/// cohort, and it carries no personal data so there's nothing to opt out of.
+/// Fire the aggregate install beacon exactly once per install. The beacon
+/// POSTs an empty body with no device identifier to `/sentryusb/install-beacon`.
+/// The backend briefly rate-limits by the connection's source IP and persists
+/// only a daily aggregate counter.
 ///
 /// Guarded by `/mutable/.beaconed` — once that file exists, the beacon
 /// never fires again for this install (until /mutable is wiped, which on

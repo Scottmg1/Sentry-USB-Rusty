@@ -27,7 +27,7 @@ BLE also doubles as the [Keep Awake](Setup-Wizard-Guide#7-keep-awake) mechanism 
 
 ## Modes
 
-From **Settings → Tesla BLE**, two independent toggles control the BLE pipeline:
+From **Settings → Car & Network**, two independent toggles control the BLE pipeline:
 
 - **Use BLE for telemetry** — reads battery, temps, HVAC, TPMS, odometer, and location. On by default once paired.
 - **Use BLE for keep-awake** — nudges the car over BLE during archive cycles so the dashcam keeps recording. Off by default; turn it on if you don't want to use TeslaFi / Tessie / a webhook.
@@ -36,7 +36,7 @@ You can run either, both, or neither.
 
 ## Pairing
 
-The [Setup Wizard's Keep Awake step](Setup-Wizard-Guide#7-keep-awake) walks you through pairing on first install. To re-pair or repair the link later: **Settings → BLE Pairing → Re-pair**. You'll need to be near the car so it accepts the pair request.
+The [Setup Wizard's Keep Awake step](Setup-Wizard-Guide#7-keep-awake) walks you through pairing on first install. To re-pair or repair the link later, open **Settings → Car & Network**, then use **BLE Pairing → Re-pair**. You'll need to be near the car so it accepts the pair request.
 
 The card shows the paired VIN, current connection state, and a **Show output** button if you need the raw pairing log.
 

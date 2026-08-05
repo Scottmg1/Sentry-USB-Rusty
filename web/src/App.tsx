@@ -21,7 +21,9 @@ const DriveDetail = lazy(() => import("@/pages/DriveDetail"))
 const Charging = lazy(() => import("@/pages/Charging"))
 const ChargeSessionDetail = lazy(() => import("@/pages/ChargeSessionDetail"))
 // Dev-only mock-data preview of in-progress UI; not routed in production.
-const PreviewCharging = lazy(() => import("@/pages/PreviewCharging"))
+const PreviewCharging = import.meta.env.DEV
+  ? lazy(() => import("@/pages/PreviewCharging"))
+  : null
 const Support = lazy(() => import("@/pages/Support"))
 const Terminal = lazy(() => import("@/pages/Terminal"))
 const FSDAnalytics = lazy(() => import("@/pages/FSDAnalytics"))
@@ -300,7 +302,7 @@ function AppContent() {
             <Route path="/snapshots" element={<Snapshots />} />
             <Route path="/settings" element={<Settings />} />
           </Route>
-          {import.meta.env.DEV && (
+          {import.meta.env.DEV && PreviewCharging && (
             <Route path="/preview/charging" element={<PreviewCharging />} />
           )}
         </Routes>

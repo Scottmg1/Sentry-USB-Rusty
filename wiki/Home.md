@@ -30,7 +30,7 @@ Then open `http://sentryusb.local` and the [Setup Wizard](Setup-Wizard-Guide) ta
 | **Not supported** | Raspberry Pi 3B/3B+, Pi 2, Pi Zero W (v1), Pi 1 | 3B/3B+/2/1: USB goes through a hub chip — host-only, can never appear as a drive to the car. Zero W v1: too slow, build retired |
 
 Plus:
-- MicroSD card, **256 GB or larger** recommended
+- A high-quality MicroSD card sized for the USB-drive layout and snapshot retention you choose
 - A **USB 3.0 data cable** (not charge-only) — Pi to your Tesla.
   Use a 3.0 cable even on boards that only support USB 2.0 OTG: 3.0 cables
   deliver more power, which keeps lower-end boards stable.

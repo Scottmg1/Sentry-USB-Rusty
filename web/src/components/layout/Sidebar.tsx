@@ -6,7 +6,7 @@ import {
   FolderOpen,
   ScrollText,
   MapPin,
-  MessageCircle,
+  Bot,
   Settings,
   ChevronLeft,
   ChevronRight,
@@ -175,11 +175,11 @@ export function Sidebar({ collapsed, onToggle }: SidebarProps) {
         {!collapsed && <span>Terminal</span>}
       </NavLink>
 
-      {/* Support link (secondary) */}
+      {/* AI Support link (secondary) */}
       <NavLink
         to="/support"
-        title={collapsed ? "Support" : undefined}
-        aria-label={collapsed ? "Support" : undefined}
+        title={collapsed ? "AI Support & Help" : undefined}
+        aria-label={collapsed ? "AI Support & Help" : undefined}
         className={({ isActive }) =>
           cn(
             "mx-2 mb-1 flex items-center gap-2 rounded-lg px-3 py-2 text-xs transition-colors",
@@ -190,8 +190,8 @@ export function Sidebar({ collapsed, onToggle }: SidebarProps) {
           )
         }
       >
-        <MessageCircle className="h-3.5 w-3.5 shrink-0" />
-        {!collapsed && <span>Support</span>}
+        <Bot className="h-3.5 w-3.5 shrink-0" />
+        {!collapsed && <span>AI Support &amp; Help</span>}
       </NavLink>
 
       {/* Connection status */}

@@ -28,7 +28,7 @@
 
 The Rust rewrite of the original Go version. Same `sentryusb.conf`, faster server, more reliable.
 
-Sentry USB is one of four free tools for Tesla owners from the [Sentry Six](https://sentry-six.com) project, alongside [Sentry Studio](https://github.com/Sentry-Six/Sentry-Six) (desktop TeslaCam viewer), [Sentry Drive](https://github.com/Sentry-Six/Sentry-Drive) (drive history and FSD analytics), and [Sentry Connect](https://sentry-six.com/sentry-connect/) (the iPhone companion app for this Pi). Not affiliated with Tesla, Inc. Unrelated to the Sentry (sentry.io) error-monitoring service.
+Sentry USB is one of the free tools for Tesla owners from the [Sentry Six](https://sentry-six.com) project, alongside [Sentry Studio](https://github.com/Sentry-Six/Sentry-Six) (desktop TeslaCam viewer), [Sentry Drive](https://github.com/Sentry-Six/Sentry-Drive) (drive history and FSD analytics), and [Sentry Connect](https://sentry-six.com/sentry-connect/) (the iPhone companion app for this Pi). Not affiliated with Tesla, Inc. Unrelated to the Sentry (sentry.io) error-monitoring service.
 
 > [!IMPORTANT]
 > Beginning with update 2026.20, Tesla has begun offering the ability to encrypt Tesla cam footage, which is enabled by default. Encrypted files cannot be read by Sentry USB. To continue using Sentry USB, please disable the encryption.
@@ -108,7 +108,7 @@ Then open `http://sentryusb.local` in a browser and the setup wizard takes you t
 | **Community** | Radxa Rock Pi 4C+, Radxa Zero 3W | USB 3.0 OTG — reported working, not officially supported |
 | **Not supported** | Raspberry Pi 3B/3B+, Pi 2, Pi Zero W (v1), Pi 1 | 3B/3B+/2/1: USB goes through a hub chip — host-only, can never appear as a drive to the car. Zero W v1: too slow, build retired |
 
-Plus a **256 GB+ MicroSD card** and a **USB 3.0 data cable** (not charge-only) between the Pi and your Tesla. Use a 3.0 cable even on USB 2.0 boards — it delivers more power and keeps lower-end Pis stable.
+Plus a **high-quality MicroSD card sized for the storage layout you choose** and a **USB 3.0 data cable** (not charge-only) between the Pi and your Tesla. Use a 3.0 cable even on USB 2.0 boards — it delivers more power and keeps lower-end Pis stable.
 
 ---
 
@@ -118,13 +118,14 @@ By default, Sentry USB sends **no device identifier** to our servers. Here's eve
 
 | When | What | Identifier? |
 |---|---|---|
-| Daily update check | Software version, CPU arch, board model | None by default |
-| Once per install | Empty ping (no body) | None — anonymous counter |
-| Wraps / lock chime submissions | The file + your IP for rate-limiting | None |
+| Daily update check | Software version, CPU arch, board model | No device ID by default; source IP briefly rate-limited |
+| Once per install | Empty ping; the source IP is briefly used for rate-limiting | No payload or device ID; only a daily aggregate count is stored |
+| Wraps / lock chime submissions | The file + your IP for rate-limiting and abuse handling | No device or hardware fingerprint; the IP may be retained with the submission |
 | Sentry Cloud (if signed in) | Your account + synced files | Account credentials |
 | iOS push pairing (if enabled) | Random pairing ID | Not tied to hardware |
+| AI Support & Help (if used) | Chat messages, product/software version, and the Pi connection's public IP for abuse prevention; diagnostics only after a separate one-time approval | Random conversation ID and access token; no hardware fingerprint |
 
-The only way a device fingerprint is sent is if you explicitly opt in to **Settings → Privacy → Analytics opt-in** (default: off). Full disclosure including legal basis, retention, and how to disable each flow lives in [`wiki/Privacy.md`](wiki/Privacy.md).
+The only way a device fingerprint is sent is if you explicitly opt in to **Settings → System → Analytics opt-in** (default: off). Full disclosure including legal basis, retention, and how to disable each flow lives in [`wiki/Privacy.md`](wiki/Privacy.md).
 
 ---
 

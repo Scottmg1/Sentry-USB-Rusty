@@ -579,7 +579,8 @@ const DIAGNOSTICS_SCRIPT: &str = r#"{
   echo ""
 
   echo "====== archiveloop ======"
-  tail -50 /mutable/archiveloop.log 2>/dev/null || echo "no archiveloop log"
+  # Keep this bounded, but include enough context to diagnose an archive cycle.
+  tail -200 /mutable/archiveloop.log 2>/dev/null || echo "no archiveloop log"
   echo ""
 
   echo "====== drive-import history (persisted, last 20) ======"

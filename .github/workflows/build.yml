@@ -343,7 +343,7 @@ jobs:
 
   release:
     name: Create Release
-    needs: [build, test]
+    needs: [build, test, lint-web]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-22.04
     permissions:
@@ -365,3 +365,6 @@ jobs:
         with:
           files: release/*
           generate_release_notes: true
+          # Tags such as v3.16.0-rc.1 are published as GitHub pre-releases;
+          # stable vX.Y.Z tags remain normal releases.
+          prerelease: ${{ contains(github.ref_name, '-') }}

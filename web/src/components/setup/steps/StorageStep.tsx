@@ -47,7 +47,7 @@ export function StorageStep({ data, onChange }: StepProps) {
 
       <p className="text-xs text-slate-500">
         Configure the size of each USB drive partition. Choose GB or MB per drive.
-        A 128GB+ SD card is recommended. The remaining space is used for snapshots.
+        Use a high-quality SD card with enough capacity for the drive sizes you choose. The remaining space is used for snapshots.
       </p>
 
       <div className="grid gap-3">

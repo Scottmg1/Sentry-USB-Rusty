@@ -6,7 +6,7 @@ import {
   FolderOpen,
   ScrollText,
   MapPin,
-  MessageCircle,
+  Bot,
   Settings,
   X,
   Shield,
@@ -174,7 +174,7 @@ export function MobileNav({ open, onClose }: MobileNavProps) {
           <span>Terminal</span>
         </NavLink>
 
-        {/* Support link (secondary) */}
+        {/* AI Support link (secondary) */}
         <NavLink
           to="/support"
           onClick={onClose}
@@ -187,8 +187,8 @@ export function MobileNav({ open, onClose }: MobileNavProps) {
             )
           }
         >
-          <MessageCircle className="h-3.5 w-3.5 shrink-0" />
-          <span>Support</span>
+          <Bot className="h-3.5 w-3.5 shrink-0" />
+          <span>AI Support &amp; Help</span>
         </NavLink>
 
         {/* Connection status */}

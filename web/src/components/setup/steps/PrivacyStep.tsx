@@ -4,25 +4,8 @@ import type { StepProps } from "../SetupWizard"
 import { cn } from "@/lib/utils"
 
 /**
- * Privacy disclosure + analytics opt-in.
- *
- * This step covers two GDPR requirements:
- *
- * 1. Article 13 transparency at the point of collection. The "What we send
- *    and when" table below enumerates every outbound data flow before the
- *    user clicks past this screen, so the user knows what's coming before
- *    it leaves the device.
- *
- * 2. Article 21 right to object, exercisable by automated means. The
- *    analytics opt-in is the toggle — explicit affirmative action required
- *    (no pre-ticked default, per CJEU Planet49 / Art. 4(11)). Both buttons
- *    have equal visual weight to avoid the dark-pattern asymmetry EDPB
- *    Guidelines 03/2022 flags.
- *
- * The opt-in writes the `analytics_opt_in` preference immediately on click
- * (independent of the wizard's Apply flow) — that way the choice sticks
- * even if the user backs out of the wizard, and the next update-check
- * telemetry already honors it.
+ * Privacy disclosure and analytics preference. The choice is saved
+ * immediately so update checks honor it even if setup is not completed.
  */
 export function PrivacyStep(_props: StepProps) {
   const [choice, setChoice] = useState<boolean | null>(null)
@@ -75,7 +58,7 @@ export function PrivacyStep(_props: StepProps) {
         does.
       </p>
 
-      {/* Disclosure table — Article 13 transparency at point of collection */}
+      {/* Outbound data-flow disclosure. */}
       <div className="mt-8 w-full max-w-2xl rounded-xl border border-white/10 bg-white/[0.02] p-5">
         <p className="mb-3 text-xs font-semibold uppercase tracking-wider text-slate-400">
           What we send, when, and why
@@ -85,13 +68,13 @@ export function PrivacyStep(_props: StepProps) {
             when="Daily update check"
             what="Software version, CPU architecture, board model"
             why="Detect vulnerable builds, ship compatible binaries"
-            note="No device identifier sent unless you opt in below."
+            note="No device identifier unless you opt in below; the source IP is briefly used for rate limiting."
           />
           <FlowRow
             when="Once per install"
-            what="Empty ping (no body, no identifier)"
+            what="Empty ping with no payload or device identifier"
             why="Count gross install volume on the server"
-            note="Anonymous. There's nothing to opt out of."
+            note="The source IP is briefly rate-limited; only a daily aggregate count is stored. See the privacy wiki to suppress it."
           />
           <FlowRow
             when="When you use Sentry Cloud"
@@ -100,10 +83,16 @@ export function PrivacyStep(_props: StepProps) {
             note="Don't sign in to Cloud if you don't want this."
           />
           <FlowRow
+            when="When you use AI Support & Help"
+            what="Messages, product/software version, the Pi connection's public IP for abuse prevention + only diagnostics you explicitly approve"
+            why="Generate product-specific troubleshooting help"
+            note="Online AI: messages are processed by Ollama Cloud and stored redacted on Sentry Six servers for up to 90 days after the last activity; maintainers may review them. Approved diagnostics are retained for 7 days."
+          />
+          <FlowRow
             when="When you submit a wrap or lock chime"
             what="The file you uploaded + your IP for rate-limiting"
             why="Sharing the submission with the community"
-            note="No device fingerprint is sent — submissions are anonymous to the server."
+            note="No device fingerprint is sent. Your IP is used and retained for rate-limiting and abuse handling."
           />
           <FlowRow
             when="If you enable iOS push notifications"
@@ -145,7 +134,7 @@ export function PrivacyStep(_props: StepProps) {
           device ID (derived from your board's serial number) so we can tell
           how many unique devices are running each version, without double-
           counting reinstalls. You can change this any time in Settings →
-          Privacy.
+          System.
         </p>
 
         <div className="mt-4 flex flex-col gap-2 sm:flex-row">
@@ -195,7 +184,7 @@ export function PrivacyStep(_props: StepProps) {
         )}
         {choice !== null && !error && (
           <p className="mt-3 text-[11px] text-emerald-300/70">
-            Saved. You can change this any time in Settings → Privacy.
+            Saved. You can change this any time in Settings → System.
           </p>
         )}
         {error && (
