@@ -182,6 +182,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/drives/tags", get(crate::drives_handler::list_tags))
         .route("/api/drives/process", get(crate::drives_handler::processing_status).post(crate::drives_handler::process_files))
         .route("/api/drives/reprocess", post(crate::drives_handler::reprocess_all))
+        .route("/api/drives/check-summon", post(crate::drives_handler::check_summon))
         .route("/api/drives/status", get(crate::drives_handler::processing_status))
         .route("/api/drives/data/download", get(crate::drives_handler::download_data))
         .route("/api/drives/data/upload", post(crate::drives_handler::upload_data))

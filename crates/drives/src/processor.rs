@@ -19,7 +19,7 @@ use tracing::{info, warn};
 
 use crate::db::DriveStore;
 use crate::extract;
-use crate::types::ProcessingStatus;
+use crate::types::{ProcessingStatus, SummonCheckOutcome};
 
 /// Fire a `PRAGMA wal_checkpoint(PASSIVE)` every N files processed. Keeps
 /// the `-wal` file bounded during long processing runs without blocking
@@ -133,6 +133,144 @@ impl Processor {
         let result = self.do_process(true).await;
         self.running.store(false, Ordering::SeqCst);
         result
+    }
+
+    /// Targeted summon evidence re-read — port of Sentry-Drive's
+    /// `check-summon` repair (electron-main.cjs): the cheap alternative
+    /// to reprocess-all for libraries processed before flag evidence
+    /// existed. Re-reads only the candidate clips selected by
+    /// `grouper::summon_check_candidates` (whole drives inside the
+    /// summon envelope, plus the low-speed edge clips of faster drives)
+    /// so the next grouping can tag summon drives.
+    ///
+    /// Divergence from the JS (deliberate): Sentry-Drive patches only
+    /// `flagRuns`/`gearRuns`/`rawFrameCount`/`rawParkCount` onto the
+    /// stored route; here the whole row is refreshed through the
+    /// standard `add_route` upsert. Same extractor as normal processing,
+    /// and the refresh also (re)writes `sei_speed_abs_max` — which the
+    /// detector's legacy speed fallback needs — plus aggregates that
+    /// pre-v16 extractions computed with worse gear evidence.
+    pub async fn check_summon(&self) -> Result<SummonCheckOutcome> {
+        if self.running.swap(true, Ordering::SeqCst) {
+            anyhow::bail!("processing already in progress");
+        }
+        let result = self.do_check_summon().await;
+        self.running.store(false, Ordering::SeqCst);
+        result
+    }
+
+    async fn do_check_summon(&self) -> Result<SummonCheckOutcome> {
+        let cands = self
+            .store
+            .with_route_summaries(crate::grouper::summon_check_candidates)?;
+        let total = cands.files.len();
+
+        {
+            let mut status = self.status.lock().await;
+            status.running = true;
+            status.total_files = total;
+            status.processed_files = 0;
+            status.current_file = None;
+        }
+
+        let mut scanned = 0usize;
+        let mut updated = 0usize;
+        let mut missing = 0usize;
+        let mut full_path = String::new();
+        for (i, file) in cands.files.iter().enumerate() {
+            {
+                let mut status = self.status.lock().await;
+                status.current_file = Some(file.clone());
+                status.processed_files = i;
+            }
+
+            full_path.clear();
+            full_path.push_str(&self.clip_dir);
+            full_path.push('/');
+            full_path.push_str(file);
+            if !std::path::Path::new(&full_path).is_file() {
+                missing += 1;
+                continue;
+            }
+
+            match extract::extract_gps_from_file(&full_path) {
+                Ok(gps) => {
+                    scanned += 1;
+                    // Mirrors the JS `extracted.flags.length > 0` gate:
+                    // a clip whose SEI stream yielded nothing can't
+                    // improve evidence — leave the stored row alone.
+                    if gps.raw_frame_count > 0 {
+                        let date: &str = file.split('/').next().unwrap_or("");
+                        match self.store.add_route(
+                            file,
+                            date,
+                            &gps.points,
+                            &gps.gear_states,
+                            &gps.autopilot_states,
+                            &gps.speeds,
+                            &gps.accel_positions,
+                            gps.raw_park_count,
+                            gps.raw_frame_count,
+                            &gps.gear_runs,
+                            &gps.flag_runs,
+                        ) {
+                            Ok(()) => updated += 1,
+                            Err(e) => warn!("check summon: save failed for {}: {}", file, e),
+                        }
+                    }
+                }
+                Err(e) => {
+                    warn!("check summon: extract failed for {}: {}", file, e);
+                    missing += 1;
+                }
+            }
+
+            // Same WAL + Pi-CPU hygiene as `do_process`.
+            if (i + 1) % SAVE_EVERY == 0
+                && let Err(e) = self.store.save()
+            {
+                warn!("check-summon WAL checkpoint failed: {}", e);
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let _ = self.store.save();
+
+        {
+            let mut status = self.status.lock().await;
+            status.running = false;
+            status.processed_files = total;
+            status.current_file = None;
+        }
+
+        let outcome = SummonCheckOutcome {
+            candidate_drives: cands.candidate_drives,
+            clips_scanned: scanned,
+            updated_routes: updated,
+            missing_clips: missing,
+        };
+        self.hub.broadcast(
+            "summon_check",
+            &serde_json::json!({
+                "status": "complete",
+                "candidateDrives": outcome.candidate_drives,
+                "clipsScanned": outcome.clips_scanned,
+                "updatedRoutes": outcome.updated_routes,
+                "missingClips": outcome.missing_clips,
+            }),
+        );
+        info!(
+            "check summon: {} candidate drive(s), {} clip(s) read, {} route(s) gained flag+gear evidence, {} clip(s) unavailable",
+            outcome.candidate_drives, outcome.clips_scanned, outcome.updated_routes, outcome.missing_clips
+        );
+
+        // Refreshed rows change drive grouping and cloud-synced routes —
+        // wake the uploader sweep like a normal process pass does.
+        if outcome.updated_routes > 0
+            && let Some(n) = &self.on_complete
+        {
+            n.notify_one();
+        }
+        Ok(outcome)
     }
 
     async fn do_process(&self, _reprocess: bool) -> Result<()> {

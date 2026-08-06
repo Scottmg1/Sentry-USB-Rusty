@@ -499,6 +499,18 @@ pub struct ProcessingStatus {
     pub current_file: Option<String>,
 }
 
+/// Result of the targeted summon evidence re-read (see
+/// `Processor::check_summon`). Field names mirror Sentry-Drive's
+/// `check-summon` IPC result payload.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SummonCheckOutcome {
+    pub candidate_drives: usize,
+    pub clips_scanned: usize,
+    pub updated_routes: usize,
+    pub missing_clips: usize,
+}
+
 /// Internal timed route used during grouping.
 #[derive(Debug, Clone)]
 pub struct TimedRoute {

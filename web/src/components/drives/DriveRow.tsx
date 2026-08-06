@@ -1,4 +1,4 @@
-import { Clock, Gauge, Sparkles } from "lucide-react"
+import { Clock, Gauge, Radio, Sparkles } from "lucide-react"
 import { useNavigate } from "react-router-dom"
 import { cn } from "@/lib/utils"
 import { formatDistance, formatDuration, formatPercent } from "@/lib/drive-format"
@@ -108,15 +108,22 @@ export function DriveRow({
             <Clock className="h-3.5 w-3.5" />
             {formatDuration(drive.durationMs)}
           </Chip>
-          <Chip emphasis>
-            <Sparkles className="h-3.5 w-3.5" />
-            FSD {fsdDisplay}%
-            {fsdFull && (
-              <span className="ml-0.5 text-amber-300" aria-hidden>
-                ★
-              </span>
-            )}
-          </Chip>
+          {drive.summon ? (
+            <Chip summon>
+              <Radio className="h-3.5 w-3.5" />
+              Summon
+            </Chip>
+          ) : (
+            <Chip emphasis>
+              <Sparkles className="h-3.5 w-3.5" />
+              FSD {fsdDisplay}%
+              {fsdFull && (
+                <span className="ml-0.5 text-amber-300" aria-hidden>
+                  ★
+                </span>
+              )}
+            </Chip>
+          )}
         </div>
         <div className="flex items-end gap-2">
           <div
@@ -138,16 +145,19 @@ export function DriveRow({
 interface ChipProps {
   children: React.ReactNode
   emphasis?: boolean
+  summon?: boolean
 }
 
-function Chip({ children, emphasis }: ChipProps) {
+function Chip({ children, emphasis, summon }: ChipProps) {
   return (
     <span
       className={cn(
         "inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-xs font-medium tabular-nums",
-        emphasis
-          ? "bg-emerald-400/15 text-emerald-200 ring-1 ring-inset ring-emerald-400/20"
-          : "bg-white/5 text-slate-300 ring-1 ring-inset ring-white/10",
+        summon
+          ? "bg-violet-400/15 text-violet-200 ring-1 ring-inset ring-violet-400/20"
+          : emphasis
+            ? "bg-emerald-400/15 text-emerald-200 ring-1 ring-inset ring-emerald-400/20"
+            : "bg-white/5 text-slate-300 ring-1 ring-inset ring-white/10",
       )}
     >
       {children}

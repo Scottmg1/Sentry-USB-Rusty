@@ -503,6 +503,47 @@ pub async fn reprocess_all(
     crate::json_ok()
 }
 
+/// POST /api/drives/check-summon — targeted summon evidence re-read.
+///
+/// Port of Sentry-Drive's `check-summon` repair: re-extracts only the
+/// clips that could hide a summon drive but lack current flag evidence
+/// (see `Processor::check_summon`), so old libraries gain summon flags
+/// without a full reprocess. Runs async like `reprocess`; progress is
+/// visible on `GET /api/drives/status`, and the outcome is broadcast on
+/// the WebSocket hub as `summon_check` and logged.
+pub async fn check_summon(
+    State(state): State<AppState>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    if state.drives.processor.is_running() {
+        return crate::json_error(StatusCode::CONFLICT, "processing already in progress");
+    }
+    if state.drives.importing.load(Ordering::SeqCst) {
+        return crate::json_error(
+            StatusCode::CONFLICT,
+            "drive data import in progress — please wait until it finishes",
+        );
+    }
+    if is_archiving() {
+        return crate::json_error(
+            StatusCode::CONFLICT,
+            "archive is currently running — please wait until it finishes",
+        );
+    }
+
+    let processor = state.drives.processor.clone();
+    tokio::spawn(async move {
+        register_keep_awake_want("processor");
+        start_keep_awake("Drive Processing");
+        let result = processor.check_summon().await;
+        release_keep_awake_want("processor");
+        stop_keep_awake();
+        if let Err(e) = result {
+            tracing::warn!("summon check error: {}", e);
+        }
+    });
+    crate::json_ok()
+}
+
 /// GET /api/drives/stats — aggregate stats
 /// Served from the pre-computed cache; no grouper work or BLOB decoding per request.
 /// `processed_count` is injected live from the atomic counter (it changes on

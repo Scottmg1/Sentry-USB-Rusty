@@ -305,6 +305,176 @@ pub fn find_drive_start_time(summaries: &[RouteSummary], id: &str) -> Option<Str
     None
 }
 
+/// Output of [`summon_check_candidates`].
+pub struct SummonCheckCandidates {
+    /// Drives whose shape says "could hide a summon".
+    pub candidate_drives: usize,
+    /// Unique candidate clip files (drive order) lacking current flag
+    /// evidence — the set worth re-reading from the USB.
+    pub files: Vec<String>,
+}
+
+/// Candidate selection for the targeted summon evidence re-read — port
+/// of Sentry-Drive's `check-summon` repair (electron-main.cjs). Returns
+/// the clip files that could hide a summon drive but lack current flag
+/// evidence, so the processor can re-read just those MP4s instead of
+/// reprocessing the whole library.
+///
+/// Candidates come from two places (mirroring the JS selection):
+///  1. Whole drives inside the summon speed/duration envelope (an
+///     isolated summon that already grouped as its own tiny drive).
+///  2. The LOW-SPEED EDGE CLIPS of every dashcam drive, plus ONE
+///     boundary clip past each slow run. A summon fused onto a
+///     following drive hides at its head (verified live on 2026-07-27:
+///     a summon-end clip's row missed the trailing Park run, so the
+///     park splitter never separated the summon from the hour of
+///     driving after it — the merged drive fails the envelope and would
+///     never be re-read). Summon only ever sits at a drive's edges (it
+///     is always bracketed by Park), so edge clips at parking-lot speed
+///     are the complete hiding set. The boundary clip matters because a
+///     summon ending seconds before the human drives off shares its
+///     final clip with fast driving — that mixed clip holds the end
+///     bookend AND the park run that lets the splitter isolate the
+///     summon.
+///
+/// Evidence is current only when every flag run carries per-run speed
+/// (`max_mps`) — earlier extractions lacked it and their drives can
+/// fail the speed gate on point-slice pollution, so they get one
+/// upgrade re-read.
+pub fn summon_check_candidates(summaries: &[RouteSummary]) -> SummonCheckCandidates {
+    /// Summon duration cap is 10 min = at most 10 minute-clips per edge.
+    const MAX_EDGE_CLIPS: usize = 10;
+    // + 0.01 rounding guard: max_speed_mph is stored rounded to 2 dp.
+    let max_mph = SUMMON_MAX_SPEED_MPS * calc::MPS_TO_MPH + 0.01;
+
+    let by_file: HashMap<&str, &RouteSummary> =
+        summaries.iter().map(|s| (s.file.as_str(), s)).collect();
+
+    let has_current_evidence = |s: &RouteSummary| -> bool {
+        !s.flag_runs.is_empty()
+            && s.flag_runs
+                .iter()
+                .all(|r| r.max_mps.is_some_and(f64::is_finite))
+    };
+
+    // Sentry-Drive scans the route's per-sample |speeds|; summary rows
+    // don't carry the speeds BLOB, so the v16 `sei_speed_abs_max`
+    // column stands in — it IS the max |SEI speed| (reverse counts).
+    // Pre-v16 rows fall back to the locked `max_speed_mps`
+    // (positive-only, possibly GPS-derived): candidate selection only,
+    // where a wrong call costs (or skips) a single clip re-read. No
+    // speed evidence at all means "can't verify slow", matching the
+    // JS empty-speeds bail.
+    let route_is_slow = |file: &str| -> bool {
+        let Some(r) = by_file.get(file) else {
+            return false;
+        };
+        match r.aggregates.sei_speed_abs_max {
+            Some(m) => m <= SUMMON_MAX_SPEED_MPS,
+            None => {
+                r.aggregates.speed_sample_count > 0
+                    && r.aggregates.max_speed_mps <= SUMMON_MAX_SPEED_MPS
+            }
+        }
+    };
+
+    let mut candidate_drives = 0usize;
+    let mut files_out: Vec<String> = Vec::new();
+    let mut queued: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    let mut add_clip = |file: &str| {
+        // Synthetic gap-fill bridge rows have no MP4 on disk.
+        if file.contains("-front-bridge.mp4") {
+            return;
+        }
+        let Some(r) = by_file.get(file) else {
+            return;
+        };
+        if has_current_evidence(r) {
+            return;
+        }
+        if let Some((key, _)) = by_file.get_key_value(file) {
+            if queued.insert(key) {
+                files_out.push(file.to_string());
+            }
+        }
+    };
+
+    let groups = group_summary_clips(summaries);
+    let empty_tags = HashMap::new();
+    for (idx, clips) in groups.iter().enumerate() {
+        if clips.is_empty() {
+            continue;
+        }
+        // Deduped parent files in drive order (see `find_drive_files`).
+        let mut seen = std::collections::HashSet::new();
+        let files: Vec<&str> = clips
+            .iter()
+            .filter_map(|c| {
+                if seen.insert(c.summary.file.as_str()) {
+                    Some(c.summary.file.as_str())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        if files.is_empty() {
+            continue;
+        }
+
+        let d = build_summary_from_aggregates(clips, idx, &empty_tags);
+        // Imported drives can't gain SEI evidence; flagged drives are done.
+        if d.source.as_deref().is_some_and(|s| s != "sei") || d.summon {
+            continue;
+        }
+
+        // No lower speed bound: reverse-only summons report NEGATIVE
+        // SEI speeds, which the display stat ignores — such drives
+        // show 0 mph.
+        let whole_drive =
+            d.max_speed_mph <= max_mph && d.duration_ms <= SUMMON_MAX_DURATION_MS;
+        if whole_drive {
+            candidate_drives += 1;
+            for f in &files {
+                add_clip(f);
+            }
+            continue;
+        }
+
+        // Low-speed head and tail of a faster drive (fused-summon
+        // case): the slow run PLUS ONE boundary clip each way.
+        let mut took = false;
+        for &f in files.iter().take(MAX_EDGE_CLIPS) {
+            if !route_is_slow(f) {
+                if took {
+                    add_clip(f); // boundary clip after the slow run
+                }
+                break;
+            }
+            add_clip(f);
+            took = true;
+        }
+        let mut took_tail = false;
+        for &f in files.iter().rev().take(MAX_EDGE_CLIPS) {
+            if !route_is_slow(f) {
+                if took_tail {
+                    add_clip(f); // boundary clip before the slow tail
+                }
+                break;
+            }
+            add_clip(f);
+            took_tail = true;
+        }
+        if took || took_tail {
+            candidate_drives += 1;
+        }
+    }
+
+    SummonCheckCandidates {
+        candidate_drives,
+        files: files_out,
+    }
+}
+
 /// Build a full `Drive` (with all merged point data, gear/FSD arrays,
 /// and FSD events) from a slice of routes that are **already known to
 /// belong to a single drive**. Skips `group_clips` entirely so the
@@ -4807,5 +4977,185 @@ mod tests {
             "per-drive averages must not gain a phantom summon denominator"
         );
         assert_eq!(fsd.best_day_percent, 100.0);
+    }
+
+    // ── check-summon candidate selection ─────────────────────────────
+    // Ports the selection rules of Sentry-Drive's `check-summon` repair
+    // (electron-main.cjs): envelope drives whole, low-speed edges +
+    // one boundary clip for fused drives, skip rows whose evidence is
+    // already current.
+
+    #[test]
+    fn summon_check_selects_whole_envelope_drive_lacking_evidence() {
+        // Slow 2-clip drive from a pre-flags extraction (no flag_runs
+        // at all — unverifiable, so it can't be flagged yet): whole
+        // drive inside the envelope → both clips selected.
+        let clip_a = summon_summary(
+            "2026-07-15/2026-07-15_20-49-54-front.mp4",
+            &[(GEAR_PARK, 60), (1, 1726)],
+            &[],
+            Some(2.7),
+        );
+        let clip_b = summon_summary(
+            "2026-07-15/2026-07-15_20-50-43-front.mp4",
+            &[(1, 500), (GEAR_PARK, 53)],
+            &[],
+            Some(2.7),
+        );
+        let cands = summon_check_candidates(&[clip_a, clip_b]);
+        assert_eq!(cands.candidate_drives, 1);
+        assert_eq!(
+            cands.files,
+            vec![
+                "2026-07-15/2026-07-15_20-49-54-front.mp4".to_string(),
+                "2026-07-15/2026-07-15_20-50-43-front.mp4".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn summon_check_skips_rows_with_current_evidence_and_flagged_drives() {
+        // Same envelope drive but modern runs (per-run maxima): the
+        // drive both counts as a candidate AND needs no re-read — and
+        // since its evidence already flags it as summon, the drive is
+        // skipped entirely (JS: `d.summon → continue`).
+        let clip_a = summon_summary_runs(
+            "2026-07-15/2026-07-15_20-49-54-front.mp4",
+            &[(GEAR_PARK, 60), (1, 1726)],
+            frm(&[(0, 27, 0.0), (3, 123, 0.1), (0, 1640, 2.7)]),
+            Some(2.7),
+        );
+        let clip_b = summon_summary_runs(
+            "2026-07-15/2026-07-15_20-50-43-front.mp4",
+            &[(1, 500), (GEAR_PARK, 53)],
+            frm(&[(0, 471, 2.7), (3, 82, 0.3)]),
+            Some(2.7),
+        );
+        let cands = summon_check_candidates(&[clip_a, clip_b]);
+        assert_eq!(cands.candidate_drives, 0, "already-flagged drive is done");
+        assert!(cands.files.is_empty(), "current evidence never re-reads");
+
+        // A pedal-disqualified envelope drive with current evidence:
+        // still a candidate drive (shape matches), zero re-reads.
+        let clip_c = summon_summary_runs(
+            "2026-07-16/2026-07-16_09-00-00-front.mp4",
+            &[(1, 1800)],
+            frm(&[(8, 900, 2.0), (0, 900, 2.0)]),
+            Some(2.0),
+        );
+        let cands = summon_check_candidates(&[clip_c]);
+        assert_eq!(cands.candidate_drives, 1);
+        assert!(cands.files.is_empty());
+    }
+
+    #[test]
+    fn summon_check_selects_slow_edges_and_boundary_clips_of_fast_drive() {
+        // 4-clip drive, slow-fast-fast-slow, all rows evidence-less.
+        // Head scan takes the slow head + one boundary clip; tail scan
+        // takes the slow tail + one boundary clip → all four here.
+        let mk = |file: &str, abs_max: f64| {
+            let mut c = summon_summary(file, &[(1, 1800)], &[], Some(abs_max));
+            c.aggregates.max_speed_mps = abs_max;
+            c
+        };
+        let clips = [
+            mk("2026-07-16/2026-07-16_09-00-00-front.mp4", 2.0),
+            mk("2026-07-16/2026-07-16_09-01-00-front.mp4", 20.0),
+            mk("2026-07-16/2026-07-16_09-02-00-front.mp4", 20.0),
+            mk("2026-07-16/2026-07-16_09-03-00-front.mp4", 2.0),
+        ];
+        let cands = summon_check_candidates(&clips);
+        assert_eq!(cands.candidate_drives, 1);
+        assert_eq!(
+            cands.files,
+            vec![
+                "2026-07-16/2026-07-16_09-00-00-front.mp4".to_string(),
+                "2026-07-16/2026-07-16_09-01-00-front.mp4".to_string(),
+                "2026-07-16/2026-07-16_09-03-00-front.mp4".to_string(),
+                "2026-07-16/2026-07-16_09-02-00-front.mp4".to_string(),
+            ]
+        );
+
+        // All-fast drive: no slow edge → no boundary read, no candidate.
+        let fast = [
+            mk("2026-07-17/2026-07-17_09-00-00-front.mp4", 20.0),
+            mk("2026-07-17/2026-07-17_09-01-00-front.mp4", 20.0),
+        ];
+        let cands = summon_check_candidates(&fast);
+        assert_eq!(cands.candidate_drives, 0);
+        assert!(cands.files.is_empty());
+    }
+
+    #[test]
+    fn summon_check_pre_v16_rows_fall_back_to_locked_max_speed() {
+        // Pre-v16 row: no sei_speed_abs_max. Slow needs speed samples
+        // plus a locked max under the cap; a sample-less row can't be
+        // verified slow (matches the JS empty-speeds bail).
+        let mk = |file: &str, max_mps: f64, samples: i64| {
+            let mut c = summon_summary(file, &[(1, 1800)], &[], None);
+            c.aggregates.max_speed_mps = max_mps;
+            c.aggregates.speed_sample_count = samples;
+            c
+        };
+        // Slow verified head on a fast drive → head + boundary selected.
+        let clips = [
+            mk("2026-07-18/2026-07-18_09-00-00-front.mp4", 2.0, 100),
+            mk("2026-07-18/2026-07-18_09-01-00-front.mp4", 20.0, 100),
+            mk("2026-07-18/2026-07-18_09-02-00-front.mp4", 20.0, 100),
+        ];
+        let cands = summon_check_candidates(&clips);
+        assert_eq!(cands.candidate_drives, 1);
+        assert_eq!(
+            cands.files,
+            vec![
+                "2026-07-18/2026-07-18_09-00-00-front.mp4".to_string(),
+                "2026-07-18/2026-07-18_09-01-00-front.mp4".to_string(),
+            ]
+        );
+
+        // Same head with zero speed samples → unverifiable, no scan.
+        let clips = [
+            mk("2026-07-19/2026-07-19_09-00-00-front.mp4", 0.0, 0),
+            mk("2026-07-19/2026-07-19_09-01-00-front.mp4", 20.0, 100),
+            mk("2026-07-19/2026-07-19_09-02-00-front.mp4", 20.0, 100),
+        ];
+        let cands = summon_check_candidates(&clips);
+        assert_eq!(cands.candidate_drives, 0);
+        assert!(cands.files.is_empty());
+    }
+
+    #[test]
+    fn summon_check_skips_imported_drives_and_bridge_files() {
+        let mut imported = summon_summary(
+            "2026-07-20/2026-07-20_09-00-00-front.mp4",
+            &[(1, 1800)],
+            &[],
+            Some(2.0),
+        );
+        imported.source = Some("tessie".to_string());
+        let cands = summon_check_candidates(&[imported]);
+        assert_eq!(cands.candidate_drives, 0, "imported drives can't gain SEI evidence");
+        assert!(cands.files.is_empty());
+
+        // Synthetic gap-fill bridge rows have no MP4 on disk — an
+        // envelope drive containing one selects only the real clip.
+        let real = summon_summary(
+            "2026-07-21/2026-07-21_09-00-00-front.mp4",
+            &[(1, 1800)],
+            &[],
+            Some(2.0),
+        );
+        let bridge = summon_summary(
+            "2026-07-21/2026-07-21_09-01-00-front-bridge.mp4",
+            &[(1, 1800)],
+            &[],
+            Some(2.0),
+        );
+        let cands = summon_check_candidates(&[real, bridge]);
+        assert_eq!(cands.candidate_drives, 1);
+        assert_eq!(
+            cands.files,
+            vec!["2026-07-21/2026-07-21_09-00-00-front.mp4".to_string()]
+        );
     }
 }

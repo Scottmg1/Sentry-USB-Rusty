@@ -4,6 +4,7 @@ import {
   Download,
   Loader2,
   Play,
+  Radio,
   RefreshCw,
   Trash2,
   Upload,
@@ -13,6 +14,7 @@ import {
   deleteAllDrives,
   triggerProcessNew,
   triggerReprocessAll,
+  triggerSummonCheck,
   uploadDriveData,
 } from "@/api/drives"
 
@@ -40,12 +42,13 @@ export function DrivesActionsBar({ onChanged }: DrivesActionsBarProps) {
     return () => document.removeEventListener("mousedown", onDoc)
   }, [processMenuOpen])
 
-  const runProcess = async (mode: "new" | "all") => {
+  const runProcess = async (mode: "new" | "all" | "summon") => {
     setProcessMenuOpen(false)
     setProcessing(true)
     setError(null)
     try {
       if (mode === "new") await triggerProcessNew()
+      else if (mode === "summon") await triggerSummonCheck()
       else await triggerReprocessAll()
       // Backend runs the job async; surface a soft hint, then refresh
       // the list so newly extracted drives appear when the user comes back.
@@ -116,6 +119,12 @@ export function DrivesActionsBar({ onChanged }: DrivesActionsBarProps) {
                 title="Reprocess all drives"
                 hint="Re-extract every existing clip on disk"
                 onClick={() => runProcess("all")}
+              />
+              <MenuItem
+                icon={<Radio className="h-3.5 w-3.5 text-violet-400" />}
+                title="Scan for Summon drives"
+                hint="Re-read slow clips for summon evidence"
+                onClick={() => runProcess("summon")}
               />
             </div>
           )}
