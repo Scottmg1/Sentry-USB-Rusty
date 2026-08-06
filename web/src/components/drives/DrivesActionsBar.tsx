@@ -10,6 +10,8 @@ import {
   Upload,
 } from "lucide-react"
 import { cn } from "@/lib/utils"
+import { api } from "@/lib/api"
+import { wsClient } from "@/lib/ws"
 import {
   deleteAllDrives,
   triggerProcessNew,
@@ -25,6 +27,7 @@ interface DrivesActionsBarProps {
 export function DrivesActionsBar({ onChanged }: DrivesActionsBarProps) {
   const [processMenuOpen, setProcessMenuOpen] = useState(false)
   const [processing, setProcessing] = useState(false)
+  const [backendProcessing, setBackendProcessing] = useState(false)
   const [importing, setImporting] = useState(false)
   const [deleting, setDeleting] = useState(false)
   const [confirmingDelete, setConfirmingDelete] = useState(false)
@@ -32,6 +35,58 @@ export function DrivesActionsBar({ onChanged }: DrivesActionsBarProps) {
 
   const menuRef = useRef<HTMLDivElement>(null)
   const fileInputRef = useRef<HTMLInputElement>(null)
+
+  // Ref-stable onChanged so the status effect never re-subscribes when
+  // the parent passes an inline callback.
+  const onChangedRef = useRef(onChanged)
+  useEffect(() => {
+    onChangedRef.current = onChanged
+  })
+
+  // Backend processing state for the pill: the local `processing` flag
+  // only covers the trigger POST round-trip, but the job itself runs
+  // async on the Pi (and can be started elsewhere — post-archive,
+  // Dashboard). Initial fetch + drive_process/summon_check WS events,
+  // with a visibility-aware poll as the WS-drop fallback (Dashboard
+  // idiom). Completion also refreshes the list, so newly extracted or
+  // newly flagged drives appear without a manual reload.
+  useEffect(() => {
+    let mounted = true
+    const check = () =>
+      api
+        .getDriveStatus()
+        .then((s) => {
+          if (mounted) setBackendProcessing(s.running)
+        })
+        .catch(() => {})
+    check()
+    const unsubProcess = wsClient.subscribe("drive_process", (data) => {
+      if (!mounted) return
+      const msg = data as { status: string }
+      if (msg.status === "started" || msg.status === "progress") {
+        setBackendProcessing(true)
+      } else if (msg.status === "complete" || msg.status === "error") {
+        setBackendProcessing(false)
+        onChangedRef.current()
+      }
+    })
+    const unsubSummon = wsClient.subscribe("summon_check", (data) => {
+      if (!mounted) return
+      if ((data as { status: string }).status === "complete") {
+        setBackendProcessing(false)
+        onChangedRef.current()
+      }
+    })
+    const interval = setInterval(() => {
+      if (!document.hidden) check()
+    }, 5000)
+    return () => {
+      mounted = false
+      clearInterval(interval)
+      unsubProcess()
+      unsubSummon()
+    }
+  }, [])
 
   useEffect(() => {
     if (!processMenuOpen) return
@@ -50,8 +105,11 @@ export function DrivesActionsBar({ onChanged }: DrivesActionsBarProps) {
       if (mode === "new") await triggerProcessNew()
       else if (mode === "summon") await triggerSummonCheck()
       else await triggerReprocessAll()
-      // Backend runs the job async; surface a soft hint, then refresh
-      // the list so newly extracted drives appear when the user comes back.
+      // Backend accepted and runs the job async — flip the pill to
+      // "Processing" right away instead of waiting a poll interval.
+      setBackendProcessing(true)
+      // Refresh the list so newly extracted drives appear when the
+      // user comes back.
       window.setTimeout(onChanged, 2000)
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e))
@@ -94,19 +152,21 @@ export function DrivesActionsBar({ onChanged }: DrivesActionsBarProps) {
         <div ref={menuRef} className="relative">
           <button
             type="button"
-            disabled={processing}
+            disabled={processing || backendProcessing}
             onClick={() => setProcessMenuOpen((o) => !o)}
             className="inline-flex items-center gap-1.5 rounded-lg border border-white/10 bg-white/[0.03] px-3 py-1.5 text-xs font-medium text-slate-200 transition-colors hover:bg-white/[0.06] disabled:opacity-50"
           >
-            {processing ? (
+            {processing || backendProcessing ? (
               <Loader2 className="h-3.5 w-3.5 animate-spin" />
             ) : (
               <RefreshCw className="h-3.5 w-3.5" />
             )}
-            Process
-            <ChevronDown className="h-3 w-3" />
+            {processing || backendProcessing ? "Processing" : "Process"}
+            {!(processing || backendProcessing) && (
+              <ChevronDown className="h-3 w-3" />
+            )}
           </button>
-          {processMenuOpen && !processing && (
+          {processMenuOpen && !(processing || backendProcessing) && (
             <div className="absolute right-0 z-50 mt-1 w-60 rounded-lg border border-white/10 bg-slate-950/95 py-1 shadow-2xl backdrop-blur">
               <MenuItem
                 icon={<Play className="h-3.5 w-3.5 text-emerald-400" />}
