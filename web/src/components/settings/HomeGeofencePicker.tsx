@@ -95,7 +95,7 @@ export function HomeGeofencePicker({
     const lon = parts.length === 2 ? Number(parts[1].trim()) : NaN
     if (!Number.isFinite(lat) || !Number.isFinite(lon) || Math.abs(lat) > 90) {
       setCoordError(
-        'Couldn\'t parse that — enter as "latitude, longitude" (e.g. 30.2248202, -97.6221229).',
+        'Couldn\'t parse that — enter as "latitude, longitude" (e.g. 30.22214, -97.61833).',
       )
       return
     }
@@ -167,7 +167,7 @@ export function HomeGeofencePicker({
           onKeyDown={(e) => {
             if (e.key === "Enter") (e.target as HTMLInputElement).blur()
           }}
-          placeholder="30.2248202, -97.6221229"
+          placeholder="30.22214, -97.61833"
           className="w-full rounded-lg border border-white/10 bg-white/5 px-3 py-2 text-sm text-slate-100 outline-none transition placeholder:text-slate-600 focus:border-blue-500/50 focus:ring-1 focus:ring-blue-500/25"
         />
         <p className="mt-1 text-xs text-slate-600">
