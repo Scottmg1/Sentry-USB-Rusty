@@ -251,7 +251,18 @@ fn single_drive_blocking(
     match store.with_routes_by_files(&file_refs, |routes| {
         (
             routes.len(),
-            grouper::build_single_drive_from_clips(routes, idx as i32, &tags),
+            // target_start scopes the full-BLOB rebuild to the requested
+            // drive's park-split segment — the fetched parents are whole
+            // clips, and a drive sharing a clip with its neighbor (the
+            // fused-summon shape) must not draw the neighbor's points on
+            // the detail map. The mini-map path (route_overviews) already
+            // splits; the two must agree.
+            grouper::build_single_drive_from_clips(
+                routes,
+                idx as i32,
+                &tags,
+                summary.as_ref().map(|s| s.start_time.as_str()),
+            ),
         )
     }) {
         Ok((_, Some(mut drive))) => {
