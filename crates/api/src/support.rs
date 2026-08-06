@@ -23,7 +23,7 @@ use crate::router::AppState;
 
 const SUPPORT_API: &str = "https://api.sentry-six.com";
 const AI_PRODUCT_ID: &str = "sentry-usb-rusty";
-const AI_DISCLOSURE_VERSION: &str = "rusty-ai-support-2026-08-05";
+const AI_DISCLOSURE_VERSION: &str = "rusty-ai-support-2026-08-06";
 const AI_FILE_CONSENT_VERSION: &str = "diagnostic-upload-v1";
 const AI_MAX_MESSAGE_CHARS: usize = 5_000;
 const AI_MAX_RESPONSE_BYTES: usize = 1024 * 1024;
@@ -784,7 +784,7 @@ mod tests {
             "message":"help",
             "clientMessageId":"client-018f42a0-7f52-7b3c-9a11-0123456789ab",
             "disclosureAccepted":true,
-            "disclosureVersion":"rusty-ai-support-2026-08-05",
+            "disclosureVersion":"rusty-ai-support-2026-08-06",
             "productId":"dash-usb",
             "product_id":"sentry-usb",
             "productSlug":"other-product"
@@ -805,7 +805,7 @@ mod tests {
             "message":"help",
             "clientMessageId":"client-018f42a0-7f52-7b3c-9a11-0123456789ab",
             "disclosureAccepted":true,
-            "disclosureVersion":"rusty-ai-support-2026-08-05",
+            "disclosureVersion":"rusty-ai-support-2026-08-06",
             "clientVersion":"v999.0.0"
         }"#;
         assert!(normalize_ai_json(raw, AiJsonKind::CreateConversation).is_err());

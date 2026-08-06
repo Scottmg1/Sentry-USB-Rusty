@@ -15,6 +15,7 @@ import {
   X,
 } from "lucide-react"
 import { cn, errorMessage } from "@/lib/utils"
+import { AssistantMarkdown } from "./assistantMarkdown"
 import {
   isSupportConversationGone,
   supportConversationResetReason,
@@ -823,7 +824,9 @@ function MessageBubble({
             ? "rounded-br-md bg-blue-500/20 text-slate-100 ring-1 ring-blue-400/10"
             : "rounded-bl-md border border-white/[0.07] bg-white/[0.04] text-slate-300",
         )}>
-          <p className="whitespace-pre-wrap break-words text-sm leading-relaxed">{message.content}</p>
+          {isUser
+            ? <p className="whitespace-pre-wrap break-words text-sm leading-relaxed">{message.content}</p>
+            : <AssistantMarkdown content={message.content} />}
           <p className={cn("mt-1 text-[10px]", isUser ? "text-blue-200/50" : "text-slate-600")}>{displayTime(message.createdAt)}</p>
         </div>
 
@@ -901,7 +904,7 @@ function FileConsentCard({
       </dl>
       <div className="px-3 py-2.5">
         <p className="mb-2 text-[10px] leading-relaxed text-slate-500">
-        Includes date, hostname, uptime, software/OS/board and service details, storage, USB-gadget and network status, temperatures, and recent logs including archiveloop. Logs can incidentally contain local IPs, device or vehicle identifiers, error payloads, or location-related details. Do not upload secrets or data you are not authorized to share. Nothing is collected or uploaded until you approve.
+        Includes date, hostname, uptime, software/OS/board and service details, storage, USB-gadget and network status, temperatures, Bluetooth adapter and BLE telemetry state, and recent logs including archiveloop, the drive-import history and the Sentry USB service journal. Logs can incidentally contain local IPs, device or vehicle identifiers, error payloads, or location-related details. Do not upload secrets or data you are not authorized to share. Nothing is collected or uploaded until you approve.
         </p>
         {policyIssue && state.phase === "idle" && (
           <p className="mb-2 flex items-start gap-1.5 text-[10px] text-rose-300"><AlertCircle className="mt-0.5 h-3 w-3 shrink-0" />{policyIssue}</p>

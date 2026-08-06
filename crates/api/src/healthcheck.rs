@@ -579,8 +579,23 @@ const DIAGNOSTICS_SCRIPT: &str = r#"{
   echo ""
 
   echo "====== archiveloop ======"
-  # Keep this bounded, but include enough context to diagnose an archive cycle.
-  tail -200 /mutable/archiveloop.log 2>/dev/null || echo "no archiveloop log"
+  # Bounded, but wide enough to show a failure repeating across several
+  # archive cycles rather than a single truncated window.
+  tail -1000 /mutable/archiveloop.log 2>/dev/null || echo "no archiveloop log"
+  echo ""
+
+  echo "====== bluetooth / BLE telemetry ======"
+  # Same single-page BLE dump the Logs -> Bluetooth view shows: adapter in
+  # use, sampler service state, observed vehicle activity, sample ages,
+  # recent failures and journal lines. Without this a BLE question cannot be
+  # answered from this report at all.
+  curl -fsS --max-time 10 http://[::1]/api/logs/bluetooth 2>/dev/null \
+    || echo "could not reach /api/logs/bluetooth"
+  echo ""
+
+  echo "====== sentryusb service journal (last 300) ======"
+  journalctl -u sentryusb -n 300 --no-pager 2>/dev/null \
+    || echo "no sentryusb journal entries"
   echo ""
 
   echo "====== drive-import history (persisted, last 20) ======"
