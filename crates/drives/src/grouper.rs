@@ -476,11 +476,22 @@ pub fn summon_check_candidates(summaries: &[RouteSummary]) -> SummonCheckCandida
 }
 
 /// Build a full `Drive` (with all merged point data, gear/FSD arrays,
-/// and FSD events) from a slice of routes that are **already known to
-/// belong to a single drive**. Skips `group_clips` entirely so the
-/// caller can scope the expensive BLOB decode via the summary path
-/// without paying the cost to re-run the full grouper against the
-/// whole store.
+/// and FSD events) from a slice of routes whose parent clips are
+/// **already known to belong to a single drive**. Skips the gap-split
+/// half of `group_clips` so the caller can scope the expensive BLOB
+/// decode via the summary path without re-running the full grouper
+/// against the whole store.
+///
+/// The fetched parents are WHOLE clips, but a drive that shares a clip
+/// with its neighbor (park-split mid-clip — every fused-summon shape)
+/// must not drag the neighbor's points onto the detail map. The same
+/// gear-state park splitter `group_clips` uses runs here, and
+/// `target_start` — the summary drive's canonical `%Y-%m-%dT%H:%M:%S`
+/// start time — picks the matching sub-drive. The two sides compute
+/// segment starts differently (gear-frame offsets vs point-fraction
+/// offsets), so the match is nearest-start rather than exact; adjacent
+/// sub-drives are separated by a ≥2 s park, typically far more.
+/// Without a target the first sub-drive wins.
 ///
 /// `idx` is the drive's numeric index in the summary-path global list
 /// — stamped onto `Drive.id` so the frontend's subsequent per-drive
@@ -489,6 +500,7 @@ pub fn build_single_drive_from_clips(
     routes: &[Route],
     idx: i32,
     tags: &HashMap<String, Vec<String>>,
+    target_start: Option<&str>,
 ) -> Option<Drive> {
     if routes.is_empty() {
         return None;
@@ -513,7 +525,27 @@ pub fn build_single_drive_from_clips(
         return None;
     }
     timed.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
-    Some(build_drive_stats(&timed, idx, tags))
+
+    let mut sub_drives = split_by_gear_state(timed);
+    if sub_drives.is_empty() {
+        return None;
+    }
+    let pick = if sub_drives.len() == 1 {
+        0
+    } else if let Some(t) = target_start
+        .and_then(|s| NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S").ok())
+    {
+        sub_drives
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, g)| (g[0].timestamp - t).num_seconds().abs())
+            .map(|(i, _)| i)
+            .unwrap_or(0)
+    } else {
+        0
+    };
+    let clips = sub_drives.swap_remove(pick);
+    Some(build_drive_stats(&clips, idx, tags))
 }
 
 // ---------------------------------------------------------------------------
@@ -3430,7 +3462,8 @@ mod tests {
             vec![[37.02, -122.0]],
         );
         let drive =
-            build_single_drive_from_clips(&[native, gapfill], 0, &HashMap::new()).expect("drive");
+            build_single_drive_from_clips(&[native, gapfill], 0, &HashMap::new(), None)
+                .expect("drive");
         assert_eq!(drive.clip_count, 2);
         let max_t = drive.points.iter().map(|p| p[2]).fold(0.0_f64, f64::max);
         // Clip time (12:02) => ~120 000 ms. Event-folder time (12:40) =>
@@ -3439,6 +3472,55 @@ mod tests {
             max_t < 300_000.0,
             "gap-fill clip placed at {max_t} ms — expected ~120 000 (clip time), not the event-folder time",
         );
+    }
+
+    #[test]
+    fn test_single_drive_park_split_scopes_points_to_target_segment() {
+        // A summon and the following drive sharing ONE clip, separated by
+        // a 10 s mid-clip Park (the fused-summon shape). The detail
+        // rebuild receives the whole parent clip; without the park split
+        // + target pick it merged BOTH segments' points, so the detail
+        // map drew the neighbor's route while the mini-map path
+        // (route_overviews, which splits) drew only the drive's own —
+        // the mismatch this test locks out.
+        let mut shared = test_route(
+            "RecentClips/2026-07-27/2026-07-27_20-04-00-front.mp4",
+            (0..18).map(|i| [37.0 + i as f64 * 1e-4, -122.0]).collect(),
+        );
+        shared.raw_frame_count = 1800;
+        shared.gear_runs = vec![
+            GearRun { gear: 1, frames: 600 },          // summon crawl
+            GearRun { gear: GEAR_PARK, frames: 300 },  // 10 s park
+            GearRun { gear: 1, frames: 900 },          // human drives off
+        ];
+        let tags = HashMap::new();
+
+        // Summary start of the summon = clip start (offset 0).
+        let summon = build_single_drive_from_clips(
+            &[shared.clone()],
+            0,
+            &tags,
+            Some("2026-07-27T20:04:00"),
+        )
+        .expect("summon segment");
+        assert_eq!(summon.point_count, 6, "first segment's points only");
+
+        // Summary start of the following drive ≈ clip start + 30 s
+        // (frame 900 of 1800). Nearest-start matching absorbs the
+        // gear-frame vs point-fraction offset difference.
+        let human = build_single_drive_from_clips(
+            &[shared.clone()],
+            1,
+            &tags,
+            Some("2026-07-27T20:04:33"),
+        )
+        .expect("human segment");
+        assert_eq!(human.point_count, 9, "second segment's points only");
+
+        // No target: first sub-drive wins.
+        let default_pick =
+            build_single_drive_from_clips(&[shared], 0, &tags, None).expect("drive");
+        assert_eq!(default_pick.point_count, 6);
     }
 
     #[test]

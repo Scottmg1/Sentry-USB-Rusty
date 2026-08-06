@@ -8,6 +8,7 @@ import {
   Gauge,
   Loader2,
   MapPin,
+  Radio,
   Sparkles,
   Thermometer,
   Wind,
@@ -204,7 +205,7 @@ function DriveDetailContent({ drive, onSaveTags }: DriveDetailContentProps) {
     <>
       <div className="flex items-start justify-between gap-3">
         <h1 className="text-2xl font-semibold text-slate-100 sm:text-3xl">
-          Drive to {title}
+          {drive.summon ? "Summon to" : "Drive to"} {title}
         </h1>
         {showTessieBadge && (
           <span className="mt-1 inline-flex shrink-0 items-center rounded-full bg-violet-500/15 px-2 py-0.5 text-xs font-medium text-violet-200 ring-1 ring-inset ring-violet-400/30">
@@ -283,14 +284,27 @@ function DriveDetailContent({ drive, onSaveTags }: DriveDetailContentProps) {
           icon={<Gauge className="h-4 w-4" />}
           size="headline"
         />
-        <StatTile
-          label="Self-driving"
-          value={`${formatPercent(drive.fsdPercent)}%`}
-          icon={<Sparkles className="h-4 w-4" />}
-          star={fsdFull}
-          info="Percentage of the drive's distance with FSD engaged."
-          size="headline"
-        />
+        {drive.summon ? (
+          // Summon drives run driverless with autopilot_state unset, so
+          // "0% self-driving" would be misleading — mirror the list
+          // row's Summon pill instead.
+          <StatTile
+            label="Self-driving"
+            value="Summon"
+            icon={<Radio className="h-4 w-4" />}
+            info="The car drove itself via Summon. FSD % doesn't apply — summon telemetry reports no autopilot state."
+            size="headline"
+          />
+        ) : (
+          <StatTile
+            label="Self-driving"
+            value={`${formatPercent(drive.fsdPercent)}%`}
+            icon={<Sparkles className="h-4 w-4" />}
+            star={fsdFull}
+            info="Percentage of the drive's distance with FSD engaged."
+            size="headline"
+          />
+        )}
         <StatTile
           label="Duration"
           value={formatDuration(drive.durationMs)}
