@@ -12,10 +12,10 @@ Click **Get Started**.
 
 Lists every outbound data flow Sentry USB will make and asks you to confirm an **Analytics opt-in** choice before the wizard moves on. Both buttons carry equal visual weight — pick whichever you actually want.
 
-- **Opted out (default)** — no device fingerprint ever leaves the Pi. Update checks still happen but carry no identifier.
+- **Opted out (default)** — no device fingerprint leaves the Pi. Update checks still happen without a device identifier; the connection's source IP is briefly used for rate limiting.
 - **Opted in** — a one-way salted hash of your board's serial number is attached to update-check telemetry, so we can count unique installs without double-counting reinstalls.
 
-Either choice takes effect immediately and persists if you back out of the wizard. You can change it any time at **Settings → Privacy**. Full per-flow disclosure is on the [Privacy](Privacy) page.
+Either choice takes effect immediately and persists if you back out of the wizard. You can change it any time at **Settings → System**. Full per-flow disclosure is on the [Privacy](Privacy) page.
 
 ## 3. Network
 

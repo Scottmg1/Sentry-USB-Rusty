@@ -189,12 +189,7 @@ export function SystemTab({ onOpenRawConfig, onOpenWizard, version, hostname }: 
   )
 }
 
-/**
- * Settings → System → Privacy. Lets users review the disclosure and flip
- * the analytics opt-in at any time. This is the Art. 21 right-to-object
- * mechanism required for legitimate-interest processing — automated means,
- * no email needed.
- */
+/** Settings → System privacy disclosure and analytics preference. */
 function PrivacyCards() {
   const [choice, setChoice] = useState<boolean | null>(null)
   const [saving, setSaving] = useState(false)
@@ -239,8 +234,11 @@ function PrivacyCards() {
         <p className="t-xs">
           When opted in, daily update checks include a one-way hashed device
           ID (derived from your board serial) so we can count unique installs
-          without double-counting reinstalls. When opted out, nothing
-          identifying is sent on update checks.
+          without double-counting reinstalls. When opted out, no
+          device-derived identifier is sent on future update checks; normal
+          connection metadata such as the source IP is briefly used for rate
+          limiting. Opting out does not automatically erase a row sent earlier;
+          email privacy@sentry-six.com to request its deletion.
         </p>
 
         <div className="mt-1 flex flex-col gap-2 sm:flex-row">
@@ -303,13 +301,18 @@ function PrivacyCards() {
           />
           <FlowRow
             when="Once per install"
-            what="Empty ping (no body, no identifier)"
-            note="Anonymous gross-install counter."
+            what="Empty ping with no payload or device identifier"
+            note="The source IP is briefly rate-limited; only a daily aggregate count is stored."
           />
           <FlowRow
             when="Sentry Cloud (if signed in)"
             what="Account credentials + synced files"
             note="Stop using Cloud to stop this."
+          />
+          <FlowRow
+            when="AI Support & Help (when used)"
+            what="Messages, product/software version, the Pi connection's public IP for abuse prevention + diagnostics you explicitly approve"
+            note="Ollama Cloud processes messages. Redacted chats stay on Sentry Six servers up to 90 days after the last activity and may be reviewed; approved diagnostics stay 7 days."
           />
           <FlowRow
             when="Wraps / lock chime submissions"

@@ -343,7 +343,7 @@ jobs:
 
   release:
     name: Create Release
-    needs: [build, test]
+    needs: [build, test, lint-web]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-22.04
     permissions:
@@ -365,3 +365,6 @@ jobs:
         with:
           files: release/*
           generate_release_notes: true
+          # Hyphenated tags are pre-releases by convention. The repository owner
+          # can also nominate one exact stable-looking tag as a pre-release.
+          prerelease: ${{ contains(github.ref_name, '-') || vars.SENTRYUSB_PRERELEASE_TAG == github.ref_name }}
