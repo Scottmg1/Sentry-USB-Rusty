@@ -72,9 +72,16 @@ export function HomeGeofencePicker({
   // + commit-on-blur/Enter pattern as the radius field above.
   const [coordText, setCoordText] = useState(() => formatCoords(values.homeLat, values.homeLon))
   const [coordError, setCoordError] = useState<string | null>(null)
-  useEffect(() => {
+  // Re-sync while rendering rather than from an effect: every map click and
+  // pin drag pushes new coords through onChange, and an effect would make
+  // each one cost a second render pass. This is React's documented "adjust
+  // state when a prop changes" shape, and it keeps the file clear of the
+  // repo's react-hooks/set-state-in-effect warning budget.
+  const [syncedFrom, setSyncedFrom] = useState({ lat: values.homeLat, lon: values.homeLon })
+  if (values.homeLat !== syncedFrom.lat || values.homeLon !== syncedFrom.lon) {
+    setSyncedFrom({ lat: values.homeLat, lon: values.homeLon })
     setCoordText(formatCoords(values.homeLat, values.homeLon))
-  }, [values.homeLat, values.homeLon])
+  }
 
   function commitCoords() {
     const trimmed = coordText.trim()
