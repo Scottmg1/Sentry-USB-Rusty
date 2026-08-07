@@ -32,6 +32,129 @@ const SAVE_EVERY: usize = 50;
 /// of unreadable files).
 const MAX_ERROR_MESSAGES: usize = 200;
 
+/// Sets the store's bulk-ingest flag for a scope; clears it on drop.
+struct BulkIngestGuard(Arc<DriveStore>);
+
+impl BulkIngestGuard {
+    fn new(store: Arc<DriveStore>) -> Self {
+        store.set_bulk_ingest(true);
+        BulkIngestGuard(store)
+    }
+}
+
+impl Drop for BulkIngestGuard {
+    fn drop(&mut self) {
+        self.0.set_bulk_ingest(false);
+    }
+}
+
+/// Per-clip result from the blocking-pool worker; folded back into the
+/// async loop's totals.
+struct ClipOutcome {
+    route_added: bool,
+    had_gps: bool,
+    parked_skipped: bool,
+    /// Error message without the file prefix (the loop adds it).
+    error: Option<String>,
+}
+
+impl ClipOutcome {
+    fn err(msg: String) -> Self {
+        ClipOutcome {
+            route_added: false,
+            had_gps: false,
+            parked_skipped: false,
+            error: Some(msg),
+        }
+    }
+}
+
+/// Sync body of one clip — GPS extraction plus the add_route /
+/// mark_processed write transaction. Runs on the blocking pool.
+fn process_one_clip(store: &DriveStore, file: &str, full_path: &str) -> ClipOutcome {
+    let mut out = ClipOutcome {
+        route_added: false,
+        had_gps: false,
+        parked_skipped: false,
+        error: None,
+    };
+    // `add_route` accepts `date_dir: &str` — no need to materialize
+    // an owned String just to take a slice of it.
+    let date: &str = file.split('/').next().unwrap_or("");
+    match extract::extract_gps_from_file(full_path) {
+        // Driving gate for gap-fill event clips: the
+        // pre-extraction scan is timestamp-only, so a parked
+        // car's sentry clips chained after a drive reach here
+        // too. A route row under SavedClips/SentryClips would
+        // put the clip in the drive list and its telemetry in
+        // the drive map — exactly the parked bloat 60c5602
+        // removed — so a no-driving event clip is never stored,
+        // only marked processed. (Playback continuity is
+        // separate: update_gapfill_manifest's ungated interior
+        // scan still restores parked minutes that sit strictly
+        // inside a RecentClips hole.)
+        Ok(gps)
+            if crate::grouper::is_event_folder_path(file)
+                && !crate::grouper::telemetry_has_driving(
+                    &gps.gear_runs,
+                    &gps.gear_states,
+                    &gps.speeds,
+                    gps.raw_park_count,
+                    gps.raw_frame_count,
+                ) =>
+        {
+            out.parked_skipped = true;
+            if let Err(me) = store.mark_processed(file) {
+                warn!("failed to mark {} processed: {}", file, me);
+            }
+        }
+        Ok(gps) => {
+            if !gps.points.is_empty() {
+                out.had_gps = true;
+            }
+            // add_route both marks the file processed AND writes
+            // the route row (with v2 aggregate columns). Single
+            // transaction per clip — durable on return.
+            match store.add_route(
+                file,
+                date,
+                &gps.points,
+                &gps.gear_states,
+                &gps.autopilot_states,
+                &gps.speeds,
+                &gps.accel_positions,
+                gps.raw_park_count,
+                gps.raw_frame_count,
+                &gps.gear_runs,
+                &gps.flag_runs,
+            ) {
+                Ok(()) => out.route_added = true,
+                Err(e) => {
+                    warn!("failed to save route for {}: {}", file, e);
+                    out.error = Some(format!("save failed — {}", e));
+                    // Still mark processed so we don't retry forever.
+                    let _ = store.mark_processed(file);
+                }
+            }
+        }
+        Err(e) => {
+            warn!("failed to extract GPS from {}: {}", file, e);
+            out.error = Some(format!("extract failed — {}", e));
+            // Mark processed anyway — clip has no extractable GPS,
+            // retrying won't change that. Tolerate a mark failure
+            // like the save-error path above does: propagating it
+            // aborted the whole run AND left status.running stuck
+            // true (the early return skipped the reset below), so
+            // the UI showed "processing" forever. The unmarked file
+            // is simply retried next cycle.
+            if let Err(me) = store.mark_processed(file) {
+                warn!("failed to mark {} processed: {}", file, me);
+            }
+        }
+    }
+    out
+}
+
 /// Orchestrates GPS extraction from TeslaCam clip files.
 pub struct Processor {
     store: Arc<DriveStore>,
@@ -274,6 +397,12 @@ impl Processor {
     }
 
     async fn do_process(&self, _reprocess: bool) -> Result<()> {
+        // Bulk-ingest mode for the whole pass: lets the drive-cache
+        // getters serve a briefly-stale copy instead of re-running the
+        // grouper on every poll while add_route re-dirties per clip.
+        // RAII so every exit path (including `?`) clears it.
+        let _bulk = BulkIngestGuard::new(self.store.clone());
+
         // Scan for -front.mp4 files
         let clip_dir = std::path::Path::new(&self.clip_dir);
         if !clip_dir.exists() {
@@ -377,87 +506,35 @@ impl Processor {
             full_path.push('/');
             full_path.push_str(file);
 
-            // `add_route` accepts `date_dir: &str` — no need to materialize
-            // an owned String just to take a slice of it.
-            let date: &str = file.split('/').next().unwrap_or("");
-            match extract::extract_gps_from_file(&full_path) {
-                // Driving gate for gap-fill event clips: the
-                // pre-extraction scan is timestamp-only, so a parked
-                // car's sentry clips chained after a drive reach here
-                // too. A route row under SavedClips/SentryClips would
-                // put the clip in the drive list and its telemetry in
-                // the drive map — exactly the parked bloat 60c5602
-                // removed — so a no-driving event clip is never stored,
-                // only marked processed. (Playback continuity is
-                // separate: update_gapfill_manifest's ungated interior
-                // scan still restores parked minutes that sit strictly
-                // inside a RecentClips hole.)
-                Ok(gps)
-                    if crate::grouper::is_event_folder_path(file)
-                        && !crate::grouper::telemetry_has_driving(
-                            &gps.gear_runs,
-                            &gps.gear_states,
-                            &gps.speeds,
-                            gps.raw_park_count,
-                            gps.raw_frame_count,
-                        ) =>
-                {
-                    gap_fill_parked_skipped += 1;
-                    if let Err(me) = self.store.mark_processed(file) {
-                        warn!("failed to mark {} processed: {}", file, me);
-                    }
-                }
-                Ok(gps) => {
-                    if !gps.points.is_empty() {
-                        files_with_gps += 1;
-                    }
-                    // add_route both marks the file processed AND writes
-                    // the route row (with v2 aggregate columns). Single
-                    // transaction per clip — durable on return.
-                    match self.store.add_route(
-                        file,
-                        date,
-                        &gps.points,
-                        &gps.gear_states,
-                        &gps.autopilot_states,
-                        &gps.speeds,
-                        &gps.accel_positions,
-                        gps.raw_park_count,
-                        gps.raw_frame_count,
-                        &gps.gear_runs,
-                        &gps.flag_runs,
-                    ) {
-                        Ok(()) => routes_found += 1,
-                        Err(e) => {
-                            warn!("failed to save route for {}: {}", file, e);
-                            error_count += 1;
-                            if errors.len() < MAX_ERROR_MESSAGES {
-                                errors.push(format!("{}: save failed — {}", file, e));
-                            }
-                            // Still mark processed so we don't retry forever.
-                            let _ = self.store.mark_processed(file);
-                        }
-                    }
-                }
-                Err(e) => {
-                    warn!("failed to extract GPS from {}: {}", file, e);
-                    error_count += 1;
-                    if errors.len() < MAX_ERROR_MESSAGES {
-                        errors.push(format!("{}: extract failed — {}", file, e));
-                    }
-                    // Mark processed anyway — clip has no extractable GPS,
-                    // retrying won't change that. Tolerate a mark failure
-                    // like the save-error path above does: propagating it
-                    // aborted the whole run AND left status.running stuck
-                    // true (the early return skipped the reset below), so
-                    // the UI showed "processing" forever. The unmarked file
-                    // is simply retried next cycle.
-                    if let Err(me) = self.store.mark_processed(file) {
-                        warn!("failed to mark {} processed: {}", file, me);
-                    }
+            // Extraction (CPU + disk) and the add_route write transaction
+            // are sync work; run each clip on the blocking pool so a long
+            // import never pins an async worker — a pinned worker starves
+            // every other handler and the WebSocket ping, which is what
+            // flapped the UI's "Reconnecting" banner during archive runs.
+            let store = self.store.clone();
+            let clip_file = file.clone();
+            let clip_path = full_path.clone();
+            let clip = tokio::task::spawn_blocking(move || {
+                process_one_clip(&store, &clip_file, &clip_path)
+            })
+            .await
+            .unwrap_or_else(|e| ClipOutcome::err(format!("clip task panicked — {}", e)));
+
+            if clip.route_added {
+                routes_found += 1;
+            }
+            if clip.had_gps {
+                files_with_gps += 1;
+            }
+            if clip.parked_skipped {
+                gap_fill_parked_skipped += 1;
+            }
+            if let Some(msg) = clip.error {
+                error_count += 1;
+                if errors.len() < MAX_ERROR_MESSAGES {
+                    errors.push(format!("{}: {}", file, msg));
                 }
             }
-
             // Broadcast progress every 10 files.
             if (i + 1) % 10 == 0 || i + 1 == total {
                 self.hub.broadcast("drive_process", &serde_json::json!({

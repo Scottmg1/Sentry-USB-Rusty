@@ -387,7 +387,7 @@ pub async fn list_charging(
     let store = state.drives.store.clone();
     let result =
         tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<ChargeSessionSummary>> {
-            let rows = store.with_locked_conn(|conn| load_charge_rows(conn, 0, None))?;
+            let rows = store.with_read_conn(|conn| load_charge_rows(conn, 0, None))?;
             let rates = RateConfig::load();
             let tag_map = store.get_all_charge_tags().unwrap_or_default();
             let cost_map = store.get_all_charge_costs().unwrap_or_default();
@@ -439,7 +439,7 @@ pub async fn single_charging(
             // split ends the session well before the bound in practice.
             let window_end = id + 7 * 24 * 60 * 60;
             let rows =
-                store.with_locked_conn(|conn| load_charge_rows(conn, id, Some(window_end)))?;
+                store.with_read_conn(|conn| load_charge_rows(conn, id, Some(window_end)))?;
 
             let session = match group_sessions(rows).into_iter().next() {
                 Some(s) => s,
@@ -562,7 +562,7 @@ pub async fn current_charging(
     let store = state.drives.store.clone();
     let cur = tokio::task::spawn_blocking(move || {
         use rusqlite::OptionalExtension;
-        let latest = store.with_locked_conn(|conn| {
+        let latest = store.with_read_conn(|conn| {
             conn.query_row(
                 "SELECT ts, battery_pct, charge_limit_soc, charger_power_kw, \
                         charge_rate_mph, charge_minutes_to_full, battery_range_mi, \
@@ -640,12 +640,16 @@ pub struct SetChargeTagsRequest {
 pub async fn list_charge_tags(
     State(state): State<AppState>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    match state.drives.store.get_all_charge_tag_names() {
-        Ok(tags) => (
+    let store = state.drives.store.clone();
+    match tokio::task::spawn_blocking(move || store.get_all_charge_tag_names()).await {
+        Ok(Ok(tags)) => (
             StatusCode::OK,
             Json(serde_json::to_value(tags).unwrap_or_default()),
         ),
-        Err(e) => crate::json_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+        Ok(Err(e)) => crate::json_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+        Err(e) => {
+            crate::json_error(StatusCode::INTERNAL_SERVER_ERROR, &format!("tags task: {}", e))
+        }
     }
 }
 
@@ -657,9 +661,13 @@ pub async fn set_charge_tags(
     Path(id): Path<i64>,
     Json(body): Json<SetChargeTagsRequest>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    match state.drives.store.set_charge_tags(id, &body.tags) {
-        Ok(()) => crate::json_ok(),
-        Err(e) => crate::json_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    let store = state.drives.store.clone();
+    match tokio::task::spawn_blocking(move || store.set_charge_tags(id, &body.tags)).await {
+        Ok(Ok(())) => crate::json_ok(),
+        Ok(Err(e)) => crate::json_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+        Err(e) => {
+            crate::json_error(StatusCode::INTERNAL_SERVER_ERROR, &format!("tags task: {}", e))
+        }
     }
 }
 
@@ -693,9 +701,13 @@ pub async fn set_charge_cost(
         // Explicit null → clear the override.
         None => None,
     };
-    match state.drives.store.set_charge_cost(id, cost) {
-        Ok(()) => crate::json_ok(),
-        Err(e) => crate::json_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    let store = state.drives.store.clone();
+    match tokio::task::spawn_blocking(move || store.set_charge_cost(id, cost)).await {
+        Ok(Ok(())) => crate::json_ok(),
+        Ok(Err(e)) => crate::json_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+        Err(e) => {
+            crate::json_error(StatusCode::INTERNAL_SERVER_ERROR, &format!("cost task: {}", e))
+        }
     }
 }
 

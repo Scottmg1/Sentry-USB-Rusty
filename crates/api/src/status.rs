@@ -213,6 +213,68 @@ struct PiStatus {
 pub async fn get_status(
     State(state): State<AppState>,
 ) -> (StatusCode, Json<serde_json::Value>) {
+    // The sysfs/procfs reads are cheap, but the snapshot directory scan
+    // and file metadata hit /backingfiles — seconds while an archive run
+    // saturates the disk. This is the endpoint the web UI's connection
+    // banner polls, so a pinned worker here reads as "Reconnecting".
+    // Blocking pool for the whole sync-FS half.
+    let mut s = match tokio::task::spawn_blocking(status_fs_snapshot).await {
+        Ok(s) => s,
+        Err(e) => {
+            return crate::json_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("status task: {}", e),
+            );
+        }
+    };
+
+    // Disk space — cached statvfs syscall. Replaces a per-call
+    // `stat --file-system` shell-out and serves the cached value for
+    // STORAGE_TTL between fresh reads.
+    let storage = cached_storage().await;
+    if storage.total_space > 0 {
+        s.total_space = storage.total_space.to_string();
+        s.free_space = storage.free_space.to_string();
+    }
+
+    // Network info — IPs, SSID, and ether_speed are cached at
+    // NETWORK_TTL (they change only on reconnect/cable swap).
+    //
+    // WiFi signal strength + dBm are read LIVE from /proc/net/wireless
+    // every poll so the bars and dBm value update in near-real-time as
+    // the user moves around — the cached version would lag by 10 s,
+    // which feels broken for a "signal strength" indicator.
+    //
+    // Throughput (rx_bps/tx_bps) is also live, derived from the
+    // net_sampler background loop.
+    let net = cached_network().await;
+    s.wifi_ssid = net.wifi_ssid;
+    s.wifi_freq = net.wifi_freq;
+    s.wifi_ip = net.wifi_ip;
+    s.ether_ip = net.ether_ip;
+    s.ether_speed = net.ether_speed;
+    if !net.wifi_dev.is_empty() {
+        if let Some((strength, dbm)) = read_wireless_quality(&net.wifi_dev) {
+            s.wifi_strength = strength;
+            s.wifi_signal_dbm = dbm;
+        }
+        let (rx, tx) = compute_throughput(&state.net_sampler, &net.wifi_dev);
+        s.wifi_rx_bps = rx;
+        s.wifi_tx_bps = tx;
+    }
+    if !net.eth_dev.is_empty() {
+        let (rx, tx) = compute_throughput(&state.net_sampler, &net.eth_dev);
+        s.ether_rx_bps = rx;
+        s.ether_tx_bps = tx;
+    }
+
+    (StatusCode::OK, Json(serde_json::to_value(s).unwrap_or_default()))
+}
+
+/// Sync half of `get_status`: the PiStatus skeleton plus every direct
+/// filesystem read (sysfs/procfs, gadget state, snapshot scan). Runs on
+/// the blocking pool.
+fn status_fs_snapshot() -> PiStatus {
     let mut s = PiStatus {
         cpu_temp: String::new(),
         num_snapshots: "0".into(),
@@ -288,47 +350,7 @@ pub async fn get_status(
         }
     }
 
-    // Disk space — cached statvfs syscall. Replaces a per-call
-    // `stat --file-system` shell-out and serves the cached value for
-    // STORAGE_TTL between fresh reads.
-    let storage = cached_storage().await;
-    if storage.total_space > 0 {
-        s.total_space = storage.total_space.to_string();
-        s.free_space = storage.free_space.to_string();
-    }
-
-    // Network info — IPs, SSID, and ether_speed are cached at
-    // NETWORK_TTL (they change only on reconnect/cable swap).
-    //
-    // WiFi signal strength + dBm are read LIVE from /proc/net/wireless
-    // every poll so the bars and dBm value update in near-real-time as
-    // the user moves around — the cached version would lag by 10 s,
-    // which feels broken for a "signal strength" indicator.
-    //
-    // Throughput (rx_bps/tx_bps) is also live, derived from the
-    // net_sampler background loop.
-    let net = cached_network().await;
-    s.wifi_ssid = net.wifi_ssid;
-    s.wifi_freq = net.wifi_freq;
-    s.wifi_ip = net.wifi_ip;
-    s.ether_ip = net.ether_ip;
-    s.ether_speed = net.ether_speed;
-    if !net.wifi_dev.is_empty() {
-        if let Some((strength, dbm)) = read_wireless_quality(&net.wifi_dev) {
-            s.wifi_strength = strength;
-            s.wifi_signal_dbm = dbm;
-        }
-        let (rx, tx) = compute_throughput(&state.net_sampler, &net.wifi_dev);
-        s.wifi_rx_bps = rx;
-        s.wifi_tx_bps = tx;
-    }
-    if !net.eth_dev.is_empty() {
-        let (rx, tx) = compute_throughput(&state.net_sampler, &net.eth_dev);
-        s.ether_rx_bps = rx;
-        s.ether_tx_bps = tx;
-    }
-
-    (StatusCode::OK, Json(serde_json::to_value(s).unwrap_or_default()))
+    s
 }
 
 /// Refresh-on-stale wrapper around the heavy WiFi + Ethernet shell-outs.

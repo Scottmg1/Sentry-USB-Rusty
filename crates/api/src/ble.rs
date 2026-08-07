@@ -523,7 +523,7 @@ pub async fn ble_connected(
 
     let store = s.drives.store.clone();
     let (sampler_ts, sample_count_10min) = tokio::task::spawn_blocking(move || {
-        store.with_locked_conn(|conn| {
+        store.with_read_conn(|conn| {
             let max_ts: Option<i64> = conn
                 .query_row(
                     "SELECT MAX(ts) FROM telemetry_samples",
@@ -637,7 +637,7 @@ pub async fn ble_latest_sample(
         .unwrap_or(0)
         - LATEST_SAMPLE_WINDOW_SECS;
     let result = tokio::task::spawn_blocking(move || {
-        store.with_locked_conn(|conn| {
+        store.with_read_conn(|conn| {
             // Pull two things:
             //   1. The "envelope" — `ts` + `source` of the most recent
             //      sample, used by the UI to render "polled Xs ago"

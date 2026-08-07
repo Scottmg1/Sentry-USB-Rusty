@@ -11,7 +11,7 @@ pub struct PendingRoute {
 }
 
 pub fn select_pending(store: &DriveStore, limit: i64) -> Result<Vec<PendingRoute>> {
-    let files: Vec<(String, Option<String>)> = store.with_locked_conn(|conn| -> Result<_> {
+    let files: Vec<(String, Option<String>)> = store.with_read_conn(|conn| -> Result<_> {
         // `start_ts` is always NULL (insert_or_update_route binds it NULL),
         // so it can't actually order anything — without a tiebreaker the
         // upload order is undefined. `file ASC` makes it deterministic, and
@@ -70,7 +70,7 @@ pub fn temp_samples_for_route(store: &DriveStore, file: &str) -> Vec<TempSample>
         return Vec::new();
     };
     store
-        .with_locked_conn(|conn| -> Result<Vec<TempSample>> {
+        .with_read_conn(|conn| -> Result<Vec<TempSample>> {
             let mut stmt = conn.prepare_cached(
                 "SELECT ts, interior_temp_c, exterior_temp_c FROM telemetry_samples \
                  WHERE ts BETWEEN ?1 AND ?2 \

@@ -641,6 +641,17 @@ pub async fn create_backup(
 /// Merges local and archive listings, deduping by date (archive wins over
 /// local when both exist).
 pub async fn list_backups(State(_s): State<AppState>) -> (StatusCode, Json<serde_json::Value>) {
+    // Directory scans over /backingfiles and the archive mount — slow
+    // while an archive run saturates the disk (observed 7+ s), so keep
+    // them off the async workers.
+    tokio::task::spawn_blocking(list_backups_blocking)
+        .await
+        .unwrap_or_else(|_| {
+            crate::json_error(StatusCode::INTERNAL_SERVER_ERROR, "backup listing task failed")
+        })
+}
+
+fn list_backups_blocking() -> (StatusCode, Json<serde_json::Value>) {
     let mut all: Vec<BackupEntry> = Vec::new();
     all.extend(list_backups_in_dir(LOCAL_BACKUP_DIR, "ssd"));
     if Path::new(ARCHIVE_BACKUP_DIR).exists() {

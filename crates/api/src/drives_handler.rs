@@ -354,9 +354,13 @@ pub struct AllRoutesQuery {
 pub async fn list_tags(
     State(state): State<AppState>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    match state.drives.store.get_all_tag_names() {
-        Ok(tags) => (StatusCode::OK, Json(serde_json::to_value(tags).unwrap_or_default())),
-        Err(e) => crate::json_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    let store = state.drives.store.clone();
+    match tokio::task::spawn_blocking(move || store.get_all_tag_names()).await {
+        Ok(Ok(tags)) => (StatusCode::OK, Json(serde_json::to_value(tags).unwrap_or_default())),
+        Ok(Err(e)) => crate::json_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+        Err(e) => {
+            crate::json_error(StatusCode::INTERNAL_SERVER_ERROR, &format!("tags task: {}", e))
+        }
     }
 }
 
@@ -918,7 +922,11 @@ pub async fn upload_data(
 pub async fn import_history(
     State(state): State<AppState>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    match state.drives.store.import_history() {
+    let store = state.drives.store.clone();
+    match tokio::task::spawn_blocking(move || store.import_history())
+        .await
+        .unwrap_or_else(|e| Err(anyhow::anyhow!("import-history task: {}", e)))
+    {
         Ok(history) => (
             StatusCode::OK,
             Json(serde_json::json!({ "history": history })),
@@ -1181,7 +1189,7 @@ pub async fn temperature_series(
                 _ => return Ok(Some(serde_json::json!({ "points": [] }))),
             };
 
-            let points = store.with_locked_conn(|conn| {
+            let points = store.with_read_conn(|conn| {
                 let mut stmt = conn.prepare(
                     "SELECT ts, interior_temp_c, exterior_temp_c \
                      FROM telemetry_samples \
@@ -1286,7 +1294,7 @@ pub async fn battery_series(
                 _ => return Ok(Some(serde_json::json!({ "points": [] }))),
             };
 
-            let points = store.with_locked_conn(|conn| {
+            let points = store.with_read_conn(|conn| {
                 let mut stmt = conn.prepare(
                     "SELECT ts, battery_pct \
                      FROM telemetry_samples \
@@ -1369,7 +1377,7 @@ pub async fn tire_history(
 
     let store = state.drives.store.clone();
     let result = tokio::task::spawn_blocking(move || {
-        store.with_locked_conn(|conn| {
+        store.with_read_conn(|conn| {
             let mut stmt = conn.prepare(
                 "SELECT ts, tire_fl_psi, tire_fr_psi, tire_rl_psi, tire_rr_psi \
                  FROM telemetry_samples \

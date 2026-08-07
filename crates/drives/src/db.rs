@@ -41,6 +41,10 @@ use crate::types::{FlagRun, GearRun, GpsPoint, Route, RouteAggregates, RouteSumm
 /// Default SQLite DB path on the Pi.
 pub const DEFAULT_DATA_PATH: &str = "/backingfiles/drive-data.db";
 
+/// While the drive caches are dirty, serve the last-built copy for this
+/// long instead of rebuilding per request (see `stale_cache_within_debounce`).
+const CACHE_REBUILD_DEBOUNCE_SECS: i64 = 15;
+
 /// JSON staging mirror — regenerated on demand by `ExportJSONForSync` so
 /// `post-archive-process.sh` can ship it to the archive server. Lives on
 /// `/backingfiles` (same partition as the DB) because the export can
@@ -178,6 +182,24 @@ pub fn cleanup_legacy_mutable_files() {
 pub struct DriveStore {
     path: String,
     conn: Mutex<Connection>,
+    /// Read-only connections for API SELECTs. WAL lets these run
+    /// concurrently with `conn`'s write transactions, so a processor
+    /// batch can no longer starve dashboard/charging reads for seconds.
+    /// Two handles so one long scan doesn't serialize every other read.
+    /// Empty for `:memory:` stores (a second handle would be a separate
+    /// empty DB) — `with_read_conn` falls back to the writer there.
+    read_conns: Vec<Mutex<Connection>>,
+    /// Round-robin pick among `read_conns`.
+    read_rr: AtomicU64,
+    /// Unix seconds of the last drive-cache rebuild. Debounces rebuild
+    /// thrash during archive ingest, where every `add_route` re-dirties
+    /// the cache and every stats poll would otherwise re-run the full
+    /// grouper.
+    last_cache_rebuild: AtomicI64,
+    /// True while the processor runs a bulk ingest pass. Gates the
+    /// rebuild debounce so interactive mutations (tag edit, delete,
+    /// upload) still rebuild immediately.
+    bulk_ingest: AtomicBool,
     /// Cached row counts so `/api/drives/status` doesn't hit SQLite for
     /// every poll.
     route_count: AtomicI64,
@@ -228,9 +250,21 @@ impl DriveStore {
         let conn = open_connection(&path)
             .with_context(|| format!("open: sql.Open {}", path))?;
 
+        // Opened AFTER the writer so the DB file (and WAL) exist. A
+        // failure here is fatal: silently falling back to the writer
+        // would reintroduce the read-starvation this pool removes.
+        let read_conns = vec![
+            Mutex::new(open_readonly_connection(&path)?),
+            Mutex::new(open_readonly_connection(&path)?),
+        ];
+
         let store = DriveStore {
             path,
             conn: Mutex::new(conn),
+            read_conns,
+            read_rr: AtomicU64::new(0),
+            last_cache_rebuild: AtomicI64::new(0),
+            bulk_ingest: AtomicBool::new(false),
             route_count: AtomicI64::new(0),
             processed_count: AtomicI64::new(0),
             drive_cache_dirty: AtomicBool::new(true),
@@ -253,6 +287,10 @@ impl DriveStore {
         let store = DriveStore {
             path: ":memory:".to_string(),
             conn: Mutex::new(conn),
+            read_conns: Vec::new(),
+            read_rr: AtomicU64::new(0),
+            last_cache_rebuild: AtomicI64::new(0),
+            bulk_ingest: AtomicBool::new(false),
             route_count: AtomicI64::new(0),
             processed_count: AtomicI64::new(0),
             drive_cache_dirty: AtomicBool::new(false),
@@ -284,6 +322,29 @@ impl DriveStore {
     pub fn with_locked_conn<R>(&self, f: impl FnOnce(&Connection) -> R) -> R {
         let guard = self.conn.lock().unwrap();
         f(&guard)
+    }
+
+    /// Run a SELECT-only closure on a read-only connection. Under WAL
+    /// these see the last committed state and never queue behind the
+    /// writer mutex — the processor can batch-ingest clips while API
+    /// reads keep answering. Round-robin over two handles so one slow
+    /// scan doesn't serialize every other read. `:memory:` stores (tests)
+    /// fall back to the writer connection.
+    pub fn with_read_conn<R>(&self, f: impl FnOnce(&Connection) -> R) -> R {
+        if self.read_conns.is_empty() {
+            return self.with_locked_conn(f);
+        }
+        let idx = self.read_rr.fetch_add(1, Ordering::Relaxed) as usize % self.read_conns.len();
+        let guard = self.read_conns[idx].lock().unwrap();
+        f(&guard)
+    }
+
+    /// Mark the start/end of a processor bulk-ingest pass. While set,
+    /// the drive-cache getters may serve a copy up to
+    /// `CACHE_REBUILD_DEBOUNCE_SECS` stale instead of re-running the
+    /// grouper per poll.
+    pub fn set_bulk_ingest(&self, active: bool) {
+        self.bulk_ingest.store(active, Ordering::Release);
     }
 
     /// Re-load (re-migrate + re-import). Safe to call multiple times.
@@ -468,16 +529,17 @@ impl DriveStore {
     /// Return the set of all processed file paths (normalized to forward
     /// slashes). Called once per ProcessDirectory run.
     pub fn processed_set(&self) -> Result<std::collections::HashSet<String>> {
-        let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare_cached("SELECT file FROM processed_files")?;
-        let files = stmt
-            .query_map([], |row| row.get::<_, String>(0))?
-            .filter_map(|r| r.ok())
-            // Rows are already normalized on write; reuse the owned String
-            // instead of re-allocating one per row through normalize_path.
-            .map(|f| if f.contains('\\') { f.replace('\\', "/") } else { f })
-            .collect();
-        Ok(files)
+        self.with_read_conn(|conn| {
+            let mut stmt = conn.prepare_cached("SELECT file FROM processed_files")?;
+            let files = stmt
+                .query_map([], |row| row.get::<_, String>(0))?
+                .filter_map(|r| r.ok())
+                // Rows are already normalized on write; reuse the owned String
+                // instead of re-allocating one per row through normalize_path.
+                .map(|f| if f.contains('\\') { f.replace('\\', "/") } else { f })
+                .collect();
+            Ok(files)
+        })
     }
 
     /// Mark a file processed without adding route data. Idempotent.
@@ -627,9 +689,10 @@ impl DriveStore {
     where
         F: FnOnce(&[RouteSummary]) -> R,
     {
-        let conn = self.conn.lock().unwrap();
-        let summaries = select_all_route_summaries(&conn)?;
-        Ok(f(&summaries))
+        self.with_read_conn(|conn| {
+            let summaries = select_all_route_summaries(conn)?;
+            Ok(f(&summaries))
+        })
     }
 
     /// Fetch full `Route` rows (with all BLOB columns decoded) for the
@@ -643,9 +706,10 @@ impl DriveStore {
     where
         F: FnOnce(&[Route]) -> R,
     {
-        let conn = self.conn.lock().unwrap();
-        let routes = select_routes_by_files(&conn, files)?;
-        Ok(f(&routes))
+        self.with_read_conn(|conn| {
+            let routes = select_routes_by_files(conn, files)?;
+            Ok(f(&routes))
+        })
     }
 
     /// Files of every **driving** event-folder route row — i.e. the
@@ -667,7 +731,7 @@ impl DriveStore {
     /// manifest and the drive list never disagree on which event clips are
     /// part of a drive.
     pub fn gap_fill_files(&self) -> Result<Vec<String>> {
-        let conn = self.conn.lock().unwrap();
+        self.with_read_conn(|conn| {
         let mut stmt = conn.prepare(
             "SELECT file, raw_park_count, raw_frame_count, gear_runs_blob, max_speed_mps \
              FROM routes \
@@ -699,6 +763,7 @@ impl DriveStore {
             }
         }
         Ok(out)
+        })
     }
 
     /// Wipe routes + processed_files + drive_tags and bulk-insert `data`.
@@ -915,7 +980,7 @@ impl DriveStore {
 
     /// Tags for one charge session, or an empty vec.
     pub fn get_charge_tags(&self, session_ts: i64) -> Result<Vec<String>> {
-        let conn = self.conn.lock().unwrap();
+        self.with_read_conn(|conn| {
         let mut stmt = conn.prepare_cached(
             "SELECT tag FROM charge_tags WHERE session_ts = ?1 ORDER BY tag",
         )?;
@@ -924,13 +989,14 @@ impl DriveStore {
             .filter_map(|r| r.ok())
             .collect();
         Ok(out)
+        })
     }
 
     /// Full session_ts → tags map for charge sessions.
     pub fn get_all_charge_tags(
         &self,
     ) -> Result<std::collections::HashMap<i64, Vec<String>>> {
-        let conn = self.conn.lock().unwrap();
+        self.with_read_conn(|conn| {
         let mut stmt = conn.prepare_cached(
             "SELECT session_ts, tag FROM charge_tags ORDER BY session_ts, tag",
         )?;
@@ -942,18 +1008,20 @@ impl DriveStore {
             out.entry(k).or_default().push(t);
         }
         Ok(out)
+        })
     }
 
     /// Every charge tag name in use, sorted and deduplicated.
     pub fn get_all_charge_tag_names(&self) -> Result<Vec<String>> {
-        let conn = self.conn.lock().unwrap();
-        let mut stmt =
-            conn.prepare_cached("SELECT DISTINCT tag FROM charge_tags ORDER BY tag")?;
-        let tags = stmt
-            .query_map([], |row| row.get::<_, String>(0))?
-            .filter_map(|r| r.ok())
-            .collect();
-        Ok(tags)
+        self.with_read_conn(|conn| {
+            let mut stmt =
+                conn.prepare_cached("SELECT DISTINCT tag FROM charge_tags ORDER BY tag")?;
+            let tags = stmt
+                .query_map([], |row| row.get::<_, String>(0))?
+                .filter_map(|r| r.ok())
+                .collect();
+            Ok(tags)
+        })
     }
 
     // ── Charge-cost overrides ───────────────────────────────────────────
@@ -1001,19 +1069,20 @@ impl DriveStore {
 
     /// Manual cost override for one charge session, if set.
     pub fn get_charge_cost(&self, session_ts: i64) -> Result<Option<(f64, String)>> {
-        let conn = self.conn.lock().unwrap();
-        let mut stmt = conn
-            .prepare_cached("SELECT amount, currency FROM charge_costs WHERE session_ts = ?1")?;
-        let mut rows = stmt.query_map(params![session_ts], |row| {
-            Ok((
-                row.get::<_, f64>(0)?,
-                row.get::<_, Option<String>>(1)?.unwrap_or_default(),
-            ))
-        })?;
-        match rows.next() {
-            Some(r) => Ok(Some(r?)),
-            None => Ok(None),
-        }
+        self.with_read_conn(|conn| {
+            let mut stmt = conn
+                .prepare_cached("SELECT amount, currency FROM charge_costs WHERE session_ts = ?1")?;
+            let mut rows = stmt.query_map(params![session_ts], |row| {
+                Ok((
+                    row.get::<_, f64>(0)?,
+                    row.get::<_, Option<String>>(1)?.unwrap_or_default(),
+                ))
+            })?;
+            match rows.next() {
+                Some(r) => Ok(Some(r?)),
+                None => Ok(None),
+            }
+        })
     }
 
     /// Full session_ts → (amount, currency) map of manual cost overrides,
@@ -1021,7 +1090,7 @@ impl DriveStore {
     pub fn get_all_charge_costs(
         &self,
     ) -> Result<std::collections::HashMap<i64, (f64, String)>> {
-        let conn = self.conn.lock().unwrap();
+        self.with_read_conn(|conn| {
         let mut stmt =
             conn.prepare_cached("SELECT session_ts, amount, currency FROM charge_costs")?;
         let rows = stmt.query_map([], |row| {
@@ -1037,6 +1106,7 @@ impl DriveStore {
             out.insert(k, (amount, currency));
         }
         Ok(out)
+        })
     }
 
     // ── Cloud mutable sync ─────────────────────────────────────────────
@@ -1051,18 +1121,19 @@ impl DriveStore {
 
     /// Every locally-changed mutable awaiting push: (kind, key, changed_at ms).
     pub fn dirty_mutables(&self) -> Result<Vec<(String, String, i64)>> {
-        let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare_cached(
-            "SELECT kind, key, changed_at FROM mutable_dirty ORDER BY changed_at ASC",
-        )?;
-        let rows = stmt.query_map([], |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)?))
-        })?;
-        let mut out = Vec::new();
-        for r in rows {
-            out.push(r?);
-        }
-        Ok(out)
+        self.with_read_conn(|conn| {
+            let mut stmt = conn.prepare_cached(
+                "SELECT kind, key, changed_at FROM mutable_dirty ORDER BY changed_at ASC",
+            )?;
+            let rows = stmt.query_map([], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)?))
+            })?;
+            let mut out = Vec::new();
+            for r in rows {
+                out.push(r?);
+            }
+            Ok(out)
+        })
     }
 
     /// Drop a dirty row after a successful push — only if `changed_at`
@@ -1101,24 +1172,25 @@ impl DriveStore {
     pub fn charge_uploads_map(
         &self,
     ) -> Result<std::collections::HashMap<i64, (String, String, i64)>> {
-        let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare_cached(
-            "SELECT session_ts, cloud_charge_id, wrapped_charge_key, uploaded_at FROM charge_uploads",
-        )?;
-        let rows = stmt.query_map([], |r| {
-            Ok((
-                r.get::<_, i64>(0)?,
-                r.get::<_, String>(1)?,
-                r.get::<_, String>(2)?,
-                r.get::<_, i64>(3)?,
-            ))
-        })?;
-        let mut out = std::collections::HashMap::new();
-        for r in rows {
-            let (ts, id, key, at) = r?;
-            out.insert(ts, (id, key, at));
-        }
-        Ok(out)
+        self.with_read_conn(|conn| {
+            let mut stmt = conn.prepare_cached(
+                "SELECT session_ts, cloud_charge_id, wrapped_charge_key, uploaded_at FROM charge_uploads",
+            )?;
+            let rows = stmt.query_map([], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, i64>(3)?,
+                ))
+            })?;
+            let mut out = std::collections::HashMap::new();
+            for r in rows {
+                let (ts, id, key, at) = r?;
+                out.insert(ts, (id, key, at));
+            }
+            Ok(out)
+        })
     }
 
     /// Reverse lookup: cloud chargeId → local session_ts.
@@ -1532,6 +1604,16 @@ impl DriveStore {
             }
         }
 
+        // Debounce (bulk ingest only): a rebuild that finished moments
+        // ago — typically while we waited on rebuild_lock — is fresh
+        // enough. last != 0 implies the caches were written at least once.
+        if !force && self.bulk_ingest.load(Ordering::Acquire) {
+            let last = self.last_cache_rebuild.load(Ordering::Acquire);
+            if last != 0 && now_unix() - last < CACHE_REBUILD_DEBOUNCE_SECS {
+                return Ok(());
+            }
+        }
+
         // Snapshot point: clear the dirty flag BEFORE opening the read
         // snapshot. A mutation landing in the gap is still visible to the
         // snapshot (it begins after) AND re-dirties the flag — worst case
@@ -1563,8 +1645,31 @@ impl DriveStore {
         let artifacts = compute_drive_caches(inputs)?;
 
         // Phase 3 (locked, fast): persist.
-        let conn = self.conn.lock().unwrap();
-        write_drive_caches(&conn, &artifacts)
+        {
+            let conn = self.conn.lock().unwrap();
+            write_drive_caches(&conn, &artifacts)?;
+        }
+        self.last_cache_rebuild.store(now_unix(), Ordering::Release);
+        Ok(())
+    }
+
+    /// Serve the last-built cache entry while the dirty flag is set but a
+    /// rebuild finished within the debounce window. During bulk ingest
+    /// every `add_route` re-dirties the caches; without this, every stats
+    /// poll re-runs the full grouper (~400ms on a Pi 5, seconds on a
+    /// Zero 2 W) just to fold in a handful of new clips. None → out of
+    /// window or no cache yet; the caller rebuilds.
+    fn stale_cache_within_debounce(&self, key: &str) -> Result<Option<String>> {
+        if !self.bulk_ingest.load(Ordering::Acquire) {
+            return Ok(None);
+        }
+        let last = self.last_cache_rebuild.load(Ordering::Acquire);
+        if last == 0 || now_unix() - last >= CACHE_REBUILD_DEBOUNCE_SECS {
+            return Ok(None);
+        }
+        Ok(self
+            .with_read_conn(|conn| schema::meta_get(conn, key))?
+            .filter(|j| !j.is_empty()))
     }
 
     /// Return the pre-computed drives list as a JSON string. On a cache hit
@@ -1577,20 +1682,22 @@ impl DriveStore {
     /// lock only for the snapshot and write phases, not the compute.
     pub fn get_cached_drives_json(&self) -> Result<String> {
         if !self.drive_cache_dirty.load(Ordering::Acquire) {
-            let conn = self.conn.lock().unwrap();
-            if let Some(json) = schema::meta_get(&conn, "drive_list_cache")? {
+            if let Some(json) = self.with_read_conn(|conn| schema::meta_get(conn, "drive_list_cache"))? {
                 if !json.is_empty() {
                     return Ok(json);
                 }
             }
+        } else if let Some(json) = self.stale_cache_within_debounce("drive_list_cache")? {
+            return Ok(json);
         }
 
         // force when the flag was clean (the entry itself was missing or
         // empty) — the stampede early-exit would otherwise skip the repair.
         let force = !self.drive_cache_dirty.load(Ordering::Acquire);
         self.rebuild_caches_off_lock(force)?;
-        let conn = self.conn.lock().unwrap();
-        Ok(schema::meta_get(&conn, "drive_list_cache")?.unwrap_or_else(|| "[]".to_string()))
+        Ok(self
+            .with_read_conn(|conn| schema::meta_get(conn, "drive_list_cache"))?
+            .unwrap_or_else(|| "[]".to_string()))
     }
 
     /// Serve `/api/drives/routes` map-overview JSON from an in-memory cache;
@@ -1607,10 +1714,7 @@ impl DriveStore {
                 }
             }
         }
-        let routes = {
-            let conn = self.conn.lock().unwrap();
-            select_all_routes(&conn)?
-        };
+        let routes = self.with_read_conn(select_all_routes)?;
         let overviews = crate::grouper::route_overviews(routes, max_points);
         let json = serde_json::to_string(&overviews).unwrap_or_else(|_| "[]".to_string());
         let mut cache = self.route_overview_cache.lock().unwrap();
@@ -1622,35 +1726,42 @@ impl DriveStore {
     /// is stored as 0 in the cache; callers must inject the live value.
     pub fn get_cached_drive_stats_json(&self) -> Result<String> {
         if !self.drive_cache_dirty.load(Ordering::Acquire) {
-            let conn = self.conn.lock().unwrap();
-            if let Some(json) = schema::meta_get(&conn, "drive_stats_cache")? {
+            if let Some(json) = self.with_read_conn(|conn| schema::meta_get(conn, "drive_stats_cache"))? {
                 if !json.is_empty() {
                     return Ok(json);
                 }
             }
+        } else if let Some(json) = self.stale_cache_within_debounce("drive_stats_cache")? {
+            return Ok(json);
         }
         let force = !self.drive_cache_dirty.load(Ordering::Acquire);
         self.rebuild_caches_off_lock(force)?;
-        let conn = self.conn.lock().unwrap();
-        Ok(schema::meta_get(&conn, "drive_stats_cache")?.unwrap_or_else(|| "{}".to_string()))
+        Ok(self
+            .with_read_conn(|conn| schema::meta_get(conn, "drive_stats_cache"))?
+            .unwrap_or_else(|| "{}".to_string()))
     }
 
     /// Return the pre-computed FSD analytics as a JSON string.
     pub fn get_cached_fsd_analytics_json(&self) -> Result<String> {
         if !self.drive_cache_dirty.load(Ordering::Acquire) {
-            let conn = self.conn.lock().unwrap();
-            if let Some(json) = schema::meta_get(&conn, "fsd_analytics_cache")? {
+            if let Some(json) = self.with_read_conn(|conn| schema::meta_get(conn, "fsd_analytics_cache"))? {
                 // Treat "{}" as a cache miss: older builds could persist an
                 // empty-object placeholder which then masks real data forever.
                 if !json.is_empty() && json.trim() != "{}" {
                     return Ok(json);
                 }
             }
+        } else if let Some(json) = self
+            .stale_cache_within_debounce("fsd_analytics_cache")?
+            .filter(|j| j.trim() != "{}")
+        {
+            return Ok(json);
         }
         let force = !self.drive_cache_dirty.load(Ordering::Acquire);
         self.rebuild_caches_off_lock(force)?;
-        let conn = self.conn.lock().unwrap();
-        Ok(schema::meta_get(&conn, "fsd_analytics_cache")?.unwrap_or_else(|| "{}".to_string()))
+        Ok(self
+            .with_read_conn(|conn| schema::meta_get(conn, "fsd_analytics_cache"))?
+            .unwrap_or_else(|| "{}".to_string()))
     }
 
     /// Refresh the cached row counts with full COUNT(*) queries. Called

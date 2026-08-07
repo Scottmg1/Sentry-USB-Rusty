@@ -82,35 +82,45 @@ pub async fn sweep_once(state: Arc<CloudStateInner>) -> Result<u32> {
 
     // Derive eligible sessions. Sessions still inside the gap window may
     // yet grow — skip them; the safety timer re-sweeps soon enough.
+    // The full charge-row scan + grouping is sync DB/CPU work — blocking
+    // pool, so the 10-minute safety sweep can't stall the reactor.
     let store = state.store.clone();
-    let uploads = store.charge_uploads_map().context("charge_uploads_map")?;
-    let rows = store
-        .with_locked_conn(|conn| -> Result<_> { charging::load_charge_rows(conn, 0, None) })
-        .context("load charge rows")?;
-    let now_secs = now_ms() / 1000;
-    let pending: Vec<Vec<charging::ChargeRow>> = charging::group_sessions(rows)
-        .into_iter()
-        .filter(|s| {
-            let Some(first) = s.first() else { return false };
-            let Some(last) = s.last() else { return false };
-            now_secs - last.ts >= SESSION_GAP_SECS && !uploads.contains_key(&first.ts)
+    let (pending, tag_map, cost_map, dirty) = {
+        let store = store.clone();
+        tokio::task::spawn_blocking(move || -> Result<_> {
+            let uploads = store.charge_uploads_map().context("charge_uploads_map")?;
+            let rows = store
+                .with_read_conn(|conn| -> Result<_> { charging::load_charge_rows(conn, 0, None) })
+                .context("load charge rows")?;
+            let now_secs = now_ms() / 1000;
+            let pending: Vec<Vec<charging::ChargeRow>> = charging::group_sessions(rows)
+                .into_iter()
+                .filter(|s| {
+                    let Some(first) = s.first() else { return false };
+                    let Some(last) = s.last() else { return false };
+                    now_secs - last.ts >= SESSION_GAP_SECS && !uploads.contains_key(&first.ts)
+                })
+                .collect();
+
+            let tag_map = store.get_all_charge_tags().unwrap_or_default();
+            let cost_map = store.get_all_charge_costs().unwrap_or_default();
+            // Dirty rows we're about to fold into upload payloads — cleared on
+            // stored/duplicate so the sync push doesn't re-send the same state.
+            let dirty: std::collections::HashMap<String, i64> = store
+                .dirty_mutables()
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|(kind, _, _)| kind == "charge")
+                .map(|(_, key, at)| (key, at))
+                .collect();
+            Ok((pending, tag_map, cost_map, dirty))
         })
-        .collect();
+        .await
+        .map_err(|e| anyhow!("charge prep task: {}", e))??
+    };
     if pending.is_empty() {
         return Ok(0);
     }
-
-    let tag_map = store.get_all_charge_tags().unwrap_or_default();
-    let cost_map = store.get_all_charge_costs().unwrap_or_default();
-    // Dirty rows we're about to fold into upload payloads — cleared on
-    // stored/duplicate so the sync push doesn't re-send the same state.
-    let dirty: std::collections::HashMap<String, i64> = store
-        .dirty_mutables()
-        .unwrap_or_default()
-        .into_iter()
-        .filter(|(kind, _, _)| kind == "charge")
-        .map(|(_, key, at)| (key, at))
-        .collect();
 
     let client =
         CloudClient::new(&creds_snapshot.cloud_base_url).with_bearer(&unlocked.pi_auth_token);

@@ -233,7 +233,7 @@ fn write_observation(out: &mut String, now: i64) {
 async fn write_sample_db(out: &mut String, s: &AppState, now: i64) {
     let store = s.drives.store.clone();
     let res = tokio::task::spawn_blocking(move || {
-        store.with_locked_conn(|conn| {
+        store.with_read_conn(|conn| {
             let state_ts: Option<i64> = conn
                 .query_row(
                     "SELECT ts FROM telemetry_samples WHERE source='state' \
@@ -779,7 +779,7 @@ fn mask_vin_line(line: &str) -> String {
 async fn write_sample_db_extended(out: &mut String, s: &AppState, now: i64) {
     let store = s.drives.store.clone();
     let res = tokio::task::spawn_blocking(move || {
-        store.with_locked_conn(|conn| {
+        store.with_read_conn(|conn| {
             let since = now - 3600;
             let state_n: i64 = conn
                 .query_row(

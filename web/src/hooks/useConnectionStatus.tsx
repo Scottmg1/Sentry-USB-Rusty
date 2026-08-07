@@ -27,6 +27,11 @@ export function ConnectionProvider({ children }: { children: React.ReactNode }) 
   // naturally (server timeouts, keepalive, etc.) and don't indicate a real
   // connectivity problem. Only show "reconnecting"/"disconnected" when
   // HTTP polls actually fail.
+  //
+  // Hysteresis: one failed poll is noise — a status handler held up by a
+  // busy disk, or this fetch queuing behind video streams on the
+  // browser's per-host connection limit. Two consecutive failures show
+  // "reconnecting", three show "disconnected".
   function evaluate() {
     if (httpOk.current) {
       if (disconnectTimer.current) {
@@ -38,8 +43,7 @@ export function ConnectionProvider({ children }: { children: React.ReactNode }) 
     } else if (httpFailCount.current >= 3) {
       // Multiple HTTP failures — truly disconnected
       setState("disconnected")
-    } else {
-      // First HTTP failure — show reconnecting, give it time
+    } else if (httpFailCount.current >= 2) {
       setState("reconnecting")
     }
   }
@@ -52,14 +56,21 @@ export function ConnectionProvider({ children }: { children: React.ReactNode }) 
   // HTTP heartbeat poll — primary connectivity signal
   useEffect(() => {
     let mounted = true
+    // The 15s abort outlives the 8s interval — without this guard a slow
+    // window runs overlapping polls, double-counting one stall as two
+    // consecutive failures (and holding two connection slots).
+    let inFlight = false
 
     async function poll() {
+      if (inFlight) return
+      inFlight = true
       try {
         const controller = new AbortController()
-        const timeout = setTimeout(() => controller.abort(), 10000)
+        // 15s: over BLE the proxy itself allows 15s, and a poll that
+        // queues behind video streams counts its queue time here too.
+        const timeout = setTimeout(() => controller.abort(), 15000)
         const res = await fetch("/api/status", {
           signal: controller.signal,
-          priority: "low",
         } as RequestInit)
         clearTimeout(timeout)
         if (mounted) {
@@ -74,6 +85,8 @@ export function ConnectionProvider({ children }: { children: React.ReactNode }) 
           httpFailCount.current++
           evaluate()
         }
+      } finally {
+        inFlight = false
       }
     }
 
