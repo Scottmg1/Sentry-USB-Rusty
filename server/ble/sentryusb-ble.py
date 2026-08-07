@@ -1258,6 +1258,10 @@ class Advertisement(dbus.service.Object):
         # The iOS app scans by WIFI_SERVICE_UUID only, so one UUID is enough.
         # The LocalName is placed in the scan response by BlueZ automatically.
         self.service_uuids = [WIFI_SERVICE_UUID]
+        # Dedup guard: True while a _reregister is scheduled or running its
+        # retry chain, so the Release path and the disconnect-poke path
+        # can't stack parallel retry chains.
+        self._reregister_pending = False
         dbus.service.Object.__init__(self, bus, self.path)
 
     def get_properties(self):
@@ -1286,10 +1290,27 @@ class Advertisement(dbus.service.Object):
         log.info(f'Advertisement released: {self.path}')
         # BlueZ released the advertisement (happens after a connection or internal
         # timeout).  Schedule a re-registration so the Pi stays discoverable.
-        GLib.timeout_add(2000, self._reregister)
+        self.ensure_registered(delay_ms=2000)
+
+    def ensure_registered(self, delay_ms=1500):
+        """Schedule a re-registration unless one is already in flight.
+
+        Called from Release AND from the central-disconnect signal. The
+        disconnect poke matters: BlueZ does not reliably call Release when
+        the adapter's internal reset drops the advert after an iOS
+        disconnect, and when it does, the retry chain used to back off
+        2s->4s->8s->16s->30s->60s while every early attempt failed inside
+        the reset window — leaving the Pi undiscoverable for minutes
+        ("sometimes you gotta scan again"). Poking on disconnect restarts
+        a fresh chain the moment the slot frees up.
+        """
+        if self._reregister_pending:
+            return
+        self._reregister_pending = True
+        GLib.timeout_add(delay_ms, self._reregister)
 
     def _reregister(self, retry_count=0):
-        max_retries = 5
+        max_retries = 8
         # Defer while a central connect is in flight (no retry consumed).
         if connect_in_flight():
             log.info('Re-registration deferred: central connect in flight')
@@ -1299,6 +1320,7 @@ class Advertisement(dbus.service.Object):
 
         def on_success():
             log.info('Advertisement registered')
+            self._reregister_pending = False
             if not (self.service_manager and self.app):
                 return
             # Always attempt GATT re-registration after advertisement Release.
@@ -1330,7 +1352,10 @@ class Advertisement(dbus.service.Object):
                 on_success()
                 return
             if retry_count < max_retries:
-                delay = min(2000 * (2 ** retry_count), 30000)  # exponential backoff, max 30s
+                # Backoff capped at 10s: the failure mode is the adapter's
+                # post-disconnect reset window (a few seconds), not load —
+                # long 30s gaps just extended the undiscoverable stretch.
+                delay = min(2000 * (2 ** retry_count), 10000)
                 log.warning(f'Advertisement re-registration failed (attempt {retry_count + 1}/{max_retries + 1}): {error} — retrying in {delay}ms')
                 GLib.timeout_add(delay, self._reregister, retry_count + 1)
             else:
@@ -1639,7 +1664,7 @@ def verify_gatt_objects(app):
     return False  # don't repeat GLib timeout
 
 
-def setup_connection_monitoring(bus, adapter_path, app=None):
+def setup_connection_monitoring(bus, adapter_path, app=None, adv=None):
     """Subscribe to BlueZ D-Bus signals to log BLE central connect/disconnect
     events.  Without this, the daemon has no visibility into whether iOS
     actually established a connection — making pairing failures hard to debug.
@@ -1668,6 +1693,13 @@ def setup_connection_monitoring(bus, adapter_path, app=None):
             # next one (see Application.reset_session_state).
             if app is not None:
                 app.reset_session_state()
+            # Poke the advertisement back up now that the peripheral slot is
+            # free — BlueZ does not reliably Release it after an adapter
+            # reset, and waiting on the Release-path backoff tail left the
+            # Pi undiscoverable for minutes. Native adv mode only (the
+            # raw-HCI helper self-heals via its own 5s loop).
+            if adv is not None:
+                adv.ensure_registered()
 
     bus.add_signal_receiver(
         on_properties_changed,
@@ -1847,12 +1879,6 @@ def main():
 
     app = Application(bus)
 
-    # Subscribe to BlueZ D-Bus signals so connection events are logged and
-    # per-connection state (auth, write buffers, resend caches) is dropped on
-    # disconnect. Needs `app` for the buffer reset, hence registered here
-    # rather than before Application creation.
-    setup_connection_monitoring(bus, adapter_path, app)
-
     service_manager.RegisterApplication(
         app.get_path(), {},
         reply_handler=register_app_cb,
@@ -1866,6 +1892,15 @@ def main():
                         service_manager=service_manager, app=app,
                         local_name=ble_name)
 
+    # Subscribe to BlueZ D-Bus signals so connection events are logged,
+    # per-connection state (auth, write buffers, resend caches) is dropped
+    # on disconnect, and — in native adv mode — the advertisement is poked
+    # back up as soon as the peripheral slot frees. Registered after both
+    # `app` and `adv` exist since it needs them.
+    setup_connection_monitoring(
+        bus, adapter_path, app,
+        adv=adv if adv_mode == 'native' else None)
+
     # Defer initial advertisement registration while a connect is in flight.
     def register_initial_adv():
         if connect_in_flight():
@@ -1876,7 +1911,7 @@ def main():
             # Transient BlueZ failure at boot must not leave the board dark until
             # a daemon restart — reuse the Release-path retry machinery.
             log.warning(f'Initial advertisement registration failed ({error}) — scheduling retries; GATT stays up')
-            GLib.timeout_add(2000, adv._reregister)
+            adv.ensure_registered(delay_ms=2000)
         ad_manager.RegisterAdvertisement(
             adv.get_path(), {},
             reply_handler=register_ad_cb,
