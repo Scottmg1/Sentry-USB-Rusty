@@ -18,8 +18,13 @@
 #   name with the helper OFF, then add its model + kernel-family here.
 #   Never add a bare chip or a family wildcard — that is the original bug.
 
-# Raspberry Pi 5 — rpt BlueZ build; RF-confirmed to advertise the name natively.
-Raspberry Pi 5|+rpt-rpi
+# Raspberry Pi 5 — REMOVED from native. Basic advertising RF-verified, but
+# the BCM chip silently stops radiating whenever the car-side stack churns
+# central connections (keep-awake/telemetry during archives). BlueZ keeps
+# reporting the advert as registered, so the daemon can't detect or recover
+# from it; the helper's 5s raw-HCI re-assert loop is immune. RF-verified
+# dark-under-churn 2026-08-07 on Pi 5 / BCM.
+# Raspberry Pi 5|+rpt-rpi
 
 # Radxa ZERO 3 (AIC8800) — RF-confirmed native. (Separate AIC8800 dark-after-
 # restart quirk is handled by its own reboot-recovery path, not here.)
