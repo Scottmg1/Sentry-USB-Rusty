@@ -3,6 +3,7 @@ import { Archive, Loader2, CheckCircle, XCircle, HardDrive, Save } from "lucide-
 import type { StepProps } from "../SetupWizard"
 import { SecretInput } from "../SecretInput"
 import { NasSSHKey } from "../NasSSHKey"
+import { rsyncSshPortError } from "../rsyncPort"
 import { cn } from "@/lib/utils"
 
 const archiveSystems = [
@@ -22,6 +23,7 @@ function Field({
   onChange,
   hint,
   error,
+  errorText,
 }: {
   label: string
   field: string
@@ -31,10 +33,13 @@ function Field({
   onChange: StepProps["onChange"]
   hint?: string
   error?: boolean
+  /** Shown in place of `hint`, in red. Also marks the input as invalid. */
+  errorText?: string | null
 }) {
+  const invalid = error || !!errorText
   const inputCls = cn(
     "w-full rounded-lg border bg-white/5 px-3 py-2 text-sm text-slate-100 placeholder-slate-600 outline-none transition focus:ring-1",
-    error
+    invalid
       ? "border-red-500/50 focus:border-red-500/50 focus:ring-red-500/25"
       : "border-white/10 focus:border-blue-500/50 focus:ring-blue-500/25"
   )
@@ -59,7 +64,11 @@ function Field({
           className={inputCls}
         />
       )}
-      {hint && <p className="mt-1 text-xs text-slate-600">{hint}</p>}
+      {errorText ? (
+        <p className="mt-1 text-xs text-red-400">{errorText}</p>
+      ) : (
+        hint && <p className="mt-1 text-xs text-slate-600">{hint}</p>
+      )}
     </div>
   )
 }
@@ -104,6 +113,8 @@ export function ArchiveStep({ data, onChange }: StepProps) {
     return () => { cancelled = true; ws?.close() }
   }, [testing])
 
+  const portError = system === "rsync" ? rsyncSshPortError(data.RSYNC_SSH_PORT) : null
+
   function req(field: string, systems: string[]): boolean {
     return systems.includes(system) && !data[field]?.trim()
   }
@@ -111,7 +122,9 @@ export function ArchiveStep({ data, onChange }: StepProps) {
   function canTest(): boolean {
     if (system === "none") return false
     if (system === "cifs") return !!(data.ARCHIVE_SERVER?.trim() && data.SHARE_NAME?.trim() && data.SHARE_USER?.trim() && data.SHARE_PASSWORD?.trim())
-    if (system === "rsync") return !!(data.RSYNC_SERVER?.trim() && data.RSYNC_USER?.trim() && data.RSYNC_PATH?.trim())
+    // A bad port would make the backend reject the probe with a 400, so
+    // don't let the user fire it off in the first place.
+    if (system === "rsync") return !portError && !!(data.RSYNC_SERVER?.trim() && data.RSYNC_USER?.trim() && data.RSYNC_PATH?.trim())
     if (system === "rclone") return !!(data.RCLONE_DRIVE?.trim() && data.RCLONE_PATH?.trim())
     if (system === "nfs") return !!(data.ARCHIVE_SERVER?.trim() && data.SHARE_NAME?.trim())
     return false
@@ -194,8 +207,23 @@ export function ArchiveStep({ data, onChange }: StepProps) {
             <Field label="Server" field="RSYNC_SERVER" placeholder="hostname or IP" data={data} onChange={onChange} error={req("RSYNC_SERVER", ["rsync"])} />
             <Field label="Username" field="RSYNC_USER" placeholder="username" data={data} onChange={onChange} error={req("RSYNC_USER", ["rsync"])} />
             <Field label="Remote Path" field="RSYNC_PATH" placeholder="/path/on/server" data={data} onChange={onChange} error={req("RSYNC_PATH", ["rsync"])} />
+            <Field
+              label="SSH Port"
+              field="RSYNC_SSH_PORT"
+              placeholder="22"
+              data={data}
+              onChange={onChange}
+              hint="Only if your server uses a port other than 22"
+              errorText={portError}
+            />
           </div>
-          <NasSSHKey pubKey={pubKey} setPubKey={setPubKey} />
+          {/* Only hand over a valid port, or the instructions there would
+              show a command with the user's typo in it. */}
+          <NasSSHKey
+            pubKey={pubKey}
+            setPubKey={setPubKey}
+            sshPort={portError ? null : data.RSYNC_SSH_PORT?.trim() || null}
+          />
         </>
       )}
 

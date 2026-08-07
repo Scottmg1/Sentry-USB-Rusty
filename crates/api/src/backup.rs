@@ -307,6 +307,7 @@ async fn sync_backup_to_rsync(data: &BackupData) -> Result<(), String> {
     if server.is_empty() || user.is_empty() {
         return Err("rsync not configured".to_string());
     }
+    let port = sentryusb_shell::SshPort::new(sentryusb_config::rsync_ssh_port(&active));
 
     let tmp_dir = "/tmp/sentryusb-backup-sync";
     let _ = std::fs::create_dir_all(tmp_dir);
@@ -318,18 +319,21 @@ async fn sync_backup_to_rsync(data: &BackupData) -> Result<(), String> {
     // Ensure remote backups/ dir exists. Best-effort.
     let user_at_server = format!("{}@{}", user, server);
     let remote_dir = format!("{}/backups", rsync_path);
+    let mut ssh_args: Vec<&str> = vec![
+        "-o", "ConnectTimeout=10", "-o", "StrictHostKeyChecking=no", "-o", "BatchMode=yes",
+    ];
+    ssh_args.extend(port.ssh_args());
+    ssh_args.extend_from_slice(&[&user_at_server, "mkdir", "-p", &remote_dir]);
     let _ = sentryusb_shell::run_with_timeout(
-        Duration::from_secs(10), "ssh",
-        &[
-            "-o", "ConnectTimeout=10", "-o", "StrictHostKeyChecking=no", "-o", "BatchMode=yes",
-            &user_at_server, "mkdir", "-p", &remote_dir,
-        ],
+        Duration::from_secs(10), "ssh", &ssh_args,
     ).await;
 
     let dest = format!("{}@{}:{}/backups/{}", user, server, rsync_path, filename);
+    let mut args: Vec<&str> = vec!["-avh", "--no-perms", "--omit-dir-times", "--timeout=60"];
+    args.extend(port.rsync_args());
+    args.extend_from_slice(&[&tmp_path, &dest]);
     let res = sentryusb_shell::run_with_timeout(
-        Duration::from_secs(60), "rsync",
-        &["-avh", "--no-perms", "--omit-dir-times", "--timeout=60", &tmp_path, &dest],
+        Duration::from_secs(60), "rsync", &args,
     ).await;
     let _ = std::fs::remove_file(&tmp_path);
     res.map(|_| ()).map_err(|e| e.to_string())
@@ -485,15 +489,16 @@ async fn ship_drive_data(location: &str, gz_path: &str, date: &str) -> Result<()
             if server.is_empty() || user.is_empty() {
                 return Err("rsync not configured".to_string());
             }
+            let port = sentryusb_shell::SshPort::new(sentryusb_config::rsync_ssh_port(&active));
             let dest = format!("{}@{}:{}/backups/{}", user, server, rsync_path, filename);
-            sentryusb_shell::run_with_timeout(
-                Duration::from_secs(600),
-                "rsync",
-                &["-h", "--no-perms", "--omit-dir-times", "--timeout=300", gz_path, &dest],
-            )
-            .await
-            .map(|_| ())
-            .map_err(|e| e.to_string())
+            let mut args: Vec<&str> =
+                vec!["-h", "--no-perms", "--omit-dir-times", "--timeout=300"];
+            args.extend(port.rsync_args());
+            args.extend_from_slice(&[gz_path, &dest]);
+            sentryusb_shell::run_with_timeout(Duration::from_secs(600), "rsync", &args)
+                .await
+                .map(|_| ())
+                .map_err(|e| e.to_string())
         }
         "rclone" => {
             let drive = active.get("RCLONE_DRIVE").cloned().unwrap_or_default();

@@ -3,6 +3,13 @@
 DST="/mnt/music"
 LOG="/tmp/rsyncmusiclog.txt"
 
+# Optional non-standard SSH port, via rsync's remote-shell override (see
+# archive-clips.sh). Unset means the SSH default.
+RSYNC_SSH_ARGS=()
+if [ -n "${RSYNC_SSH_PORT:-}" ]; then
+  RSYNC_SSH_ARGS=(-e "ssh -p ${RSYNC_SSH_PORT}")
+fi
+
 # check that DST is the mounted disk image, not the mountpoint directory
 if ! findmnt --mountpoint $DST > /dev/null
 then
@@ -47,6 +54,7 @@ function do_music_sync {
   rsync -rum --no-human-readable --exclude=.fseventsd/*** --exclude=*.DS_Store --exclude=.metadata_never_index \
                 --exclude="System Volume Information/***" \
                 --delete --modify-window=2 --info=stats2 \
+                ${RSYNC_SSH_ARGS[@]+"${RSYNC_SSH_ARGS[@]}"} \
                 "$RSYNC_USER@$RSYNC_SERVER:$MUSIC_SHARE_NAME/" "$DST" &> "$LOG"
   RSYNC_EXIT=$?
   set -e

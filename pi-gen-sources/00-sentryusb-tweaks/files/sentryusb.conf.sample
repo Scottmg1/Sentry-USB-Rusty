@@ -35,6 +35,8 @@ export SHARE_PASSWORD='password'
 #export RSYNC_USER=username
 #export RSYNC_SERVER=hostname_or_ip
 #export RSYNC_PATH=path_on_server
+# Only needed if your server's SSH daemon does not listen on port 22.
+#export RSYNC_SSH_PORT=2222
 
 # Variables for rclone archiving
 # If you are using rclone to archive to a local (non-cloud) server,

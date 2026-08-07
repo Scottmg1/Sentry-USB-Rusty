@@ -52,6 +52,9 @@ fn validate_archive_config(env: &SetupEnv, system: ArchiveSystem) -> Result<()> 
             require("RSYNC_USER")?;
             require("RSYNC_SERVER")?;
             require("RSYNC_PATH")?;
+            // Optional, but reject a typo here rather than let it degrade
+            // to port 22 and fail later inside the archive loop.
+            sentryusb_config::validate_rsync_ssh_port(&env.config).map_err(ConfigError)?;
         }
         ArchiveSystem::Rclone => {
             require("RCLONE_DRIVE")?;
@@ -81,30 +84,54 @@ fn validate_archive_config(env: &SetupEnv, system: ArchiveSystem) -> Result<()> 
 /// inside a systemd service, not in their shell). Idempotent: ssh-keyscan
 /// returns the same line on every run; we deduplicate against the
 /// existing known_hosts before appending.
+///
+/// Scans the configured SSH port, not just 22. OpenSSH files a non-default
+/// port's key under `[host]:port`, so a scan that ignored the port would
+/// store an entry rsync never matches (assuming anything answers on 22 at
+/// all), leaving every archive cycle stuck on "Host key verification
+/// failed".
 async fn trust_rsync_host_key(env: &SetupEnv, emitter: &SetupEmitter) -> Result<()> {
     let server = match env.config.get("RSYNC_SERVER") {
         Some(s) if !s.trim().is_empty() => s.trim().to_string(),
         _ => return Ok(()),
+    };
+    let port = sentryusb_config::rsync_ssh_port(&env.config);
+    let port_flags = sentryusb_shell::SshPort::new(port);
+    // Label progress in OpenSSH's own notation so it matches what the user
+    // will read back out of known_hosts.
+    let endpoint = match port {
+        Some(p) => format!("[{}]:{}", server, p),
+        None => server.clone(),
     };
 
     let _ = std::fs::create_dir_all("/root/.ssh");
     let known_hosts_path = "/root/.ssh/known_hosts";
     let existing = std::fs::read_to_string(known_hosts_path).unwrap_or_default();
 
-    emitter.progress(&format!("Trusting SSH host key for {}...", server));
+    emitter.progress(&format!("Trusting SSH host key for {}...", endpoint));
+    let mut args: Vec<&str> = vec!["-H", "-T", "5"];
+    args.extend(port_flags.ssh_args());
+    args.push(&server);
     let scan = match sentryusb_shell::run_with_timeout(
         Duration::from_secs(15),
-        "ssh-keyscan", &["-H", "-T", "5", &server],
+        "ssh-keyscan", &args,
     ).await {
         Ok(s) => s,
         Err(e) => {
             // Don't fail the whole setup if the server is currently
-            // unreachable — the archive cycle will report a clearer
-            // error later, and the user can re-run setup once the
-            // server is online.
+            // unreachable. The archive cycle reports a clearer error
+            // later, and re-running setup once the server is up fixes it.
+            // Spell out the manual escape hatch, since until the key is
+            // trusted every transfer fails, not just music sync.
+            let manual = match port {
+                Some(p) => format!("ssh-keyscan -p {} -H {}", p, server),
+                None => format!("ssh-keyscan -H {}", server),
+            };
             emitter.progress(&format!(
-                "ssh-keyscan {} failed: {}. Music sync may need a manual ssh-keyscan later.",
-                server, e
+                "ssh-keyscan {} failed: {}. Archiving will fail with \"Host key \
+                 verification failed\" until the key is trusted. Re-run setup once \
+                 the server is up, or run: {} >> {}",
+                endpoint, e, manual, known_hosts_path
             ));
             return Ok(());
         }
@@ -136,8 +163,8 @@ async fn trust_rsync_host_key(env: &SetupEnv, emitter: &SetupEmitter) -> Result<
     std::fs::write(known_hosts_path, updated)?;
     let _ = sentryusb_shell::run("chmod", &["600", known_hosts_path]).await;
     emitter.progress(&format!(
-        "Added {} host key entry/entries for {} to /root/.ssh/known_hosts",
-        new_lines.len(), server
+        "Added {} host key entry/entries for {} to {}",
+        new_lines.len(), endpoint, known_hosts_path
     ));
     Ok(())
 }
@@ -930,6 +957,46 @@ mod tests {
             ("KEEP_AWAKE_WEBHOOK_URL", "http://ha.local/hook"),
         ]);
         assert!(validate_wake_apis(&env).is_ok());
+    }
+
+    // ── rsync SSH port ───────────────────────────────────────────────────
+
+    fn rsync_env(port: Option<&str>) -> SetupEnv {
+        let mut pairs = vec![
+            ("ARCHIVE_SYSTEM", "rsync"),
+            ("RSYNC_USER", "sentryusb"),
+            ("RSYNC_SERVER", "sentryusb.example.com"),
+            ("RSYNC_PATH", "/mnt/user/TeslaCam"),
+        ];
+        if let Some(p) = port {
+            pairs.push(("RSYNC_SSH_PORT", p));
+        }
+        env_with(&pairs)
+    }
+
+    #[test]
+    fn rsync_ssh_port_is_optional() {
+        assert!(validate_archive_config(&rsync_env(None), ArchiveSystem::Rsync).is_ok());
+        // Cleared by the wizard when the user empties the field.
+        assert!(validate_archive_config(&rsync_env(Some("")), ArchiveSystem::Rsync).is_ok());
+    }
+
+    #[test]
+    fn custom_rsync_ssh_port_validates() {
+        assert!(validate_archive_config(&rsync_env(Some("23232")), ArchiveSystem::Rsync).is_ok());
+    }
+
+    #[test]
+    fn invalid_rsync_ssh_port_is_a_config_error() {
+        // Must be a ConfigError so the runner stops with "fix your
+        // settings" instead of silently falling back to port 22 and
+        // boot-looping on an archive that can never connect.
+        let err = validate_archive_config(&rsync_env(Some("not-a-port")), ArchiveSystem::Rsync)
+            .unwrap_err();
+        assert!(
+            err.downcast_ref::<crate::error::ConfigError>().is_some(),
+            "bad RSYNC_SSH_PORT must be a ConfigError, got: {err:?}"
+        );
     }
 
     // ── migrate_rclone_config state machine ──────────────────────────────

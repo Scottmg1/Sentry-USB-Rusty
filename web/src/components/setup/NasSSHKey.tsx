@@ -4,13 +4,20 @@ import { Key, Copy, Check, Loader2, RefreshCw } from "lucide-react"
 export function NasSSHKey({
   pubKey,
   setPubKey,
+  sshPort,
 }: {
   pubKey: string | null
   setPubKey: (v: string | null) => void
+  /** Custom SSH port, so the copy-paste commands below actually work. */
+  sshPort?: string | null
 }) {
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [copied, setCopied] = useState(false)
+
+  // known_hosts entries are stored per-port, so a copied keyscan command
+  // without -p trusts the wrong endpoint, or nothing at all.
+  const portFlag = sshPort ? ` -p ${sshPort}` : ""
 
   async function fetchKey() {
     setLoading(true)
@@ -114,9 +121,18 @@ chmod 600 ~/.ssh/authorized_keys`}
           The test uses the <code className="rounded bg-white/10 px-1">ssh</code> client
           built into Sentry USB — no extra packages need to be installed on this device.
           The test is permissive about host-key verification; the real archive job uses
-          strict host-key checking. If archiving later fails with{" "}
-          <em>"Host key verification failed"</em>, SSH into the Pi and run{" "}
-          <code className="rounded bg-white/10 px-1">ssh-keyscan -H your-server &gt;&gt; /root/.ssh/known_hosts</code>.
+          strict host-key checking. Setup trusts the key for you, but if any transfer
+          (clip archiving, music sync, config backup) later fails with{" "}
+          <em>"Host key verification failed"</em>, SSH into the Pi and run:
+        </p>
+        <pre className="overflow-x-auto rounded bg-black/40 px-2 py-1 font-mono text-[11px] leading-relaxed text-slate-300">
+{`mount -o remount,rw /
+ssh-keyscan${portFlag} -H your-server >> /root/.ssh/known_hosts
+mount -o remount,ro /`}
+        </pre>
+        <p className="text-slate-600">
+          The remounts are needed because root is mounted read-only in normal
+          operation.
         </p>
       </div>
 
