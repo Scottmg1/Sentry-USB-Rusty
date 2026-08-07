@@ -318,11 +318,9 @@ _VERSION_FETCHING = False
 def get_version():
     """Cached app version for DeviceInfo reads.
 
-    ReadValue used to call urlopen(...timeout=3) inline — an ATT read
-    blocked on local HTTP, which stalls the whole GATT dispatch right at
-    connect time (DeviceInfo is the first thing the app reads). Serve the
-    cache and refresh it from a worker thread instead; the first read may
-    say 'unknown' but never blocks.
+    Served from cache with a worker-thread refresh: an inline urlopen would
+    block ATT dispatch right at connect time (DeviceInfo is the first thing
+    the app reads). The first read may say 'unknown' but never blocks.
     """
     global _VERSION_FETCHING
     if _VERSION_CACHE == 'unknown' and not _VERSION_FETCHING:
@@ -871,9 +869,8 @@ class WifiScanCharacteristic(Characteristic):
                 self.send_notification(
                     dbus.Array([dbus.Byte(b) for b in msg], signature='y'))
                 return False
-            # Start after 500ms (give Read Blob first shot), 25ms stagger —
-            # the client takes whichever path completes first, so there is
-            # no reason for the fallback to dawdle at the old 200ms/chunk.
+            # 500ms head start for Read Blob, then 25ms stagger — the
+            # client takes whichever path completes first.
             GLib.timeout_add(500 + 25 * idx, send_chunk)
 
         return False  # Don't repeat the timeout
@@ -1076,12 +1073,9 @@ class APIRequestCharacteristic(Characteristic):
     """Receives API requests as JSON {id, method, path, body?}.
     Forwards to local Go API and sends response via APIResponseCharacteristic."""
 
-    # Pacing between chunk notifications. 200ms was cargo-culted (the old
-    # comment even said 50ms) and made any multi-KB response take many
-    # seconds; 20ms keeps a small safety gap for BlueZ's TX queue while
-    # cutting a 40-chunk response from 8s to under 1s. If drops appear on
-    # some board, the client's {"resend": id} recovery path (below) covers
-    # them rather than slower pacing for everyone.
+    # Pacing between chunk notifications: a small safety gap for BlueZ's TX
+    # queue. Boards that drop at this rate are covered by the client's
+    # {"resend": id} recovery below, not by slower pacing for everyone.
     CHUNK_STAGGER_MS = 20
     # How many recently-completed responses to keep for resend, per daemon.
     # Requests are serialized on the client, so 4 is already generous.
@@ -1270,9 +1264,8 @@ class Advertisement(dbus.service.Object):
             'ServiceUUIDs': dbus.Array(self.service_uuids, signature='s'),
             # Without these BlueZ leaves the controller's default interval
             # (commonly ~1.28s). iOS/macOS duty-cycle their background
-            # scans, so a slow interval means CoreBluetooth can take 30-60s
-            # to even SEE the Pi — measured 37s to connect on a Mac. The
-            # raw-HCI helper always advertised at 100ms; match it here.
+            # scans, so a slow interval can delay discovery by 30-60s.
+            # The raw-HCI helper advertises at 100ms; match it here.
             # Values are milliseconds (BlueZ range 20ms-10.24s); ignored
             # harmlessly by BlueZ versions predating the property.
             'MinInterval': dbus.UInt32(100),
@@ -1307,11 +1300,10 @@ class Advertisement(dbus.service.Object):
         Called from Release AND from the central-disconnect signal. The
         disconnect poke matters: BlueZ does not reliably call Release when
         the adapter's internal reset drops the advert after an iOS
-        disconnect, and when it does, the retry chain used to back off
-        2s->4s->8s->16s->30s->60s while every early attempt failed inside
-        the reset window — leaving the Pi undiscoverable for minutes
-        ("sometimes you gotta scan again"). Poking on disconnect restarts
-        a fresh chain the moment the slot frees up.
+        disconnect, and Release-path retries that start inside the reset
+        window all fail and back off — leaving the Pi undiscoverable for
+        minutes. Poking on disconnect starts a fresh chain the moment the
+        peripheral slot frees.
         """
         if self._reregister_pending:
             return
@@ -1362,8 +1354,7 @@ class Advertisement(dbus.service.Object):
                 return
             if retry_count < max_retries:
                 # Backoff capped at 10s: the failure mode is the adapter's
-                # post-disconnect reset window (a few seconds), not load —
-                # long 30s gaps just extended the undiscoverable stretch.
+                # post-disconnect reset window (a few seconds), not load.
                 delay = min(2000 * (2 ** retry_count), 10000)
                 log.warning(f'Advertisement re-registration failed (attempt {retry_count + 1}/{max_retries + 1}): {error} — retrying in {delay}ms')
                 GLib.timeout_add(delay, self._reregister, retry_count + 1)
