@@ -1310,13 +1310,22 @@ class Advertisement(dbus.service.Object):
         self._reregister_pending = True
         GLib.timeout_add(delay_ms, self._reregister)
 
-    def _reregister(self, retry_count=0):
+    def _reregister(self, retry_count=0, deferrals=0):
         max_retries = 8
-        # Defer while a central connect is in flight (no retry consumed).
-        if connect_in_flight():
-            log.info('Re-registration deferred: central connect in flight')
-            GLib.timeout_add(1000, self._reregister, retry_count)
+        # Defer while a central connect is in flight (no retry consumed) —
+        # but only up to 20s. The car-side stack (keep-awake/telemetry)
+        # refreshes the connecting flag on every dial, so an uncapped
+        # deferral leaves the Pi undiscoverable to phones for as long as
+        # the car link churns (27s observed at boot). Registering during
+        # the chip race at worst errors and lands in the retry chain —
+        # strictly better than staying dark.
+        if connect_in_flight() and deferrals < 20:
+            if deferrals == 0:
+                log.info('Re-registration deferred: central connect in flight')
+            GLib.timeout_add(1000, self._reregister, retry_count, deferrals + 1)
             return False
+        if deferrals >= 20:
+            log.warning('Central connect still in flight after 20s — registering advertisement anyway')
         log.info(f'Re-registering advertisement... (attempt {retry_count + 1})')
 
         def on_success():
