@@ -12,6 +12,7 @@ Run as: python3 sentryusb-ble.py
 Or via systemd: sentryusb-ble.service
 """
 
+import base64
 import dbus
 import dbus.exceptions
 import dbus.mainloop.glib
@@ -27,6 +28,7 @@ import hmac
 import urllib.request
 import urllib.error
 import threading
+import zlib
 
 try:
     from gi.repository import GLib
@@ -1126,16 +1128,37 @@ class APIRequestCharacteristic(Characteristic):
         method = request.get('method', 'GET')
         path = request.get('path', '/status')
         body = request.get('body')
+        # Client opts into compressed responses. At phone MTU (~185) the
+        # chunk count is the entire bill; deflating repetitive JSON cuts
+        # it 8-15x. Clients that never send the flag get plain bodies.
+        wants_gz = bool(request.get('gz'))
 
         log.info(f'API proxy: {method} {path} (id={request_id})')
 
         def do_request():
+            t0 = time.monotonic()
             result = proxy_api_request(method, path, body)
+            api_ms = int((time.monotonic() - t0) * 1000)
             response = {
                 'id': request_id,
                 'status': result['status'],
                 'body': result['body'],
             }
+            # Compress the body alone (not the envelope) as raw DEFLATE —
+            # wbits=-15 matches Apple's COMPRESSION_ZLIB so the app can
+            # decode with NSData.decompressed(using: .zlib). Worker thread
+            # only; zlib on the GLib loop would stall GATT.
+            if wants_gz:
+                body_bytes = json.dumps(result['body']).encode()
+                if len(body_bytes) > 512:
+                    comp = zlib.compressobj(6, zlib.DEFLATED, -15)
+                    deflated = comp.compress(body_bytes) + comp.flush()
+                    response = {
+                        'id': request_id,
+                        'status': result['status'],
+                        'gz': True,
+                        'body_gz': base64.b64encode(deflated).decode('ascii'),
+                    }
             response_json = json.dumps(response).encode()
 
             # Send response, chunking if it exceeds the negotiated BLE MTU.
@@ -1173,6 +1196,17 @@ class APIRequestCharacteristic(Characteristic):
                     }).encode()
                     for idx, chunk_data in enumerate(chunks)
                 ]
+
+            # Per-request transfer economics: payload size, negotiated MTU,
+            # frame count, local API time, and the pacing floor of the BLE
+            # transfer. journalctl on these lines shows exactly where a
+            # slow phone session spends its time.
+            log.info(
+                f'API proxy: {method} {path} id={request_id} -> '
+                f"{result['status']} {len(response_json)}B "
+                f'mtu={self._client_mtu} frames={len(frames)} '
+                f'api={api_ms}ms xfer_floor={len(frames) * self.CHUNK_STAGGER_MS}ms'
+            )
 
             # Cache + schedule on the main context (D-Bus emission and the
             # cache dict must not be touched from this worker thread).
