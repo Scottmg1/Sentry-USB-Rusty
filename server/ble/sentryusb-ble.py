@@ -1268,6 +1268,15 @@ class Advertisement(dbus.service.Object):
         props = {
             'Type': self.ad_type,
             'ServiceUUIDs': dbus.Array(self.service_uuids, signature='s'),
+            # Without these BlueZ leaves the controller's default interval
+            # (commonly ~1.28s). iOS/macOS duty-cycle their background
+            # scans, so a slow interval means CoreBluetooth can take 30-60s
+            # to even SEE the Pi — measured 37s to connect on a Mac. The
+            # raw-HCI helper always advertised at 100ms; match it here.
+            # Values are milliseconds (BlueZ range 20ms-10.24s); ignored
+            # harmlessly by BlueZ versions predating the property.
+            'MinInterval': dbus.UInt32(100),
+            'MaxInterval': dbus.UInt32(150),
         }
         if self.local_name:
             props['LocalName'] = dbus.String(self.local_name)
