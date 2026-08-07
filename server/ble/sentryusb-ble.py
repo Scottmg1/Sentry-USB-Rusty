@@ -311,13 +311,34 @@ def get_device_suffix():
             pass
     return '0000'
 
+_VERSION_CACHE = 'unknown'
+_VERSION_FETCHING = False
+
+
 def get_version():
+    """Cached app version for DeviceInfo reads.
+
+    Served from cache with a worker-thread refresh: an inline urlopen would
+    block ATT dispatch right at connect time (DeviceInfo is the first thing
+    the app reads). The first read may say 'unknown' but never blocks.
+    """
+    global _VERSION_FETCHING
+    if _VERSION_CACHE == 'unknown' and not _VERSION_FETCHING:
+        _VERSION_FETCHING = True
+        threading.Thread(target=_refresh_version, daemon=True).start()
+    return _VERSION_CACHE
+
+
+def _refresh_version():
+    global _VERSION_CACHE, _VERSION_FETCHING
     try:
         resp = urllib.request.urlopen(f'{API_BASE}/system/version', timeout=3)
         data = json.loads(resp.read())
-        return data.get('version', 'unknown')
+        _VERSION_CACHE = data.get('version', 'unknown')
     except Exception:
-        return 'unknown'
+        pass
+    finally:
+        _VERSION_FETCHING = False
 
 def is_setup_finished():
     paths = [
@@ -469,10 +490,25 @@ def configure_wifi(ssid, password, hostname=None):
 # API proxy: forward requests to the local Go server
 # ============================================================
 
-def proxy_api_request(method, path, body=None, retries=2, retry_delay=1.5):
+# Daemon start time — gates the proxy's connection-refused retries to the
+# boot window. At boot the local API may legitimately still be coming up
+# (slow SD, OTA restart) and retrying is right; mid-session a refused
+# connection means the API is down NOW, and 3x15s retry attempts (~48s)
+# just blow past the client's 30s timeout while blocking the serialized
+# request pipeline behind it.
+DAEMON_START_MONOTONIC = time.monotonic()
+PROXY_RETRY_BOOT_WINDOW_S = 120
+
+
+def proxy_api_request(method, path, body=None, retries=None, retry_delay=1.5):
     """Forward an API request to the local Go server.
-    Retries on connection errors (e.g. server still starting up)."""
+    Retries on connection errors only during the boot window (see above)."""
     import time
+    if retries is None:
+        in_boot_window = (
+            time.monotonic() - DAEMON_START_MONOTONIC < PROXY_RETRY_BOOT_WINDOW_S
+        )
+        retries = 2 if in_boot_window else 0
     url = f'{API_BASE}{path}'
     last_error = None
     for attempt in range(1 + retries):
@@ -549,6 +585,30 @@ class Application(dbus.service.Object):
                     response[desc.get_path()] = desc.get_properties()
         log.info(f'GetManagedObjects called — returning {len(response)} objects: {list(response.keys())}')
         return response
+
+    def reset_session_state(self):
+        """Drop per-connection state when a central disconnects.
+
+        Without this, a write that died mid-JSON poisons the reassembly
+        buffer: the NEXT session's first write appends to the stale prefix,
+        never parses, and silently discards until the 64KB cap trips. The
+        resend cache must also go — request ids restart at 0 per client
+        session, so a stale cache entry could replay the wrong response.
+        """
+        for service in self.services:
+            for chrc in service.get_characteristics():
+                if isinstance(getattr(chrc, 'write_buffer', None), bytearray) \
+                        and chrc.write_buffer:
+                    log.info(f'Clearing {len(chrc.write_buffer)}B stale write '
+                             f'buffer on {chrc.uuid}')
+                if hasattr(chrc, 'write_buffer'):
+                    chrc.write_buffer = bytearray()
+                if hasattr(chrc, '_resend_cache'):
+                    chrc._resend_cache = {}
+                    chrc._resend_counts = {}
+                if hasattr(chrc, '_cached_networks'):
+                    chrc._cached_networks = None
+                    chrc._read_blob_data = None
 
 
 class Service(dbus.service.Object):
@@ -731,25 +791,37 @@ class WifiScanCharacteristic(Characteristic):
         if not self._scanning:
             self._scanning = True
             log.info('WiFi scan requested — scanning async, will notify when ready')
-            GLib.idle_add(lambda: (GLib.timeout_add(100, self._do_scan), False)[-1])
+            # Worker thread, NOT the GLib main loop: scan_wifi_networks
+            # blocks 6-15s (nmcli rescan + settle sleep + list), and on the
+            # main loop that stalls every GATT read/write/notify for the
+            # whole daemon. Same pattern as the API proxy's do_request.
+            threading.Thread(target=self._scan_worker, daemon=True).start()
 
         data = json.dumps({'scanning': True}).encode()
         self._read_blob_data = None  # No blob data for short responses
         return dbus.Array([dbus.Byte(b) for b in data], signature='y')
 
-    def _do_scan(self):
-        """Run WiFi scan, cache results, and deliver via two parallel paths.
+    def _scan_worker(self):
+        """Blocking scan in a worker thread, then publish on the main loop.
+
+        D-Bus signal emission (send_notification) must happen on the GLib
+        main context, so the worker hands results to _publish_scan via
+        idle_add and does no D-Bus work itself.
+        """
+        networks = scan_wifi_networks()
+        GLib.idle_add(self._publish_scan, networks)
+
+    def _publish_scan(self, networks):
+        """Cache results and deliver via two parallel paths.
 
         Path 1 (Read Blob): Cache results and send a "ready" notification.
                 The client reads the characteristic; BlueZ handles ATT Read Blob
                 to transfer data larger than the MTU.  Works on Pi 5, Pi Zero 2 W.
         Path 2 (Chunked notifications): Also send the data as chunked
-                notifications with generous stagger, starting after a 1-second
-                delay.  This is the fallback for boards where BlueZ does not
+                notifications, as fallback for boards where BlueZ does not
                 handle Read Blob correctly (e.g. Pi 4B).
         The client accepts whichever path delivers complete data first.
         """
-        networks = scan_wifi_networks()
         self._scanning = False
 
         data_str = json.dumps(networks)
@@ -797,8 +869,9 @@ class WifiScanCharacteristic(Characteristic):
                 self.send_notification(
                     dbus.Array([dbus.Byte(b) for b in msg], signature='y'))
                 return False
-            # Start after 1s delay (give Read Blob time), 200ms stagger between chunks
-            GLib.timeout_add(1000 + 200 * idx, send_chunk)
+            # 500ms head start for Read Blob, then 25ms stagger — the
+            # client takes whichever path completes first.
+            GLib.timeout_add(500 + 25 * idx, send_chunk)
 
         return False  # Don't repeat the timeout
 
@@ -823,20 +896,6 @@ class WifiConfigCharacteristic(Characteristic):
                 self.write_buffer = bytearray()
             return
 
-        if not is_authenticated(options):
-            log.warning('WiFi config rejected: not authenticated')
-            return
-
-        ssid = config.get('ssid', '')
-        password = config.get('password', '')
-        hostname = config.get('hostname')
-
-        if not ssid or not password:
-            log.warning('WiFi config missing ssid or password')
-            return
-
-        log.info(f'Configuring WiFi: ssid={ssid}, hostname={hostname}')
-
         # Find the WifiStatusCharacteristic to send notifications
         status_chrc = None
         for chrc in self.service.get_characteristics():
@@ -844,21 +903,47 @@ class WifiConfigCharacteristic(Characteristic):
                 status_chrc = chrc
                 break
 
-        # Send "connecting" status
-        if status_chrc:
-            status_data = json.dumps({'connected': False, 'ip': '', 'error': ''}).encode()
+        def notify_status(payload):
+            if not status_chrc:
+                return
+            status_data = json.dumps(payload).encode()
             status_chrc.send_notification(
                 dbus.Array([dbus.Byte(b) for b in status_data], signature='y'))
 
-        # Configure WiFi in background
+        # Every rejection MUST notify a status — a silent return leaves the
+        # client's "Configuring WiFi..." spinner running until its timeout.
+        if not is_authenticated(options):
+            log.warning('WiFi config rejected: not authenticated')
+            notify_status({'connected': False, 'ip': '',
+                           'error': 'not_authenticated'})
+            return
+
+        ssid = config.get('ssid', '')
+        password = config.get('password', '')
+        hostname = config.get('hostname')
+
+        # Open networks have no password — ssid alone is a valid config.
+        if not ssid:
+            log.warning('WiFi config missing ssid')
+            notify_status({'connected': False, 'ip': '',
+                           'error': 'missing_ssid'})
+            return
+
+        log.info(f'Configuring WiFi: ssid={ssid}, hostname={hostname}')
+
+        # Send "connecting" status
+        notify_status({'connected': False, 'ip': '', 'error': ''})
+
+        # Worker thread, NOT the GLib main loop: configure_wifi blocks up to
+        # ~45s (nmcli connect 30s + 15x1s IP wait), which would stall every
+        # GATT operation for the whole daemon if run via GLib.timeout_add.
+        # The result notification hops back to the main context via idle_add
+        # (D-Bus emission is not thread-safe).
         def do_configure():
             result = configure_wifi(ssid, password, hostname)
-            if status_chrc:
-                status_data = json.dumps(result).encode()
-                status_chrc.send_notification(
-                    dbus.Array([dbus.Byte(b) for b in status_data], signature='y'))
+            GLib.idle_add(lambda: (notify_status(result), False)[-1])
 
-        GLib.idle_add(lambda: (GLib.timeout_add(100, do_configure), False)[-1])
+        threading.Thread(target=do_configure, daemon=True).start()
 
 
 class WifiStatusCharacteristic(Characteristic):
@@ -988,12 +1073,25 @@ class APIRequestCharacteristic(Characteristic):
     """Receives API requests as JSON {id, method, path, body?}.
     Forwards to local Go API and sends response via APIResponseCharacteristic."""
 
+    # Pacing between chunk notifications: a small safety gap for BlueZ's TX
+    # queue. Boards that drop at this rate are covered by the client's
+    # {"resend": id} recovery below, not by slower pacing for everyone.
+    CHUNK_STAGGER_MS = 20
+    # How many recently-completed responses to keep for resend, per daemon.
+    # Requests are serialized on the client, so 4 is already generous.
+    RESEND_CACHE_SIZE = 4
+    RESEND_MAX_PER_ID = 2
+
     def __init__(self, bus, index, service, response_chrc):
         Characteristic.__init__(self, bus, index, API_REQUEST_UUID,
                                 ['write'], service)
         self.response_chrc = response_chrc
         self.write_buffer = bytearray()
         self._client_mtu = 185  # conservative default; updated from WriteValue options
+        # id -> list of ready-to-send chunk byte strings, for {"resend": id}.
+        # Insertion-ordered; oldest evicted past RESEND_CACHE_SIZE.
+        self._resend_cache = {}
+        self._resend_counts = {}
 
     def WriteValue(self, value, options):
         # Capture negotiated MTU from BlueZ for response chunking
@@ -1016,6 +1114,14 @@ class APIRequestCharacteristic(Characteristic):
                 dbus.Array([dbus.Byte(b) for b in err_response], signature='y'))
             return
 
+        # Recovery path: a dropped notification leaves the client with an
+        # incomplete chunk set. Rather than a per-chunk NACK protocol, the
+        # client asks for the whole response again and we replay the cached
+        # frames. Bounded per id so chronic RF loss can't loop forever.
+        if 'resend' in request:
+            self._handle_resend(request.get('resend'))
+            return
+
         request_id = request.get('id', 0)
         method = request.get('method', 'GET')
         path = request.get('path', '/status')
@@ -1036,11 +1142,7 @@ class APIRequestCharacteristic(Characteristic):
             # ATT notification overhead is 3 bytes.
             max_msg = self._client_mtu - 8
             if len(response_json) <= max_msg:
-                def send_single():
-                    self.response_chrc.send_notification(
-                        dbus.Array([dbus.Byte(b) for b in response_json], signature='y'))
-                    return False
-                GLib.idle_add(send_single)
+                frames = [response_json]
             else:
                 # Binary-search split: find largest data slices whose
                 # JSON-wrapped chunk messages fit within max_msg.
@@ -1062,23 +1164,61 @@ class APIRequestCharacteristic(Characteristic):
                     chunks.append(remaining[:lo])
                     remaining = remaining[lo:]
                 total = len(chunks)
-                for idx, chunk_data in enumerate(chunks):
-                    chunk_msg = json.dumps({
+                frames = [
+                    json.dumps({
                         'id': request_id,
                         'chunks': total,
                         'chunk': idx,
                         'data': chunk_data,
                     }).encode()
-                    def send_chunk(msg=chunk_msg):
-                        self.response_chrc.send_notification(
-                            dbus.Array([dbus.Byte(b) for b in msg], signature='y'))
-                        return False
-                    # Stagger chunk notifications by 50ms to prevent BlueZ drops
-                    GLib.timeout_add(200 * idx, send_chunk)
+                    for idx, chunk_data in enumerate(chunks)
+                ]
+
+            # Cache + schedule on the main context (D-Bus emission and the
+            # cache dict must not be touched from this worker thread).
+            GLib.idle_add(self._store_and_send, request_id, frames)
 
         # Run the blocking HTTP proxy call in a background thread
         # so the GLib main loop stays responsive for BLE operations
         threading.Thread(target=do_request, daemon=True).start()
+
+    def _store_and_send(self, request_id, frames):
+        """Main-context only: cache the frames for resend, then send them."""
+        self._resend_cache[request_id] = frames
+        self._resend_counts.pop(request_id, None)
+        while len(self._resend_cache) > self.RESEND_CACHE_SIZE:
+            oldest = next(iter(self._resend_cache))
+            self._resend_cache.pop(oldest, None)
+            self._resend_counts.pop(oldest, None)
+        self._send_frames(frames)
+        return False
+
+    def _send_frames(self, frames):
+        for idx, frame in enumerate(frames):
+            def send_one(msg=frame):
+                self.response_chrc.send_notification(
+                    dbus.Array([dbus.Byte(b) for b in msg], signature='y'))
+                return False
+            if idx == 0:
+                GLib.idle_add(send_one)
+            else:
+                GLib.timeout_add(self.CHUNK_STAGGER_MS * idx, send_one)
+
+    def _handle_resend(self, request_id):
+        frames = self._resend_cache.get(request_id)
+        if frames is None:
+            # Unknown id (evicted, or pre-resend daemon restart) — nothing
+            # to replay; the client falls back to its own request retry.
+            log.warning(f'API proxy: resend requested for unknown id={request_id}')
+            return
+        count = self._resend_counts.get(request_id, 0)
+        if count >= self.RESEND_MAX_PER_ID:
+            log.warning(f'API proxy: resend budget exhausted for id={request_id}')
+            return
+        self._resend_counts[request_id] = count + 1
+        log.info(f'API proxy: resending {len(frames)} frames for id={request_id} '
+                 f'(attempt {count + 1}/{self.RESEND_MAX_PER_ID})')
+        self._send_frames(frames)
 
 
 class APIResponseCharacteristic(Characteristic):
@@ -1112,12 +1252,24 @@ class Advertisement(dbus.service.Object):
         # The iOS app scans by WIFI_SERVICE_UUID only, so one UUID is enough.
         # The LocalName is placed in the scan response by BlueZ automatically.
         self.service_uuids = [WIFI_SERVICE_UUID]
+        # Dedup guard: True while a _reregister is scheduled or running its
+        # retry chain, so the Release path and the disconnect-poke path
+        # can't stack parallel retry chains.
+        self._reregister_pending = False
         dbus.service.Object.__init__(self, bus, self.path)
 
     def get_properties(self):
         props = {
             'Type': self.ad_type,
             'ServiceUUIDs': dbus.Array(self.service_uuids, signature='s'),
+            # Without these BlueZ leaves the controller's default interval
+            # (commonly ~1.28s). iOS/macOS duty-cycle their background
+            # scans, so a slow interval can delay discovery by 30-60s.
+            # The raw-HCI helper advertises at 100ms; match it here.
+            # Values are milliseconds (BlueZ range 20ms-10.24s); ignored
+            # harmlessly by BlueZ versions predating the property.
+            'MinInterval': dbus.UInt32(100),
+            'MaxInterval': dbus.UInt32(150),
         }
         if self.local_name:
             props['LocalName'] = dbus.String(self.local_name)
@@ -1140,10 +1292,26 @@ class Advertisement(dbus.service.Object):
         log.info(f'Advertisement released: {self.path}')
         # BlueZ released the advertisement (happens after a connection or internal
         # timeout).  Schedule a re-registration so the Pi stays discoverable.
-        GLib.timeout_add(2000, self._reregister)
+        self.ensure_registered(delay_ms=2000)
+
+    def ensure_registered(self, delay_ms=1500):
+        """Schedule a re-registration unless one is already in flight.
+
+        Called from Release AND from the central-disconnect signal. The
+        disconnect poke matters: BlueZ does not reliably call Release when
+        the adapter's internal reset drops the advert after an iOS
+        disconnect, and Release-path retries that start inside the reset
+        window all fail and back off — leaving the Pi undiscoverable for
+        minutes. Poking on disconnect starts a fresh chain the moment the
+        peripheral slot frees.
+        """
+        if self._reregister_pending:
+            return
+        self._reregister_pending = True
+        GLib.timeout_add(delay_ms, self._reregister)
 
     def _reregister(self, retry_count=0):
-        max_retries = 5
+        max_retries = 8
         # Defer while a central connect is in flight (no retry consumed).
         if connect_in_flight():
             log.info('Re-registration deferred: central connect in flight')
@@ -1153,6 +1321,7 @@ class Advertisement(dbus.service.Object):
 
         def on_success():
             log.info('Advertisement registered')
+            self._reregister_pending = False
             if not (self.service_manager and self.app):
                 return
             # Always attempt GATT re-registration after advertisement Release.
@@ -1184,7 +1353,9 @@ class Advertisement(dbus.service.Object):
                 on_success()
                 return
             if retry_count < max_retries:
-                delay = min(2000 * (2 ** retry_count), 30000)  # exponential backoff, max 30s
+                # Backoff capped at 10s: the failure mode is the adapter's
+                # post-disconnect reset window (a few seconds), not load.
+                delay = min(2000 * (2 ** retry_count), 10000)
                 log.warning(f'Advertisement re-registration failed (attempt {retry_count + 1}/{max_retries + 1}): {error} — retrying in {delay}ms')
                 GLib.timeout_add(delay, self._reregister, retry_count + 1)
             else:
@@ -1493,7 +1664,7 @@ def verify_gatt_objects(app):
     return False  # don't repeat GLib timeout
 
 
-def setup_connection_monitoring(bus, adapter_path):
+def setup_connection_monitoring(bus, adapter_path, app=None, adv=None):
     """Subscribe to BlueZ D-Bus signals to log BLE central connect/disconnect
     events.  Without this, the daemon has no visibility into whether iOS
     actually established a connection — making pairing failures hard to debug.
@@ -1517,6 +1688,18 @@ def setup_connection_monitoring(bus, adapter_path):
             # address can't inherit a prior session's authentication) and
             # the tracking sets don't grow unbounded.
             clear_peer_auth(str(path))
+            # Drop per-connection reassembly buffers and resend caches so a
+            # half-written request from the dead session can't poison the
+            # next one (see Application.reset_session_state).
+            if app is not None:
+                app.reset_session_state()
+            # Poke the advertisement back up now that the peripheral slot is
+            # free — BlueZ does not reliably Release it after an adapter
+            # reset, and waiting on the Release-path backoff tail left the
+            # Pi undiscoverable for minutes. Native adv mode only (the
+            # raw-HCI helper self-heals via its own 5s loop).
+            if adv is not None:
+                adv.ensure_registered()
 
     bus.add_signal_receiver(
         on_properties_changed,
@@ -1630,6 +1813,9 @@ def main():
 
     # Detect which port the Go API server is on (80 production, 8788 dev)
     API_BASE = detect_api_base()
+    # Kick the version-cache refresh now so the first DeviceInfo read after
+    # a connect returns a real version instead of 'unknown'.
+    get_version()
 
     # Wait up to 15s for BlueZ to expose the LE adapter — see wait_for_adapter()
     # docstring for race-condition rationale. Single-shot find_adapter() loses
@@ -1656,11 +1842,6 @@ def main():
     adv_mode = ble_adv_mode()
     log.info(f'BLE advertising mode: {adv_mode}')
     enable_controller_advertising(adapter_path, advertise=False)
-
-    # Subscribe to BlueZ D-Bus signals so connection events are logged.
-    # This makes it possible to see whether iOS actually connects to the Pi
-    # versus failing at the BLE advertisement/discovery stage.
-    setup_connection_monitoring(bus, adapter_path)
 
     # Exit (triggering systemd restart) if bluetoothd restarts, which drops
     # our GATT registration and causes iOS to see stale/wrong services.
@@ -1697,6 +1878,7 @@ def main():
         bus.get_object(BLUEZ_SERVICE, adapter_path), GATT_MANAGER_IFACE)
 
     app = Application(bus)
+
     service_manager.RegisterApplication(
         app.get_path(), {},
         reply_handler=register_app_cb,
@@ -1710,6 +1892,15 @@ def main():
                         service_manager=service_manager, app=app,
                         local_name=ble_name)
 
+    # Subscribe to BlueZ D-Bus signals so connection events are logged,
+    # per-connection state (auth, write buffers, resend caches) is dropped
+    # on disconnect, and — in native adv mode — the advertisement is poked
+    # back up as soon as the peripheral slot frees. Registered after both
+    # `app` and `adv` exist since it needs them.
+    setup_connection_monitoring(
+        bus, adapter_path, app,
+        adv=adv if adv_mode == 'native' else None)
+
     # Defer initial advertisement registration while a connect is in flight.
     def register_initial_adv():
         if connect_in_flight():
@@ -1720,7 +1911,7 @@ def main():
             # Transient BlueZ failure at boot must not leave the board dark until
             # a daemon restart — reuse the Release-path retry machinery.
             log.warning(f'Initial advertisement registration failed ({error}) — scheduling retries; GATT stays up')
-            GLib.timeout_add(2000, adv._reregister)
+            adv.ensure_registered(delay_ms=2000)
         ad_manager.RegisterAdvertisement(
             adv.get_path(), {},
             reply_handler=register_ad_cb,

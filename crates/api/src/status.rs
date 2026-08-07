@@ -828,3 +828,29 @@ pub fn get_sbc_model() -> String {
     }
     "unknown".to_string()
 }
+
+/// GET /api/dashboard-snapshot
+///
+/// The dashboard's three per-tick fetches (/status, /drives/stats,
+/// /drives/status) bundled into one response. Over BLE each request is a
+/// serialized round trip through the GATT proxy, so three calls per tick
+/// tripled the latency and kept the pipe busy; the app calls this instead
+/// when the transport is BLE (falling back to the three calls on 404 for
+/// older Pi builds).
+pub async fn dashboard_snapshot(
+    State(state): State<AppState>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let (status, stats, drive_status) = tokio::join!(
+        get_status(State(state.clone())),
+        crate::drives_handler::drive_stats(State(state.clone())),
+        crate::drives_handler::processing_status(State(state)),
+    );
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "status": status.1.0,
+            "drive_stats": stats.1.0,
+            "drive_status": drive_status.1.0,
+        })),
+    )
+}
