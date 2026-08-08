@@ -2786,6 +2786,7 @@ dependencies = [
  "prost-types",
  "protoc-bin-vendored",
  "rand 0.10.2",
+ "sentryusb-ble-health",
  "sha1 0.11.0",
  "sha2 0.11.0",
  "tempfile",
