@@ -35,6 +35,33 @@ use sentryusb_drives::charging::{
     SESSION_GAP_SECS,
 };
 
+/// /api/charging response cache. The list derives from a full
+/// telemetry_samples scan — 14s+ observed while an archive owns the
+/// disk — and sessions only change as samples land, so a short TTL is
+/// invisible to the UI. Tag/cost/delete mutations clear it so edits
+/// reflect immediately.
+const CHARGING_LIST_TTL: std::time::Duration = std::time::Duration::from_secs(15);
+
+static CHARGING_LIST_CACHE: std::sync::Mutex<
+    Option<(std::time::Instant, serde_json::Value)>,
+> = std::sync::Mutex::new(None);
+
+fn cached_charging_list() -> Option<serde_json::Value> {
+    let guard = CHARGING_LIST_CACHE.lock().unwrap();
+    guard
+        .as_ref()
+        .filter(|(at, _)| at.elapsed() < CHARGING_LIST_TTL)
+        .map(|(_, v)| v.clone())
+}
+
+fn store_charging_list(v: &serde_json::Value) {
+    *CHARGING_LIST_CACHE.lock().unwrap() = Some((std::time::Instant::now(), v.clone()));
+}
+
+fn invalidate_charging_list() {
+    *CHARGING_LIST_CACHE.lock().unwrap() = None;
+}
+
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -380,6 +407,9 @@ const CHARGE_STALE_SECS: i64 = 86_400;
 pub async fn list_charging(
     State(state): State<AppState>,
 ) -> (StatusCode, Json<serde_json::Value>) {
+    if let Some(v) = cached_charging_list() {
+        return (StatusCode::OK, Json(v));
+    }
     // Whole-table scan + per-session grouping/summarizing + a prefs-file
     // read (RateConfig::load) — all blocking + CPU, so run it on the
     // blocking pool instead of stalling an async worker on the Pi's two
@@ -408,10 +438,11 @@ pub async fn list_charging(
         .await;
 
     match result {
-        Ok(Ok(sessions)) => (
-            StatusCode::OK,
-            Json(serde_json::json!({ "sessions": sessions })),
-        ),
+        Ok(Ok(sessions)) => {
+            let v = serde_json::json!({ "sessions": sessions });
+            store_charging_list(&v);
+            (StatusCode::OK, Json(v))
+        }
         Ok(Err(e)) => crate::json_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
         Err(e) => {
             crate::json_error(StatusCode::INTERNAL_SERVER_ERROR, &format!("charging task: {}", e))
@@ -663,7 +694,10 @@ pub async fn set_charge_tags(
 ) -> (StatusCode, Json<serde_json::Value>) {
     let store = state.drives.store.clone();
     match tokio::task::spawn_blocking(move || store.set_charge_tags(id, &body.tags)).await {
-        Ok(Ok(())) => crate::json_ok(),
+        Ok(Ok(())) => {
+            invalidate_charging_list();
+            crate::json_ok()
+        }
         Ok(Err(e)) => crate::json_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
         Err(e) => {
             crate::json_error(StatusCode::INTERNAL_SERVER_ERROR, &format!("tags task: {}", e))
@@ -703,7 +737,10 @@ pub async fn set_charge_cost(
     };
     let store = state.drives.store.clone();
     match tokio::task::spawn_blocking(move || store.set_charge_cost(id, cost)).await {
-        Ok(Ok(())) => crate::json_ok(),
+        Ok(Ok(())) => {
+            invalidate_charging_list();
+            crate::json_ok()
+        }
         Ok(Err(e)) => crate::json_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
         Err(e) => {
             crate::json_error(StatusCode::INTERNAL_SERVER_ERROR, &format!("cost task: {}", e))
@@ -776,10 +813,13 @@ pub async fn bulk_delete_charges(
     .await;
 
     match result {
-        Ok(Ok((deleted, sessions))) => (
-            StatusCode::OK,
-            Json(serde_json::json!({ "deleted": deleted, "sessions": sessions })),
-        ),
+        Ok(Ok((deleted, sessions))) => {
+            invalidate_charging_list();
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({ "deleted": deleted, "sessions": sessions })),
+            )
+        }
         Ok(Err(e)) => crate::json_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
         Err(e) => {
             crate::json_error(StatusCode::INTERNAL_SERVER_ERROR, &format!("charging task: {}", e))
