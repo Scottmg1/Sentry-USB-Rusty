@@ -212,6 +212,11 @@ const TELEMETRY_CHARGE_INDEX: &str =
         OR charger_power_kw IS NOT NULL \
         OR charge_rate_mph IS NOT NULL";
 
+/// `route_sync_info_by_cloud_id` reverse lookup (cloud sync pull).
+const CLOUD_ROUTE_ID_INDEX: &str =
+    "CREATE INDEX IF NOT EXISTS idx_routes_cloud_route_id \
+     ON routes(cloud_route_id) WHERE cloud_route_id IS NOT NULL";
+
 /// v4 Tessie provenance columns. Preserves `source`, `externalSignature`,
 /// and `tessieAutopilotPercent` through SQLite on import/export so a
 /// round-trip with Sentry-Drive's `drive-data.json` is lossless.
@@ -564,6 +569,7 @@ pub fn migrate(conn: &Connection) -> Result<()> {
     for (stmt, name) in [
         (CLOUD_UPLOADED_INDEX, "idx_routes_cloud_uploaded"),
         (TELEMETRY_CHARGE_INDEX, "idx_telemetry_charge_ts"),
+        (CLOUD_ROUTE_ID_INDEX, "idx_routes_cloud_route_id"),
     ] {
         let exists: i64 = conn.query_row(
             "SELECT count(*) FROM sqlite_master WHERE type='index' AND name=?1",

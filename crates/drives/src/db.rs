@@ -72,6 +72,13 @@ const ARCHIVE_SYNC_ROUTE_COUNT_KEY: &str = "archive_sync_route_count";
 /// archive backup would never pick up new charging history until the
 /// next drive.
 const ARCHIVE_SYNC_SAMPLE_COUNT_KEY: &str = "archive_sync_sample_count";
+
+/// Meta key: UTC date (`YYYY-MM-DD`) of the last successful archive JSON
+/// export. Gates the multi-minute full-history export to once per day —
+/// same rationale as the daily drive-DB backup gate; on a grown DB the
+/// per-archive-cycle export was a disk storm with no recovery-granularity
+/// gain (rsync ships whole-file anyway; same-day copies overwrite).
+const ARCHIVE_SYNC_EXPORT_DATE_KEY: &str = "archive_sync_export_date";
 // Bump on every drive-list-shape change so existing on-disk caches
 // rebuild on first boot after upgrade.
 //
@@ -1558,7 +1565,7 @@ impl DriveStore {
         // processing pass and the COUNT walks the whole samples table.
         // A COUNT failure propagates — treating it as 0 would spuriously
         // mismatch the baseline and trigger a full multi-minute export.
-        let (samples_now, last_synced, last_synced_samples) =
+        let (samples_now, last_synced, last_synced_samples, last_export_date) =
             self.with_read_conn(|conn| -> Result<_> {
                 let samples: i64 = conn
                     .query_row("SELECT COUNT(*) FROM telemetry_samples", [], |r| r.get(0))
@@ -1568,7 +1575,8 @@ impl DriveStore {
                 let samples_baseline: Option<i64> =
                     schema::meta_get(conn, ARCHIVE_SYNC_SAMPLE_COUNT_KEY)?
                         .and_then(|s| s.parse().ok());
-                Ok((samples, routes, samples_baseline))
+                let export_date = schema::meta_get(conn, ARCHIVE_SYNC_EXPORT_DATE_KEY)?;
+                Ok((samples, routes, samples_baseline, export_date))
             })?;
         if last_synced == Some(routes_now)
             && last_synced_samples == Some(samples_now)
@@ -1581,12 +1589,25 @@ impl DriveStore {
             return Ok(());
         }
 
+        // Daily gate: counts moved, but an export already ran today. The
+        // count baselines are deliberately NOT advanced, so tomorrow's
+        // first pass exports everything accumulated since this one.
+        let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+        if last_export_date.as_deref() == Some(today.as_str()) && Path::new(archive).exists() {
+            info!(
+                "[drives] archive_json_export_skipped reason=already_today date={}",
+                today
+            );
+            return Ok(());
+        }
+
         self.export_json_to_file(mirror)?;
         sync_to_path(mirror, archive, cache)?;
 
         let conn = self.conn.lock().unwrap();
         schema::meta_set(&conn, ARCHIVE_SYNC_ROUTE_COUNT_KEY, &routes_now.to_string())?;
         schema::meta_set(&conn, ARCHIVE_SYNC_SAMPLE_COUNT_KEY, &samples_now.to_string())?;
+        schema::meta_set(&conn, ARCHIVE_SYNC_EXPORT_DATE_KEY, &today)?;
         Ok(())
     }
 
@@ -3917,6 +3938,14 @@ mod tests {
             .unwrap();
     }
 
+    /// Pretend the last archive JSON export ran long ago so the daily
+    /// gate lets the next sync through.
+    fn rewind_export_date(store: &DriveStore) {
+        store.with_locked_conn(|conn| {
+            schema::meta_set(conn, ARCHIVE_SYNC_EXPORT_DATE_KEY, "2000-01-01").unwrap();
+        });
+    }
+
     #[test]
     fn archive_sync_pushes_then_skips_until_new_routes() {
         let dir = TmpDir::new("push-skip");
@@ -3936,8 +3965,14 @@ mod tests {
         store.sync_to_archive_at(&mirror, &archive, &cache).unwrap();
         assert_eq!(std::fs::read_to_string(&archive).unwrap(), "sentinel");
 
-        // New route moves the baseline: archive rewritten.
+        // New route same day: counts moved but the daily gate holds —
+        // archive untouched, baselines not advanced.
         add_test_route(&store, "a/2025-01-15_11-00-00-front.mp4");
+        store.sync_to_archive_at(&mirror, &archive, &cache).unwrap();
+        assert_eq!(std::fs::read_to_string(&archive).unwrap(), "sentinel");
+
+        // Next day: the deferred route exports.
+        rewind_export_date(&store);
         store.sync_to_archive_at(&mirror, &archive, &cache).unwrap();
         let repushed = std::fs::read_to_string(&archive).unwrap();
         assert_ne!(repushed, "sentinel");
@@ -3956,7 +3991,8 @@ mod tests {
         add_test_route(&store, "a/2025-01-15_10-00-00-front.mp4");
         store.sync_to_archive_at(&mirror, &archive, &cache).unwrap();
 
-        // No new routes, but the sampler wrote a row: archive rewritten.
+        // No new routes, but the sampler wrote a row: archive rewritten
+        // (once past the daily gate).
         std::fs::write(&archive, "sentinel").unwrap();
         store.with_locked_conn(|conn| {
             conn.execute(
@@ -3965,6 +4001,7 @@ mod tests {
             )
             .unwrap();
         });
+        rewind_export_date(&store);
         store.sync_to_archive_at(&mirror, &archive, &cache).unwrap();
         let repushed = std::fs::read_to_string(&archive).unwrap();
         assert_ne!(repushed, "sentinel");
