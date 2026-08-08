@@ -41,6 +41,7 @@ import { BannerStack, type BannerItem } from "@/components/ui/Banner"
 import { Pill, LiveDot } from "@/components/ui/Pill"
 import type { Halo } from "@/components/ui/StatusTile"
 import type { TireHistoryResponse } from "@/components/dashboard/TirePressureCard"
+import type { BleHealth } from "@/lib/bleHealth"
 
 function getTempHalo(milliC: number): Halo {
   if (milliC <= 0) return "blue"
@@ -146,6 +147,7 @@ export default function Dashboard() {
   // Polled at 30s — the BLE sampler itself runs once a minute while
   // parked + awake, so anything faster on the UI side is wasted.
   const [carStatusSample, setCarStatusSample] = useState<CarStatusSample | null>(null)
+  const [bleHealth, setBleHealth] = useState<BleHealth | null>(null)
   // Live charge status for the CarStatusCard battery chip.
   const [currentCharge, setCurrentCharge] = useState<CurrentCharge | null>(null)
   // ISO end-time of the latest drive on record — used to derive the
@@ -247,10 +249,19 @@ export default function Dashboard() {
     // overview tile; the user can still pair BLE from Settings.
     async function fetchCarStatusSample() {
       try {
-        const res = await fetch("/api/system/ble-latest-sample")
-        if (!res.ok) return
-        const d = (await res.json()) as CarStatusSample
-        if (mounted) setCarStatusSample(d)
+        const [sampleRes, healthRes] = await Promise.all([
+          fetch("/api/system/ble-latest-sample"),
+          fetch("/api/system/ble-connected"),
+        ])
+        if (!mounted) return
+        if (healthRes.ok) {
+          const d = (await healthRes.json()) as { health?: BleHealth }
+          if (mounted) setBleHealth(d.health ?? null)
+        }
+        if (sampleRes.ok) {
+          const d = (await sampleRes.json()) as CarStatusSample
+          if (mounted) setCarStatusSample(d)
+        }
       } catch {
         /* non-critical */
       }
@@ -519,9 +530,12 @@ export default function Dashboard() {
           full content width so its flex-1 chips line up under the status
           tiles above; the page-level max-width keeps it from over-stretching
           on ultrawide. */}
-      {(carStatusSample?.ts != null || currentCharge?.soc != null) && (
+      {(carStatusSample?.ts != null ||
+        currentCharge?.soc != null ||
+        bleHealth?.code === "repair_required") && (
         <CarStatusCard
           sample={carStatusSample}
+          bleHealth={bleHealth}
           latestDriveEnd={latestDriveEnd}
           tireHistory={tireHistory ?? undefined}
           useFahrenheit={useFahrenheit}
