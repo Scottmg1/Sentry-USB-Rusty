@@ -12,3 +12,4 @@ server/ble/__pycache__
 docs/superpowers
 /crates/sentryusb/static/
 /graphify-out
+/.worktrees/
