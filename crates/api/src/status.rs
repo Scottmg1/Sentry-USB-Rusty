@@ -563,26 +563,28 @@ pub async fn get_wifi_config(
     let mut connected = false;
     let mut source = String::new();
 
-    // 1. Try nmcli
-    if let Ok(out) = sentryusb_shell::run("nmcli", &["-t", "-f", "active,ssid", "dev", "wifi"]).await {
-        for line in out.lines() {
-            if line.starts_with("yes:") {
-                ssid = line.strip_prefix("yes:").unwrap_or("").to_string();
-                connected = true;
-                source = "networkmanager".into();
-                break;
-            }
+    // 1. Try iwgetid — reads the kernel's association state in
+    // milliseconds. `nmcli dev wifi` triggers a WiFi SCAN (3+ s
+    // observed) and is only needed when iwgetid comes up empty.
+    if let Ok(out) = sentryusb_shell::run("iwgetid", &["-r"]).await {
+        let s = out.trim();
+        if !s.is_empty() {
+            ssid = s.to_string();
+            connected = true;
+            source = "iwgetid".into();
         }
     }
 
-    // 2. Fallback: iwgetid
+    // 2. Fallback: nmcli
     if ssid.is_empty() {
-        if let Ok(out) = sentryusb_shell::run("iwgetid", &["-r"]).await {
-            let s = out.trim();
-            if !s.is_empty() {
-                ssid = s.to_string();
-                connected = true;
-                source = "iwgetid".into();
+        if let Ok(out) = sentryusb_shell::run("nmcli", &["-t", "-f", "active,ssid", "dev", "wifi"]).await {
+            for line in out.lines() {
+                if line.starts_with("yes:") {
+                    ssid = line.strip_prefix("yes:").unwrap_or("").to_string();
+                    connected = true;
+                    source = "networkmanager".into();
+                    break;
+                }
             }
         }
     }

@@ -127,7 +127,13 @@ pub async fn get_queue(
     axum::extract::Query(q): axum::extract::Query<QueueQuery>,
 ) -> impl IntoResponse {
     let limit = q.limit.unwrap_or(100).clamp(1, 200);
-    match state.cloud.uploader.pending_queue(limit) {
+    // BLOB-length aggregation over every pending route — blocking pool,
+    // not the reactor (1.5s observed while an archive owned the disk).
+    let uploader = state.cloud.uploader.clone();
+    let queue = tokio::task::spawn_blocking(move || uploader.pending_queue(limit))
+        .await
+        .unwrap_or_else(|e| Err(anyhow::anyhow!("queue task: {}", e)));
+    match queue {
         Ok(entries) => {
 
             let pending = state.cloud.uploader.status().await.pending_route_count;

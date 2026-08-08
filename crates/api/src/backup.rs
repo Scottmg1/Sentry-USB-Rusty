@@ -629,6 +629,7 @@ pub async fn create_backup(
     }
 
     write_last_hash(&current_hash);
+    invalidate_backup_list();
     (StatusCode::OK, Json(serde_json::json!({
         "success": true,
         "date": data.date,
@@ -636,19 +637,47 @@ pub async fn create_backup(
     })))
 }
 
+/// Backups change at most daily; the listing scans /backingfiles plus a
+/// possibly-network archive mount (7-10s observed while an archive owned
+/// the disk), so a short TTL makes repeat Settings visits instant.
+const BACKUP_LIST_TTL: std::time::Duration = std::time::Duration::from_secs(60);
+
+static BACKUP_LIST_CACHE: std::sync::Mutex<
+    Option<(std::time::Instant, serde_json::Value)>,
+> = std::sync::Mutex::new(None);
+
+/// Called by the backup-creation paths so a fresh backup shows up
+/// immediately instead of after the TTL.
+pub(crate) fn invalidate_backup_list() {
+    *BACKUP_LIST_CACHE.lock().unwrap() = None;
+}
+
 /// GET /api/system/backups
 ///
 /// Merges local and archive listings, deduping by date (archive wins over
 /// local when both exist).
 pub async fn list_backups(State(_s): State<AppState>) -> (StatusCode, Json<serde_json::Value>) {
+    {
+        let guard = BACKUP_LIST_CACHE.lock().unwrap();
+        if let Some((at, v)) = guard.as_ref() {
+            if at.elapsed() < BACKUP_LIST_TTL {
+                return (StatusCode::OK, Json(v.clone()));
+            }
+        }
+    }
     // Directory scans over /backingfiles and the archive mount — slow
     // while an archive run saturates the disk (observed 7+ s), so keep
     // them off the async workers.
-    tokio::task::spawn_blocking(list_backups_blocking)
+    let (code, body) = tokio::task::spawn_blocking(list_backups_blocking)
         .await
         .unwrap_or_else(|_| {
             crate::json_error(StatusCode::INTERNAL_SERVER_ERROR, "backup listing task failed")
-        })
+        });
+    if code == StatusCode::OK {
+        *BACKUP_LIST_CACHE.lock().unwrap() =
+            Some((std::time::Instant::now(), body.0.clone()));
+    }
+    (code, body)
 }
 
 fn list_backups_blocking() -> (StatusCode, Json<serde_json::Value>) {
