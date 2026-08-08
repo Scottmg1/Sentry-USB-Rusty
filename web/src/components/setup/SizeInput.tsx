@@ -41,6 +41,14 @@ export function SizeInput({
     if (!focused) setLocalVal(numericVal)
   }, [numericVal, focused])
 
+  // Seed the default into form data so an untouched required field (e.g.
+  // Dashcam) isn't validated as 0 before the user ever focuses it. Only when
+  // empty and not locked; never overwrites an existing value.
+  useEffect(() => {
+    if (!disabled && !raw.trim() && defaultVal) onChange(field, defaultVal)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
   const handleFocus = () => {
     if (disabled) return
     setFocused(true)
@@ -56,14 +64,24 @@ export function SizeInput({
 
   const handleChange = (v: string) => {
     if (disabled) return
-    setLocalVal(v.replace(/[^0-9]/g, ""))
+    const cleaned = v.replace(/[^0-9]/g, "")
+    setLocalVal(cleaned)
+    // Commit on every keystroke, not just onBlur: mobile browsers don't
+    // reliably fire blur before the wizard's Next/validation reads the form,
+    // so a blur-only commit left the value empty and tripped "Dashcam drive
+    // size must be greater than 0 GB" even though a value was typed. Empty
+    // commits "" (not the default) so the stored value+unit never disagree;
+    // blur + the mount seed restore the default for an untouched field.
+    onChange(field, cleaned ? cleaned + unit : "")
   }
 
   const handleUnitChange = (newUnit: Unit) => {
     if (disabled) return
     setUnit(newUnit)
-    const currentNum = focused ? localVal : numericVal
-    if (currentNum) onChange(field, currentNum + newUnit)
+    // Commit on a unit toggle with the NEW unit so the label and stored value
+    // stay in sync; empty commits "" (default is restored on blur / mount).
+    const currentNum = (focused ? localVal : numericVal).replace(/[^0-9]/g, "")
+    onChange(field, currentNum ? currentNum + newUnit : "")
   }
 
   const unitLabel = unit === "M" ? "MB" : "GB"
