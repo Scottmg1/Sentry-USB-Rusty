@@ -2648,6 +2648,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "sentryusb-ble-health"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
 name = "sentryusb-cloud-crypto"
 version = "0.1.0"
 dependencies = [
