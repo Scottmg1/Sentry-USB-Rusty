@@ -200,6 +200,9 @@ pub struct DriveStore {
     /// rebuild debounce so interactive mutations (tag edit, delete,
     /// upload) still rebuild immediately.
     bulk_ingest: AtomicBool,
+    /// Unix seconds of the last route-overview recompute; pairs with
+    /// `bulk_ingest` the same way `last_cache_rebuild` does.
+    last_overview_rebuild: AtomicI64,
     /// Cached row counts so `/api/drives/status` doesn't hit SQLite for
     /// every poll.
     route_count: AtomicI64,
@@ -265,6 +268,7 @@ impl DriveStore {
             read_rr: AtomicU64::new(0),
             last_cache_rebuild: AtomicI64::new(0),
             bulk_ingest: AtomicBool::new(false),
+            last_overview_rebuild: AtomicI64::new(0),
             route_count: AtomicI64::new(0),
             processed_count: AtomicI64::new(0),
             drive_cache_dirty: AtomicBool::new(true),
@@ -291,6 +295,7 @@ impl DriveStore {
             read_rr: AtomicU64::new(0),
             last_cache_rebuild: AtomicI64::new(0),
             bulk_ingest: AtomicBool::new(false),
+            last_overview_rebuild: AtomicI64::new(0),
             route_count: AtomicI64::new(0),
             processed_count: AtomicI64::new(0),
             drive_cache_dirty: AtomicBool::new(false),
@@ -1709,8 +1714,21 @@ impl DriveStore {
         {
             let cache = self.route_overview_cache.lock().unwrap();
             if let Some(c) = cache.as_ref() {
-                if c.generation == generation && c.max_points == max_points {
-                    return Ok(c.json.clone());
+                if c.max_points == max_points {
+                    if c.generation == generation {
+                        return Ok(c.json.clone());
+                    }
+                    // Bulk ingest bumps the generation on every clip, and a
+                    // recompute is the heaviest read in the store (full BLOB
+                    // decode of every route) — serve the last-built overview
+                    // for the debounce window instead of recomputing per
+                    // map request.
+                    if self.bulk_ingest.load(Ordering::Acquire)
+                        && now_unix() - self.last_overview_rebuild.load(Ordering::Acquire)
+                            < CACHE_REBUILD_DEBOUNCE_SECS
+                    {
+                        return Ok(c.json.clone());
+                    }
                 }
             }
         }
@@ -1719,6 +1737,7 @@ impl DriveStore {
         let json = serde_json::to_string(&overviews).unwrap_or_else(|_| "[]".to_string());
         let mut cache = self.route_overview_cache.lock().unwrap();
         *cache = Some(RouteOverviewCache { generation, max_points, json: json.clone() });
+        self.last_overview_rebuild.store(now_unix(), Ordering::Release);
         Ok(json)
     }
 
