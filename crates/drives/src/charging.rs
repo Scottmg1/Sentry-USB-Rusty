@@ -102,6 +102,9 @@ pub struct ChargeSessionSummary {
     /// tag/rate engine. Lets the UI show the cost as manually set and skip
     /// the "set a rate" hint.
     pub cost_overridden: bool,
+    /// Charged inside the configured home geofence. Set by the api crate;
+    /// `false` in the cloud blob. Drives the auto "Home" chip + Home rate.
+    pub at_home: bool,
 }
 
 /// One point on the detail charts. Carries every per-sample series the
@@ -385,6 +388,9 @@ pub fn summarize(rows: &[ChargeRow]) -> ChargeSessionSummary {
         currency: String::new(),
         fast_charging: peak_power_kw.is_some_and(|p| p > FAST_CHARGE_THRESHOLD_KW),
         cost_overridden: false,
+        // Derived by the api crate from the home geofence; stays false here
+        // (and in the cloud blob, which never fills it).
+        at_home: false,
     }
 }
 
@@ -426,6 +432,30 @@ pub fn downsample_points(points: Vec<ChargePoint>, max: usize) -> Vec<ChargePoin
         }
     }
     out
+}
+
+/// Reserved, DERIVED charge tags — computed on read, never stored.
+///
+/// They live here rather than in the API crate because two independent call
+/// sites must agree on them: the API's tag-write handler, and the cloud
+/// sync-in path in `sentryusb-cloud-uploader`. Neither crate depends on the
+/// other; both depend on this one. A tag arriving from the cloud is otherwise
+/// persisted as a real stored tag, which is exactly what the local write
+/// handler forbids.
+pub const HOME_TAG: &str = "Home";
+
+/// Derived from charger power, not stored — see [`HOME_TAG`].
+pub const FAST_TAG: &str = "Fast charging";
+
+/// True when `tag` is reserved (case-insensitive) and so must never be stored.
+pub fn is_reserved_tag(tag: &str) -> bool {
+    tag.eq_ignore_ascii_case(HOME_TAG) || tag.eq_ignore_ascii_case(FAST_TAG)
+}
+
+/// Drop every reserved tag from user- or cloud-supplied tags, so a derived
+/// label can never round-trip into the store as an editable one.
+pub fn strip_reserved_tags(tags: Vec<String>) -> Vec<String> {
+    tags.into_iter().filter(|t| !is_reserved_tag(t)).collect()
 }
 
 #[cfg(test)]

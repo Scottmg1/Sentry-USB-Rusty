@@ -4,6 +4,7 @@ import {
   BatteryCharging,
   CheckSquare,
   ChevronRight,
+  Home,
   Loader2,
   MapPin,
   Trash2,
@@ -156,14 +157,32 @@ export default function Charging() {
       const t = new Date(s.startMs)
       if (from && t < from) return false
       if (to && t >= to) return false
-      if (
-        selectedTags.length > 0 &&
-        !s.tags.some((tag) => selectedTags.includes(tag))
-      )
-        return false
+      if (selectedTags.length > 0) {
+        // "Home" and "Fast charging" are derived filters (not stored tags) —
+        // match them via atHome / fastCharging; everything else is a real tag.
+        const sel = selectedTags.map((t) => t.toLowerCase())
+        const tagMatch =
+          s.tags.some((tag) => selectedTags.includes(tag)) ||
+          (s.atHome && sel.includes("home")) ||
+          (s.fastCharging && sel.includes("fast charging"))
+        if (!tagMatch) return false
+      }
       return true
     })
   }, [sessions, range, selectedTags])
+
+  // Tags-dropdown options = real tags (incl. the API-surfaced "Home") plus the
+  // derived "Fast charging" filter when any session qualifies — so it lives in
+  // the Tags dropdown alongside Home, not as a separate pill.
+  const filterTags = useMemo(() => {
+    if (
+      sessions.some((s) => s.fastCharging) &&
+      !tags.some((t) => t.toLowerCase() === "fast charging")
+    ) {
+      return [...tags, "Fast charging"]
+    }
+    return tags
+  }, [tags, sessions])
 
   const onSelectAll = useCallback(() => {
     setSelected(new Set(visible.map((s) => s.id)))
@@ -222,7 +241,7 @@ export default function Charging() {
       <div className="flex flex-wrap items-center gap-x-3 gap-y-2">
         <DatePopover range={range} onChange={setRange} />
         <ChargingTagFilter
-          tags={tags}
+          tags={filterTags}
           selected={selectedTags}
           onChange={setSelectedTags}
         />
@@ -551,7 +570,19 @@ function ChargeRow({
         )}
       </div>
 
-      <div onClick={(e) => e.stopPropagation()}>
+      <div
+        onClick={(e) => e.stopPropagation()}
+        className="flex items-center gap-1.5"
+      >
+        {session.atHome && (
+          <span
+            title="Charged at home (automatic)"
+            className="inline-flex items-center gap-1 rounded-md border border-emerald-400/30 bg-emerald-400/10 px-2 py-1 text-xs font-medium text-emerald-200"
+          >
+            <Home className="h-3 w-3" />
+            Home
+          </span>
+        )}
         <TagPopover
           tags={session.tags}
           onChange={(t) => onTagsChange(session.id, t)}

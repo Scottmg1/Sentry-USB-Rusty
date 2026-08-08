@@ -337,12 +337,28 @@ fn apply_rates(
     s: &mut ChargeSessionSummary,
     rows: &[ChargeRow],
     tags: Vec<String>,
+    at_home: bool,
     rates: &RateConfig,
 ) {
+    // Rate keys are the user tags, plus the configured "Home" rate (matched
+    // case-insensitively) when inside the home geofence. "Home" is a derived
+    // flag, never a stored tag — it prices a home charge without being
+    // persisted or shown as editable.
+    let mut rate_keys: Vec<&str> = tags.iter().map(String::as_str).collect();
+    if at_home {
+        // Price a home charge via any configured "Home" rate key (any casing),
+        // regardless of stored tags. The most-expensive fold below takes the max
+        // over plans, so adding each distinct key once can't double-count.
+        for k in rates.tags.keys() {
+            if k.eq_ignore_ascii_case(HOME_TAG) && !rate_keys.contains(&k.as_str()) {
+                rate_keys.push(k.as_str());
+            }
+        }
+    }
     // Most expensive configured tag plan the session carries, if any.
-    let best_tag_cost = tags
+    let best_tag_cost = rate_keys
         .iter()
-        .filter_map(|t| rates.tags.get(t))
+        .filter_map(|t| rates.tags.get(*t))
         .filter(|p| p.is_configured())
         .filter_map(|p| plan_cost(rows, p.flat, &p.schedules, rates.default_rate))
         .fold(None, |acc: Option<f64>, c| Some(acc.map_or(c, |a: f64| a.max(c))));
@@ -363,6 +379,7 @@ fn apply_rates(
     s.rate = rate;
     s.currency = rates.currency.clone();
     s.tags = tags;
+    s.at_home = at_home;
 }
 
 /// Apply a manual per-charge cost override on top of the rate-derived
@@ -384,6 +401,65 @@ fn apply_cost_override(s: &mut ChargeSessionSummary, override_cost: Option<(f64,
     }
 }
 
+/// Default home geofence radius (m) when `KEEP_ACCESSORY_HOME_RADIUS_M` is unset.
+const HOME_TAG_RADIUS_M: f64 = 120.0;
+
+// Reserved-tag vocabulary is shared with the cloud sync-in path via the
+// drives crate — see sentryusb_drives::charging. Keeping one owner means a
+// change to either label cannot silently diverge between the two writers.
+use sentryusb_drives::charging::{strip_reserved_tags, HOME_TAG};
+
+
+/// Home geofence (lat, lon, radius_m) for the auto "Home" charge tag. Center
+/// is shared with keep-accessory (`KEEP_ACCESSORY_HOME_LAT/LON`); `None` when
+/// unset, leaving the feature inert.
+fn home_geofence() -> Option<(f64, f64, f64)> {
+    let config_path = sentryusb_config::find_config_path();
+    let (active, commented) = sentryusb_config::parse_file(config_path).ok()?;
+    let g = |k: &str| sentryusb_config::get_config_value(&active, &commented, k);
+    // Range-checked rather than merely finite, matching the BLE at_home reader:
+    // a malformed KEEP_ACCESSORY_HOME_LAT must not yield a different verdict in
+    // one place than the other. Subsumes the finite check.
+    let lat = g("KEEP_ACCESSORY_HOME_LAT")
+        .and_then(|s| s.trim().parse::<f64>().ok())
+        .filter(|v| (-90.0..=90.0).contains(v))?;
+    // Normalize on read (older configs may hold a world-copy longitude).
+    let lon = g("KEEP_ACCESSORY_HOME_LON")
+        .and_then(|s| s.trim().parse::<f64>().ok())
+        .filter(|v| v.is_finite())
+        .map(crate::normalize_lon)?;
+    // Guard finiteness + sane bounds so a malformed radius (e.g. `inf`) can't
+    // classify every finite-GPS session as home.
+    let radius = g("KEEP_ACCESSORY_HOME_RADIUS_M")
+        .and_then(|s| s.trim().parse::<f64>().ok())
+        .filter(|r| r.is_finite() && *r > 0.0 && *r <= 100_000.0)
+        .unwrap_or(HOME_TAG_RADIUS_M);
+    Some((lat, lon, radius))
+}
+
+/// Great-circle distance in meters (haversine). Local copy, as in `away_mode`.
+fn distance_m(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
+    const EARTH_R_M: f64 = 6_371_000.0;
+    let (p1, p2) = (lat1.to_radians(), lat2.to_radians());
+    let dphi = (lat2 - lat1).to_radians();
+    let dlambda = (lon2 - lon1).to_radians();
+    let a = (dphi / 2.0).sin().powi(2) + p1.cos() * p2.cos() * (dlambda / 2.0).sin().powi(2);
+    2.0 * EARTH_R_M * a.sqrt().min(1.0).asin()
+}
+
+
+/// True when a session's charge location falls inside the home geofence.
+fn is_home_charge(lat: Option<f64>, lon: Option<f64>, home: Option<(f64, f64, f64)>) -> bool {
+    match (lat, lon, home) {
+        (Some(la), Some(lo), Some((hla, hlo, r))) => {
+            // Normalised for symmetry with the BLE at_home path; haversine's
+            // sin(dlon/2) is periodic so a world-copy longitude already measures
+            // correctly, but the two should read the same way.
+            distance_m(la, crate::normalize_lon(lo), hla, hlo) <= r
+        }
+        _ => false,
+    }
+}
 
 /// How stale the latest charge row may be before the banner gives up
 /// entirely. Generous (24h) because the only case that can leave a
@@ -413,15 +489,24 @@ pub async fn list_charging(State(state): State<AppState>) -> axum::response::Res
             let build = || -> anyhow::Result<Vec<ChargeSessionSummary>> {
                 let rows = store.with_read_conn(|conn| load_charge_rows(conn, 0, None))?;
                 let rates = RateConfig::load();
+                // Read the geofence ONCE per cache miss and hoist it above the
+                // loop: it parses the config file, so doing it per session would
+                // scale the cost with history length. Computed inside the cache
+                // because the cache stores the rendered JSON — a home-location
+                // change therefore applies on the next miss (<=15s), which is
+                // the deliberate trade for not re-serialising on every request.
+                let home = home_geofence();
                 let tag_map = store.get_all_charge_tags().unwrap_or_default();
                 let cost_map = store.get_all_charge_costs().unwrap_or_default();
                 let mut sessions: Vec<ChargeSessionSummary> = group_sessions(rows)
                     .iter()
                     .map(|s| {
                         let mut summary = summarize(s);
-                        let tags = tag_map.get(&summary.id).cloned().unwrap_or_default();
+                        let stored = tag_map.get(&summary.id).cloned().unwrap_or_default();
+                        let at_home =
+                            is_home_charge(summary.location_lat, summary.location_lon, home);
                         let override_cost = cost_map.get(&summary.id).cloned();
-                        apply_rates(&mut summary, s, tags, &rates);
+                        apply_rates(&mut summary, s, stored, at_home, &rates);
                         apply_cost_override(&mut summary, override_cost);
                         summary
                     })
@@ -481,9 +566,11 @@ pub async fn single_charging(
             };
 
             let mut summary = summarize(&session);
-            let tags = store.get_charge_tags(summary.id).unwrap_or_default();
+            let stored = store.get_charge_tags(summary.id).unwrap_or_default();
+            let at_home =
+                is_home_charge(summary.location_lat, summary.location_lon, home_geofence());
             let override_cost = store.get_charge_cost(summary.id).unwrap_or_default();
-            apply_rates(&mut summary, &session, tags, &RateConfig::load());
+            apply_rates(&mut summary, &session, stored, at_home, &RateConfig::load());
             apply_cost_override(&mut summary, override_cost);
 
             let points: Vec<ChargePoint> = session
@@ -681,7 +768,16 @@ pub async fn list_charge_tags(
     State(state): State<AppState>,
 ) -> (StatusCode, Json<serde_json::Value>) {
     let store = state.drives.store.clone();
-    match tokio::task::spawn_blocking(move || store.get_all_charge_tag_names()).await {
+    let task = tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<String>> {
+        let mut tags = store.get_all_charge_tag_names()?;
+        // Surface the virtual "Home" tag (filterable + rateable) when a home is set.
+        if home_geofence().is_some() && !tags.iter().any(|t| t.eq_ignore_ascii_case(HOME_TAG)) {
+            tags.push(HOME_TAG.to_string());
+            tags.sort();
+        }
+        Ok(tags)
+    });
+    match task.await {
         Ok(Ok(tags)) => (
             StatusCode::OK,
             Json(serde_json::to_value(tags).unwrap_or_default()),
@@ -702,7 +798,11 @@ pub async fn set_charge_tags(
     Json(body): Json<SetChargeTagsRequest>,
 ) -> (StatusCode, Json<serde_json::Value>) {
     let store = state.drives.store.clone();
-    match tokio::task::spawn_blocking(move || store.set_charge_tags(id, &body.tags)).await {
+    // "Home" and "Fast charging" are reserved, derived tags — strip them before
+    // storing (see strip_reserved_tags): keeps them out of the store and out of
+    // the cloud envelope.
+    let tags = strip_reserved_tags(body.tags);
+    match tokio::task::spawn_blocking(move || store.set_charge_tags(id, &tags)).await {
         Ok(Ok(())) => {
             invalidate_charging_list();
             crate::json_ok()
@@ -1040,7 +1140,7 @@ mod tests {
         let r = rates(Some(0.10), &[("Home", 0.12), ("Public", 0.40)]);
         let cost_for = |tags: Vec<String>| {
             let mut s = summarize(&session);
-            apply_rates(&mut s, &session, tags, &r);
+            apply_rates(&mut s, &session, tags, false, &r);
             s.cost
         };
         // No tags, or a tag with no configured plan → default (0.10 × 10).
@@ -1054,11 +1154,58 @@ mod tests {
     }
 
     #[test]
+    fn strip_reserved_tags_removes_home_any_casing() {
+        let out = strip_reserved_tags(vec![
+            "Home".into(),
+            "home".into(),
+            "HOME".into(),
+            "Fast charging".into(),
+            "FAST CHARGING".into(),
+            "Work".into(),
+            "Homebrew".into(),
+        ]);
+        // Only exact "Home"/"Fast charging" (any casing) are reserved; other
+        // tags (incl. substrings like "Homebrew") are kept.
+        assert_eq!(out, vec!["Work".to_string(), "Homebrew".to_string()]);
+    }
+
+    #[test]
+    fn at_home_prices_via_home_rate_and_sets_flag() {
+        let session = hour_session();
+        let run = |tags: Vec<String>, at_home: bool, r: &RateConfig| {
+            let mut s = summarize(&session);
+            apply_rates(&mut s, &session, tags, at_home, r);
+            (s.cost, s.at_home, s.tags)
+        };
+        // Derived home charge, no stored tag → the "Home" rate applies (0.40 × 10).
+        let (cost, at_home, stored) = run(vec![], true, &rates(Some(0.10), &[("Home", 0.40)]));
+        assert!(approx(cost, 4.0));
+        assert!(at_home);
+        assert!(stored.is_empty()); // "Home" is derived, never added to tags
+        // A stored lowercase "home" tag must NOT suppress the "Home"-keyed rate.
+        assert!(approx(
+            run(vec!["home".into()], true, &rates(Some(0.10), &[("Home", 0.40)])).0,
+            4.0
+        ));
+        // Both casing variants configured → most expensive wins, no double-count.
+        assert!(approx(
+            run(vec![], true, &rates(Some(0.10), &[("Home", 0.20), ("home", 0.40)])).0,
+            4.0
+        ));
+        // Not at home, no matching tag → default only (0.10 × 10).
+        let (cost, at_home, _) = run(vec![], false, &rates(Some(0.10), &[("Home", 0.40)]));
+        assert!(approx(cost, 1.0));
+        assert!(!at_home);
+        // At home but no Home rate configured → default (0.10 × 10).
+        assert!(approx(run(vec![], true, &rates(Some(0.10), &[])).0, 1.0));
+    }
+
+    #[test]
     fn cost_is_none_without_default_or_tag_plan() {
         let session = hour_session();
         let mut s = summarize(&session);
         // A tag with no configured plan and no default → no cost.
-        apply_rates(&mut s, &session, vec!["Home".into()], &rates(None, &[]));
+        apply_rates(&mut s, &session, vec!["Home".into()], false, &rates(None, &[]));
         assert_eq!(s.cost, None);
         assert_eq!(s.rate, None);
     }
@@ -1231,7 +1378,7 @@ mod tests {
         assert_eq!(s.efficiency_pct.map(|p| p.round()), Some(90.0));
 
         // Cost is rate × used (not added): 0.30 × 10.0 = 3.00.
-        apply_rates(&mut s, &session, vec!["Home".into()], &rates(None, &[("Home", 0.30)]));
+        apply_rates(&mut s, &session, vec!["Home".into()], false, &rates(None, &[("Home", 0.30)]));
         assert_eq!(s.tags, vec!["Home".to_string()]);
         assert_eq!(s.rate, Some(0.30));
         assert_eq!(s.cost, Some(3.0));
@@ -1245,7 +1392,7 @@ mod tests {
             row(3600, Some(10), Some(30.0), Some(9.0)),
         ];
         let mut s = summarize(&session);
-        apply_rates(&mut s, &session, vec![], &rates(None, &[]));
+        apply_rates(&mut s, &session, vec![], false, &rates(None, &[]));
         assert_eq!(s.cost, None);
         assert_eq!(s.rate, None);
     }
@@ -1255,7 +1402,7 @@ mod tests {
         let session = hour_session();
         let mut s = summarize(&session);
         // Rate engine would price this at 0.30 × 10 kWh = 3.00.
-        apply_rates(&mut s, &session, vec!["Home".into()], &rates(None, &[("Home", 0.30)]));
+        apply_rates(&mut s, &session, vec!["Home".into()], false, &rates(None, &[("Home", 0.30)]));
         assert_eq!(s.cost, Some(3.0));
         assert!(!s.cost_overridden);
         // A manual override wins: replaces cost, clears the per-kWh rate,
@@ -1271,7 +1418,7 @@ mod tests {
     fn no_override_leaves_rate_cost_untouched() {
         let session = hour_session();
         let mut s = summarize(&session);
-        apply_rates(&mut s, &session, vec!["Home".into()], &rates(None, &[("Home", 0.30)]));
+        apply_rates(&mut s, &session, vec!["Home".into()], false, &rates(None, &[("Home", 0.30)]));
         apply_cost_override(&mut s, None);
         assert_eq!(s.cost, Some(3.0));
         assert!(!s.cost_overridden);
@@ -1352,7 +1499,7 @@ mod tests {
             },
         );
         let mut s = summarize(&session);
-        apply_rates(&mut s, &session, vec!["Home".into()], &r);
+        apply_rates(&mut s, &session, vec!["Home".into()], false, &r);
         assert!(approx(s.cost, 2.0));
         assert!(approx(s.rate, 0.20));
     }
@@ -1366,6 +1513,7 @@ mod tests {
             &mut s,
             &session,
             vec!["Supercharger".into()],
+            false,
             &rates(Some(0.10), &[("Supercharger", 0.40)]),
         );
         assert!(approx(s.cost, 4.0)); // 0.40 × 10 used; tag beats default

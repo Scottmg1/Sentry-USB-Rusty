@@ -36,6 +36,9 @@ export interface ChargeSessionSummary {
   // True when `cost` is a user-entered per-charge override rather than a
   // rate-derived value (so `rate` is null and the UI shows it as manual).
   costOverridden: boolean
+  // True when the session charged inside the configured home geofence.
+  // Derived (not a stored tag) — drives the auto "Home" chip + Home rate.
+  atHome: boolean
 }
 
 export interface ChargePoint {

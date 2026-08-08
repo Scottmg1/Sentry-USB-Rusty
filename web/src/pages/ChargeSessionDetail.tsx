@@ -6,6 +6,7 @@ import {
   Check,
   DollarSign,
   Gauge,
+  Home,
   Leaf,
   Loader2,
   MapPin,
@@ -252,7 +253,18 @@ export default function ChargeSessionDetailPage() {
                 )}
               </div>
             </div>
-            <TagPopover tags={session.tags} onChange={onTagsChange} />
+            <div className="flex items-center gap-1.5">
+              {session.atHome && (
+                <span
+                  title="Charged at home (automatic)"
+                  className="inline-flex items-center gap-1 rounded-md border border-emerald-400/30 bg-emerald-400/10 px-2 py-1 text-xs font-medium text-emerald-200"
+                >
+                  <Home className="h-3 w-3" />
+                  Home
+                </span>
+              )}
+              <TagPopover tags={session.tags} onChange={onTagsChange} />
+            </div>
           </div>
 
           {inProgress && (
