@@ -2628,6 +2628,7 @@ dependencies = [
  "reqwest",
  "ring",
  "rusqlite",
+ "sentryusb-ble-health",
  "sentryusb-cloud-uploader",
  "sentryusb-config",
  "sentryusb-drives",
