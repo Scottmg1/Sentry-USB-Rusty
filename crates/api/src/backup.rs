@@ -409,6 +409,81 @@ fn drive_data_filename(date: &str) -> String {
 /// the sampler writes; other DB users queue for the few seconds it
 /// takes, which is fine for a manual/nightly backup. Returns the .gz
 /// path.
+/// Marker for the last calendar day the drive-DB snapshot shipped
+/// successfully (content: "<date> <location>"). Lives on /mutable like
+/// `.last_hash` so recording it never touches the DB.
+const DB_BACKUP_STAMP: &str = "/mutable/.last-drive-db-backup";
+
+/// Serializes VACUUM+gzip+ship across concurrent backup calls — two
+/// racers passing the date gate would otherwise fight over the shared
+/// DB_EXPORT_TMP scratch file.
+static DB_BACKUP_JOB: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// True while a VACUUM/gzip/ship is in flight — the slow-request
+/// middleware logs it so an episode during a backup names its cause.
+pub static DB_BACKUP_IN_FLIGHT: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Daily-gated drive-DB snapshot. Returns whether a dated DB companion
+/// exists for `date` (shipped now, or earlier today on a skip).
+async fn ship_drive_data_gated(
+    s: &AppState,
+    location: &str,
+    date: &str,
+    force: bool,
+) -> bool {
+    use std::sync::atomic::Ordering;
+
+    let _job = DB_BACKUP_JOB.lock().await;
+
+    if location == "ssd" {
+        // ship_drive_data refuses ssd targets — skip up front instead of
+        // paying VACUUM+gzip for an artifact that can never ship.
+        info!("[backup] drive_db_snapshot_skipped reason=ssd_location");
+        return false;
+    }
+    let stamp = std::fs::read_to_string(DB_BACKUP_STAMP).unwrap_or_default();
+    if !force && stamp.split_whitespace().next() == Some(date) {
+        info!(
+            "[backup] drive_db_snapshot_skipped reason=already_today date={}",
+            date
+        );
+        // The dated companion exists from the earlier run today.
+        return true;
+    }
+
+    DB_BACKUP_IN_FLIGHT.store(true, Ordering::Release);
+    let shipped = match export_drive_data_gz(s.drives.store.clone()).await {
+        Ok(gz) => {
+            let ok = match ship_drive_data(location, &gz, date).await {
+                Ok(()) => {
+                    info!(
+                        "[backup] Drive DB snapshot shipped as {}",
+                        drive_data_filename(date)
+                    );
+                    true
+                }
+                Err(e) => {
+                    warn!("[backup] Drive DB snapshot not shipped: {}", e);
+                    false
+                }
+            };
+            let _ = std::fs::remove_file(&gz);
+            ok
+        }
+        Err(e) => {
+            warn!("[backup] Drive DB export failed: {}", e);
+            false
+        }
+    };
+    DB_BACKUP_IN_FLIGHT.store(false, Ordering::Release);
+
+    if shipped {
+        let _ = std::fs::write(DB_BACKUP_STAMP, format!("{} {}", date, location));
+    }
+    shipped
+}
+
 async fn export_drive_data_gz(
     store: std::sync::Arc<sentryusb_drives::DriveStore>,
 ) -> Result<String, String> {
@@ -420,13 +495,10 @@ async fn export_drive_data_gz(
     let _ = std::fs::remove_file(DB_EXPORT_TMP);
     let _ = std::fs::remove_file(&gz);
 
-    let vacuum = tokio::task::spawn_blocking(move || {
-        store.with_locked_conn(|conn| {
-            conn.execute("VACUUM INTO ?1", rusqlite::params![DB_EXPORT_TMP])
-                .map(|_| ())
-        })
-    })
-    .await;
+    // Dedicated connection: VACUUM INTO only reads the source DB, so the
+    // copy runs without seizing the app's writer mutex.
+    let vacuum =
+        tokio::task::spawn_blocking(move || store.vacuum_into(DB_EXPORT_TMP)).await;
     match vacuum {
         Ok(Ok(())) => {}
         Ok(Err(e)) => return Err(format!("VACUUM INTO failed: {}", e)),
@@ -552,28 +624,23 @@ pub async fn create_backup(
         .unwrap_or("archive")
         .to_string();
 
+    let force = q.force.as_deref() == Some("1");
+
     // Snapshot + ship the drive DB (drives, charges, telemetry) next to
     // the JSON backup. Runs even when the config hash is unchanged —
     // drive data changes every day the car is used, and a stale export
     // is exactly how users lose drive history on a reflash. Best-effort:
     // a DB export failure must never block the config backup.
-    let mut drive_data_shipped = false;
-    match export_drive_data_gz(s.drives.store.clone()).await {
-        Ok(gz) => {
-            match ship_drive_data(&location, &gz, &data.date).await {
-                Ok(()) => {
-                    info!("[backup] Drive DB snapshot shipped as {}", drive_data_filename(&data.date));
-                    drive_data_shipped = true;
-                }
-                Err(e) => warn!("[backup] Drive DB snapshot not shipped: {}", e),
-            }
-            let _ = std::fs::remove_file(&gz);
-        }
-        Err(e) => warn!("[backup] Drive DB export failed: {}", e),
-    }
-    data.drive_data_included = drive_data_shipped;
-
-    let force = q.force.as_deref() == Some("1");
+    //
+    // Gated to once per calendar day for AUTOMATIC calls: post-archive
+    // invokes this endpoint after EVERY successful archive, and on a
+    // grown DB (908MB measured) each VACUUM+gzip+ship was a multi-minute
+    // disk storm — the dated filename overwrites same-day copies anyway,
+    // so extra runs bought no recovery granularity. Manual Backup Now
+    // (force=1) still ships. The job mutex serializes concurrent calls
+    // over the shared scratch file; the marker advances only after a
+    // successful ship.
+    data.drive_data_included = ship_drive_data_gated(&s, &location, &data.date, force).await;
     let current_hash = compute_backup_hash(&data);
     if !force && current_hash == read_last_hash() && !current_hash.is_empty() {
         let short = &current_hash[..12.min(current_hash.len())];
@@ -582,7 +649,7 @@ pub async fn create_backup(
             "success": true,
             "skipped": true,
             "reason": "no changes detected",
-            "drive_data_refreshed": drive_data_shipped,
+            "drive_data_refreshed": data.drive_data_included,
             "date": data.date,
         })));
     }
