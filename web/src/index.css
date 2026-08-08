@@ -590,7 +590,9 @@ code, pre, .font-mono {
 .action-chip[aria-pressed="true"] { background: color-mix(in srgb, var(--color-accent) 12%, transparent); color: var(--color-accent); }
 
 /* Modal primitive — replaces 3 inconsistently-built overlays */
-.modal-shell { position: fixed; inset: 0; background: rgba(0,0,0,.55); backdrop-filter: blur(4px); display: flex; align-items: center; justify-content: center; padding: 16px; z-index: 50; }
+/* z-index above the mobile header (500) and nav drawer (700) — modals must
+   cover the whole app chrome, matching the Drives/Charging overlays. */
+.modal-shell { position: fixed; inset: 0; background: rgba(0,0,0,.55); backdrop-filter: blur(4px); display: flex; align-items: center; justify-content: center; padding: 16px; z-index: 2000; }
 .modal-card { width: 100%; max-width: 560px; max-height: 90vh; display: flex; flex-direction: column; }
 .modal-header { display: flex; align-items: center; gap: 10px; padding: 12px 16px; border-bottom: 1px solid rgba(255,255,255,.05); }
 .modal-header .modal-title { font-size: 14px; font-weight: 600; color: #e6e9ef; flex: 1 1 auto; }

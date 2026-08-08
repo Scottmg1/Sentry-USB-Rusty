@@ -1,5 +1,4 @@
 import { useEffect, useState } from "react"
-import { createPortal } from "react-dom"
 import { Plane, Loader2 } from "lucide-react"
 import { Modal } from "@/components/ui/Modal"
 import { Toggle } from "@/components/ui/Toggle"
@@ -118,10 +117,7 @@ export function TravelModeDialog({ onClose, onChange }: Props) {
     }
   }
 
-  // Portal to document.body: the Away Mode card is a `glass-card` with a
-  // backdrop-filter, which establishes a containing block for `position:
-  // fixed` and would otherwise pin/clip this overlay inside the card.
-  return createPortal(
+  return (
     <Modal
       title={
         <span className="flex items-center gap-2">
@@ -196,7 +192,6 @@ export function TravelModeDialog({ onClose, onChange }: Props) {
           you’re back home to resume normal cleanup.
         </p>
       </div>
-    </Modal>,
-    document.body,
+    </Modal>
   )
 }
