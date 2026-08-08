@@ -148,6 +148,7 @@ export default function Dashboard() {
   // parked + awake, so anything faster on the UI side is wasted.
   const [carStatusSample, setCarStatusSample] = useState<CarStatusSample | null>(null)
   const [bleHealth, setBleHealth] = useState<BleHealth | null>(null)
+  const [bleHealthConfigured, setBleHealthConfigured] = useState(false)
   // Live charge status for the CarStatusCard battery chip.
   const [currentCharge, setCurrentCharge] = useState<CurrentCharge | null>(null)
   // ISO end-time of the latest drive on record — used to derive the
@@ -255,7 +256,11 @@ export default function Dashboard() {
         ])
         if (!mounted) return
         if (healthRes.ok) {
-          const d = (await healthRes.json()) as { health?: BleHealth }
+          const d = (await healthRes.json()) as {
+            configured?: boolean
+            health?: BleHealth
+          }
+          if (mounted) setBleHealthConfigured(Boolean(d.configured))
           if (mounted) setBleHealth(d.health ?? null)
         }
         if (sampleRes.ok) {
@@ -532,7 +537,7 @@ export default function Dashboard() {
           on ultrawide. */}
       {(carStatusSample?.ts != null ||
         currentCharge?.soc != null ||
-        bleHealth?.code === "repair_required") && (
+        (bleHealthConfigured && bleHealth != null)) && (
         <CarStatusCard
           sample={carStatusSample}
           bleHealth={bleHealth}

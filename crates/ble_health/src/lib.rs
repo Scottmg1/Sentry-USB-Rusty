@@ -1,3 +1,5 @@
+#[cfg(unix)]
+use std::fs::{File, OpenOptions};
 use std::io;
 use std::path::{Path, PathBuf};
 
@@ -11,6 +13,12 @@ pub enum FaultKind {
     RepairRequired,
     TransportError,
     ProtocolError,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SuccessKind {
+    Authenticated,
+    TransportOnly,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -31,41 +39,100 @@ pub fn read_at(path: &Path) -> io::Result<Option<HealthRecord>> {
 }
 
 pub fn record_fault_at(path: &Path, fault: FaultKind, now_ts: i64) -> io::Result<()> {
-    if let Some(existing) = read_at(path)? {
-        if existing.fault == FaultKind::RepairRequired && fault != FaultKind::RepairRequired {
-            return Ok(());
+    ensure_parent(path)?;
+    with_health_lock(path, || {
+        if let Some(existing) = read_at(path)? {
+            if existing.fault == FaultKind::RepairRequired && fault != FaultKind::RepairRequired {
+                return Ok(());
+            }
+            if existing.fault == fault {
+                return Ok(());
+            }
         }
-        if existing.fault == fault {
-            return Ok(());
-        }
-    }
 
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let tmp = temporary_path(path);
-    let body = serde_json::to_vec(&HealthRecord {
-        fault,
-        since_ts: now_ts,
+        let tmp = temporary_path(path);
+        let body = serde_json::to_vec(&HealthRecord {
+            fault,
+            since_ts: now_ts,
+        })
+        .map_err(io::Error::other)?;
+        std::fs::write(&tmp, body)?;
+        std::fs::rename(&tmp, path)?;
+        Ok(())
     })
-    .map_err(io::Error::other)?;
-    std::fs::write(&tmp, body)?;
-    std::fs::rename(&tmp, path)?;
-    Ok(())
 }
 
-pub fn clear_transient_at(path: &Path) -> io::Result<()> {
-    if read_at(path)?.is_some_and(|record| record.fault == FaultKind::RepairRequired) {
-        return Ok(());
+pub fn record_success_at(path: &Path, success: SuccessKind) -> io::Result<()> {
+    match success {
+        SuccessKind::Authenticated => clear_all_at(path),
+        SuccessKind::TransportOnly => Ok(()),
     }
-    clear_all_at(path)
 }
 
 pub fn clear_all_at(path: &Path) -> io::Result<()> {
+    ensure_parent(path)?;
+    with_health_lock(path, || clear_all_unlocked(path))
+}
+
+fn clear_all_unlocked(path: &Path) -> io::Result<()> {
     match std::fs::remove_file(path) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(e),
+    }
+}
+
+fn ensure_parent(path: &Path) -> io::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn lock_path(path: &Path) -> PathBuf {
+    let mut name = path
+        .file_name()
+        .map(|name| name.to_os_string())
+        .unwrap_or_default();
+    name.push(".lock");
+    path.with_file_name(name)
+}
+
+#[cfg(unix)]
+fn with_health_lock<T>(path: &Path, operation: impl FnOnce() -> io::Result<T>) -> io::Result<T> {
+    let lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(lock_path(path))?;
+    lock_exclusive(&lock)?;
+    operation()
+}
+
+#[cfg(not(unix))]
+fn with_health_lock<T>(_path: &Path, operation: impl FnOnce() -> io::Result<T>) -> io::Result<T> {
+    static PROCESS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _guard = PROCESS_LOCK
+        .lock()
+        .map_err(|_| io::Error::other("BLE health process lock poisoned"))?;
+    operation()
+}
+
+#[cfg(unix)]
+fn lock_exclusive(file: &File) -> io::Result<()> {
+    use std::os::unix::io::AsRawFd;
+
+    loop {
+        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+        if rc == 0 {
+            return Ok(());
+        }
+        let error = io::Error::last_os_error();
+        if error.raw_os_error() != Some(libc::EINTR) {
+            return Err(error);
+        }
     }
 }
 
@@ -186,6 +253,9 @@ fn temporary_path(path: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Barrier};
+    use std::time::Duration;
 
     #[test]
     fn repair_required_cannot_be_overwritten_by_transient_failure() {
@@ -203,14 +273,56 @@ mod tests {
     }
 
     #[test]
-    fn transient_clear_preserves_repair_required_but_full_clear_removes_it() {
+    fn transport_only_success_clears_nothing_but_authenticated_success_clears_faults() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("health.json");
+
+        record_fault_at(&path, FaultKind::TransportError, 100).unwrap();
+        record_success_at(&path, SuccessKind::TransportOnly).unwrap();
+        assert_eq!(
+            read_at(&path).unwrap().unwrap().fault,
+            FaultKind::TransportError,
+        );
+        record_success_at(&path, SuccessKind::Authenticated).unwrap();
+        assert!(read_at(&path).unwrap().is_none());
+
         record_fault_at(&path, FaultKind::RepairRequired, 100).unwrap();
-        clear_transient_at(&path).unwrap();
+        record_success_at(&path, SuccessKind::TransportOnly).unwrap();
         assert!(read_at(&path).unwrap().is_some());
-        clear_all_at(&path).unwrap();
+        record_success_at(&path, SuccessKind::Authenticated).unwrap();
         assert_eq!(read_at(&path).unwrap(), None);
+    }
+
+    #[test]
+    fn health_updates_are_serialized() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = Arc::new(dir.path().join("health.json"));
+        let barrier = Arc::new(Barrier::new(8));
+        let active = Arc::new(AtomicUsize::new(0));
+        let max_active = Arc::new(AtomicUsize::new(0));
+        let mut threads = Vec::new();
+
+        for _ in 0..8 {
+            let path = Arc::clone(&path);
+            let barrier = Arc::clone(&barrier);
+            let active = Arc::clone(&active);
+            let max_active = Arc::clone(&max_active);
+            threads.push(std::thread::spawn(move || {
+                barrier.wait();
+                with_health_lock(&path, || {
+                    let current = active.fetch_add(1, Ordering::SeqCst) + 1;
+                    max_active.fetch_max(current, Ordering::SeqCst);
+                    std::thread::sleep(Duration::from_millis(5));
+                    active.fetch_sub(1, Ordering::SeqCst);
+                    Ok(())
+                })
+                .unwrap();
+            }));
+        }
+        for thread in threads {
+            thread.join().unwrap();
+        }
+        assert_eq!(max_active.load(Ordering::SeqCst), 1);
     }
 
     #[test]

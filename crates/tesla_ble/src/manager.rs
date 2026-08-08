@@ -34,7 +34,7 @@ use anyhow::{Context, Result, bail};
 use btleplug::api::Peripheral as _;
 use prost::Message;
 use sentryusb_ble_health::{
-    DEFAULT_HEALTH_PATH, FaultKind, clear_all_at, clear_transient_at, record_fault_at,
+    DEFAULT_HEALTH_PATH, FaultKind, SuccessKind, record_fault_at, record_success_at,
 };
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::sleep;
@@ -349,14 +349,11 @@ fn record_health_fault(fault: FaultKind) {
     }
 }
 
-fn clear_transient_health_fault() {
-    if let Err(e) = clear_transient_at(std::path::Path::new(DEFAULT_HEALTH_PATH)) {
-        warn!("PersistentSession: could not clear transient BLE health fault: {e}");
-    }
-}
-
 fn clear_authenticated_health_fault() {
-    if let Err(e) = clear_all_at(std::path::Path::new(DEFAULT_HEALTH_PATH)) {
+    if let Err(e) = record_success_at(
+        std::path::Path::new(DEFAULT_HEALTH_PATH),
+        SuccessKind::Authenticated,
+    ) {
         warn!("PersistentSession: could not clear authenticated BLE health fault: {e}");
     }
 }
@@ -658,7 +655,6 @@ async fn run_session_task(
                     handle_transport_error_if_any(&mut state, &r).await;
                     match &r {
                         Ok(_) => {
-                            clear_transient_health_fault();
                             debug!("BLE keepalive: idle-feed ok");
                         }
                         Err(e) => debug!(
@@ -711,7 +707,6 @@ async fn run_session_task(
                 let result = handle_body_controller(&mut state).await;
                 handle_transport_error_if_any(&mut state, &result).await;
                 if result.is_ok() {
-                    clear_transient_health_fault();
                     note_successful_query(&mut state, started.elapsed().as_millis());
                 }
                 let _ = reply.send(result);
@@ -747,7 +742,6 @@ async fn run_session_task(
                 let result = handle_add_key(&mut state).await;
                 handle_transport_error_if_any(&mut state, &result).await;
                 if result.is_ok() {
-                    clear_transient_health_fault();
                     note_successful_query(&mut state, started.elapsed().as_millis());
                 }
                 let _ = reply.send(result);
@@ -1065,13 +1059,14 @@ async fn try_signed_request_once(
         if parsed.status
             == crate::proto::signatures::SessionInfoStatus::KeyNotOnWhitelist as i32
         {
-            bail!(
-                "BLE pair revoked: car responded to {:?} query with \
-                 SESSION_INFO_STATUS_KEY_NOT_ON_WHITELIST. Our key has been \
-                 removed from the car (could be the user deleted the SentryUSB \
-                 entry from Locks → Phone Keys, or someone re-paired with the \
-                 same name). Re-pair from the SentryUSB UI.",
-                domain
+            return Err(anyhow::Error::new(session::SessionError::KeyNotPaired)).with_context(
+                || {
+                    format!(
+                        "BLE pair revoked during cached {:?} session; our key has been \
+                         removed from the car. Re-pair from the SentryUSB UI",
+                        domain
+                    )
+                },
             );
         }
 
@@ -1082,6 +1077,17 @@ async fn try_signed_request_once(
     }
 
     if fault != 0 {
+        if is_repair_required_fault_code(fault) {
+            return Err(anyhow::Error::new(session::SessionError::KeyNotPaired)).with_context(
+                || {
+                    format!(
+                        "car rejected cached {:?} session with \
+                         MESSAGEFAULT_ERROR_UNKNOWN_KEY_ID",
+                        domain
+                    )
+                },
+            );
+        }
         // Counter/epoch faults recover by re-handshaking: drop the
         // cached session so the next query re-runs SessionInfoRequest.
         const FAULT_INVALID_SIGNATURE: u32 = 5;
@@ -1231,14 +1237,7 @@ async fn handle_transport_error_if_any<T>(
     result: &Result<T>,
 ) {
     if let Err(e) = result {
-        let fault = if is_connect_failure(e)
-            || is_transport_error(e)
-            || is_query_response_timeout(e)
-        {
-            FaultKind::TransportError
-        } else {
-            FaultKind::ProtocolError
-        };
+        let fault = fault_for_anyhow_error(e);
         record_health_fault(fault);
 
         if state.conn.is_none() {
@@ -1518,6 +1517,27 @@ fn fault_for_session_error(error: &session::SessionError) -> FaultKind {
     match error {
         session::SessionError::KeyNotPaired => FaultKind::RepairRequired,
         session::SessionError::Other(_) => FaultKind::ProtocolError,
+    }
+}
+
+fn is_repair_required_fault_code(fault: u32) -> bool {
+    const MESSAGEFAULT_ERROR_UNKNOWN_KEY_ID: u32 = 3;
+    fault == MESSAGEFAULT_ERROR_UNKNOWN_KEY_ID
+}
+
+fn fault_for_anyhow_error(error: &anyhow::Error) -> FaultKind {
+    if error
+        .downcast_ref::<session::SessionError>()
+        .is_some_and(|error| matches!(error, session::SessionError::KeyNotPaired))
+    {
+        FaultKind::RepairRequired
+    } else if is_connect_failure(error)
+        || is_transport_error(error)
+        || is_query_response_timeout(error)
+    {
+        FaultKind::TransportError
+    } else {
+        FaultKind::ProtocolError
     }
 }
 
@@ -2100,7 +2120,8 @@ async fn capture_recent_bluetooth_dmesg() -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        fault_for_session_error, is_decrypt_error, is_query_response_timeout, is_transport_error,
+        fault_for_anyhow_error, fault_for_session_error, is_decrypt_error,
+        is_query_response_timeout, is_repair_required_fault_code, is_transport_error,
     };
     use sentryusb_ble_health::FaultKind;
 
@@ -2110,6 +2131,15 @@ mod tests {
             fault_for_session_error(&crate::session::SessionError::KeyNotPaired),
             FaultKind::RepairRequired,
         );
+    }
+
+    #[test]
+    fn cached_session_key_rejection_is_a_repair_required_fault() {
+        let error = anyhow::Error::new(crate::session::SessionError::KeyNotPaired)
+            .context("cached session refresh was rejected");
+        assert_eq!(fault_for_anyhow_error(&error), FaultKind::RepairRequired);
+        assert!(is_repair_required_fault_code(3));
+        assert!(!is_repair_required_fault_code(5));
     }
 
     #[test]

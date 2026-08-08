@@ -529,6 +529,15 @@ fn authenticated_activity(conn: &rusqlite::Connection, since: i64) -> (i64, i64)
     (max_ts.unwrap_or(0), count)
 }
 
+fn health_is_configured(
+    enabled: bool,
+    paired_marker: bool,
+    last_authenticated_success_ts: i64,
+    has_health_record: bool,
+) -> bool {
+    enabled && (paired_marker || last_authenticated_success_ts > 0 || has_health_record)
+}
+
 pub async fn ble_connected(
     State(s): State<AppState>,
 ) -> (StatusCode, Json<serde_json::Value>) {
@@ -570,6 +579,12 @@ pub async fn ble_connected(
             None
         }
     };
+    let configured = health_is_configured(
+        is_ble_enabled(),
+        std::path::Path::new("/root/.ble/paired").exists(),
+        last,
+        health_record.is_some(),
+    );
     let health = classify_health(&HealthInput {
         record: health_record,
         last_authenticated_success_ts: last,
@@ -586,6 +601,7 @@ pub async fn ble_connected(
             "sample_count_10min": sample_count_10min,
             "radio_owner": radio_owner,
             "archiving": archiving,
+            "configured": configured,
             "health": health,
         })),
     )
@@ -1159,6 +1175,15 @@ mod tests {
         )
         .unwrap();
         assert_eq!(authenticated_activity(&conn, 900), (100, 0));
+    }
+
+    #[test]
+    fn dashboard_health_is_only_configured_for_an_active_or_previously_paired_install() {
+        assert!(!health_is_configured(false, true, 0, false));
+        assert!(!health_is_configured(true, false, 0, false));
+        assert!(health_is_configured(true, true, 0, false));
+        assert!(health_is_configured(true, false, 100, false));
+        assert!(health_is_configured(true, false, 0, true));
     }
 
     fn cfg(pairs: &[(&str, &str)]) -> sentryusb_config::SetupConfig {
