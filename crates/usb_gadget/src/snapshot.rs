@@ -621,7 +621,10 @@ fn list_snapshots_by_age_in(base: &Path) -> Vec<String> {
             let numeric = name
                 .strip_prefix("snap-")
                 .is_some_and(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()));
-            if !numeric || !entry.path().is_dir() {
+            // file_type() reads the dirent and does NOT follow symlinks:
+            // a planted `snap-NNNNNN` symlink pointing elsewhere must
+            // never become an eviction candidate.
+            if !numeric || !entry.file_type().is_ok_and(|ft| ft.is_dir()) {
                 continue;
             }
             let Ok(meta) = std::fs::symlink_metadata(entry.path().join("snap.bin")) else {
@@ -651,7 +654,35 @@ fn pick_next_snapshot_slot() -> Result<(u32, Option<String>)> {
     pick_next_snapshot_slot_in(Path::new(SNAPSHOTS_DIR))
 }
 
+/// True when anything is mounted inside `<base>/<name>` or at that
+/// snapshot's autofs mount (`/tmp/snapshots/<name>`). Prefix match, not
+/// the exact-mountpoint [`is_mounted`]: the loop image mounts *under*
+/// the snapshot dir, so an exact compare would miss it.
+fn snapshot_slot_has_mounts(base: &Path, name: &str) -> bool {
+    let under = format!("{}/{}/", base.to_string_lossy(), name);
+    let autofs = format!("/tmp/snapshots/{}", name);
+    let Ok(mounts) = std::fs::read_to_string("/proc/mounts") else {
+        // Can't prove it's unmounted → assume it is mounted and skip the
+        // destructive reuse. Losing one slot number is free; wiping a
+        // live mount is not.
+        return true;
+    };
+    mounts.lines().any(|l| {
+        let Some(mp) = l.split_whitespace().nth(1) else {
+            return false;
+        };
+        mp.starts_with(&under) || mp == autofs || mp.starts_with(&format!("{}/", autofs))
+    })
+}
+
 fn pick_next_snapshot_slot_in(base: &Path) -> Result<(u32, Option<String>)> {
+    pick_next_snapshot_slot_with(base, &|b, n| snapshot_slot_has_mounts(b, n))
+}
+
+fn pick_next_snapshot_slot_with(
+    base: &Path,
+    has_mounts: &dyn Fn(&Path, &str) -> bool,
+) -> Result<(u32, Option<String>)> {
     // Option, not a 0 sentinel: "only snap-000000 exists" used to be
     // indistinguishable from "no snapshots at all", which skipped the
     // identical-snapshot TOC compare against a real snap-000000 (bash
@@ -680,12 +711,32 @@ fn pick_next_snapshot_slot_in(base: &Path) -> Result<(u32, Option<String>)> {
         return Ok((1, None));
     };
 
-    let prev_dir = base.join(format!("snap-{:06}", max_num));
+    let prev_name = format!("snap-{:06}", max_num);
+    let prev_dir = base.join(&prev_name);
     let prev_toc = prev_dir.join("snap.bin.toc");
     let prev_bin = prev_dir.join("snap.bin");
 
     // Abandoned: no TOC was committed → reuse this slot.
     if !prev_toc.exists() || !prev_bin.exists() {
+        // ...unless something is still mounted under it (a stuck autofs
+        // mount, or a crash mid-snapshot while the loop image is live).
+        // `remove_dir_all` would race a live mount and could tear down
+        // footage the archive is still reading, so append past it
+        // instead — parity with make_snapshot.sh's guard.
+        if has_mounts(base, &prev_name) {
+            let next = max_num + 1;
+            let backstop = if max_num > 0 {
+                let p = base.join(format!("snap-{:06}/snap.bin.toc", max_num - 1));
+                if p.exists() { Some(p.to_string_lossy().into_owned()) } else { None }
+            } else {
+                None
+            };
+            warn!(
+                "slot pick: picker=rust max_seen={} incomplete BUT MOUNTED — appending next={}",
+                max_num, next
+            );
+            return Ok((next, backstop));
+        }
         let _ = std::fs::remove_dir_all(&prev_dir);
         let next = max_num;
         // Look one further back for a usable previous TOC.
@@ -1991,14 +2042,14 @@ mod tests {
     fn pick_next_slot_distinguishes_only_snap_000000_from_empty() {
         let base = scratch("slot-zero");
         // Empty dir → fresh start at 1, no previous TOC.
-        assert_eq!(pick_next_snapshot_slot_in(&base).unwrap(), (1, None));
+        assert_eq!(pick_next_snapshot_slot_with(&base, &|_, _| false).unwrap(), (1, None));
 
         // Only a COMPLETE snap-000000 (bash numbering starts at 0): the
         // next slot is 1 and its TOC must be carried for the
         // identical-snapshot compare — this used to be conflated with
         // the empty case and skipped the compare.
         mk_snap(&base, "snap-000000", Some(1_785_000_000), true);
-        let (num, toc) = pick_next_snapshot_slot_in(&base).unwrap();
+        let (num, toc) = pick_next_snapshot_slot_with(&base, &|_, _| false).unwrap();
         let _ = std::fs::remove_dir_all(&base);
         assert_eq!(num, 1);
         assert!(
@@ -2006,6 +2057,26 @@ mod tests {
             "previous TOC must be carried: {:?}",
             toc
         );
+    }
+
+    #[test]
+    fn pick_next_slot_never_wipes_a_mounted_incomplete_slot() {
+        // A crash mid-snapshot (or a stuck autofs mount) leaves the
+        // highest slot incomplete WITH the loop image still mounted
+        // under it. Reusing it means remove_dir_all racing a live mount
+        // while the archive may still be reading footage from it, so
+        // append past it instead — parity with make_snapshot.sh.
+        let base = scratch("slot-mounted");
+        mk_snap(&base, "snap-000010", Some(1_785_000_000), true);
+        mk_snap(&base, "snap-000011", Some(1_785_000_100), false); // incomplete
+
+        let (num, toc) = pick_next_snapshot_slot_with(&base, &|_, n| n == "snap-000011").unwrap();
+        let still_there = base.join("snap-000011").exists();
+        let _ = std::fs::remove_dir_all(&base);
+
+        assert_eq!(num, 12, "must append past the mounted slot, not reuse it");
+        assert!(still_there, "mounted incomplete slot must NOT be wiped");
+        assert!(toc.as_deref().is_some_and(|t| t.contains("snap-000010")));
     }
 
     #[test]
@@ -2018,7 +2089,7 @@ mod tests {
         // with the previous complete snapshot's TOC as backstop.
         mk_snap(&base, "snap-000011", Some(1_785_000_100), false);
 
-        let (num, toc) = pick_next_snapshot_slot_in(&base).unwrap();
+        let (num, toc) = pick_next_snapshot_slot_with(&base, &|_, _| false).unwrap();
         let dir_gone = !base.join("snap-000011").exists();
         let _ = std::fs::remove_dir_all(&base);
         assert_eq!(num, 11, "incomplete max slot is reused");

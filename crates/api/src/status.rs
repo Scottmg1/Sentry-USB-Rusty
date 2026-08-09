@@ -690,6 +690,18 @@ fn scan_snapshots(base: &std::path::Path) -> SnapshotScan {
         if !ft.is_dir() {
             continue;
         }
+        // Numeric `snap-NNNNNN` only, matching what the eviction and
+        // listing paths consider a snapshot; a tooling/scratch directory
+        // that happens to contain a `snap.bin` must not inflate the
+        // count or skew the dashboard's date range.
+        if !entry
+            .file_name()
+            .to_string_lossy()
+            .strip_prefix("snap-")
+            .is_some_and(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
+        {
+            continue;
+        }
         let snap_bin = entry.path().join("snap.bin");
         // Use symlink_metadata to avoid traversing into anything weird;
         // snap.bin is always a regular file on the parent XFS.
@@ -748,6 +760,18 @@ mod tests {
         // A non-snapshot stray file and an empty dir must not count.
         std::fs::File::create(base.join("stray.txt")).unwrap();
         std::fs::create_dir_all(base.join("not-a-snap")).unwrap();
+        // A tooling/scratch dir that happens to hold a `snap.bin` must
+        // not inflate the count or skew the range: its mtime here is
+        // older than every real snapshot, so a leak would show up as a
+        // wrong "oldest" date.
+        let decoy = base.join("snap-backup-old");
+        std::fs::create_dir_all(&decoy).unwrap();
+        let df = std::fs::File::create(decoy.join("snap.bin")).unwrap();
+        df.set_times(
+            std::fs::FileTimes::new()
+                .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000)),
+        )
+        .unwrap();
 
         let scan = scan_snapshots(&base);
         let _ = std::fs::remove_dir_all(&base);

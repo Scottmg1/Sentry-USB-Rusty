@@ -637,6 +637,22 @@ pub(crate) fn telemetry_has_driving(
         || speeds.iter().any(|&s| s.abs() > GAP_FILL_MIN_SPEED_MPS)
 }
 
+/// POSITIVE gear evidence only: at least one non-Park gear frame.
+///
+/// Deliberately NOT [`telemetry_has_driving`], which also accepts a
+/// speed sample above a crawl and — when gear telemetry is missing
+/// entirely — infers motion from raw frame counters. Those are fine for
+/// admitting a clip next to an anchor, but they are not proof for
+/// minting a drive out of an isolated event cluster: a single bogus
+/// speed sample, a legacy/imported row with no gear RLE, or a partial
+/// extract would all qualify. Gear comes straight from Tesla's SEI for
+/// the recording car, so a non-Park frame cannot be produced by another
+/// vehicle moving in view.
+pub(crate) fn telemetry_gear_driving(gear_runs: &[GearRun], gear_states: &[u8]) -> bool {
+    gear_runs.iter().any(|r| r.gear != GEAR_PARK)
+        || gear_states.iter().any(|&g| g != GEAR_PARK)
+}
+
 /// [`telemetry_has_driving`] over a full Route row.
 fn route_has_driving(r: &Route) -> bool {
     telemetry_has_driving(
@@ -683,11 +699,12 @@ pub(crate) struct GapFillCandidate<'a> {
     pub(crate) ts: NaiveDateTime,
     pub(crate) file: &'a str,
     pub(crate) driving: Option<bool>,
-    /// POSITIVE gear-based SEI evidence (non-Park gear frames), stricter
-    /// than `driving`: the speed-only clause is excluded so a single
-    /// bogus speed sample can't qualify a clip. Only unanchored-cluster
-    /// admission consults this; anchored admission keeps the ordinary
-    /// `driving` gate. Always false for pre-extraction candidates.
+    /// POSITIVE gear evidence — see [`telemetry_gear_driving`]. Stricter
+    /// than `driving`: no speed clause and no raw-frame-count inference,
+    /// so neither a lone bogus speed sample nor a row that simply lacks
+    /// gear telemetry can qualify. Only unanchored-cluster admission
+    /// consults this; anchored admission keeps the ordinary `driving`
+    /// gate. Always false for pre-extraction candidates.
     pub(crate) gear_driving: bool,
 }
 
@@ -972,13 +989,7 @@ fn group_clips(routes: Vec<Route>) -> Vec<Vec<TimedRoute>> {
                     ts: *ts,
                     file: r.file.as_str(),
                     driving: Some(route_has_driving(r)),
-                    gear_driving: telemetry_has_driving(
-                        &r.gear_runs,
-                        &r.gear_states,
-                        &[],
-                        r.raw_park_count,
-                        r.raw_frame_count,
-                    ),
+                    gear_driving: telemetry_gear_driving(&r.gear_runs, &r.gear_states),
                 }
             })
             .collect();
@@ -2620,13 +2631,7 @@ fn group_summary_clips<'a>(summaries: &'a [RouteSummary]) -> Vec<Vec<SubClipSumm
                 ts: *ts,
                 file: s.file.as_str(),
                 driving: Some(summary_has_driving(s)),
-                gear_driving: telemetry_has_driving(
-                    &s.gear_runs,
-                    &[],
-                    &[],
-                    s.raw_park_count,
-                    s.raw_frame_count,
-                ),
+                gear_driving: telemetry_gear_driving(&s.gear_runs, &[]),
             })
             .collect();
         let admitted = select_gap_fill(&recent_ts, &keys);
@@ -4243,6 +4248,31 @@ mod tests {
         let groups = group_clips(routes);
         assert_eq!(groups.len(), 1, "event-only driving routes must form a drive");
         assert_eq!(groups[0].len(), 2);
+    }
+
+    #[test]
+    fn test_gap_fill_unanchored_rejects_raw_count_only_evidence() {
+        // A row with NO gear telemetry at all (empty gear runs and
+        // states) but raw frame counters implying motion passes the
+        // ordinary driving gate via its raw-count fallback. That is not
+        // gear PROOF — legacy/imported rows and partial extracts land
+        // here — so it must not mint an unanchored drive on its own.
+        let mut raw_only = test_route(
+            "SentryClips/2026-05-28_14-05-00/2026-05-28_14-00-00-front.mp4",
+            vec![[37.1, -122.1]],
+        );
+        raw_only.gear_states = Vec::new();
+        raw_only.gear_runs = Vec::new();
+        raw_only.speeds = Vec::new();
+        raw_only.raw_park_count = 0;
+        raw_only.raw_frame_count = 10;
+        let routes = vec![
+            test_route("RecentClips/2026-05-28/2026-05-28_10-00-00-front.mp4", vec![[37.0, -122.0]]),
+            raw_only,
+        ];
+        let groups = group_clips(routes);
+        assert_eq!(groups.len(), 1, "raw-count-only event clip must stay unanchored-ineligible");
+        assert!(groups[0][0].route.file.starts_with("RecentClips/"));
     }
 
     #[test]
