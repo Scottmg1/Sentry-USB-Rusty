@@ -6,6 +6,9 @@ use axum::Json;
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
+use sentryusb_ble_health::{
+    DEFAULT_HEALTH_PATH, FaultKind, clear_all_at, read_at, record_fault_at,
+};
 use crate::router::AppState;
 
 /// POST /api/system/reboot
@@ -483,8 +486,25 @@ pub async fn ble_status(
         })));
     }
 
+    let health_path = std::path::Path::new(DEFAULT_HEALTH_PATH);
+    let repair_required = match read_at(health_path) {
+        Ok(record) => record.is_some_and(|record| record.fault == FaultKind::RepairRequired),
+        Err(e) => {
+            tracing::warn!("could not read BLE health record for pairing status: {e}");
+            false
+        }
+    };
+
     // Quick check (no BLE probe)
     if params.get("quick").map(|v| v.as_str()) == Some("true") {
+        if repair_required {
+            return (StatusCode::OK, Json(serde_json::json!({
+                "status": "repair_required",
+                "vin": vin,
+                "binaries_installed": binaries_installed,
+                "note": "Re-pair from the BLE card and tap your key card on the center console",
+            })));
+        }
         if std::path::Path::new("/root/.ble/paired").exists() {
             return (StatusCode::OK, Json(serde_json::json!({
                 "status": "paired",
@@ -526,6 +546,9 @@ pub async fn ble_status(
         "PAIRED" => {
             // Feed the live "connected" indicator on the BLE card.
             crate::ble::mark_ble_success();
+            if let Err(e) = clear_all_at(health_path) {
+                tracing::warn!("could not clear BLE repair-required health after pairing: {e}");
+            }
             set_ble_paired_marker(true);
             (StatusCode::OK, Json(serde_json::json!({
                 "status": "paired",
@@ -536,6 +559,13 @@ pub async fn ble_status(
         "NOT_PAIRED" => {
             // The ONLY case that clears the marker: the car explicitly
             // rejected our key (KEY_NOT_ON_WHITELIST). Re-pair needed.
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|duration| duration.as_secs() as i64)
+                .unwrap_or(0);
+            if let Err(e) = record_fault_at(health_path, FaultKind::RepairRequired, now) {
+                tracing::warn!("could not persist BLE repair-required health: {e}");
+            }
             set_ble_paired_marker(false);
             (StatusCode::OK, Json(serde_json::json!({
                 "status": "keys_generated",

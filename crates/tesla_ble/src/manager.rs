@@ -33,6 +33,9 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, bail};
 use btleplug::api::Peripheral as _;
 use prost::Message;
+use sentryusb_ble_health::{
+    DEFAULT_HEALTH_PATH, FaultKind, SuccessKind, record_fault_at, record_success_at,
+};
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::sleep;
 use tracing::{debug, info, warn};
@@ -328,6 +331,32 @@ const STATUS_LOG_EVERY_N_QUERIES: u32 = 25;
 /// `"waiting for response"` error falls through to the normal teardown
 /// path. Reset to 0 on any successful query.
 const MAX_QUERY_TIMEOUT_RETRIES: u32 = 2;
+
+fn health_now_ts() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+fn record_health_fault(fault: FaultKind) {
+    if let Err(e) = record_fault_at(
+        std::path::Path::new(DEFAULT_HEALTH_PATH),
+        fault,
+        health_now_ts(),
+    ) {
+        warn!("PersistentSession: could not persist BLE health fault: {e}");
+    }
+}
+
+fn clear_authenticated_health_fault() {
+    if let Err(e) = record_success_at(
+        std::path::Path::new(DEFAULT_HEALTH_PATH),
+        SuccessKind::Authenticated,
+    ) {
+        warn!("PersistentSession: could not clear authenticated BLE health fault: {e}");
+    }
+}
 
 /// Minimum time between consecutive [`Command::ForceReconnect`] actions
 /// that actually close a conn. Inside this window, ForceReconnect returns
@@ -625,7 +654,9 @@ async fn run_session_task(
                     let r = handle_body_controller(&mut state).await;
                     handle_transport_error_if_any(&mut state, &r).await;
                     match &r {
-                        Ok(_) => debug!("BLE keepalive: idle-feed ok"),
+                        Ok(_) => {
+                            debug!("BLE keepalive: idle-feed ok");
+                        }
                         Err(e) => debug!(
                             "BLE keepalive: idle-feed failed (recovers on next op): {e:#}"
                         ),
@@ -651,6 +682,7 @@ async fn run_session_task(
                 .await;
                 handle_transport_error_if_any(&mut state, &result).await;
                 if result.is_ok() {
+                    clear_authenticated_health_fault();
                     note_successful_query(&mut state, started.elapsed().as_millis());
                 }
                 let _ = reply.send(result);
@@ -666,6 +698,7 @@ async fn run_session_task(
                 .await;
                 handle_transport_error_if_any(&mut state, &result).await;
                 if result.is_ok() {
+                    clear_authenticated_health_fault();
                     note_successful_query(&mut state, started.elapsed().as_millis());
                 }
                 let _ = reply.send(result);
@@ -687,7 +720,17 @@ async fn run_session_task(
                 let result = handle_check_pairing(&mut state).await;
                 handle_transport_error_if_any(&mut state, &result).await;
                 let status = match result {
-                    Ok(status) => status,
+                    Ok(PairingStatus::Paired) => {
+                        clear_authenticated_health_fault();
+                        PairingStatus::Paired
+                    }
+                    Ok(PairingStatus::NotPaired) => {
+                        record_health_fault(FaultKind::RepairRequired);
+                        PairingStatus::NotPaired
+                    }
+                    Ok(PairingStatus::Unreachable(reason)) => {
+                        PairingStatus::Unreachable(reason)
+                    }
                     Err(e) => PairingStatus::Unreachable(format!("{e:#}")),
                 };
                 let _ = reply.send(status);
@@ -1016,13 +1059,14 @@ async fn try_signed_request_once(
         if parsed.status
             == crate::proto::signatures::SessionInfoStatus::KeyNotOnWhitelist as i32
         {
-            bail!(
-                "BLE pair revoked: car responded to {:?} query with \
-                 SESSION_INFO_STATUS_KEY_NOT_ON_WHITELIST. Our key has been \
-                 removed from the car (could be the user deleted the SentryUSB \
-                 entry from Locks → Phone Keys, or someone re-paired with the \
-                 same name). Re-pair from the SentryUSB UI.",
-                domain
+            return Err(anyhow::Error::new(session::SessionError::KeyNotPaired)).with_context(
+                || {
+                    format!(
+                        "BLE pair revoked during cached {:?} session; our key has been \
+                         removed from the car. Re-pair from the SentryUSB UI",
+                        domain
+                    )
+                },
             );
         }
 
@@ -1033,6 +1077,17 @@ async fn try_signed_request_once(
     }
 
     if fault != 0 {
+        if is_repair_required_fault_code(fault) {
+            return Err(anyhow::Error::new(session::SessionError::KeyNotPaired)).with_context(
+                || {
+                    format!(
+                        "car rejected cached {:?} session with \
+                         MESSAGEFAULT_ERROR_UNKNOWN_KEY_ID",
+                        domain
+                    )
+                },
+            );
+        }
         // Counter/epoch faults recover by re-handshaking: drop the
         // cached session so the next query re-runs SessionInfoRequest.
         const FAULT_INVALID_SIGNATURE: u32 = 5;
@@ -1182,6 +1237,9 @@ async fn handle_transport_error_if_any<T>(
     result: &Result<T>,
 ) {
     if let Err(e) = result {
+        let fault = fault_for_anyhow_error(e);
+        record_health_fault(fault);
+
         if state.conn.is_none() {
             return;
         }
@@ -1455,6 +1513,34 @@ async fn handle_add_key(state: &mut SessionState) -> Result<()> {
     conn.write_frame(&payload).await
 }
 
+fn fault_for_session_error(error: &session::SessionError) -> FaultKind {
+    match error {
+        session::SessionError::KeyNotPaired => FaultKind::RepairRequired,
+        session::SessionError::Other(_) => FaultKind::ProtocolError,
+    }
+}
+
+fn is_repair_required_fault_code(fault: u32) -> bool {
+    const MESSAGEFAULT_ERROR_UNKNOWN_KEY_ID: u32 = 3;
+    fault == MESSAGEFAULT_ERROR_UNKNOWN_KEY_ID
+}
+
+fn fault_for_anyhow_error(error: &anyhow::Error) -> FaultKind {
+    if error
+        .downcast_ref::<session::SessionError>()
+        .is_some_and(|error| matches!(error, session::SessionError::KeyNotPaired))
+    {
+        FaultKind::RepairRequired
+    } else if is_connect_failure(error)
+        || is_transport_error(error)
+        || is_query_response_timeout(error)
+    {
+        FaultKind::TransportError
+    } else {
+        FaultKind::ProtocolError
+    }
+}
+
 /// session-info handshake over the held connection for the
 /// [`Command::CheckPairing`] probe. `Ok(Paired)`/`Ok(NotPaired)` are
 /// answers the car gave us; `Err` is a connect/transport failure the
@@ -1469,7 +1555,10 @@ async fn handle_check_pairing(state: &mut SessionState) -> Result<PairingStatus>
         .context("ensure_connected returned without a connection")?;
     match session::request_session_info(conn, &state.keypair, Domain::Infotainment).await {
         Ok(_) => Ok(PairingStatus::Paired),
-        Err(session::SessionError::KeyNotPaired) => Ok(PairingStatus::NotPaired),
+        Err(error @ session::SessionError::KeyNotPaired) => {
+            record_health_fault(fault_for_session_error(&error));
+            Ok(PairingStatus::NotPaired)
+        }
         Err(session::SessionError::Other(e)) => Err(e).context("session-info handshake"),
     }
 }
@@ -1761,7 +1850,8 @@ async fn ensure_domain_session(state: &mut SessionState, domain: Domain) -> Resu
     info!("PersistentSession: handshake for {:?}", domain);
     let info = match session::request_session_info(conn, &state.keypair, domain).await {
         Ok(info) => info,
-        Err(session::SessionError::KeyNotPaired) => {
+        Err(error @ session::SessionError::KeyNotPaired) => {
+            record_health_fault(fault_for_session_error(&error));
             // Don't drop the connection — re-handshaking won't help;
             // the user must re-pair on the car.
             bail!(
@@ -2029,7 +2119,38 @@ async fn capture_recent_bluetooth_dmesg() -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_decrypt_error, is_query_response_timeout, is_transport_error};
+    use super::{
+        fault_for_anyhow_error, fault_for_session_error, is_decrypt_error,
+        is_query_response_timeout, is_repair_required_fault_code, is_transport_error,
+    };
+    use sentryusb_ble_health::FaultKind;
+
+    #[test]
+    fn key_not_paired_is_a_repair_required_fault() {
+        assert_eq!(
+            fault_for_session_error(&crate::session::SessionError::KeyNotPaired),
+            FaultKind::RepairRequired,
+        );
+    }
+
+    #[test]
+    fn cached_session_key_rejection_is_a_repair_required_fault() {
+        let error = anyhow::Error::new(crate::session::SessionError::KeyNotPaired)
+            .context("cached session refresh was rejected");
+        assert_eq!(fault_for_anyhow_error(&error), FaultKind::RepairRequired);
+        assert!(is_repair_required_fault_code(3));
+        assert!(!is_repair_required_fault_code(5));
+    }
+
+    #[test]
+    fn other_session_error_is_a_protocol_fault() {
+        assert_eq!(
+            fault_for_session_error(&crate::session::SessionError::Other(anyhow::anyhow!(
+                "bad reply"
+            ))),
+            FaultKind::ProtocolError,
+        );
+    }
 
     #[test]
     fn decrypt_failure_is_decrypt_not_transport() {

@@ -2628,6 +2628,7 @@ dependencies = [
  "reqwest",
  "ring",
  "rusqlite",
+ "sentryusb-ble-health",
  "sentryusb-cloud-uploader",
  "sentryusb-config",
  "sentryusb-drives",
@@ -2645,6 +2646,16 @@ dependencies = [
  "tokio-util",
  "tracing",
  "zip",
+]
+
+[[package]]
+name = "sentryusb-ble-health"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "serde",
+ "serde_json",
+ "tempfile",
 ]
 
 [[package]]
@@ -2777,6 +2788,7 @@ dependencies = [
  "prost-types",
  "protoc-bin-vendored",
  "rand 0.10.2",
+ "sentryusb-ble-health",
  "sha1 0.11.0",
  "sha2 0.11.0",
  "tempfile",

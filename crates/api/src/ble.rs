@@ -13,20 +13,21 @@ use std::sync::atomic::{AtomicI64, Ordering};
 use axum::Json;
 use axum::extract::State;
 use axum::http::StatusCode;
+use sentryusb_ble_health::{
+    DEFAULT_HEALTH_PATH, HealthInput, classify_health, read_at,
+};
 
 use crate::router::AppState;
 
-/// Unix-second timestamp of the most recent successful `tesla-control`
-/// invocation against the car (any subcommand). Used by `ble_connected`
-/// to render a live indicator in the pair card. 0 at process start.
+/// Unix-second timestamp of the most recent successful authenticated
+/// pairing probe made by the API. Used by `ble_connected` alongside
+/// authenticated telemetry rows. 0 at process start.
 ///
 /// Writers: `system::ble_status`'s `session-info` probe and (later)
 /// the telemetry sampler daemon's per-sample success path.
 pub static LAST_BLE_SUCCESS_TS: AtomicI64 = AtomicI64::new(0);
 
-/// Mark a successful tesla-control round-trip. Cheap, lock-free —
-/// safe to call from any code path that just got a non-error response
-/// from the car.
+/// Mark a successful authenticated pairing probe. Cheap and lock-free.
 pub fn mark_ble_success() {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -497,19 +498,46 @@ pub async fn ble_vin_set(
 /// taken as the maximum of two sources:
 ///   * `LAST_BLE_SUCCESS_TS` — webui process's own probes (clicking
 ///     pair, settings-page session-info polls).
-///   * `MAX(ts) FROM telemetry_samples` — the out-of-process sampler
-///     daemon's autonomous activity.
+///   * `MAX(ts) FROM telemetry_samples WHERE source='state'` — the
+///     out-of-process sampler daemon's authenticated activity.
 /// Without the second source the indicator would say "Disconnected"
 /// while the sampler is happily writing rows every 15 s.
 ///
-/// Callers (the BlePairButton card) interpret the freshness:
-///   * `seconds_ago < 60`  → "Connected"
-///   * `< 600`            → "Last seen Ns ago"
-///   * `>= 600` or null   → "Disconnected"
+/// Body-controller rows deliberately do not count: those unauthenticated
+/// pings can keep working after Tesla rejects our paired key, which was
+/// the source of the false-green status this endpoint must prevent.
 ///
 /// `sample_count_10min` lets the UI render a "5 samples / 10m" hint
 /// so the user can tell that data is flowing, not just that the radio
 /// pinged once a long time ago.
+fn authenticated_activity(conn: &rusqlite::Connection, since: i64) -> (i64, i64) {
+    let max_ts: Option<i64> = conn
+        .query_row(
+            "SELECT MAX(ts) FROM telemetry_samples WHERE source = 'state'",
+            [],
+            |row| row.get(0),
+        )
+        .ok()
+        .flatten();
+    let count = conn
+        .query_row(
+            "SELECT count(*) FROM telemetry_samples WHERE source = 'state' AND ts >= ?1",
+            (since,),
+            |row| row.get(0),
+        )
+        .unwrap_or(0);
+    (max_ts.unwrap_or(0), count)
+}
+
+fn health_is_configured(
+    enabled: bool,
+    paired_marker: bool,
+    last_authenticated_success_ts: i64,
+    has_health_record: bool,
+) -> bool {
+    enabled && (paired_marker || last_authenticated_success_ts > 0 || has_health_record)
+}
+
 pub async fn ble_connected(
     State(s): State<AppState>,
 ) -> (StatusCode, Json<serde_json::Value>) {
@@ -523,24 +551,7 @@ pub async fn ble_connected(
 
     let store = s.drives.store.clone();
     let (sampler_ts, sample_count_10min) = tokio::task::spawn_blocking(move || {
-        store.with_read_conn(|conn| {
-            let max_ts: Option<i64> = conn
-                .query_row(
-                    "SELECT MAX(ts) FROM telemetry_samples",
-                    [],
-                    |r| r.get(0),
-                )
-                .ok()
-                .flatten();
-            let count: i64 = conn
-                .query_row(
-                    "SELECT count(*) FROM telemetry_samples WHERE ts >= ?1",
-                    (since,),
-                    |r| r.get(0),
-                )
-                .unwrap_or(0);
-            (max_ts.unwrap_or(0), count)
-        })
+        store.with_read_conn(|conn| authenticated_activity(conn, since))
     })
     .await
     .unwrap_or((0, 0));
@@ -561,6 +572,26 @@ pub async fn ble_connected(
     // samples, so the freshness pill should say "paused" not "broken".
     let radio_owner = read_radio_owner();
     let archiving = crate::drives_handler::is_archiving();
+    let health_record = match read_at(std::path::Path::new(DEFAULT_HEALTH_PATH)) {
+        Ok(record) => record,
+        Err(e) => {
+            tracing::warn!("could not read BLE health record; using freshness fallback: {e}");
+            None
+        }
+    };
+    let configured = health_is_configured(
+        is_ble_enabled(),
+        std::path::Path::new("/root/.ble/paired").exists(),
+        last,
+        health_record.is_some(),
+    );
+    let health = classify_health(&HealthInput {
+        record: health_record,
+        last_authenticated_success_ts: last,
+        radio_owner: radio_owner.as_deref(),
+        archiving,
+        now_ts: now,
+    });
 
     (
         StatusCode::OK,
@@ -570,6 +601,8 @@ pub async fn ble_connected(
             "sample_count_10min": sample_count_10min,
             "radio_owner": radio_owner,
             "archiving": archiving,
+            "configured": configured,
+            "health": health,
         })),
     )
 }
@@ -665,8 +698,8 @@ pub async fn ble_latest_sample(
             // source='state' so body_controller pings don't make the
             // UI say "polled 2s ago" when the actual battery/temps
             // are from a state poll 10 min ago. The body_controller
-            // pings still count for the "Connected" indicator
-            // (handled by ble_connected) — different concern.
+            // pings do not count as authenticated connection health;
+            // `ble_connected` only uses source='state'.
             let envelope = conn
                 .query_row(
                     "SELECT ts, source FROM telemetry_samples \
@@ -1131,6 +1164,27 @@ pub async fn ble_install(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn body_controller_ping_does_not_count_as_authenticated_activity() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE telemetry_samples (ts INTEGER PRIMARY KEY, source TEXT NOT NULL);\
+             INSERT INTO telemetry_samples (ts, source) VALUES (100, 'state');\
+             INSERT INTO telemetry_samples (ts, source) VALUES (999, 'body_controller');",
+        )
+        .unwrap();
+        assert_eq!(authenticated_activity(&conn, 900), (100, 0));
+    }
+
+    #[test]
+    fn dashboard_health_is_only_configured_for_an_active_or_previously_paired_install() {
+        assert!(!health_is_configured(false, true, 0, false));
+        assert!(!health_is_configured(true, false, 0, false));
+        assert!(health_is_configured(true, true, 0, false));
+        assert!(health_is_configured(true, false, 100, false));
+        assert!(health_is_configured(true, false, 0, true));
+    }
 
     fn cfg(pairs: &[(&str, &str)]) -> sentryusb_config::SetupConfig {
         pairs
