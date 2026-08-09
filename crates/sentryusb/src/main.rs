@@ -186,6 +186,11 @@ async fn main() {
 
     // Drive store (SQLite)
     let db_path = sentryusb_drives::DEFAULT_DB_PATH;
+    // `true` when the persistent store could not be opened on a real
+    // device and we are running on an ephemeral in-memory one. Startup
+    // steps whose safety depends on a SUCCESSFUL open must be skipped in
+    // that state (see the legacy-cleanup call below).
+    let mut store_degraded = false;
     let store = match sentryusb_drives::DriveStore::open(db_path) {
         Ok(s) => Arc::new(s),
         Err(e) => {
@@ -205,11 +210,12 @@ async fn main() {
                 .parent()
                 .is_some_and(|p| p.exists());
             if looks_like_device {
+                store_degraded = true;
                 tracing::error!(
                     "Failed to open drive DB at {}: {}. SERVING AN EMPTY IN-MEMORY STORE: \
-                     the on-disk history is still there, but this boot shows no drives and \
-                     anything ingested now is lost on reboot. Most often the disk is full \
-                     or the DB is locked — free space and restart.",
+                     this boot shows no drives and anything ingested now is lost on reboot. \
+                     Common causes are a full disk, a locked DB, or a damaged file — free \
+                     space and restart, and do NOT re-run setup before checking the DB.",
                     db_path,
                     e
                 );
@@ -231,7 +237,20 @@ async fn main() {
     // moved to /backingfiles, plus a couple of pre-Rust state files). Runs
     // after DriveStore::open so any one-shot importer that needs the legacy
     // path has already had a chance to consume it.
-    sentryusb_drives::cleanup_legacy_mutable_files();
+    // ONLY safe after a successful persistent open. The cleanup deletes
+    // /mutable/drive-data.json on the documented premise that
+    // DriveStore::open already imported it — but when open FAILED that
+    // import never ran, so deleting it would destroy the user's last
+    // remaining copy of their drive history at exactly the moment the
+    // database is unavailable. Keep it as a recovery source instead.
+    if store_degraded {
+        tracing::error!(
+            "skipping legacy-file cleanup: the persistent store never opened, so nothing \
+             was imported — preserving /mutable/drive-data.json as a recovery source"
+        );
+    } else {
+        sentryusb_drives::cleanup_legacy_mutable_files();
+    }
     phase!("drive_store_opened");
 
     // Legacy-JSON migration is now handled automatically inside

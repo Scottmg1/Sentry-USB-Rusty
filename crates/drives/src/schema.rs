@@ -479,6 +479,16 @@ pub const MUTABLE_DIRTY_TABLE: &[&str] = &[
 
 /// Bring the DB up to `CURRENT_SCHEMA_VERSION`. Safe on every open â€”
 /// idempotent by construction.
+/// True for `CREATE [UNIQUE] INDEX ...` — performance DDL that
+/// [`try_create_index`] may skip on an operational failure. Everything
+/// else (tables, columns, data migrations) is correctness and stays
+/// fail-hard.
+fn is_index_ddl(stmt: &str) -> bool {
+    let s = stmt.trim_start();
+    let up = s.get(..20).unwrap_or(s).to_ascii_uppercase();
+    up.starts_with("CREATE INDEX") || up.starts_with("CREATE UNIQUE INDEX")
+}
+
 /// Create a PERFORMANCE index, tolerating operational failures.
 ///
 /// Index DDL used to propagate, which aborts `migrate()`, which fails
@@ -505,6 +515,12 @@ fn try_create_index(conn: &Connection, stmt: &str, name: &str) -> Result<()> {
             };
             // Operational/resource conditions: transient or
             // environmental, and recoverable on a later boot.
+            // SystemIoFailure is deliberately NOT here: SQLITE_IOERR
+            // carries corruption-bearing extended codes (IOERR_DATA is a
+            // page-checksum failure, IOERR_CORRUPTFS a corrupt
+            // filesystem), and both collapse to this one primary code. A
+            // full disk already reports SQLITE_FULL, so nothing we
+            // actually need to survive requires accepting IOERR.
             let operational = matches!(
                 code,
                 Some(
@@ -512,7 +528,6 @@ fn try_create_index(conn: &Connection, stmt: &str, name: &str) -> Result<()> {
                         | ErrorCode::DatabaseBusy
                         | ErrorCode::DatabaseLocked
                         | ErrorCode::ReadOnly
-                        | ErrorCode::SystemIoFailure
                         | ErrorCode::OutOfMemory
                 )
             );
@@ -534,8 +549,14 @@ fn try_create_index(conn: &Connection, stmt: &str, name: &str) -> Result<()> {
 
 pub fn migrate(conn: &Connection) -> Result<()> {
     for stmt in V1_SCHEMA {
-        conn.execute(stmt, [])
-            .with_context(|| format!("migrate: applying DDL {:?}", truncate(stmt, 60)))?;
+        if is_index_ddl(stmt) {
+            // Performance index: an operational failure (full disk, busy)
+            // must not cost the whole store — see try_create_index.
+            try_create_index(conn, stmt, &truncate(stmt, 60))?;
+        } else {
+            conn.execute(stmt, [])
+                .with_context(|| format!("migrate: applying DDL {:?}", truncate(stmt, 60)))?;
+        }
     }
 
     // Drop the legacy `idx_routes_start_ts` index that every V1_SCHEMA
@@ -547,13 +568,20 @@ pub fn migrate(conn: &Connection) -> Result<()> {
     // ships the CREATE), and every upgraded DB (pre-v6 / v6 / v7 / v8
     // / v9 â€” all inherited the index from the old V1_SCHEMA). The
     // `routes.start_ts` column itself stays.
-    conn.execute("DROP INDEX IF EXISTS idx_routes_start_ts", [])?;
+    // Performance-only cleanup: never fail the open over it.
+    if let Err(e) = conn.execute("DROP INDEX IF EXISTS idx_routes_start_ts", []) {
+        tracing::error!("schema: could not drop legacy idx_routes_start_ts ({e}); continuing");
+    }
 
     // v6 standalone tables. Idempotent (`IF NOT EXISTS`) so safe on
     // every open and on first-run alongside V1_SCHEMA.
     for stmt in V6_NEW_TABLES {
-        conn.execute(stmt, [])
-            .with_context(|| format!("migrate: applying v6 DDL {:?}", truncate(stmt, 60)))?;
+        if is_index_ddl(stmt) {
+            try_create_index(conn, stmt, &truncate(stmt, 60))?;
+        } else {
+            conn.execute(stmt, [])
+                .with_context(|| format!("migrate: applying v6 DDL {:?}", truncate(stmt, 60)))?;
+        }
     }
 
     // Charging-session tags. Idempotent standalone table; see the

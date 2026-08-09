@@ -853,11 +853,42 @@ async fn self_update(
                 .map(|m| m.len() > 0)
                 .unwrap_or(false)
             {
-                match std::fs::rename(patches_tmp, patches_path) {
-                    Ok(()) => {
-                        let _ = sentryusb_shell::run("chmod", &["+x", patches_path]).await;
+                // Validate the STAGED file before it replaces the live
+                // one. curl writes 0644, so the old sequence (rename,
+                // then chmod, ignoring its result) could leave a
+                // non-executable helper where a working one used to be
+                // — and a truncated download would replace a valid
+                // script with an unparseable one. Both are checked
+                // while the original is still intact; on failure we
+                // keep the existing helper.
+                let staged_ok = sentryusb_shell::run("chmod", &["+x", patches_tmp])
+                    .await
+                    .is_ok()
+                    && sentryusb_shell::run("bash", &["-n", patches_tmp]).await.is_ok();
+                if !staged_ok {
+                    let _ = std::fs::remove_file(patches_tmp);
+                    tracing::error!(
+                        "update.rs: staged runtime-patches script failed chmod/syntax check; \
+                         keeping the existing one"
+                    );
+                    install_warnings.push(
+                        "the downloaded runtime-patches script was not executable or failed a \
+                         syntax check, so the previous one was kept; fixes added in this \
+                         release may not have applied."
+                            .to_string(),
+                    );
+                }
+                match if staged_ok {
+                    std::fs::rename(patches_tmp, patches_path)
+                } else {
+                    // Validation already handled above; don't touch the
+                    // live script at all.
+                    Ok(())
+                } {
+                    Ok(()) if staged_ok => {
                         tracing::info!("update.rs: runtime-patches script refreshed");
                     }
+                    Ok(()) => {}
                     Err(e) => {
                         // Never claim success on a failed swap: the whole
                         // point of this refresh is that NEW patches reach
