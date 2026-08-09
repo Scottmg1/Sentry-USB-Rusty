@@ -110,7 +110,12 @@ const ARCHIVE_SYNC_EXPORT_DATE_KEY: &str = "archive_sync_export_date";
 // v8 (2026-07-06): event-clip gap-fill — the summary grouper now admits
 // SavedClips/SentryClips rows that fill RecentClips holes (and filters
 // all other event rows, which it previously passed through untouched).
-const DRIVE_LIST_CACHE_ALGO_VERSION: &str = "8";
+//
+// v9 (2026-08-08): unanchored driving clusters — event routes with
+// gear-verified ego movement now form drives even when no RecentClips
+// route sits within the chain window (a user save can move an entire
+// short drive out of RecentClips). Stale v8 caches hide those drives.
+const DRIVE_LIST_CACHE_ALGO_VERSION: &str = "9";
 
 /// Version tag for the per-clip aggregate FORMULA (compute_route_aggregates).
 /// Distinct from the cache algo version above: this gates a one-shot

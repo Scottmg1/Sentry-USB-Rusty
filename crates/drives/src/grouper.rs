@@ -683,6 +683,12 @@ pub(crate) struct GapFillCandidate<'a> {
     pub(crate) ts: NaiveDateTime,
     pub(crate) file: &'a str,
     pub(crate) driving: Option<bool>,
+    /// POSITIVE gear-based SEI evidence (non-Park gear frames), stricter
+    /// than `driving`: the speed-only clause is excluded so a single
+    /// bogus speed sample can't qualify a clip. Only unanchored-cluster
+    /// admission consults this; anchored admission keeps the ordinary
+    /// `driving` gate. Always false for pre-extraction candidates.
+    pub(crate) gear_driving: bool,
 }
 
 /// Steps 2-3 of gap-fill admission (see [`select_gap_fill`]): drop
@@ -751,7 +757,7 @@ pub(crate) fn select_gap_fill_events(
 ) -> Vec<usize> {
     let cands: Vec<GapFillCandidate> = candidates
         .iter()
-        .map(|&(ts, file)| GapFillCandidate { ts, file, driving: None })
+        .map(|&(ts, file)| GapFillCandidate { ts, file, driving: None, gear_driving: false })
         .collect();
     select_gap_fill(recent_sorted_ts, &cands)
 }
@@ -770,13 +776,20 @@ pub(crate) fn select_gap_fill_events(
 ///    (interior) OR chains to the recent timeline: hops ≤ GAP_FILL_ADJ_MS
 ///    through recent clips / other kept candidates, anchored to at least
 ///    one recent clip, capped at GAP_FILL_MAX_MS from the nearest one
-///    (bounds trailing/leading fills; isolated event clusters have no
-///    anchor and never qualify).
+///    (bounds trailing/leading fills) — OR forms an unanchored cluster
+///    whose every member carries positive gear-based SEI evidence
+///    (`gear_driving`). A user save can swallow an ENTIRE short drive
+///    (Tesla moves every minute of it out of RecentClips, leaving nothing
+///    to anchor to — 2026-08-08 honk-save incident); ego gear frames
+///    prove the recording car itself was moving, which parked sentry
+///    footage can never show, so proximity has nothing left to guard.
+///    Pre-extraction candidates (`driving == None`, `gear_driving`
+///    false) never qualify unanchored, keeping the ingest scan bounded.
 pub(crate) fn select_gap_fill(
     recent_sorted_ts: &[NaiveDateTime],
     candidates: &[GapFillCandidate],
 ) -> Vec<usize> {
-    if recent_sorted_ts.is_empty() || candidates.is_empty() {
+    if candidates.is_empty() {
         return Vec::new();
     }
     let holes = fillable_holes(recent_sorted_ts);
@@ -829,6 +842,18 @@ pub(crate) fn select_gap_fill(
                 if let Some(k) = k
                     && nearest_recent_ms(ts) <= GAP_FILL_MAX_MS
                 {
+                    chained[k] = true;
+                }
+            }
+        } else if cluster
+            .iter()
+            .all(|&(_, k)| k.is_some_and(|k| candidates[kept[k]].gear_driving))
+        {
+            // Unanchored driving cluster: no recent clip to anchor to,
+            // but every member has gear-verified ego movement — a real
+            // drive Tesla relocated wholesale into an event folder.
+            for &(_, k) in cluster {
+                if let Some(k) = k {
                     chained[k] = true;
                 }
             }
@@ -912,7 +937,11 @@ fn group_clips(routes: Vec<Route>) -> Vec<Vec<TimedRoute>> {
         );
     }
 
-    if timed.is_empty() {
+    // Don't bail yet when every route lives under an event folder —
+    // the gap-fill pass below can still admit unanchored driving
+    // clusters (a store whose RecentClips twins all rotated off before
+    // ingest would otherwise show zero drives forever).
+    if timed.is_empty() && event_candidates.is_empty() {
         info!(
             "group_clips: input={} unique={} timed=0 groups=0 (no parseable timestamps)",
             input_count, unique_count
@@ -943,6 +972,13 @@ fn group_clips(routes: Vec<Route>) -> Vec<Vec<TimedRoute>> {
                     ts: *ts,
                     file: r.file.as_str(),
                     driving: Some(route_has_driving(r)),
+                    gear_driving: telemetry_has_driving(
+                        &r.gear_runs,
+                        &r.gear_states,
+                        &[],
+                        r.raw_park_count,
+                        r.raw_frame_count,
+                    ),
                 }
             })
             .collect();
@@ -968,6 +1004,9 @@ fn group_clips(routes: Vec<Route>) -> Vec<Vec<TimedRoute>> {
         }
     }
     let timed_count = timed.len();
+    if timed.is_empty() {
+        return Vec::new();
+    }
 
     // First pass: group by time gap
     let mut time_groups: Vec<Vec<TimedRoute>> = Vec::new();
@@ -2559,7 +2598,9 @@ fn group_summary_clips<'a>(summaries: &'a [RouteSummary]) -> Vec<Vec<SubClipSumm
             Some(TimedSummary { summary: s, timestamp: ts })
         })
         .collect();
-    if timed.is_empty() {
+    // Same event-only guard as group_clips: unanchored driving clusters
+    // can still be admitted below even when no non-event route exists.
+    if timed.is_empty() && event_candidates.is_empty() {
         return Vec::new();
     }
     timed.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
@@ -2579,6 +2620,13 @@ fn group_summary_clips<'a>(summaries: &'a [RouteSummary]) -> Vec<Vec<SubClipSumm
                 ts: *ts,
                 file: s.file.as_str(),
                 driving: Some(summary_has_driving(s)),
+                gear_driving: telemetry_has_driving(
+                    &s.gear_runs,
+                    &[],
+                    &[],
+                    s.raw_park_count,
+                    s.raw_frame_count,
+                ),
             })
             .collect();
         let admitted = select_gap_fill(&recent_ts, &keys);
@@ -2589,6 +2637,10 @@ fn group_summary_clips<'a>(summaries: &'a [RouteSummary]) -> Vec<Vec<SubClipSumm
             }
             timed.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
         }
+    }
+
+    if timed.is_empty() {
+        return Vec::new();
     }
 
     // Time-gap split.
@@ -4039,12 +4091,19 @@ mod tests {
             external_signature: None,
             telemetry: Default::default(),
         };
+        // Parked event row far from any drive → filtered. Must carry
+        // actual Park telemetry: a gear-verified DRIVING event row with
+        // no anchor now legitimately forms its own drive (unanchored
+        // driving cluster), so the old all-Drive fixture would assert
+        // the wrong thing.
+        let mut parked_far = mk("SentryClips/2026-06-01_02-00-00/2026-06-01_01-59-00-front.mp4");
+        parked_far.raw_park_count = 60;
+        parked_far.gear_runs = vec![GearRun { gear: GEAR_PARK, frames: 60 }];
         let summaries = vec![
             mk("2026-06-01/2026-06-01_10-00-00-front.mp4"),
             mk("2026-06-01/2026-06-01_10-02-00-front.mp4"),
             mk("SentryClips/2026-06-01_10-02-30/2026-06-01_10-01-00-front.mp4"),
-            // Parked event row far from any drive → filtered.
-            mk("SentryClips/2026-06-01_02-00-00/2026-06-01_01-59-00-front.mp4"),
+            parked_far,
         ];
         let groups = group_summary_clips(&summaries);
         assert_eq!(groups.len(), 1);
@@ -4128,20 +4187,124 @@ mod tests {
     }
 
     #[test]
-    fn test_gap_fill_isolated_driving_cluster_stays_out() {
-        // Driving footage with NO adjacent RecentClips anchor (e.g. a
-        // weeks-old event cluster after the continuous footage rotated
-        // off) must stay out — proximity bound, independent of the
-        // driving gate.
+    fn test_gap_fill_isolated_driving_cluster_forms_own_drive() {
+        // Driving footage with NO adjacent RecentClips anchor (a user
+        // save / sentry event can swallow an ENTIRE short drive — Tesla
+        // moves every minute of it out of RecentClips, so nothing is left
+        // to anchor to). Ego SEI gear evidence already proves this is the
+        // recording car moving, so the cluster must surface as its own
+        // drive instead of vanishing (2026-08-08 honk-save incident).
         let routes = vec![
             test_route("RecentClips/2026-05-28/2026-05-28_10-00-00-front.mp4", vec![[37.0, -122.0]]),
             test_route("SentryClips/2026-05-28_14-05-00/2026-05-28_14-00-00-front.mp4", vec![[37.1, -122.1]]),
             test_route("SentryClips/2026-05-28_14-05-00/2026-05-28_14-01-00-front.mp4", vec![[37.1, -122.1]]),
         ];
         let groups = group_clips(routes);
-        assert_eq!(groups.len(), 1);
-        assert_eq!(groups[0].len(), 1);
+        assert_eq!(groups.len(), 2, "unanchored driving cluster should be its own drive");
         assert!(groups[0][0].route.file.starts_with("RecentClips/"));
+        assert_eq!(groups[1].len(), 2);
+        assert!(groups[1][0].route.file.starts_with("SentryClips/"));
+    }
+
+    #[test]
+    fn test_gap_fill_honk_save_timeline_recovers_drive() {
+        // Exact shape of the 2026-08-08 20:05:16 honk save: the whole
+        // 19:55→20:00 drive was moved into SavedClips; only 4 of its
+        // minutes carry SEI (the car's telemetry stream ramps up after
+        // wake) and became routes. Nearest RecentClips route is 20:05:13
+        // — 367 s away, past the 3-min chain hop — and the surrounding
+        // RecentClips hole is hours wide, so interior fill can't apply
+        // either. The driving cluster must still render as its own drive,
+        // separate from the later 20:05 stub.
+        let routes = vec![
+            test_route("RecentClips/2026-08-08/2026-08-08_18-11-46-front.mp4", vec![[39.0, -76.9]]),
+            test_route("SavedClips/2026-08-08_20-05-16/2026-08-08_19-56-05-front.mp4", vec![[39.1, -76.91]]),
+            test_route("SavedClips/2026-08-08_20-05-16/2026-08-08_19-57-05-front.mp4", vec![[39.11, -76.92]]),
+            test_route("SavedClips/2026-08-08_20-05-16/2026-08-08_19-58-06-front.mp4", vec![[39.12, -76.93]]),
+            test_route("SavedClips/2026-08-08_20-05-16/2026-08-08_19-59-06-front.mp4", vec![[39.13, -76.93]]),
+            test_route("RecentClips/2026-08-08/2026-08-08_20-05-13-front.mp4", vec![[39.13, -76.932]]),
+        ];
+        let groups = group_clips(routes);
+        assert_eq!(groups.len(), 3, "18:11 stub, recovered drive, 20:05 stub");
+        assert_eq!(groups[1].len(), 4, "all four SavedClips driving routes form the drive");
+        assert!(groups[1].iter().all(|c| c.route.file.starts_with("SavedClips/")));
+    }
+
+    #[test]
+    fn test_gap_fill_event_only_routes_still_group() {
+        // A store whose only routes live under event folders (every
+        // RecentClips twin rotated off before ingest) must still produce
+        // drives — group_clips used to bail out before the gap-fill pass
+        // when no non-event route existed.
+        let routes = vec![
+            test_route("SavedClips/2026-05-28_14-10-00/2026-05-28_14-00-00-front.mp4", vec![[37.1, -122.1]]),
+            test_route("SavedClips/2026-05-28_14-10-00/2026-05-28_14-01-00-front.mp4", vec![[37.11, -122.1]]),
+        ];
+        let groups = group_clips(routes);
+        assert_eq!(groups.len(), 1, "event-only driving routes must form a drive");
+        assert_eq!(groups[0].len(), 2);
+    }
+
+    #[test]
+    fn test_gap_fill_unanchored_requires_gear_evidence() {
+        // Unanchored admission demands POSITIVE gear-based SEI evidence.
+        // A speed-only outlier (all-Park gear, one bogus speed sample)
+        // passes the ordinary driving gate but must NOT mint a drive
+        // without an anchor — provenance-weak rows stay anchored.
+        let mut speed_only = test_route(
+            "SentryClips/2026-05-28_14-05-00/2026-05-28_14-00-00-front.mp4",
+            vec![[37.1, -122.1]],
+        );
+        speed_only.gear_states = vec![GEAR_PARK];
+        speed_only.gear_runs = vec![GearRun { gear: GEAR_PARK, frames: 10 }];
+        speed_only.raw_park_count = 10;
+        speed_only.speeds = vec![2.0];
+        let routes = vec![
+            test_route("RecentClips/2026-05-28/2026-05-28_10-00-00-front.mp4", vec![[37.0, -122.0]]),
+            speed_only,
+        ];
+        let groups = group_clips(routes);
+        assert_eq!(groups.len(), 1, "speed-only unanchored event clip stays out");
+        assert!(groups[0][0].route.file.starts_with("RecentClips/"));
+    }
+
+    #[test]
+    fn test_select_gap_fill_unanchored_ingest_candidates_stay_out() {
+        // The ingest scan proposes candidates with driving == None (no SEI
+        // extracted yet). An unanchored cluster of those must stay out —
+        // only post-extraction, gear-verified clusters qualify.
+        let recent = vec![dts("2026-06-01 10:00:00")];
+        let cands = vec![
+            GapFillCandidate {
+                ts: dts("2026-06-01 14:00:00"),
+                file: "SentryClips/2026-06-01_14-05-00/a-front.mp4",
+                driving: None,
+                gear_driving: false,
+            },
+            GapFillCandidate {
+                ts: dts("2026-06-01 14:01:00"),
+                file: "SentryClips/2026-06-01_14-05-00/b-front.mp4",
+                driving: None,
+                gear_driving: false,
+            },
+        ];
+        assert!(select_gap_fill(&recent, &cands).is_empty());
+    }
+
+    #[test]
+    fn test_group_summary_clips_unanchored_driving_cluster() {
+        // Summary-path parity with group_clips: the drive-list cache is
+        // built from RouteSummary rows, so the unanchored driving cluster
+        // must surface there too.
+        let summaries = vec![
+            clip_with_gear_runs("RecentClips/2026-05-28/2026-05-28_10-00-00-front.mp4", &[(1, 60)], 500.0),
+            clip_with_gear_runs("SavedClips/2026-05-28_14-10-00/2026-05-28_14-00-00-front.mp4", &[(1, 60)], 400.0),
+            clip_with_gear_runs("SavedClips/2026-05-28_14-10-00/2026-05-28_14-01-00-front.mp4", &[(1, 60)], 400.0),
+        ];
+        let groups = group_summary_clips(&summaries);
+        assert_eq!(groups.len(), 2, "summary path must admit the unanchored driving cluster");
+        assert_eq!(groups[1].len(), 2);
+        assert!(groups[1][0].summary.file.starts_with("SavedClips/"));
     }
 
     #[test]
@@ -4162,9 +4325,13 @@ mod tests {
         .into_iter()
         .map(|(ts, n)| (ts, format!("SentryClips/2026-06-01_10-20-00/{}-front.mp4", n)))
         .collect();
+        // gear_driving stays false here: these candidates model driving
+        // verdicts WITHOUT strict gear provenance, so the broken-hop clip
+        // can't ride the unanchored-cluster admission and the test keeps
+        // exercising pure chain semantics.
         let cands: Vec<GapFillCandidate> = files
             .iter()
-            .map(|(ts, f)| GapFillCandidate { ts: *ts, file: f.as_str(), driving: Some(true) })
+            .map(|(ts, f)| GapFillCandidate { ts: *ts, file: f.as_str(), driving: Some(true), gear_driving: false })
             .collect();
         let picked = select_gap_fill(&recent, &cands);
         assert_eq!(picked, vec![0, 1, 2, 3], "chain must stop at the broken hop");
@@ -4181,7 +4348,7 @@ mod tests {
             .collect();
         let cands: Vec<GapFillCandidate> = long
             .iter()
-            .map(|(ts, f)| GapFillCandidate { ts: *ts, file: f.as_str(), driving: Some(true) })
+            .map(|(ts, f)| GapFillCandidate { ts: *ts, file: f.as_str(), driving: Some(true), gear_driving: false })
             .collect();
         let picked = select_gap_fill(&recent, &cands);
         assert!(!picked.is_empty());
@@ -4208,16 +4375,19 @@ mod tests {
                 ts: dts("2026-07-04 20:44:51"), // 1s after occupied slot → twin
                 file: "SentryClips/e/2026-07-04_20-44-51-front.mp4",
                 driving: Some(true),
+                gear_driving: true,
             },
             GapFillCandidate {
                 ts: dts("2026-07-04 20:45:51"), // real trailing fill
                 file: "SentryClips/e/2026-07-04_20-45-51-front.mp4",
                 driving: Some(true),
+                gear_driving: true,
             },
             GapFillCandidate {
                 ts: dts("2026-07-04 20:46:11"), // 20s after the kept fill → overlap dup
                 file: "SavedClips/e2/2026-07-04_20-46-11-front.mp4",
                 driving: Some(true),
+                gear_driving: true,
             },
         ];
         assert_eq!(select_gap_fill(&recent, &cands), vec![1]);

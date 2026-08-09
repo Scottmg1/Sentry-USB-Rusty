@@ -98,6 +98,13 @@ struct ClipOutcome {
     route_added: bool,
     had_gps: bool,
     parked_skipped: bool,
+    /// Gate-skipped with ZERO usable SEI telemetry (vs `parked_skipped`
+    /// where SEI is present and shows Park throughout). Tesla writes
+    /// some user-save copies without SEI (telemetry stream still
+    /// ramping after wake, parked minutes), and lumping those into
+    /// "parked pre-roll" made the 2026-08-08 honk-save incident
+    /// undiagnosable from the logs.
+    no_sei_skipped: bool,
     /// Error message without the file prefix (the loop adds it).
     error: Option<String>,
 }
@@ -108,6 +115,7 @@ impl ClipOutcome {
             route_added: false,
             had_gps: false,
             parked_skipped: false,
+            no_sei_skipped: false,
             error: Some(msg),
         }
     }
@@ -120,6 +128,7 @@ fn process_one_clip(store: &DriveStore, file: &str, full_path: &str) -> ClipOutc
         route_added: false,
         had_gps: false,
         parked_skipped: false,
+        no_sei_skipped: false,
         error: None,
     };
     // `add_route` accepts `date_dir: &str` — no need to materialize
@@ -147,7 +156,19 @@ fn process_one_clip(store: &DriveStore, file: &str, full_path: &str) -> ClipOutc
                     gps.raw_frame_count,
                 ) =>
         {
-            out.parked_skipped = true;
+            // "No usable SEI at all" and "SEI shows parked" are different
+            // verdicts: the former is a telemetry-less copy (Tesla writes
+            // some user-save clips without SEI), the latter a genuine
+            // parked pre-roll. Same disposition, separate books.
+            if gps.raw_frame_count == 0
+                && gps.gear_runs.is_empty()
+                && gps.gear_states.is_empty()
+                && gps.speeds.is_empty()
+            {
+                out.no_sei_skipped = true;
+            } else {
+                out.parked_skipped = true;
+            }
             if let Err(me) = store.mark_processed(file) {
                 warn!("failed to mark {} processed: {}", file, me);
             }
@@ -501,6 +522,7 @@ impl Processor {
         let mut routes_found: usize = 0;
         let mut files_with_gps: usize = 0;
         let mut gap_fill_parked_skipped: usize = 0;
+        let mut gap_fill_no_sei_skipped: usize = 0;
         let mut errors: Vec<String> = Vec::new();
         let mut error_count: usize = 0;
         info!("found {} unprocessed clip files", total);
@@ -558,6 +580,9 @@ impl Processor {
             }
             if clip.parked_skipped {
                 gap_fill_parked_skipped += 1;
+            }
+            if clip.no_sei_skipped {
+                gap_fill_no_sei_skipped += 1;
             }
             if let Some(msg) = clip.error {
                 error_count += 1;
@@ -654,8 +679,14 @@ impl Processor {
         );
         if gap_fill_parked_skipped > 0 {
             info!(
-                "gap-fill: {} event clip(s) skipped by the driving gate (parked pre-roll)",
+                "gap-fill: {} event clip(s) skipped by the driving gate (SEI present, no driving evidence)",
                 gap_fill_parked_skipped
+            );
+        }
+        if gap_fill_no_sei_skipped > 0 {
+            info!(
+                "gap-fill: {} event clip(s) skipped by the driving gate (no usable SEI telemetry)",
+                gap_fill_no_sei_skipped
             );
         }
 
