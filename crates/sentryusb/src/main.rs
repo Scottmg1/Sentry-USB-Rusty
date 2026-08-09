@@ -100,9 +100,15 @@ enum SnapshotAction {
 enum SpaceAction {
     /// Delete old snapshots until `/backingfiles` has enough free space.
     Manage {
-        /// Reserved for future compat (e.g. reserve size); ignored for now.
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
-        args: Vec<String>,
+        /// Free-space target in BYTES, as archiveloop's freespacemanager
+        /// computes it and the manage_free_space.sh wrapper forwards.
+        /// Omitted: use the same `10 GiB + total/33` formula. Parsed
+        /// strictly — a malformed value is rejected rather than coerced
+        /// (a reserve of 0 would "satisfy" instantly, and any garbage
+        /// silently falling back to a different policy is what made the
+        /// bash and Rust paths diverge in the first place).
+        #[arg(value_parser = clap::value_parser!(u64).range(1..))]
+        reserve_bytes: Option<u64>,
     },
 }
 
@@ -549,7 +555,11 @@ async fn run_snapshot(action: SnapshotAction) -> i32 {
 
 async fn run_space(action: SpaceAction) -> i32 {
     match action {
-        SpaceAction::Manage { .. } => match sentryusb_gadget::space::manage_free_space().await {
+        SpaceAction::Manage { reserve_bytes } => match sentryusb_gadget::space::manage_free_space(
+            reserve_bytes,
+        )
+        .await
+        {
             Ok(()) => 0,
             Err(e) => {
                 eprintln!("space manage: {}", e);

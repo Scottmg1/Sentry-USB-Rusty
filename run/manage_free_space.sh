@@ -80,6 +80,15 @@ function manage_free_space {
   done
 }
 
-# This will normally be called with a value of "10G + 3% of total space",
-# but default to 20G if not specified
-manage_free_space "${1:-21474836480}"
+# Normally called by archiveloop's freespacemanager with "10G + 3% of
+# total space". When invoked by hand with no argument, compute the SAME
+# policy rather than falling back to a flat 20G: a size-blind default is
+# harsher than the real policy on small drives and far weaker on
+# multi-TB ones, which is exactly the vintage-dependent divergence this
+# shares with crates/usb_gadget/src/space.rs (default_reserve_bytes).
+reserve="${1:-}"
+if [ -z "$reserve" ]
+then
+  reserve=$(eval "$(stat --file-system --format="echo \$((10737418240 + %b*%S/33))" /backingfiles/cam_disk.bin)")
+fi
+manage_free_space "$reserve"
