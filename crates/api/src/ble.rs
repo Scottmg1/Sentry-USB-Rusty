@@ -36,6 +36,40 @@ pub fn mark_ble_success() {
     LAST_BLE_SUCCESS_TS.store(now, Ordering::Relaxed);
 }
 
+/// Home geofence (lat, lon, radius_m) from the keep-accessory config, or
+/// `None` when no home is set. Center is shared with keep-accessory/away-mode
+/// (`KEEP_ACCESSORY_HOME_LAT/LON`); radius defaults to 120m.
+fn home_geofence() -> Option<(f64, f64, f64)> {
+    let config_path = sentryusb_config::find_config_path();
+    let (active, commented) = sentryusb_config::parse_file(config_path).ok()?;
+    let g = |k: &str| sentryusb_config::get_config_value(&active, &commented, k);
+    // Range-checked, not merely finite: a stray KEEP_ACCESSORY_HOME_LAT=1000
+    // would otherwise yield a garbage distance rather than being rejected.
+    // Also subsumes the finite check — NaN and infinities fail `contains`.
+    let lat = g("KEEP_ACCESSORY_HOME_LAT")
+        .and_then(|s| s.trim().parse::<f64>().ok())
+        .filter(|v| (-90.0..=90.0).contains(v))?;
+    let lon = g("KEEP_ACCESSORY_HOME_LON")
+        .and_then(|s| s.trim().parse::<f64>().ok())
+        .filter(|v| v.is_finite())
+        .map(crate::normalize_lon)?;
+    let radius = g("KEEP_ACCESSORY_HOME_RADIUS_M")
+        .and_then(|s| s.trim().parse::<f64>().ok())
+        .filter(|r| r.is_finite() && *r > 0.0 && *r <= 100_000.0)
+        .unwrap_or(120.0);
+    Some((lat, lon, radius))
+}
+
+/// Great-circle distance in meters (haversine). Local copy, as in `away_mode`.
+fn distance_m(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
+    const EARTH_R_M: f64 = 6_371_000.0;
+    let (p1, p2) = (lat1.to_radians(), lat2.to_radians());
+    let dphi = (lat2 - lat1).to_radians();
+    let dlambda = (lon2 - lon1).to_radians();
+    let a = (dphi / 2.0).sin().powi(2) + p1.cos() * p2.cos() * (dlambda / 2.0).sin().powi(2);
+    2.0 * EARTH_R_M * a.sqrt().min(1.0).asin()
+}
+
 /// Whether the Tesla BLE telemetry sampler should be running.
 /// **Telemetry-specific** — does NOT control the BLE keep-awake nudge
 /// (that's `is_ble_keep_awake_enabled`). Strictly explicit: only true
@@ -676,6 +710,12 @@ type LatestSample = (
     Option<f64>,          // tire_rr_psi
     Option<f64>,          // odometer_mi
     Option<String>,       // location_name
+    // Coordinates ride the cache because they are plain DB columns. They are
+    // NEVER serialized — only the derived `at_home` bool is. The geofence
+    // itself is read outside the cache, so moving home still takes effect on
+    // the next request even though the fix behind it may be up to 10s old.
+    Option<f64>,          // latitude
+    Option<f64>,          // longitude
     Option<i64>,          // body_controller ts
 );
 
@@ -825,6 +865,8 @@ pub async fn ble_latest_sample(
                     latest_col_f64("tire_rr_psi"),
                     latest_col_f64("odometer_mi"),
                     latest_col_string("location_name"),
+                    latest_col_f64("latitude"),
+                    latest_col_f64("longitude"),
                     body_controller_ts,
                 )
             })
@@ -855,6 +897,8 @@ pub async fn ble_latest_sample(
             tire_rr_psi,
             odometer_mi,
             location_name,
+            latitude,
+            longitude,
             body_controller_ts,
         )) => {
             // Age of each aged (value, ts) pair, in seconds — how old the
@@ -862,6 +906,22 @@ pub async fn ble_latest_sample(
             // "seconds_ago". The UI flags a field whose age greatly
             // exceeds the envelope so a stale temp can't read as current.
             let age = |pair: &Option<(f64, i64)>| pair.map(|(_, t)| (now - t).max(0));
+            // Privacy-safe "at home" signal: is the car's latest fix inside the
+            // configured home geofence? Lets the app show a "Home" label without
+            // exposing the address. False when no home is set or there's no GPS.
+            // `home_geofence()` reads and parses the config file, so it is called
+            // only once there is a fix to test against — a tuple pattern would
+            // evaluate it on every request and discard the result whenever GPS is
+            // absent, which is the common case. Kept outside the sample cache on
+            // purpose: a changed home location then applies on the next request
+            // instead of waiting out the TTL.
+            let at_home = latitude
+                .zip(longitude)
+                .and_then(|(la, lo)| {
+                    home_geofence()
+                        .map(|(hla, hlo, r)| distance_m(la, crate::normalize_lon(lo), hla, hlo) <= r)
+                })
+                .unwrap_or(false);
             (
             StatusCode::OK,
             Json(serde_json::json!({
@@ -877,6 +937,7 @@ pub async fn ble_latest_sample(
                 "tire_rr_psi": tire_rr_psi,
                 "odometer_mi": odometer_mi,
                 "location_name": location_name,
+                "at_home": at_home,
                 // Per-field age (seconds) for the volatile values the
                 // dashboard shows. Null when the field has no value.
                 "field_secs_ago": {
