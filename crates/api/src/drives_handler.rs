@@ -1364,6 +1364,14 @@ pub struct TireHistoryQuery {
 ///   "days": 30
 /// }
 /// ```
+///
+/// A 30-day pressure chart doesn't change meaningfully inside a minute,
+/// but the scan measured 5.2s mid-archive and held one of the two read
+/// connections for that whole time — long enough to queue every other
+/// telemetry poll behind it. Cached per `days` value.
+static TIRE_HISTORY_CACHE: crate::ttl_cache::StaleWhileRevalidate<u32, Option<Vec<serde_json::Value>>> =
+    crate::ttl_cache::StaleWhileRevalidate::new(std::time::Duration::from_secs(60));
+
 pub async fn tire_history(
     State(state): State<AppState>,
     Query(q): Query<TireHistoryQuery>,
@@ -1376,7 +1384,8 @@ pub async fn tire_history(
     let cutoff = now - (days as i64) * 86_400;
 
     let store = state.drives.store.clone();
-    let result = tokio::task::spawn_blocking(move || {
+    let result = TIRE_HISTORY_CACHE
+        .get(days, move || {
         store.with_read_conn(|conn| {
             let mut stmt = conn.prepare(
                 "SELECT ts, tire_fl_psi, tire_fr_psi, tire_rl_psi, tire_rr_psi \
@@ -1416,20 +1425,21 @@ pub async fn tire_history(
             }
             Ok::<_, anyhow::Error>(out)
         })
-    })
-    .await;
+        .ok()
+        })
+        .await;
 
     match result {
-        Ok(Ok(points)) => (
+        Some(points) => (
             StatusCode::OK,
             Json(serde_json::json!({
                 "points": points,
                 "days": days,
             })),
         ),
-        Ok(Err(e)) => crate::json_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
-        Err(e) => {
-            crate::json_error(StatusCode::INTERNAL_SERVER_ERROR, &format!("tire-history task: {}", e))
-        }
+        None => crate::json_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "tire-history query failed",
+        ),
     }
 }

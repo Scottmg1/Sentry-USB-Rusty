@@ -269,8 +269,8 @@ impl DriveStore {
         // failure here is fatal: silently falling back to the writer
         // would reintroduce the read-starvation this pool removes.
         let read_conns = vec![
-            Mutex::new(open_readonly_connection(&path)?),
-            Mutex::new(open_readonly_connection(&path)?),
+            Mutex::new(open_readonly_connection_for(&path, ReadRole::Api)?),
+            Mutex::new(open_readonly_connection_for(&path, ReadRole::Api)?),
         ];
 
         let store = DriveStore {
@@ -1915,11 +1915,74 @@ fn open_connection(path: &str) -> Result<Connection> {
 /// for long-running reads (the JSON export mirror) that would otherwise
 /// hold the shared writer connection's mutex for minutes. WAL mode on
 /// the writer lets this handle see a consistent snapshot.
+/// What a read-only handle is for. The two roles want opposite page
+/// strategies, so they no longer share pragmas.
+#[derive(Clone, Copy, PartialEq)]
+enum ReadRole {
+    /// The API read pool: small, repeated, latency-sensitive lookups.
+    /// Wants its working set to survive an archive run.
+    Api,
+    /// One-shot bulk walks (JSON export, cache-rebuild snapshot) that
+    /// stream hundreds of MB once and never re-read them.
+    Bulk,
+}
+
+/// Total system RAM in KiB, or `None` when /proc/meminfo is unreadable.
+fn mem_total_kb() -> Option<u64> {
+    let meminfo = std::fs::read_to_string("/proc/meminfo").ok()?;
+    meminfo
+        .lines()
+        .find_map(|l| l.strip_prefix("MemTotal:"))
+        .and_then(|v| v.trim().trim_end_matches(" kB").trim().parse().ok())
+}
+
+/// Page cache (KiB) for an API read connection, sized to the board.
+///
+/// This is a CAP, not an allocation — SQLite grows the pager cache only
+/// as queries touch pages, and the hot poll paths touch a handful. The
+/// tiers still stay conservative because the majority of installs are
+/// 512 MB Zero 2 Ws, where a bulk read through this pool (a month of
+/// tire history, say) could actually approach the cap.
+fn api_reader_cache_kb() -> i64 {
+    match mem_total_kb() {
+        // Unreadable /proc/meminfo — assume the smallest supported board.
+        None => 4_000,
+        // Zero 2 W and friends (512 MB).
+        Some(kb) if kb <= 600_000 => 8_000,
+        // 1 GB Pi 4/5.
+        Some(kb) if kb <= 1_200_000 => 16_000,
+        Some(kb) if kb <= 2_500_000 => 24_000,
+        Some(_) => 48_000,
+    }
+}
+
 fn open_readonly_connection(path: &str) -> Result<Connection> {
+    open_readonly_connection_for(path, ReadRole::Bulk)
+}
+
+fn open_readonly_connection_for(path: &str, role: ReadRole) -> Result<Connection> {
     let flags = OpenFlags::SQLITE_OPEN_READ_ONLY
         | OpenFlags::SQLITE_OPEN_URI
         | OpenFlags::SQLITE_OPEN_NO_MUTEX;
     let conn = Connection::open_with_flags(path, flags)?;
+    if role == ReadRole::Api {
+        // mmap_size = 0 is the point of this role. With mmap on, SQLite
+        // reads ride the OS page cache — which an archive run floods
+        // with many GB of video, evicting the DB's hot B-tree pages. The
+        // same queries then measured 1000x slower (1.1ms -> 7.4s) with
+        // identical, optimal query plans. A private heap cache is
+        // anonymous memory, which the kernel reclaims far less eagerly
+        // than clean file pages, so the hot set survives the archive.
+        conn.execute_batch(&format!(
+            "PRAGMA query_only = ON;
+             PRAGMA busy_timeout = 5000;
+             PRAGMA mmap_size = 0;
+             PRAGMA cache_size = -{};
+             PRAGMA temp_store = MEMORY;",
+            api_reader_cache_kb()
+        ))?;
+        return Ok(conn);
+    }
     // mmap_size matches apply_pragmas — this connection serves the
     // BLOB-heavy full-table scans (JSON export, cache-rebuild snapshot),
     // which benefit most from skipping the pager-buffer copy.

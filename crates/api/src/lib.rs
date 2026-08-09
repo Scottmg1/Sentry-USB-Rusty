@@ -22,6 +22,7 @@ pub mod community;
 pub mod healthcheck;
 pub mod clips;
 pub mod preferences;
+pub mod ttl_cache;
 pub mod memory;
 pub mod logs;
 pub mod devices;

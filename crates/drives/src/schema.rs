@@ -217,6 +217,20 @@ const CLOUD_ROUTE_ID_INDEX: &str =
     "CREATE INDEX IF NOT EXISTS idx_routes_cloud_route_id \
      ON routes(cloud_route_id) WHERE cloud_route_id IS NOT NULL";
 
+/// TPMS rows are ~5% of `telemetry_samples` (7,977 of a 30-day window on
+/// a measured device), but `/api/telemetry/tire-history` had to walk the
+/// whole window to find them — 5.2s during an archive, holding one of
+/// the two read connections and queueing every other telemetry poll
+/// behind it. Covering: the value columns ride along so the chart is
+/// answered from the index without touching the table.
+const TELEMETRY_TIRE_INDEX: &str =
+    "CREATE INDEX IF NOT EXISTS idx_telemetry_tire_ts \
+     ON telemetry_samples(ts, tire_fl_psi, tire_fr_psi, tire_rl_psi, tire_rr_psi) \
+     WHERE tire_fl_psi IS NOT NULL \
+        OR tire_fr_psi IS NOT NULL \
+        OR tire_rl_psi IS NOT NULL \
+        OR tire_rr_psi IS NOT NULL";
+
 /// v4 Tessie provenance columns. Preserves `source`, `externalSignature`,
 /// and `tessieAutopilotPercent` through SQLite on import/export so a
 /// round-trip with Sentry-Drive's `drive-data.json` is lossless.
@@ -570,6 +584,7 @@ pub fn migrate(conn: &Connection) -> Result<()> {
         (CLOUD_UPLOADED_INDEX, "idx_routes_cloud_uploaded"),
         (TELEMETRY_CHARGE_INDEX, "idx_telemetry_charge_ts"),
         (CLOUD_ROUTE_ID_INDEX, "idx_routes_cloud_route_id"),
+        (TELEMETRY_TIRE_INDEX, "idx_telemetry_tire_ts"),
     ] {
         let exists: i64 = conn.query_row(
             "SELECT count(*) FROM sqlite_master WHERE type='index' AND name=?1",

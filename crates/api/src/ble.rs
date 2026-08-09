@@ -660,6 +660,31 @@ fn read_gate_status() -> (Option<String>, Option<String>, Option<String>) {
 /// stale enough that showing it as "current" would mislead anyway.
 const LATEST_SAMPLE_WINDOW_SECS: i64 = 30 * 86_400;
 
+/// One resolved latest-sample read. Cached as data, never as rendered
+/// JSON: the response's `seconds_ago` / `field_secs_ago` are derived
+/// from the current clock and must stay live across cache hits.
+type LatestSample = (
+    i64,                  // envelope ts
+    String,               // envelope source
+    Option<(f64, i64)>,   // battery_pct + its row ts
+    Option<(f64, i64)>,   // interior_temp_c + ts
+    Option<(f64, i64)>,   // exterior_temp_c + ts
+    Option<i64>,          // hvac_on
+    Option<(f64, i64)>,   // tire_fl_psi + ts
+    Option<f64>,          // tire_fr_psi
+    Option<f64>,          // tire_rl_psi
+    Option<f64>,          // tire_rr_psi
+    Option<f64>,          // odometer_mi
+    Option<String>,       // location_name
+    Option<i64>,          // body_controller ts
+);
+
+/// The sampler writes at best every 15s (Active) / 30s (Quiet), so a
+/// 10s TTL costs no real freshness while cutting the panel's 5s poll
+/// to at most one DB read per window.
+static LATEST_SAMPLE_CACHE: crate::ttl_cache::StaleWhileRevalidate<(), Option<LatestSample>> =
+    crate::ttl_cache::StaleWhileRevalidate::new(std::time::Duration::from_secs(10));
+
 pub async fn ble_latest_sample(
     State(s): State<AppState>,
 ) -> (StatusCode, Json<serde_json::Value>) {
@@ -669,7 +694,8 @@ pub async fn ble_latest_sample(
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
         - LATEST_SAMPLE_WINDOW_SECS;
-    let result = tokio::task::spawn_blocking(move || {
+    let result = LATEST_SAMPLE_CACHE
+        .get((), move || {
         store.with_read_conn(|conn| {
             // Pull two things:
             //   1. The "envelope" — `ts` + `source` of the most recent
@@ -802,10 +828,8 @@ pub async fn ble_latest_sample(
                 )
             })
         })
-    })
-    .await
-    .ok()
-    .flatten();
+        })
+        .await;
 
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

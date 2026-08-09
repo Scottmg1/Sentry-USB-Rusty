@@ -314,11 +314,18 @@ apply_ble_adv_helper() {
 # `ionice -c2 -n7` so the car's dashcam writes through the USB gadget
 # always win disk access — but ionice only has effect under the bfq I/O
 # scheduler (mq-deadline, the Pi OS default, ignores I/O priorities).
-# Ship a udev rule so every sd disk gets bfq at hotplug/boot, and apply
+# Ship a udev rule so the backing disk gets bfq at hotplug/boot, and apply
 # it to the live backingfiles disk immediately when that is safe.
+#
+# The pattern covers SD cards (mmcblk*) as well as USB/SATA disks (sd*).
+# Matching only sd* left every install whose /backingfiles sits on the SD
+# card — common on a Zero 2 W — silently back on mq-deadline after each
+# reboot, which makes the archive's ionice a no-op and lets rsync starve
+# the API's disk reads. NVMe is deliberately excluded: bfq's fairness
+# machinery costs more than it returns on a device that fast.
 apply_backingfiles_bfq() {
     local rule=/etc/udev/rules.d/60-sentryusb-bfq.rules
-    local want='ACTION=="add|change", KERNEL=="sd[a-z]", SUBSYSTEM=="block", ATTR{queue/scheduler}="bfq"'
+    local want='ACTION=="add|change", KERNEL=="sd[a-z]|mmcblk[0-9]", SUBSYSTEM=="block", ATTR{queue/scheduler}="bfq"'
 
     modprobe bfq 2>/dev/null || true
 

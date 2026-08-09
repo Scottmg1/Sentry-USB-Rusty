@@ -62,6 +62,12 @@ fn invalidate_charging_list() {
     *CHARGING_LIST_CACHE.lock().unwrap() = None;
 }
 
+/// Latest charge-bearing row for the dashboard banner. The sampler
+/// writes at best every 15s, so a 10s TTL costs no freshness while
+/// keeping the poll off a disk that an archive run has saturated.
+static LATEST_CHARGE_CACHE: crate::ttl_cache::StaleWhileRevalidate<(), Option<LatestCharge>> =
+    crate::ttl_cache::StaleWhileRevalidate::new(std::time::Duration::from_secs(10));
+
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -561,6 +567,7 @@ impl CurrentCharge {
 }
 
 /// The single most-recent telemetry row, charge-relevant columns only.
+#[derive(Clone)]
 struct LatestCharge {
     ts: i64,
     soc: Option<f64>,
@@ -586,14 +593,16 @@ struct LatestCharge {
 pub async fn current_charging(
     State(state): State<AppState>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    // One indexed LIMIT-1 lookup, but it contends for the same connection
-    // mutex as list_charging's whole-table scan; acquiring it on the
-    // reactor would block an async worker behind that scan. Run it on the
-    // blocking pool so a slow concurrent query can't stall the reactor.
+    // The lookup is index-backed and sub-millisecond on an idle disk, but
+    // measured 7.4s mid-archive once the page cache had been flushed by
+    // the video copy. Cache the ROW (not the response) so the derived
+    // freshness below still recomputes against the current clock, and so
+    // a poll during an archive never queues on a read connection.
     let store = state.drives.store.clone();
-    let cur = tokio::task::spawn_blocking(move || {
+    let latest = LATEST_CHARGE_CACHE
+        .get((), move || {
         use rusqlite::OptionalExtension;
-        let latest = store.with_read_conn(|conn| {
+        store.with_read_conn(|conn| {
             conn.query_row(
                 "SELECT ts, battery_pct, charge_limit_soc, charger_power_kw, \
                         charge_rate_mph, charge_minutes_to_full, battery_range_mi, \
@@ -618,10 +627,14 @@ pub async fn current_charging(
                 },
             )
             .optional()
-        });
+        })
+        .ok()
+        .flatten()
+        })
+        .await;
 
-        match latest {
-            Ok(Some(l)) => {
+        let cur = match latest {
+            Some(l) => {
                 let now = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .map(|d| d.as_secs() as i64)
@@ -654,11 +667,8 @@ pub async fn current_charging(
                     },
                 }
             }
-            _ => CurrentCharge::idle(),
-        }
-    })
-    .await
-    .unwrap_or_else(|_| CurrentCharge::idle());
+            None => CurrentCharge::idle(),
+        };
     (StatusCode::OK, Json(serde_json::to_value(cur).unwrap()))
 }
 
