@@ -834,7 +834,9 @@ function StorageTile({
         icon={<Camera className="h-3.5 w-3.5" />}
         label={`${snaps.toLocaleString()} snapshots`}
         sub={
-          snaps > 0
+          snaps > 0 &&
+          Number.isFinite(parseInt(status.snapshot_oldest)) &&
+          Number.isFinite(parseInt(status.snapshot_newest))
             ? `${new Date(
                 parseInt(status.snapshot_oldest) * 1000
               ).toLocaleDateString()} → ${new Date(
