@@ -32,6 +32,50 @@ const SAVE_EVERY: usize = 50;
 /// of unreadable files).
 const MAX_ERROR_MESSAGES: usize = 200;
 
+/// Per-candidate result of the summon re-read (see `do_check_summon`).
+struct SummonClipOutcome {
+    scanned: bool,
+    updated: bool,
+    missing: bool,
+}
+
+/// Sync body of one summon-check candidate: re-extract, and refresh the
+/// stored row when the SEI stream yielded flag evidence. Blocking pool.
+fn summon_one_clip(store: &DriveStore, file: &str, full_path: &str) -> SummonClipOutcome {
+    match extract::extract_gps_from_file(full_path) {
+        Ok(gps) => {
+            // Mirrors the JS `extracted.flags.length > 0` gate:
+            // a clip whose SEI stream yielded nothing can't
+            // improve evidence — leave the stored row alone.
+            let mut updated = false;
+            if gps.raw_frame_count > 0 {
+                let date: &str = file.split('/').next().unwrap_or("");
+                match store.add_route(
+                    file,
+                    date,
+                    &gps.points,
+                    &gps.gear_states,
+                    &gps.autopilot_states,
+                    &gps.speeds,
+                    &gps.accel_positions,
+                    gps.raw_park_count,
+                    gps.raw_frame_count,
+                    &gps.gear_runs,
+                    &gps.flag_runs,
+                ) {
+                    Ok(()) => updated = true,
+                    Err(e) => warn!("check summon: save failed for {}: {}", file, e),
+                }
+            }
+            SummonClipOutcome { scanned: true, updated, missing: false }
+        }
+        Err(e) => {
+            warn!("check summon: extract failed for {}: {}", file, e);
+            SummonClipOutcome { scanned: false, updated: false, missing: true }
+        }
+    }
+}
+
 /// Sets the store's bulk-ingest flag for a scope; clears it on drop.
 struct BulkIngestGuard(Arc<DriveStore>);
 
@@ -54,6 +98,13 @@ struct ClipOutcome {
     route_added: bool,
     had_gps: bool,
     parked_skipped: bool,
+    /// Gate-skipped with ZERO usable SEI telemetry (vs `parked_skipped`
+    /// where SEI is present and shows Park throughout). Tesla writes
+    /// some user-save copies without SEI (telemetry stream still
+    /// ramping after wake, parked minutes), and lumping those into
+    /// "parked pre-roll" made the 2026-08-08 honk-save incident
+    /// undiagnosable from the logs.
+    no_sei_skipped: bool,
     /// Error message without the file prefix (the loop adds it).
     error: Option<String>,
 }
@@ -64,6 +115,7 @@ impl ClipOutcome {
             route_added: false,
             had_gps: false,
             parked_skipped: false,
+            no_sei_skipped: false,
             error: Some(msg),
         }
     }
@@ -76,6 +128,7 @@ fn process_one_clip(store: &DriveStore, file: &str, full_path: &str) -> ClipOutc
         route_added: false,
         had_gps: false,
         parked_skipped: false,
+        no_sei_skipped: false,
         error: None,
     };
     // `add_route` accepts `date_dir: &str` — no need to materialize
@@ -103,7 +156,19 @@ fn process_one_clip(store: &DriveStore, file: &str, full_path: &str) -> ClipOutc
                     gps.raw_frame_count,
                 ) =>
         {
-            out.parked_skipped = true;
+            // "No usable SEI at all" and "SEI shows parked" are different
+            // verdicts: the former is a telemetry-less copy (Tesla writes
+            // some user-save clips without SEI), the latter a genuine
+            // parked pre-roll. Same disposition, separate books.
+            if gps.raw_frame_count == 0
+                && gps.gear_runs.is_empty()
+                && gps.gear_states.is_empty()
+                && gps.speeds.is_empty()
+            {
+                out.no_sei_skipped = true;
+            } else {
+                out.parked_skipped = true;
+            }
             if let Err(me) = store.mark_processed(file) {
                 warn!("failed to mark {} processed: {}", file, me);
             }
@@ -283,6 +348,10 @@ impl Processor {
     }
 
     async fn do_check_summon(&self) -> Result<SummonCheckOutcome> {
+        // Same cache-debounce treatment as do_process — every refreshed
+        // row re-dirties the drive caches.
+        let _bulk = BulkIngestGuard::new(self.store.clone());
+
         let cands = self
             .store
             .with_route_summaries(crate::grouper::summon_check_candidates)?;
@@ -316,37 +385,19 @@ impl Processor {
                 continue;
             }
 
-            match extract::extract_gps_from_file(&full_path) {
-                Ok(gps) => {
-                    scanned += 1;
-                    // Mirrors the JS `extracted.flags.length > 0` gate:
-                    // a clip whose SEI stream yielded nothing can't
-                    // improve evidence — leave the stored row alone.
-                    if gps.raw_frame_count > 0 {
-                        let date: &str = file.split('/').next().unwrap_or("");
-                        match self.store.add_route(
-                            file,
-                            date,
-                            &gps.points,
-                            &gps.gear_states,
-                            &gps.autopilot_states,
-                            &gps.speeds,
-                            &gps.accel_positions,
-                            gps.raw_park_count,
-                            gps.raw_frame_count,
-                            &gps.gear_runs,
-                            &gps.flag_runs,
-                        ) {
-                            Ok(()) => updated += 1,
-                            Err(e) => warn!("check summon: save failed for {}: {}", file, e),
-                        }
-                    }
-                }
-                Err(e) => {
-                    warn!("check summon: extract failed for {}: {}", file, e);
-                    missing += 1;
-                }
-            }
+            // Blocking pool, same as do_process — sync extract + DB write
+            // must not pin an async worker for the whole candidate sweep.
+            let store = self.store.clone();
+            let clip_file = file.clone();
+            let clip_path = full_path.clone();
+            let outcome = tokio::task::spawn_blocking(move || {
+                summon_one_clip(&store, &clip_file, &clip_path)
+            })
+            .await
+            .unwrap_or(SummonClipOutcome { scanned: false, updated: false, missing: true });
+            scanned += outcome.scanned as usize;
+            updated += outcome.updated as usize;
+            missing += outcome.missing as usize;
 
             // Same WAL + Pi-CPU hygiene as `do_process`.
             if (i + 1) % SAVE_EVERY == 0
@@ -471,6 +522,7 @@ impl Processor {
         let mut routes_found: usize = 0;
         let mut files_with_gps: usize = 0;
         let mut gap_fill_parked_skipped: usize = 0;
+        let mut gap_fill_no_sei_skipped: usize = 0;
         let mut errors: Vec<String> = Vec::new();
         let mut error_count: usize = 0;
         info!("found {} unprocessed clip files", total);
@@ -528,6 +580,9 @@ impl Processor {
             }
             if clip.parked_skipped {
                 gap_fill_parked_skipped += 1;
+            }
+            if clip.no_sei_skipped {
+                gap_fill_no_sei_skipped += 1;
             }
             if let Some(msg) = clip.error {
                 error_count += 1;
@@ -624,8 +679,14 @@ impl Processor {
         );
         if gap_fill_parked_skipped > 0 {
             info!(
-                "gap-fill: {} event clip(s) skipped by the driving gate (parked pre-roll)",
+                "gap-fill: {} event clip(s) skipped by the driving gate (SEI present, no driving evidence)",
                 gap_fill_parked_skipped
+            );
+        }
+        if gap_fill_no_sei_skipped > 0 {
+            info!(
+                "gap-fill: {} event clip(s) skipped by the driving gate (no usable SEI telemetry)",
+                gap_fill_no_sei_skipped
             );
         }
 

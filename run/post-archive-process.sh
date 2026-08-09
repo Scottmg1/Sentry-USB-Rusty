@@ -347,7 +347,14 @@ fi
 if [ "$SKIP_REGEN_SYNC" != "true" ] && [ "$ARCHIVE_REACHABLE" = "true" ] && [ -n "${RSYNC_SERVER:-}" ] && [ -n "${RSYNC_USER:-}" ] && [ -f "$DRIVE_DATA_JSON" ]; then
   if drive_data_size_guard_ok "$DRIVE_DATA_JSON" "rsync archive"; then
     log "Syncing drive-data.json to rsync archive..."
+    # Optional non-standard SSH port, via rsync's remote-shell override
+    # (see rsync_archive/archive-clips.sh). Unset means the SSH default.
+    RSYNC_SSH_ARGS=()
+    if [ -n "${RSYNC_SSH_PORT:-}" ]; then
+      RSYNC_SSH_ARGS=(-e "ssh -p ${RSYNC_SSH_PORT}")
+    fi
     if rsync -avh --no-perms --omit-dir-times --timeout=60 \
+        ${RSYNC_SSH_ARGS[@]+"${RSYNC_SSH_ARGS[@]}"} \
         "$DRIVE_DATA_JSON" \
         "$RSYNC_USER@$RSYNC_SERVER:${RSYNC_PATH}/drive-data.json" > /dev/null 2>&1; then
       log "Synced drive-data.json to archive ($(wc -c < "$DRIVE_DATA_JSON") bytes)."

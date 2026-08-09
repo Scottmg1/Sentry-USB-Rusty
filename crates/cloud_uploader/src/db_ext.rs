@@ -150,7 +150,7 @@ pub fn backfill_ble_reupload(store: &DriveStore) -> Result<i64> {
 
 pub fn pending_count(store: &DriveStore) -> i64 {
     store
-        .with_locked_conn(|conn| {
+        .with_read_conn(|conn| {
             conn.query_row(
                 "SELECT count(*) FROM routes \
                  WHERE cloud_uploaded_at IS NULL",
@@ -164,7 +164,7 @@ pub fn pending_count(store: &DriveStore) -> i64 {
 /// Returns `(uploaded_count, last_upload_unix_seconds)`. The `> 0` filter
 /// excludes the [`PERMANENT_SKIP_SENTINEL`] (`-1`) value.
 pub fn upload_summary(store: &DriveStore) -> (i64, Option<i64>) {
-    store.with_locked_conn(|conn| {
+    store.with_read_conn(|conn| {
         conn.query_row(
             "SELECT count(*), max(cloud_uploaded_at) FROM routes \
              WHERE cloud_uploaded_at > 0",
@@ -187,7 +187,7 @@ pub struct QueueEntry {
 }
 
 pub fn pending_queue(store: &DriveStore, limit: i64) -> Result<Vec<QueueEntry>> {
-    store.with_locked_conn(|conn| -> Result<_> {
+    store.with_read_conn(|conn| -> Result<_> {
         let mut stmt = conn.prepare(
             "SELECT file, date_dir, start_ts, \
                     coalesce(length(points_blob), 0) + \

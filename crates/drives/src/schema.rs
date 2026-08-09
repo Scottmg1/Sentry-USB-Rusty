@@ -194,6 +194,43 @@ const V3_CLOUD_PENDING_INDEX: &str =
     "CREATE INDEX IF NOT EXISTS idx_routes_cloud_pending \
      ON routes(cloud_uploaded_at) WHERE cloud_uploaded_at IS NULL";
 
+/// Positive counterpart: `upload_summary`'s COUNT/MAX over uploaded rows
+/// was a full-table scan once the table outgrew its design size (a user
+/// DB measured 29.8k routes).
+const CLOUD_UPLOADED_INDEX: &str =
+    "CREATE INDEX IF NOT EXISTS idx_routes_cloud_uploaded \
+     ON routes(cloud_uploaded_at) WHERE cloud_uploaded_at > 0";
+
+/// Charge-signal rows are a small fraction of `telemetry_samples` (48k of
+/// 308k on the same measured DB), but `current_charging` reverse-scans and
+/// `load_charge_rows` filters the whole table without this. The predicate
+/// must match those queries verbatim for SQLite to use the partial index.
+const TELEMETRY_CHARGE_INDEX: &str =
+    "CREATE INDEX IF NOT EXISTS idx_telemetry_charge_ts \
+     ON telemetry_samples(ts) \
+     WHERE charging_state IS NOT NULL \
+        OR charger_power_kw IS NOT NULL \
+        OR charge_rate_mph IS NOT NULL";
+
+/// `route_sync_info_by_cloud_id` reverse lookup (cloud sync pull).
+const CLOUD_ROUTE_ID_INDEX: &str =
+    "CREATE INDEX IF NOT EXISTS idx_routes_cloud_route_id \
+     ON routes(cloud_route_id) WHERE cloud_route_id IS NOT NULL";
+
+/// TPMS rows are ~5% of `telemetry_samples` (7,977 of a 30-day window on
+/// a measured device), but `/api/telemetry/tire-history` had to walk the
+/// whole window to find them — 5.2s during an archive, holding one of
+/// the two read connections and queueing every other telemetry poll
+/// behind it. Covering: the value columns ride along so the chart is
+/// answered from the index without touching the table.
+const TELEMETRY_TIRE_INDEX: &str =
+    "CREATE INDEX IF NOT EXISTS idx_telemetry_tire_ts \
+     ON telemetry_samples(ts, tire_fl_psi, tire_fr_psi, tire_rl_psi, tire_rr_psi) \
+     WHERE tire_fl_psi IS NOT NULL \
+        OR tire_fr_psi IS NOT NULL \
+        OR tire_rl_psi IS NOT NULL \
+        OR tire_rr_psi IS NOT NULL";
+
 /// v4 Tessie provenance columns. Preserves `source`, `externalSignature`,
 /// and `tessieAutopilotPercent` through SQLite on import/export so a
 /// round-trip with Sentry-Drive's `drive-data.json` is lossless.
@@ -442,10 +479,84 @@ pub const MUTABLE_DIRTY_TABLE: &[&str] = &[
 
 /// Bring the DB up to `CURRENT_SCHEMA_VERSION`. Safe on every open â€”
 /// idempotent by construction.
+/// True for `CREATE [UNIQUE] INDEX ...` — performance DDL that
+/// [`try_create_index`] may skip on an operational failure. Everything
+/// else (tables, columns, data migrations) is correctness and stays
+/// fail-hard.
+fn is_index_ddl(stmt: &str) -> bool {
+    let s = stmt.trim_start();
+    let up = s.get(..20).unwrap_or(s).to_ascii_uppercase();
+    up.starts_with("CREATE INDEX") || up.starts_with("CREATE UNIQUE INDEX")
+}
+
+/// Create a PERFORMANCE index, tolerating operational failures.
+///
+/// Index DDL used to propagate, which aborts `migrate()`, which fails
+/// `DriveStore::open()`, at which point the daemon falls back to an empty
+/// in-memory store: the user's entire drive history looks gone and that
+/// boot's ingest is discarded on reboot. The likeliest trigger is
+/// `SQLITE_FULL` on a nearly-full disk — precisely the condition
+/// free-space management exists to resolve — so "the disk is filling up"
+/// could present as "all my drives vanished".
+///
+/// Indexes are pure performance: without one, queries stay CORRECT and
+/// only get slower, so a resource failure must not cost the store. But
+/// this is deliberately NOT a catch-all: a corrupt database or a
+/// malformed statement is a real defect and must still abort migration
+/// rather than let the daemon limp along on a damaged file.
+fn try_create_index(conn: &Connection, stmt: &str, name: &str) -> Result<()> {
+    use rusqlite::ErrorCode;
+    match conn.execute(stmt, []) {
+        Ok(_) => Ok(()),
+        Err(e) => {
+            let code = match &e {
+                rusqlite::Error::SqliteFailure(err, _) => Some(err.code),
+                _ => None,
+            };
+            // Operational/resource conditions: transient or
+            // environmental, and recoverable on a later boot.
+            // SystemIoFailure is deliberately NOT here: SQLITE_IOERR
+            // carries corruption-bearing extended codes (IOERR_DATA is a
+            // page-checksum failure, IOERR_CORRUPTFS a corrupt
+            // filesystem), and both collapse to this one primary code. A
+            // full disk already reports SQLITE_FULL, so nothing we
+            // actually need to survive requires accepting IOERR.
+            let operational = matches!(
+                code,
+                Some(
+                    ErrorCode::DiskFull
+                        | ErrorCode::DatabaseBusy
+                        | ErrorCode::DatabaseLocked
+                        | ErrorCode::ReadOnly
+                        | ErrorCode::OutOfMemory
+                )
+            );
+            if operational {
+                tracing::error!(
+                    "schema: could not create {} ({e}); continuing without it — \
+                     queries stay correct, just slower. This usually means the \
+                     disk is full or busy; the index is retried on the next boot.",
+                    name
+                );
+                Ok(())
+            } else {
+                // DatabaseCorrupt, NotADatabase, malformed SQL, etc.
+                Err(e).with_context(|| format!("migrate: creating {}", name))
+            }
+        }
+    }
+}
+
 pub fn migrate(conn: &Connection) -> Result<()> {
     for stmt in V1_SCHEMA {
-        conn.execute(stmt, [])
-            .with_context(|| format!("migrate: applying DDL {:?}", truncate(stmt, 60)))?;
+        if is_index_ddl(stmt) {
+            // Performance index: an operational failure (full disk, busy)
+            // must not cost the whole store — see try_create_index.
+            try_create_index(conn, stmt, &truncate(stmt, 60))?;
+        } else {
+            conn.execute(stmt, [])
+                .with_context(|| format!("migrate: applying DDL {:?}", truncate(stmt, 60)))?;
+        }
     }
 
     // Drop the legacy `idx_routes_start_ts` index that every V1_SCHEMA
@@ -457,13 +568,20 @@ pub fn migrate(conn: &Connection) -> Result<()> {
     // ships the CREATE), and every upgraded DB (pre-v6 / v6 / v7 / v8
     // / v9 â€” all inherited the index from the old V1_SCHEMA). The
     // `routes.start_ts` column itself stays.
-    conn.execute("DROP INDEX IF EXISTS idx_routes_start_ts", [])?;
+    // Performance-only cleanup: never fail the open over it.
+    if let Err(e) = conn.execute("DROP INDEX IF EXISTS idx_routes_start_ts", []) {
+        tracing::error!("schema: could not drop legacy idx_routes_start_ts ({e}); continuing");
+    }
 
     // v6 standalone tables. Idempotent (`IF NOT EXISTS`) so safe on
     // every open and on first-run alongside V1_SCHEMA.
     for stmt in V6_NEW_TABLES {
-        conn.execute(stmt, [])
-            .with_context(|| format!("migrate: applying v6 DDL {:?}", truncate(stmt, 60)))?;
+        if is_index_ddl(stmt) {
+            try_create_index(conn, stmt, &truncate(stmt, 60))?;
+        } else {
+            conn.execute(stmt, [])
+                .with_context(|| format!("migrate: applying v6 DDL {:?}", truncate(stmt, 60)))?;
+        }
     }
 
     // Charging-session tags. Idempotent standalone table; see the
@@ -535,9 +653,35 @@ pub fn migrate(conn: &Connection) -> Result<()> {
             .with_context(|| format!("migrate: adding telemetry_samples.{}", name))?;
     }
 
-    // v3 partial index. Idempotent.
-    conn.execute(V3_CLOUD_PENDING_INDEX, [])
-        .context("migrate: creating idx_routes_cloud_pending")?;
+    // v3 partial index. Idempotent, and best-effort — see
+    // `try_create_index`.
+    try_create_index(conn, V3_CLOUD_PENDING_INDEX, "idx_routes_cloud_pending")?;
+
+    // Partial indexes for cloud-status counts and charge queries.
+    // Idempotent, but the FIRST build on a grown DB (hundreds of MB)
+    // can take tens of seconds — log so a slow upgrade boot explains
+    // itself in the journal.
+    for (stmt, name) in [
+        (CLOUD_UPLOADED_INDEX, "idx_routes_cloud_uploaded"),
+        (TELEMETRY_CHARGE_INDEX, "idx_telemetry_charge_ts"),
+        (CLOUD_ROUTE_ID_INDEX, "idx_routes_cloud_route_id"),
+        (TELEMETRY_TIRE_INDEX, "idx_telemetry_tire_ts"),
+    ] {
+        // Existence probe is for LOGGING only — never fail migration on
+        // it. Treat an unreadable catalog as "unknown" and carry on; the
+        // CREATE below is idempotent either way.
+        let exists: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE type='index' AND name=?1",
+                [name],
+                |r| r.get(0),
+            )
+            .unwrap_or(1);
+        if exists == 0 {
+            tracing::info!("schema: building {} (one-time, may take a while on a large DB)", name);
+        }
+        try_create_index(conn, stmt, name)?;
+    }
 
     // v5 data cleanup: purge SavedClips/SentryClips routes that pre-v5
     // scans wrote. Gated on the stored schema_version so we only pay the

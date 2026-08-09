@@ -100,9 +100,15 @@ enum SnapshotAction {
 enum SpaceAction {
     /// Delete old snapshots until `/backingfiles` has enough free space.
     Manage {
-        /// Reserved for future compat (e.g. reserve size); ignored for now.
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
-        args: Vec<String>,
+        /// Free-space target in BYTES, as archiveloop's freespacemanager
+        /// computes it and the manage_free_space.sh wrapper forwards.
+        /// Omitted: use the same `10 GiB + total/33` formula. Parsed
+        /// strictly — a malformed value is rejected rather than coerced
+        /// (a reserve of 0 would "satisfy" instantly, and any garbage
+        /// silently falling back to a different policy is what made the
+        /// bash and Rust paths diverge in the first place).
+        #[arg(value_parser = clap::value_parser!(u64).range(1..))]
+        reserve_bytes: Option<u64>,
     },
 }
 
@@ -180,11 +186,50 @@ async fn main() {
 
     // Drive store (SQLite)
     let db_path = sentryusb_drives::DEFAULT_DB_PATH;
+    // `true` when the persistent store could not be opened on a real
+    // device and we are running on an ephemeral in-memory one. Startup
+    // steps whose safety depends on a SUCCESSFUL open must be skipped in
+    // that state (see the legacy-cleanup call below).
+    let mut store_degraded = false;
     let store = match sentryusb_drives::DriveStore::open(db_path) {
         Ok(s) => Arc::new(s),
         Err(e) => {
-            // Try in-memory if DB path doesn't work (e.g., on dev machine)
-            tracing::warn!("Failed to open drive DB at {}: {}. Using in-memory.", db_path, e);
+            // Dev machines have no /backingfiles, so in-memory is the
+            // correct fallback there. On a REAL device the same fallback
+            // silently serves an empty history and makes that boot's
+            // ingest ephemeral — indistinguishable, in the UI, from
+            // "all my drives were deleted". Log accordingly so the
+            // journal names the actual condition instead of a passing
+            // warning. (Deliberately still non-fatal: exiting would
+            // crash-loop the daemon under systemd's Restart=always and
+            // take the web UI with it, leaving no way to free space or
+            // run recovery on a device that is merely full. Making this
+            // fatal is a real product tradeoff — data-truth versus
+            // remote access — and is tracked separately.)
+            let looks_like_device = std::path::Path::new(db_path)
+                .parent()
+                .is_some_and(|p| p.exists());
+            if looks_like_device {
+                store_degraded = true;
+                tracing::error!(
+                    "Failed to open drive DB at {}: {}. SERVING AN EMPTY IN-MEMORY STORE: \
+                     this boot shows no drives and anything ingested now is lost on reboot. \
+                     Common causes are a full disk, a locked DB, or a damaged file — free \
+                     space and restart, and do NOT re-run setup before checking the DB.",
+                    db_path,
+                    e
+                );
+            } else {
+                tracing::warn!(
+                    "Failed to open drive DB at {}: {}. Using in-memory (no {} — dev machine?).",
+                    db_path,
+                    e,
+                    std::path::Path::new(db_path)
+                        .parent()
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_default()
+                );
+            }
             Arc::new(sentryusb_drives::DriveStore::open_memory().expect("failed to create in-memory DB"))
         }
     };
@@ -192,7 +237,20 @@ async fn main() {
     // moved to /backingfiles, plus a couple of pre-Rust state files). Runs
     // after DriveStore::open so any one-shot importer that needs the legacy
     // path has already had a chance to consume it.
-    sentryusb_drives::cleanup_legacy_mutable_files();
+    // ONLY safe after a successful persistent open. The cleanup deletes
+    // /mutable/drive-data.json on the documented premise that
+    // DriveStore::open already imported it — but when open FAILED that
+    // import never ran, so deleting it would destroy the user's last
+    // remaining copy of their drive history at exactly the moment the
+    // database is unavailable. Keep it as a recovery source instead.
+    if store_degraded {
+        tracing::error!(
+            "skipping legacy-file cleanup: the persistent store never opened, so nothing \
+             was imported — preserving /mutable/drive-data.json as a recovery source"
+        );
+    } else {
+        sentryusb_drives::cleanup_legacy_mutable_files();
+    }
     phase!("drive_store_opened");
 
     // Legacy-JSON migration is now handled automatically inside
@@ -400,6 +458,12 @@ async fn main() {
         auth,
         sentryusb_api::auth::auth_middleware,
     ));
+
+    // Slow-request journal — outermost, so its timing covers auth +
+    // compression + handler and login slowness is visible too.
+    app = app.layer(axum::middleware::from_fn(
+        sentryusb_api::router::slow_request_log,
+    ));
     phase!("router_built");
 
     let addr = std::net::SocketAddr::from((std::net::Ipv6Addr::UNSPECIFIED, args.port));
@@ -543,7 +607,11 @@ async fn run_snapshot(action: SnapshotAction) -> i32 {
 
 async fn run_space(action: SpaceAction) -> i32 {
     match action {
-        SpaceAction::Manage { .. } => match sentryusb_gadget::space::manage_free_space().await {
+        SpaceAction::Manage { reserve_bytes } => match sentryusb_gadget::space::manage_free_space(
+            reserve_bytes,
+        )
+        .await
+        {
             Ok(()) => 0,
             Err(e) => {
                 eprintln!("space manage: {}", e);

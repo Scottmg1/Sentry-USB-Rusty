@@ -1,4 +1,5 @@
 import { useEffect, type ReactNode } from "react"
+import { createPortal } from "react-dom"
 import { CloseIcon } from "@/components/icons"
 import { cn } from "@/lib/utils"
 
@@ -37,7 +38,12 @@ export function Modal({
     return () => window.removeEventListener("keydown", onKey)
   }, [dismissable, onClose])
 
-  return (
+  // Portal to document.body: rendered in place, the fixed shell is at the
+  // mercy of its ancestors — a `glass-card`'s backdrop-filter establishes a
+  // containing block for position:fixed, and PrefGrid force-sets inline
+  // `position:absolute` + a column width on every direct child, laying the
+  // overlay out as if it were a settings card.
+  return createPortal(
     <div
       className="modal-shell"
       onClick={dismissable ? onClose : undefined}
@@ -62,6 +68,7 @@ export function Modal({
           <div className="border-t border-white/5 px-4 py-3">{footer}</div>
         )}
       </div>
-    </div>
+    </div>,
+    document.body
   )
 }

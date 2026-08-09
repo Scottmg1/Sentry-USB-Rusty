@@ -11,7 +11,6 @@ import {
   UsbIcon,
   VisibilityIcon,
   VisibilityOffIcon,
-  WifiIcon,
   WifiOffIcon,
 } from "@/components/icons"
 import { cn } from "@/lib/utils"
@@ -19,6 +18,7 @@ import { wsClient } from "@/lib/ws"
 import { PrefCard } from "@/components/settings/PrefCard"
 import { Pill, LiveDot } from "@/components/ui/Pill"
 import { useUnits } from "@/lib/units"
+import { presentBleHealth, type BleHealth } from "@/lib/bleHealth"
 
 // Telemetry reports TPMS in PSI; bar is a display conversion (PRESSURE_UNIT).
 const PSI_TO_BAR = 0.0689476
@@ -37,7 +37,7 @@ type BleState =
   | "error"
 
 interface BleStatusResp {
-  status: "not_paired" | "keys_generated" | "paired"
+  status: "not_paired" | "keys_generated" | "paired" | "repair_required"
   vin?: string
   binaries_installed?: boolean
   note?: string
@@ -59,6 +59,7 @@ interface BleConnectedResp {
   /** True when archiveloop reports phase=="archiving" — the most
    *  common reason `radio_owner === "keep_awake"`. */
   archiving: boolean
+  health?: BleHealth
 }
 
 interface ClockStatusResp {
@@ -143,6 +144,7 @@ export function BlePairButton() {
   const [sampleCount10min, setSampleCount10min] = useState<number>(0)
   const [radioOwner, setRadioOwner] = useState<string | null>(null)
   const [archiving, setArchiving] = useState<boolean>(false)
+  const [bleHealth, setBleHealth] = useState<BleHealth | null>(null)
   const [nowTs, setNowTs] = useState<number>(Math.floor(Date.now() / 1000))
   const [outputOpen, setOutputOpen] = useState(false)
   const [latestSample, setLatestSample] = useState<BleLatestSample | null>(null)
@@ -178,6 +180,22 @@ export function BlePairButton() {
       if (!en) {
         setBleState("disabled")
         setBleMsg("BLE is disabled. Enable it in the toggle above to pair.")
+        return
+      }
+      if (statusRes?.status === "repair_required") {
+        setBleState("paired")
+        setBleHealth({
+          severity: "red",
+          code: "repair_required",
+          since_ts: null,
+          label: "Re-pair required",
+          guidance:
+            "Open Settings, select Re-pair, then tap your key card on the center console.",
+        })
+        setBleMsg(
+          statusRes.note ||
+            "The car rejected this SentryUSB key. Re-pair, then tap the key card on the center console.",
+        )
         return
       }
       if (statusRes?.status === "paired") {
@@ -286,11 +304,10 @@ export function BlePairButton() {
   // ---------------------------------------------------------------------------
   // Live connection indicator: poll /api/system/ble-connected every 10s
   // and tick the "Xs ago" label every second. The backend's
-  // last_success_ts merges the webui process's own probe successes with
-  // the sampler daemon's MAX(ts) from telemetry_samples, so this
-  // indicator reflects both pairing-flow activity and the autonomous
-  // sampler — without it the pill would say "Disconnected" while the
-  // sampler was happily writing rows in another process.
+  // last_success_ts is the sampler's latest authenticated state response.
+  // The structured health result also carries durable key rejection and
+  // transient transport outcomes, so adapter connectivity alone cannot
+  // produce a false green state.
   // ---------------------------------------------------------------------------
   useEffect(() => {
     let cancelled = false
@@ -303,6 +320,8 @@ export function BlePairButton() {
           setSampleCount10min(d?.sample_count_10min ?? 0)
           setRadioOwner(d?.radio_owner ?? null)
           setArchiving(Boolean(d?.archiving))
+          setBleHealth(d?.health ?? null)
+          if (d?.health?.code === "repair_required") setOutputOpen(false)
         }
       } catch {
         /* ignore */
@@ -468,6 +487,7 @@ export function BlePairButton() {
           const data = (await res.json()) as BleStatusResp
           if (data.status === "paired") {
             setBleState("paired")
+            setBleHealth(null)
             setBleMsg("Successfully paired with car!")
             cleanup()
             return
@@ -592,22 +612,36 @@ export function BlePairButton() {
     bleState === "polling" ||
     bleState === "installing"
 
+  const secondsAgo = lastSuccessTs > 0 ? Math.max(0, nowTs - lastSuccessTs) : null
+  const showLive = bleState === "paired"
+  const healthPresentation = presentBleHealth(bleHealth, secondsAgo)
+  const repairRequired = showLive && healthPresentation.repairRequired
+  const degraded = showLive && healthPresentation.severity === "yellow"
+
   const halo: "accent" | "red" | "amber" | "blue" | "slate" =
     bleState === "disabled"
       ? "slate"
-      : bleState === "paired"
-        ? "accent"
-        : bleState === "error"
-          ? "red"
-          : isActive
-            ? "amber"
-            : "blue"
+      : repairRequired
+        ? "red"
+        : degraded
+          ? "amber"
+          : bleState === "paired"
+            ? "accent"
+            : bleState === "error"
+              ? "red"
+              : isActive
+                ? "amber"
+                : "blue"
 
   const icon =
     bleState === "loading" ? (
       <ProgressActivityIcon className="h-3.5 w-3.5 animate-spin" />
     ) : isActive ? (
       <ProgressActivityIcon className="h-3.5 w-3.5 animate-spin" />
+    ) : repairRequired ? (
+      <ErrorIcon className="h-3.5 w-3.5" />
+    ) : degraded ? (
+      <WifiOffIcon className="h-3.5 w-3.5" />
     ) : bleState === "paired" ? (
       <CheckCircleIcon className="h-3.5 w-3.5" />
     ) : bleState === "error" ? (
@@ -616,47 +650,22 @@ export function BlePairButton() {
       <BluetoothIcon className="h-3.5 w-3.5" />
     )
 
-  // ── Live connection indicator ──────────────────────────────────────────────
-  // Shown for paired devices. Reads `last_success_ts` from the backend
-  // and renders one of three states based on freshness.
-  //   < 60s   → "Connected" (green, with live dot)
-  //   < 600s  → "Last seen Ns ago" (sky)
-  //   else    → "Disconnected" (slate)
-  const secondsAgo = lastSuccessTs > 0 ? Math.max(0, nowTs - lastSuccessTs) : null
-  const showLive = bleState === "paired"
-  // "Paused" reason: the keep-awake nudge owns the radio (typically
-  // because archiveloop is mid-archive). Show that as the pill state
-  // when fresh data has stopped landing — avoids the user thinking
-  // pairing broke when really the sampler is just waiting its turn.
-  const radioBusyForOther = radioOwner === "keep_awake"
-  const showPaused =
-    showLive &&
-    radioBusyForOther &&
-    (secondsAgo === null || secondsAgo >= 60)
-  const pauseLabel = archiving ? "Paused — archiving" : "Paused — keep-awake"
-
-  const liveLabel = showPaused
-    ? pauseLabel
-    : secondsAgo === null
-      ? "Idle"
-      : secondsAgo < 60
-        ? "Connected"
-        : secondsAgo < 600
-          ? `Last seen ${formatAgo(secondsAgo)} ago`
-          : "Disconnected"
-  const liveKind: "accent" | "sky" | "slate" | "amber" = showPaused
-    ? "amber"
-    : secondsAgo !== null && secondsAgo < 60
-      ? "accent"
-      : secondsAgo !== null && secondsAgo < 600
-        ? "sky"
-        : "slate"
-  const liveIcon = showPaused ? (
-    <ProgressActivityIcon className="h-3 w-3 animate-spin" />
-  ) : secondsAgo !== null && secondsAgo < 60 ? (
+  // Backend health separates authenticated Tesla telemetry from the
+  // Bluetooth transport itself. A connected adapter cannot hide a
+  // rejected vehicle key, while sleep and radio contention stay amber.
+  const liveKind = healthPresentation.severity === "green"
+    ? "accent"
+    : healthPresentation.severity === "red"
+      ? "rose"
+      : "amber"
+  const liveIcon = healthPresentation.severity === "green" ? (
     <LiveDot />
-  ) : secondsAgo !== null && secondsAgo < 600 ? (
-    <WifiIcon className="h-3 w-3" />
+  ) : healthPresentation.code === "paused_archiving" ||
+      healthPresentation.code === "paused_keep_awake" ||
+      healthPresentation.code === "reconnecting" ? (
+    <ProgressActivityIcon className="h-3 w-3 animate-spin" />
+  ) : healthPresentation.severity === "red" ? (
+    <ErrorIcon className="h-3 w-3" />
   ) : (
     <WifiOffIcon className="h-3 w-3" />
   )
@@ -664,13 +673,21 @@ export function BlePairButton() {
   // ── Top-right badge: shows pair status + live connection ───────────────────
   const badge = (() => {
     if (bleState === "paired") {
+      if (repairRequired) {
+        return (
+          <Pill kind="rose" className="flex items-center gap-1">
+            <ErrorIcon className="h-3 w-3" />
+            {healthPresentation.label}
+          </Pill>
+        )
+      }
       return (
         <span className="flex items-center gap-1.5">
           <Pill kind="accent">Paired</Pill>
           {showLive && (
             <Pill kind={liveKind} className="flex items-center gap-1">
               {liveIcon}
-              {liveLabel}
+              {healthPresentation.label}
             </Pill>
           )}
         </span>
@@ -703,6 +720,9 @@ export function BlePairButton() {
     !validVin(vin)
 
   const buttonHandler = bleState === "error" ? handleReset : handlePair
+  const statusMessage = showLive && healthPresentation.severity !== "green"
+    ? healthPresentation.guidance
+    : bleMsg || "Initiate Bluetooth Low Energy pairing with your car."
 
   return (
     <PrefCard icon={icon} halo={halo} title="BLE Pairing" badge={badge}>
@@ -757,16 +777,20 @@ export function BlePairButton() {
       <p
         className={cn(
           "text-xs",
-          bleState === "paired"
-            ? "text-emerald-400"
-            : bleState === "error"
-              ? "text-red-400"
-              : bleState === "waiting"
-                ? "font-medium text-amber-400"
-                : "text-slate-500",
+          repairRequired
+            ? "text-red-400"
+            : degraded
+              ? "text-amber-400"
+              : bleState === "paired"
+                ? "text-emerald-400"
+                : bleState === "error"
+                  ? "text-red-400"
+                  : bleState === "waiting"
+                    ? "font-medium text-amber-400"
+                    : "text-slate-500",
         )}
       >
-        {bleMsg || "Initiate Bluetooth Low Energy pairing with your car."}
+        {statusMessage}
       </p>
 
       <div className="flex flex-wrap items-center gap-2">
@@ -775,11 +799,13 @@ export function BlePairButton() {
           disabled={buttonDisabled}
           className={cn(
             "self-start rounded-lg px-3 py-1.5 text-xs font-medium transition-colors disabled:opacity-50",
-            bleState === "paired"
-              ? "bg-white/5 text-slate-300 hover:bg-white/10"
-              : bleState === "error"
-                ? "bg-red-500/15 text-red-400 hover:bg-red-500/25"
-                : "bg-blue-500/15 text-blue-400 hover:bg-blue-500/25",
+            repairRequired
+              ? "bg-red-500/15 text-red-400 hover:bg-red-500/25"
+              : bleState === "paired"
+                ? "bg-white/5 text-slate-300 hover:bg-white/10"
+                : bleState === "error"
+                  ? "bg-red-500/15 text-red-400 hover:bg-red-500/25"
+                  : "bg-blue-500/15 text-blue-400 hover:bg-blue-500/25",
           )}
         >
           {buttonLabel}
@@ -787,7 +813,7 @@ export function BlePairButton() {
         {/* "Show output" is only useful when there's actually data
             to show — gate on a recent successful round-trip OR a
             non-zero sample count in the last 10 min. */}
-        {bleState === "paired" &&
+        {bleState === "paired" && !repairRequired &&
           ((secondsAgo !== null && secondsAgo < 600) || sampleCount10min > 0) && (
             <button
               onClick={() => setOutputOpen((v) => !v)}
@@ -849,6 +875,8 @@ export function BlePairButton() {
               setSampleCount10min(d?.sample_count_10min ?? 0)
               setRadioOwner(d?.radio_owner ?? null)
               setArchiving(Boolean(d?.archiving))
+              setBleHealth(d?.health ?? null)
+              if (d?.health?.code === "repair_required") setOutputOpen(false)
             } catch { /* ignore */ }
           }}
           radioOwner={radioOwner}

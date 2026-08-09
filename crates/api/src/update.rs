@@ -119,7 +119,7 @@ pub async fn run_update(
     tokio::spawn(async move {
         hub.broadcast("update_status", &serde_json::json!({"status": "running"}));
 
-        let result = self_update(target_version).await;
+        let result = self_update(&hub, target_version).await;
 
         UPDATE_RUNNING.store(false, Ordering::SeqCst);
 
@@ -283,7 +283,72 @@ async fn detect_release_suffix() -> anyhow::Result<String> {
     Ok("linux-arm64-a53".to_string())
 }
 
-async fn self_update(target_version: Option<String>) -> anyhow::Result<String> {
+/// Stream a release binary to `dest`, broadcasting `downloading` progress
+/// (percent when Content-Length is known, byte counts either way) over the
+/// WS hub. Progress is advisory only — the caller still owns the atomic
+/// stage-then-rename install, so a failure here never touches the live
+/// binary.
+async fn download_with_progress(
+    hub: &sentryusb_ws::Hub,
+    url: &str,
+    dest: &str,
+) -> anyhow::Result<()> {
+    use futures_util::StreamExt;
+    use tokio::io::AsyncWriteExt;
+
+    let resp = crate::http_client()
+        .get(url)
+        .header("User-Agent", "sentryusb-updater")
+        .send()
+        .await?
+        .error_for_status()?;
+    // GitHub redirects releases to a CDN; reqwest follows them, but the
+    // final response can omit Content-Length — percent goes null and the
+    // UI falls back to an indeterminate bar.
+    let total = resp.content_length().filter(|t| *t > 0);
+    let mut file = tokio::fs::File::create(dest).await?;
+    let mut stream = resp.bytes_stream();
+    let mut done: u64 = 0;
+    let mut last_percent: i64 = -1;
+    let mut last_emit = std::time::Instant::now();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk?;
+        file.write_all(&chunk).await?;
+        done += chunk.len() as u64;
+        let percent = total.map(|t| ((done as f64 / t as f64) * 100.0) as i64);
+        let emit = match percent {
+            Some(p) => p != last_percent,
+            None => last_emit.elapsed() >= std::time::Duration::from_millis(500),
+        };
+        if emit {
+            if let Some(p) = percent {
+                last_percent = p;
+            }
+            last_emit = std::time::Instant::now();
+            hub.broadcast(
+                "update_status",
+                &serde_json::json!({
+                    "status": "downloading",
+                    "message": "Downloading update…",
+                    "percent": percent,
+                    "bytes_done": done,
+                    "bytes_total": total,
+                }),
+            );
+        }
+    }
+    file.flush().await?;
+    Ok(())
+}
+
+async fn self_update(
+    hub: &sentryusb_ws::Hub,
+    target_version: Option<String>,
+) -> anyhow::Result<String> {
+    hub.broadcast(
+        "update_status",
+        &serde_json::json!({"status": "checking", "message": "Checking release…"}),
+    );
     let suffix = detect_release_suffix().await?;
     let repo = update_repo();
 
@@ -330,6 +395,10 @@ async fn self_update(target_version: Option<String>) -> anyhow::Result<String> {
     // to fail without surfacing an error — that's the root cause of
     // the "UI says updated to v3.3.1 but binary on disk is still
     // v3.3.0" bug we hit on the Rock Pi 4C+ tester.)
+    hub.broadcast(
+        "update_status",
+        &serde_json::json!({"status": "remounting", "message": "Preparing filesystem…"}),
+    );
     let _ = sentryusb_shell::run("/root/bin/remountfs_rw", &[]).await;
     let _ = sentryusb_shell::run("mount", &["-o", "remount,rw", "/"]).await;
     let _ = sentryusb_shell::run("mount", &["/", "-o", "remount,rw"]).await;
@@ -345,11 +414,12 @@ async fn self_update(target_version: Option<String>) -> anyhow::Result<String> {
     // ~15 MB binary no longer transits tmpfs RAM on a 1 GB device.
     sentryusb_shell::run("mkdir", &["-p", "/opt/sentryusb"]).await?;
     let tmp = "/opt/sentryusb/.sentryusb-update.new";
-    sentryusb_shell::run_with_timeout(
-        std::time::Duration::from_secs(120),
-        "curl", &["-fsSL", &url, "-o", tmp],
-    ).await?;
+    download_with_progress(hub, &url, tmp).await?;
 
+    hub.broadcast(
+        "update_status",
+        &serde_json::json!({"status": "installing", "message": "Installing update…"}),
+    );
     sentryusb_shell::run("chmod", &["+x", tmp]).await?;
 
     // Write to the per-variant path so the picker symlink keeps resolving
@@ -398,6 +468,10 @@ async fn self_update(target_version: Option<String>) -> anyhow::Result<String> {
     // the mv fail but the response still said "Updated to v3.3.1",
     // leaving the user with v3.3.0 on disk and v3.3.1 in the UI.
     let mut install_warnings: Vec<String> = Vec::new();
+    hub.broadcast(
+        "update_status",
+        &serde_json::json!({"status": "installing", "message": "Installing components…"}),
+    );
     let head_ok = sentryusb_shell::run_with_timeout(
         std::time::Duration::from_secs(15),
         "curl",
@@ -693,50 +767,143 @@ async fn self_update(target_version: Option<String>) -> anyhow::Result<String> {
     // is idempotent + detection-gated, so it's a no-op on non-applicable
     // boards and a no-op on already-patched files.
     //
-    // Always refresh the script body from the repo before running.
+    // Refresh the script body from the repo before running it.
     //
-    // Bootstrap-only (the old behavior) had a fatal hole: if a user already
-    // had a stale on-disk copy from an earlier release, new patches we add
-    // to apply-runtime-patches.sh would never reach them — update.rs would
-    // skip the download and invoke the rotten old script. We fix that by
-    // ALWAYS downloading; a failed download falls back to whatever is
-    // already on disk (warn-only). The script lives at a stable URL
-    // (main branch, setup/pi/) so it's fetchable as long as the repo is
-    // reachable.
+    // Bootstrap-only (the original behavior) had a fatal hole: a user with
+    // a stale on-disk copy from an earlier release would never receive new
+    // patches — update.rs skipped the download and invoked the rotten old
+    // script. So we re-download whenever we can, falling back to whatever
+    // is already on disk (warn-only) if that fails.
+    //
+    // The ref is the TAG WE JUST INSTALLED, not `main`: the script and the
+    // binary are one artifact. Pulling main next to a tagged binary can
+    // apply patches for shapes this binary does not implement, or drop a
+    // heal it still needs. See the fallback ladder just below.
+    hub.broadcast(
+        "update_status",
+        &serde_json::json!({"status": "updating_scripts", "message": "Updating scripts…"}),
+    );
     let patches_path = "/usr/local/bin/sentryusb-apply-runtime-patches";
-    let patches_url = format!(
-        "https://raw.githubusercontent.com/{}/main/setup/pi/apply-runtime-patches.sh",
-        repo
-    );
-    let patches_tmp = "/tmp/sentryusb-apply-runtime-patches.new";
-    tracing::info!(
-        "update.rs: refreshing runtime-patches script from {}",
-        patches_url
-    );
-    match sentryusb_shell::run_with_timeout(
-        std::time::Duration::from_secs(20),
-        "curl",
-        &[
-            "-fsSL",
-            "--max-time",
-            "15",
-            "-o",
-            patches_tmp,
-            &patches_url,
-        ],
-    )
-    .await
-    {
-        Ok(_) => {
+    // PIN TO THE TAG WE JUST INSTALLED. Fetching from `main` shipped the
+    // binary from release X alongside whatever patch script main happened
+    // to have — a script that may patch shapes this binary doesn't
+    // implement, or drop a heal this binary still needs. The script and
+    // the binary are one artifact and must come from one ref.
+    //
+    // Fallbacks, in order:
+    //   * tag known                → that tag (never main: a mismatched
+    //                                script is worse than an older one)
+    //   * tag unknown, script on disk → keep it, skip the download
+    //   * tag unknown, no script      → bootstrap from main so a device
+    //                                   with nothing still gets patches
+    let patches_ref = if !tag.is_empty() {
+        Some(tag.clone())
+    } else if std::path::Path::new(patches_path).exists() {
+        None
+    } else {
+        Some("main".to_string())
+    };
+    let patches_url = patches_ref.as_ref().map(|r| {
+        format!(
+            "https://raw.githubusercontent.com/{}/{}/setup/pi/apply-runtime-patches.sh",
+            repo, r
+        )
+    });
+    // Stage NEXT TO the target, not in /tmp: /tmp is a tmpfs (see
+    // setup/readonly.rs) while /usr/local/bin lives on the root
+    // filesystem, so `rename` across them fails with EXDEV. That failure
+    // used to be discarded, and the log still said "refreshed" — devices
+    // could keep re-running a stale patch script indefinitely while every
+    // update reported success. Same-filesystem staging keeps the swap
+    // atomic (no torn script if power drops mid-write).
+    let patches_tmp = "/usr/local/bin/.sentryusb-apply-runtime-patches.new";
+    // `None` = tag unknown AND a script is already on disk: skip the
+    // download and run what we have, rather than pulling an unpinned
+    // copy of main that may not match this binary.
+    let download = match &patches_url {
+        Some(url) => {
+            tracing::info!("update.rs: refreshing runtime-patches script from {}", url);
+            Some(
+                sentryusb_shell::run_with_timeout(
+                    std::time::Duration::from_secs(20),
+                    "curl",
+                    &["-fsSL", "--max-time", "15", "-o", patches_tmp, url],
+                )
+                .await,
+            )
+        }
+        None => {
+            tracing::warn!(
+                "update.rs: release tag unknown — keeping the existing runtime-patches \
+                 script rather than pulling an unpinned copy from main"
+            );
+            install_warnings.push(
+                "could not determine the release tag, so the existing runtime-patches \
+                 script was kept; fixes added in this release may not have applied."
+                    .to_string(),
+            );
+            None
+        }
+    };
+    match download {
+        Some(Ok(_)) => {
             // Only swap the live script if the download produced a non-empty
             // file (catches "200 OK + empty body" rare github edge cases).
             if std::fs::metadata(patches_tmp)
                 .map(|m| m.len() > 0)
                 .unwrap_or(false)
             {
-                let _ = std::fs::rename(patches_tmp, patches_path);
-                let _ = sentryusb_shell::run("chmod", &["+x", patches_path]).await;
-                tracing::info!("update.rs: runtime-patches script refreshed");
+                // Validate the STAGED file before it replaces the live
+                // one. curl writes 0644, so the old sequence (rename,
+                // then chmod, ignoring its result) could leave a
+                // non-executable helper where a working one used to be
+                // — and a truncated download would replace a valid
+                // script with an unparseable one. Both are checked
+                // while the original is still intact; on failure we
+                // keep the existing helper.
+                let staged_ok = sentryusb_shell::run("chmod", &["+x", patches_tmp])
+                    .await
+                    .is_ok()
+                    && sentryusb_shell::run("bash", &["-n", patches_tmp]).await.is_ok();
+                if !staged_ok {
+                    let _ = std::fs::remove_file(patches_tmp);
+                    tracing::error!(
+                        "update.rs: staged runtime-patches script failed chmod/syntax check; \
+                         keeping the existing one"
+                    );
+                    install_warnings.push(
+                        "the downloaded runtime-patches script was not executable or failed a \
+                         syntax check, so the previous one was kept; fixes added in this \
+                         release may not have applied."
+                            .to_string(),
+                    );
+                }
+                match if staged_ok {
+                    std::fs::rename(patches_tmp, patches_path)
+                } else {
+                    // Validation already handled above; don't touch the
+                    // live script at all.
+                    Ok(())
+                } {
+                    Ok(()) if staged_ok => {
+                        tracing::info!("update.rs: runtime-patches script refreshed");
+                    }
+                    Ok(()) => {}
+                    Err(e) => {
+                        // Never claim success on a failed swap: the whole
+                        // point of this refresh is that NEW patches reach
+                        // existing installs.
+                        let _ = std::fs::remove_file(patches_tmp);
+                        tracing::error!(
+                            "update.rs: runtime-patches swap FAILED ({e}); keeping existing script"
+                        );
+                        install_warnings.push(format!(
+                            "runtime-patches script could not be replaced ({e}): this device will \
+                             re-run its EXISTING patch script, so fixes added in this release may \
+                             not apply. Re-run install-pi.sh manually."
+                        ));
+                    }
+                }
             } else {
                 let _ = std::fs::remove_file(patches_tmp);
                 if !std::path::Path::new(patches_path).exists() {
@@ -748,7 +915,7 @@ async fn self_update(target_version: Option<String>) -> anyhow::Result<String> {
                 }
             }
         }
-        Err(e) => {
+        Some(Err(e)) => {
             let _ = std::fs::remove_file(patches_tmp);
             if !std::path::Path::new(patches_path).exists() {
                 install_warnings.push(format!(
@@ -762,6 +929,9 @@ async fn self_update(target_version: Option<String>) -> anyhow::Result<String> {
                 );
             }
         }
+        // Download deliberately skipped (tag unknown, script already on
+        // disk) — the warning was recorded above.
+        None => {}
     }
 
     if std::path::Path::new(patches_path).exists() {
@@ -812,6 +982,16 @@ async fn self_update(target_version: Option<String>) -> anyhow::Result<String> {
 }
 
 /// GET /api/system/version
+/// Kernel boot identifier — changes on every boot. Read per request (cheap)
+/// so it can never go stale. None on non-Linux hosts; the UI treats a null
+/// boot_id as "reboot unverified", never as proof of one.
+fn read_boot_id() -> Option<String> {
+    std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
 pub async fn get_version(State(_s): State<AppState>) -> (StatusCode, Json<serde_json::Value>) {
     let version = env!("CARGO_PKG_VERSION");
     let sbc_model = get_sbc_model();
@@ -825,6 +1005,10 @@ pub async fn get_version(State(_s): State<AppState>) -> (StatusCode, Json<serde_
         "version": installed.trim(),
         "binary_version": version,
         "sbc_model": sbc_model,
+        // The version tag alone can't prove a reboot: the old daemon
+        // rewrites /opt/sentryusb/version BEFORE `reboot` fires and keeps
+        // serving it. The updater UI compares boot_id instead.
+        "boot_id": read_boot_id(),
     })))
 }
 

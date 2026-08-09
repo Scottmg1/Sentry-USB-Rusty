@@ -71,11 +71,16 @@ pub async fn list_snapshots(
             continue;
         }
 
-        // mtime as the "created" timestamp — matches what
-        // manage_free_space.sh sorts by (alphabetic snap-<id>) closely
-        // enough for UI purposes, and is what users actually see.
-        let created_unix = entry
-            .metadata()
+        // `snap.bin` mtime as the "created" timestamp — the SAME clock
+        // free-space eviction and the dashboard date range order by, so
+        // "oldest" in this list is the snapshot cleanup would actually
+        // drop. Deliberately not the DIRECTORY mtime: autofs writes
+        // `snap.bin.opts` into the snapshot dir the first time the image
+        // is mounted (run/auto.sentryusb), which stamps the directory
+        // with "now" and made a merely-viewed old snapshot look new.
+        // Falls back to the directory only when snap.bin is unreadable.
+        let created_unix = std::fs::symlink_metadata(path.join("snap.bin"))
+            .or_else(|_| entry.metadata())
             .and_then(|m| m.modified())
             .ok()
             .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())

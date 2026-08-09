@@ -33,7 +33,7 @@ const CONFIG_GROUPS: Record<string, { label: string; keys: string[] }> = {
     keys: [
       "ARCHIVE_SYSTEM", "archiveserver", "sharename", "shareuser",
       "sharepassword", "sharepath", "RCLONE_DRIVE", "RCLONE_PATH",
-      "RSYNC_USER", "RSYNC_SERVER", "RSYNC_PATH",
+      "RSYNC_USER", "RSYNC_SERVER", "RSYNC_PATH", "RSYNC_SSH_PORT",
       "NFS_SERVER", "NFS_PATH",
     ],
   },

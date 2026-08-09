@@ -72,6 +72,13 @@ const ARCHIVE_SYNC_ROUTE_COUNT_KEY: &str = "archive_sync_route_count";
 /// archive backup would never pick up new charging history until the
 /// next drive.
 const ARCHIVE_SYNC_SAMPLE_COUNT_KEY: &str = "archive_sync_sample_count";
+
+/// Meta key: UTC date (`YYYY-MM-DD`) of the last successful archive JSON
+/// export. Gates the multi-minute full-history export to once per day —
+/// same rationale as the daily drive-DB backup gate; on a grown DB the
+/// per-archive-cycle export was a disk storm with no recovery-granularity
+/// gain (rsync ships whole-file anyway; same-day copies overwrite).
+const ARCHIVE_SYNC_EXPORT_DATE_KEY: &str = "archive_sync_export_date";
 // Bump on every drive-list-shape change so existing on-disk caches
 // rebuild on first boot after upgrade.
 //
@@ -103,7 +110,12 @@ const ARCHIVE_SYNC_SAMPLE_COUNT_KEY: &str = "archive_sync_sample_count";
 // v8 (2026-07-06): event-clip gap-fill — the summary grouper now admits
 // SavedClips/SentryClips rows that fill RecentClips holes (and filters
 // all other event rows, which it previously passed through untouched).
-const DRIVE_LIST_CACHE_ALGO_VERSION: &str = "8";
+//
+// v9 (2026-08-08): unanchored driving clusters — event routes with
+// gear-verified ego movement now form drives even when no RecentClips
+// route sits within the chain window (a user save can move an entire
+// short drive out of RecentClips). Stale v8 caches hide those drives.
+const DRIVE_LIST_CACHE_ALGO_VERSION: &str = "9";
 
 /// Version tag for the per-clip aggregate FORMULA (compute_route_aggregates).
 /// Distinct from the cache algo version above: this gates a one-shot
@@ -200,6 +212,9 @@ pub struct DriveStore {
     /// rebuild debounce so interactive mutations (tag edit, delete,
     /// upload) still rebuild immediately.
     bulk_ingest: AtomicBool,
+    /// Unix seconds of the last route-overview recompute; pairs with
+    /// `bulk_ingest` the same way `last_cache_rebuild` does.
+    last_overview_rebuild: AtomicI64,
     /// Cached row counts so `/api/drives/status` doesn't hit SQLite for
     /// every poll.
     route_count: AtomicI64,
@@ -217,6 +232,13 @@ pub struct DriveStore {
     /// Cached `/api/drives/routes` overview JSON; rebuilt lazily on the first
     /// request after a route mutation.
     route_overview_cache: Mutex<Option<RouteOverviewCache>>,
+    /// Serializes overview rebuilds. Without it, concurrent cold misses
+    /// each ran the full-store decode — the single heaviest allocation in
+    /// the process — so two map requests during an archive could stack
+    /// hundreds of MB and OOM a 1GB board. The drive-list caches have had
+    /// `rebuild_lock` for this reason; the overview path never got one.
+    /// Lock order: this BEFORE `route_overview_cache`, never the reverse.
+    overview_rebuild_lock: Mutex<()>,
     /// Bumped on every route mutation. New mutation paths must bump it too.
     route_overview_gen: AtomicU64,
 }
@@ -254,8 +276,8 @@ impl DriveStore {
         // failure here is fatal: silently falling back to the writer
         // would reintroduce the read-starvation this pool removes.
         let read_conns = vec![
-            Mutex::new(open_readonly_connection(&path)?),
-            Mutex::new(open_readonly_connection(&path)?),
+            Mutex::new(open_readonly_connection_for(&path, ReadRole::Api)?),
+            Mutex::new(open_readonly_connection_for(&path, ReadRole::Api)?),
         ];
 
         let store = DriveStore {
@@ -265,11 +287,13 @@ impl DriveStore {
             read_rr: AtomicU64::new(0),
             last_cache_rebuild: AtomicI64::new(0),
             bulk_ingest: AtomicBool::new(false),
+            last_overview_rebuild: AtomicI64::new(0),
             route_count: AtomicI64::new(0),
             processed_count: AtomicI64::new(0),
             drive_cache_dirty: AtomicBool::new(true),
             rebuild_lock: Mutex::new(()),
             route_overview_cache: Mutex::new(None),
+            overview_rebuild_lock: Mutex::new(()),
             route_overview_gen: AtomicU64::new(0),
         };
 
@@ -291,11 +315,13 @@ impl DriveStore {
             read_rr: AtomicU64::new(0),
             last_cache_rebuild: AtomicI64::new(0),
             bulk_ingest: AtomicBool::new(false),
+            last_overview_rebuild: AtomicI64::new(0),
             route_count: AtomicI64::new(0),
             processed_count: AtomicI64::new(0),
             drive_cache_dirty: AtomicBool::new(false),
             rebuild_lock: Mutex::new(()),
             route_overview_cache: Mutex::new(None),
+            overview_rebuild_lock: Mutex::new(()),
             route_overview_gen: AtomicU64::new(0),
         };
         // Still run migrate + backfill so tests exercise the real schema.
@@ -319,24 +345,73 @@ impl DriveStore {
     /// Holds the same connection mutex everything else uses, so callers
     /// share WAL serialization with `add_route` / `save` / etc. Keep the
     /// closure short — long-running work blocks all other DB I/O.
+    #[track_caller]
     pub fn with_locked_conn<R>(&self, f: impl FnOnce(&Connection) -> R) -> R {
+        let caller = std::panic::Location::caller();
+        let t0 = std::time::Instant::now();
         let guard = self.conn.lock().unwrap();
-        f(&guard)
+        let waited = t0.elapsed();
+        let t1 = std::time::Instant::now();
+        let out = f(&guard);
+        drop(guard);
+        log_slow_conn("writer", caller, waited, t1.elapsed());
+        out
     }
 
     /// Run a SELECT-only closure on a read-only connection. Under WAL
     /// these see the last committed state and never queue behind the
     /// writer mutex — the processor can batch-ingest clips while API
-    /// reads keep answering. Round-robin over two handles so one slow
-    /// scan doesn't serialize every other read. `:memory:` stores (tests)
-    /// fall back to the writer connection.
+    /// reads keep answering. Tries every handle before blocking so one
+    /// slow scan doesn't head-of-line-block half the reads behind a
+    /// blind round-robin pick. `:memory:` stores (tests) fall back to
+    /// the writer connection.
+    #[track_caller]
     pub fn with_read_conn<R>(&self, f: impl FnOnce(&Connection) -> R) -> R {
+        let caller = std::panic::Location::caller();
         if self.read_conns.is_empty() {
-            return self.with_locked_conn(f);
+            let t0 = std::time::Instant::now();
+            let guard = self.conn.lock().unwrap();
+            let waited = t0.elapsed();
+            let t1 = std::time::Instant::now();
+            let out = f(&guard);
+            drop(guard);
+            log_slow_conn("writer(fallback)", caller, waited, t1.elapsed());
+            return out;
         }
-        let idx = self.read_rr.fetch_add(1, Ordering::Relaxed) as usize % self.read_conns.len();
-        let guard = self.read_conns[idx].lock().unwrap();
-        f(&guard)
+        let start = self.read_rr.fetch_add(1, Ordering::Relaxed) as usize;
+        let n = self.read_conns.len();
+        let t0 = std::time::Instant::now();
+        let guard = 'pick: {
+            for offset in 0..n {
+                if let Ok(g) = self.read_conns[(start + offset) % n].try_lock() {
+                    break 'pick g;
+                }
+            }
+            self.read_conns[start % n].lock().unwrap()
+        };
+        let waited = t0.elapsed();
+        let t1 = std::time::Instant::now();
+        let out = f(&guard);
+        drop(guard);
+        log_slow_conn("read", caller, waited, t1.elapsed());
+        out
+    }
+
+    /// `VACUUM INTO dest` on a DEDICATED connection — SQLite takes only a
+    /// read snapshot of the source, so the daily backup no longer seizes
+    /// the writer mutex for the whole multi-minute copy of a grown DB.
+    /// `:memory:` stores fall back to the shared connection (tests).
+    pub fn vacuum_into(&self, dest: &str) -> Result<()> {
+        if self.path == ":memory:" {
+            return self.with_locked_conn(|conn| {
+                conn.execute("VACUUM INTO ?1", params![dest]).map(|_| ())
+            })
+            .map_err(Into::into);
+        }
+        let conn = Connection::open(&self.path)?;
+        conn.execute_batch("PRAGMA busy_timeout = 5000;")?;
+        conn.execute("VACUUM INTO ?1", params![dest])?;
+        Ok(())
     }
 
     /// Mark the start/end of a processor bulk-ingest pass. While set,
@@ -726,10 +801,20 @@ impl DriveStore {
     /// in the drive list — exactly the parked presence 60c5602 removed —
     /// so the driving filter stays.
     ///
-    /// The predicate is `grouper::row_has_driving` — the SAME one the
-    /// grouper applies to stored rows when admitting gap-fills — so the
-    /// manifest and the drive list never disagree on which event clips are
-    /// part of a drive.
+    /// The predicate is `grouper::row_has_driving`, which is what the
+    /// grouper applies to stored rows for ANCHORED gap-fill admission
+    /// (interior holes and chains) — those agree exactly.
+    ///
+    /// It is deliberately NOT the stricter `telemetry_gear_driving` the
+    /// grouper requires for UNANCHORED clusters. A row whose only
+    /// evidence is a speed sample or raw frame counters (legacy builds,
+    /// drive-data.json imports) can therefore reach the playback
+    /// manifest while staying out of the drive list. That asymmetry is
+    /// intended: cross-linking a clip into RecentClips only affects
+    /// playback continuity, whereas minting a drive from weak evidence
+    /// puts a phantom trip in the user's history. Do not "restore
+    /// parity" by gear-gating here — anchored speed/raw evidence is
+    /// legitimate for playback.
     pub fn gap_fill_files(&self) -> Result<Vec<String>> {
         self.with_read_conn(|conn| {
         let mut stmt = conn.prepare(
@@ -1500,17 +1585,23 @@ impl DriveStore {
         // sync (samples cover charging-only days). Tag-only edits don't
         // bump either count and stay stale for one cycle — same accepted
         // trade-off as the shell's drives_count check.
-        let (samples_now, last_synced, last_synced_samples) = {
-            let conn = self.conn.lock().unwrap();
-            let samples: i64 = conn
-                .query_row("SELECT COUNT(*) FROM telemetry_samples", [], |r| r.get(0))
-                .unwrap_or(0);
-            let routes: Option<i64> =
-                schema::meta_get(&conn, ARCHIVE_SYNC_ROUTE_COUNT_KEY)?.and_then(|s| s.parse().ok());
-            let samples_baseline: Option<i64> = schema::meta_get(&conn, ARCHIVE_SYNC_SAMPLE_COUNT_KEY)?
-                .and_then(|s| s.parse().ok());
-            (samples, routes, samples_baseline)
-        };
+        // Read pool, not the writer: this runs at the tail of every
+        // processing pass and the COUNT walks the whole samples table.
+        // A COUNT failure propagates — treating it as 0 would spuriously
+        // mismatch the baseline and trigger a full multi-minute export.
+        let (samples_now, last_synced, last_synced_samples, last_export_date) =
+            self.with_read_conn(|conn| -> Result<_> {
+                let samples: i64 = conn
+                    .query_row("SELECT COUNT(*) FROM telemetry_samples", [], |r| r.get(0))
+                    .context("sync_to_archive: telemetry count")?;
+                let routes: Option<i64> = schema::meta_get(conn, ARCHIVE_SYNC_ROUTE_COUNT_KEY)?
+                    .and_then(|s| s.parse().ok());
+                let samples_baseline: Option<i64> =
+                    schema::meta_get(conn, ARCHIVE_SYNC_SAMPLE_COUNT_KEY)?
+                        .and_then(|s| s.parse().ok());
+                let export_date = schema::meta_get(conn, ARCHIVE_SYNC_EXPORT_DATE_KEY)?;
+                Ok((samples, routes, samples_baseline, export_date))
+            })?;
         if last_synced == Some(routes_now)
             && last_synced_samples == Some(samples_now)
             && Path::new(archive).exists()
@@ -1522,12 +1613,25 @@ impl DriveStore {
             return Ok(());
         }
 
+        // Daily gate: counts moved, but an export already ran today. The
+        // count baselines are deliberately NOT advanced, so tomorrow's
+        // first pass exports everything accumulated since this one.
+        let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+        if last_export_date.as_deref() == Some(today.as_str()) && Path::new(archive).exists() {
+            info!(
+                "[drives] archive_json_export_skipped reason=already_today date={}",
+                today
+            );
+            return Ok(());
+        }
+
         self.export_json_to_file(mirror)?;
         sync_to_path(mirror, archive, cache)?;
 
         let conn = self.conn.lock().unwrap();
         schema::meta_set(&conn, ARCHIVE_SYNC_ROUTE_COUNT_KEY, &routes_now.to_string())?;
         schema::meta_set(&conn, ARCHIVE_SYNC_SAMPLE_COUNT_KEY, &samples_now.to_string())?;
+        schema::meta_set(&conn, ARCHIVE_SYNC_EXPORT_DATE_KEY, &today)?;
         Ok(())
     }
 
@@ -1709,16 +1813,46 @@ impl DriveStore {
         {
             let cache = self.route_overview_cache.lock().unwrap();
             if let Some(c) = cache.as_ref() {
-                if c.generation == generation && c.max_points == max_points {
+                if c.max_points == max_points {
+                    if c.generation == generation {
+                        return Ok(c.json.clone());
+                    }
+                    // Bulk ingest bumps the generation on every clip, and a
+                    // recompute is the heaviest read in the store (full BLOB
+                    // decode of every route) — serve the last-built overview
+                    // for the debounce window instead of recomputing per
+                    // map request.
+                    if self.bulk_ingest.load(Ordering::Acquire)
+                        && now_unix() - self.last_overview_rebuild.load(Ordering::Acquire)
+                            < CACHE_REBUILD_DEBOUNCE_SECS
+                    {
+                        return Ok(c.json.clone());
+                    }
+                }
+            }
+        }
+        // Single-flight. The rebuild below decodes every route in the
+        // store; letting two requests do that concurrently multiplies the
+        // process's largest allocation.
+        let _rebuild = self.overview_rebuild_lock.lock().unwrap();
+
+        // Re-check: whoever held the lock may have just built exactly
+        // what this request wants.
+        {
+            let cache = self.route_overview_cache.lock().unwrap();
+            if let Some(c) = cache.as_ref() {
+                if c.max_points == max_points && c.generation == generation {
                     return Ok(c.json.clone());
                 }
             }
         }
+
         let routes = self.with_read_conn(select_all_routes)?;
         let overviews = crate::grouper::route_overviews(routes, max_points);
         let json = serde_json::to_string(&overviews).unwrap_or_else(|_| "[]".to_string());
         let mut cache = self.route_overview_cache.lock().unwrap();
         *cache = Some(RouteOverviewCache { generation, max_points, json: json.clone() });
+        self.last_overview_rebuild.store(now_unix(), Ordering::Release);
         Ok(json)
     }
 
@@ -1784,6 +1918,28 @@ impl DriveStore {
 // SQL helpers (private)
 // -----------------------------------------------------------------------------
 
+/// Journal a DB access whose mutex wait or closure runtime crossed
+/// 100ms — separates "slow SQL" from "queued behind the writer" from
+/// "queued behind another read" without a profiler on the Pi.
+fn log_slow_conn(
+    kind: &str,
+    caller: &'static std::panic::Location<'static>,
+    waited: std::time::Duration,
+    ran: std::time::Duration,
+) {
+    const SLOW: std::time::Duration = std::time::Duration::from_millis(100);
+    if waited >= SLOW || ran >= SLOW {
+        warn!(
+            "slow_db conn={} wait_ms={} run_ms={} at={}:{}",
+            kind,
+            waited.as_millis(),
+            ran.as_millis(),
+            caller.file(),
+            caller.line(),
+        );
+    }
+}
+
 fn open_connection(path: &str) -> Result<Connection> {
     let conn = Connection::open(path)?;
     apply_pragmas(&conn)?;
@@ -1794,11 +1950,77 @@ fn open_connection(path: &str) -> Result<Connection> {
 /// for long-running reads (the JSON export mirror) that would otherwise
 /// hold the shared writer connection's mutex for minutes. WAL mode on
 /// the writer lets this handle see a consistent snapshot.
+/// What a read-only handle is for. The two roles want opposite page
+/// strategies, so they no longer share pragmas.
+#[derive(Clone, Copy, PartialEq)]
+enum ReadRole {
+    /// The API read pool: small, repeated, latency-sensitive lookups.
+    /// Wants its working set to survive an archive run.
+    Api,
+    /// One-shot bulk walks (JSON export, cache-rebuild snapshot) that
+    /// stream hundreds of MB once and never re-read them.
+    Bulk,
+}
+
+/// Total system RAM in KiB, or `None` when /proc/meminfo is unreadable.
+fn mem_total_kb() -> Option<u64> {
+    let meminfo = std::fs::read_to_string("/proc/meminfo").ok()?;
+    meminfo
+        .lines()
+        .find_map(|l| l.strip_prefix("MemTotal:"))
+        .and_then(|v| v.trim().trim_end_matches(" kB").trim().parse().ok())
+}
+
+/// Page cache (KiB) for an API read connection, sized to the board.
+///
+/// This is a CAP, not an allocation — SQLite grows the pager cache only
+/// as queries touch pages, and the hot poll paths touch a handful. The
+/// tiers still stay conservative because the majority of installs are
+/// 512 MB Zero 2 Ws, where a bulk read through this pool (a month of
+/// tire history, say) could actually approach the cap.
+fn api_reader_cache_kb() -> i64 {
+    match mem_total_kb() {
+        // Unreadable /proc/meminfo — assume the smallest supported board.
+        None => 4_000,
+        // Zero 2 W and friends (512 MB). The hot set here is the tails
+        // of two small partial indexes plus a few leaves, which fits
+        // well inside this; anything larger is unjustified on a board
+        // whose image ships without swap.
+        Some(kb) if kb <= 600_000 => 4_000,
+        // 1 GB Pi 4/5.
+        Some(kb) if kb <= 1_200_000 => 16_000,
+        Some(kb) if kb <= 2_500_000 => 24_000,
+        Some(_) => 48_000,
+    }
+}
+
 fn open_readonly_connection(path: &str) -> Result<Connection> {
+    open_readonly_connection_for(path, ReadRole::Bulk)
+}
+
+fn open_readonly_connection_for(path: &str, role: ReadRole) -> Result<Connection> {
     let flags = OpenFlags::SQLITE_OPEN_READ_ONLY
         | OpenFlags::SQLITE_OPEN_URI
         | OpenFlags::SQLITE_OPEN_NO_MUTEX;
     let conn = Connection::open_with_flags(path, flags)?;
+    if role == ReadRole::Api {
+        // mmap_size = 0 is the point of this role. With mmap on, SQLite
+        // reads ride the OS page cache — which an archive run floods
+        // with many GB of video, evicting the DB's hot B-tree pages. The
+        // same queries then measured 1000x slower (1.1ms -> 7.4s) with
+        // identical, optimal query plans. A private heap cache is
+        // anonymous memory, which the kernel reclaims far less eagerly
+        // than clean file pages, so the hot set survives the archive.
+        conn.execute_batch(&format!(
+            "PRAGMA query_only = ON;
+             PRAGMA busy_timeout = 5000;
+             PRAGMA mmap_size = 0;
+             PRAGMA cache_size = -{};
+             PRAGMA temp_store = MEMORY;",
+            api_reader_cache_kb()
+        ))?;
+        return Ok(conn);
+    }
     // mmap_size matches apply_pragmas — this connection serves the
     // BLOB-heavy full-table scans (JSON export, cache-rebuild snapshot),
     // which benefit most from skipping the pager-buffer copy.
@@ -3822,6 +4044,14 @@ mod tests {
             .unwrap();
     }
 
+    /// Pretend the last archive JSON export ran long ago so the daily
+    /// gate lets the next sync through.
+    fn rewind_export_date(store: &DriveStore) {
+        store.with_locked_conn(|conn| {
+            schema::meta_set(conn, ARCHIVE_SYNC_EXPORT_DATE_KEY, "2000-01-01").unwrap();
+        });
+    }
+
     #[test]
     fn archive_sync_pushes_then_skips_until_new_routes() {
         let dir = TmpDir::new("push-skip");
@@ -3841,8 +4071,14 @@ mod tests {
         store.sync_to_archive_at(&mirror, &archive, &cache).unwrap();
         assert_eq!(std::fs::read_to_string(&archive).unwrap(), "sentinel");
 
-        // New route moves the baseline: archive rewritten.
+        // New route same day: counts moved but the daily gate holds —
+        // archive untouched, baselines not advanced.
         add_test_route(&store, "a/2025-01-15_11-00-00-front.mp4");
+        store.sync_to_archive_at(&mirror, &archive, &cache).unwrap();
+        assert_eq!(std::fs::read_to_string(&archive).unwrap(), "sentinel");
+
+        // Next day: the deferred route exports.
+        rewind_export_date(&store);
         store.sync_to_archive_at(&mirror, &archive, &cache).unwrap();
         let repushed = std::fs::read_to_string(&archive).unwrap();
         assert_ne!(repushed, "sentinel");
@@ -3861,7 +4097,8 @@ mod tests {
         add_test_route(&store, "a/2025-01-15_10-00-00-front.mp4");
         store.sync_to_archive_at(&mirror, &archive, &cache).unwrap();
 
-        // No new routes, but the sampler wrote a row: archive rewritten.
+        // No new routes, but the sampler wrote a row: archive rewritten
+        // (once past the daily gate).
         std::fs::write(&archive, "sentinel").unwrap();
         store.with_locked_conn(|conn| {
             conn.execute(
@@ -3870,6 +4107,7 @@ mod tests {
             )
             .unwrap();
         });
+        rewind_export_date(&store);
         store.sync_to_archive_at(&mirror, &archive, &cache).unwrap();
         let repushed = std::fs::read_to_string(&archive).unwrap();
         assert_ne!(repushed, "sentinel");

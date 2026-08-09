@@ -314,11 +314,18 @@ apply_ble_adv_helper() {
 # `ionice -c2 -n7` so the car's dashcam writes through the USB gadget
 # always win disk access — but ionice only has effect under the bfq I/O
 # scheduler (mq-deadline, the Pi OS default, ignores I/O priorities).
-# Ship a udev rule so every sd disk gets bfq at hotplug/boot, and apply
+# Ship a udev rule so the backing disk gets bfq at hotplug/boot, and apply
 # it to the live backingfiles disk immediately when that is safe.
+#
+# The pattern covers SD cards (mmcblk*) as well as USB/SATA disks (sd*).
+# Matching only sd* left every install whose /backingfiles sits on the SD
+# card — common on a Zero 2 W — silently back on mq-deadline after each
+# reboot, which makes the archive's ionice a no-op and lets rsync starve
+# the API's disk reads. NVMe is deliberately excluded: bfq's fairness
+# machinery costs more than it returns on a device that fast.
 apply_backingfiles_bfq() {
     local rule=/etc/udev/rules.d/60-sentryusb-bfq.rules
-    local want='ACTION=="add|change", KERNEL=="sd[a-z]", SUBSYSTEM=="block", ATTR{queue/scheduler}="bfq"'
+    local want='ACTION=="add|change", KERNEL=="sd[a-z]|mmcblk[0-9]", SUBSYSTEM=="block", ATTR{queue/scheduler}="bfq"'
 
     modprobe bfq 2>/dev/null || true
 
@@ -350,7 +357,30 @@ apply_backingfiles_bfq() {
     src="$(findmnt -n -o SOURCE /backingfiles 2>/dev/null)" || true
     [ -n "${src:-}" ] || { log "bfq: /backingfiles not mounted — udev rule will cover next boot"; return 0; }
     disk="$(lsblk -n -o PKNAME "$src" 2>/dev/null | head -1)"
-    [ -n "$disk" ] || disk="$(basename "$src" | sed 's/[0-9]*$//')"
+    # Fallback when lsblk can't resolve the parent. mmcblk/nvme name their
+    # partitions <disk>p<N>, so stripping only trailing digits leaves
+    # "mmcblk0p" — a device that does not exist, which then fails the
+    # class gate below and silently skips the live switch. Strip the
+    # partition suffix per naming scheme instead.
+    if [ -z "$disk" ]; then
+        disk="$(basename "$src")"
+        case "$disk" in
+            mmcblk*|nvme*) disk="$(echo "$disk" | sed 's/p[0-9]*$//')" ;;
+            *)             disk="$(echo "$disk" | sed 's/[0-9]*$//')" ;;
+        esac
+    fi
+    # Same device-class gate the udev rule above uses (sd*/mmcblk*).
+    # Without it the LIVE switch would happily set bfq on an NVMe that
+    # the rule deliberately excludes — bfq's fairness machinery costs
+    # more than it returns on a device that fast — leaving the scheduler
+    # inconsistent with the documented policy until the next reboot.
+    case "$disk" in
+        sd[a-z]|mmcblk[0-9]) ;;
+        *)
+            log "bfq: $disk is not sd*/mmcblk* (NVMe?) — excluded by design, leaving its scheduler alone"
+            return 0
+            ;;
+    esac
     sched="/sys/block/$disk/queue/scheduler"
     if [ -w "$sched" ]; then
         if grep -q '\[bfq\]' "$sched"; then
@@ -893,19 +923,328 @@ apply_4cplus_wifi_nvram_fix() {
     fi
 }
 
+
+# ── Snapshot eviction/slot-order fixes (all boards) ─────────────────────
+#
+# Snapshot slot names are NOT time-monotonic in the field: a reflash can
+# leave a stale high-numbered snapshot above a freshly restarted sequence
+# (real device: snap-000414 from Jul 9 sitting over snap-000413 from
+# Aug 8, numbering restarted at snap-000000 beneath it). Two legacy-bash
+# consequences fixed here for installs that still run the FULL scripts:
+#   - manage_free_space.sh picked the "oldest" snapshot by NAME
+#     (`sort | head -1`) and could evict newer footage while sparing the
+#     genuinely oldest snapshot;
+#   - make_snapshot.sh derived its next slot from snap.bin paths, so a
+#     tree with dirs but no snap.bin restarts numbering at 0.
+# Modern installs have thin wrappers calling `sentryusb space manage` /
+# `sentryusb snapshot make`; the Rust binary carries these fixes there,
+# and the wrappers are deliberately left untouched.
+
+apply_snapshot_eviction_by_age() {
+    local f=/root/bin/manage_free_space.sh
+    [ -f "$f" ] || { warn "eviction-by-age: $f missing — skipping"; return 0; }
+    if grep -q 'sentryusb space manage' "$f"; then
+        log "eviction-by-age: thin Rust wrapper — binary carries the fix"
+        return 0
+    fi
+    # Marker must name the CURRENT body, not just "some mtime patch".
+    # The first shipped version of this patch only had the mtime
+    # ordering; a device that received it would match a generic marker
+    # and never get the clock-rollback guard added later — which is the
+    # data-loss fix. Key on text unique to the newest body.
+    if grep -q 'HIGHEST-numbered snapshot' "$f"; then
+        log "eviction-by-age: already patched (current version)"
+        return 0
+    fi
+    # Two accepted inputs: the ORIGINAL legacy body, or the earlier
+    # mtime-only patched body (needs upgrading to add the clock guard).
+    # Both are byte-stable shipped artifacts, so a whole-file replace is
+    # safe; anything else is a local fork and is left alone.
+    if grep -qF "oldest=\$(find /backingfiles/snapshots -maxdepth 1 -name 'snap-*' | sort | head -1)" "$f"; then
+        log "eviction-by-age: upgrading original legacy body"
+    elif grep -q 'oldest by snap.bin mtime' "$f"; then
+        log "eviction-by-age: upgrading earlier mtime-only patch to add the clock-rollback guard"
+    else
+        warn "eviction-by-age: unknown local variant of $f — leaving untouched"
+        return 0
+    fi
+    [ -x /root/bin/remountfs_rw ] && /root/bin/remountfs_rw >/dev/null 2>&1 || true
+
+    # Whole-file staged replace (this script was byte-stable since the
+    # port, so the fingerprint above proves we know exactly what we are
+    # replacing). Atomic rename so archiveloop can never see a torn file.
+    cat > "$f.new" <<'MFS_EOF'
+#!/bin/bash -eu
+
+if [ "${BASH_SOURCE[0]}" != "$0" ]
+then
+  echo "${BASH_SOURCE[0]} must be executed, not sourced"
+  return 1 # shouldn't use exit when sourced
+fi
+
+if [ "${FLOCKED:-}" != "$0" ]
+then
+  mkdir -p /backingfiles/snapshots
+  if FLOCKED="$0" flock -E 99 /backingfiles/snapshots "$0" "$@" || case "$?" in
+  99) echo "failed to lock snapshots dir"
+      exit 99
+      ;;
+  *)  exit $?
+      ;;
+  esac
+  then
+    # success
+    exit 0
+  fi
+fi
+
+# archiveloop exports its own `log` to children (export -f log), so the
+# normal path inherits it. A HAND invocation does not, and every log
+# call would then abort the script under `set -e` — right before the
+# delete, so a troubleshooting operator got `log: command not found` and
+# no cleanup. Define a stdout fallback only when nothing was inherited.
+if ! declare -F log > /dev/null 2>&1
+then
+  function log () {
+    echo "$( date ):" "$@"
+  }
+fi
+
+function manage_free_space {
+  # Try to make free space equal to 10 GB plus three percent of the total
+  # available space. This should be enough to hold the next hour of
+  # recordings without completely filling up the filesystem.
+  # todo: this could be put in a background task and with a lower free
+  # space requirement, to delete old snapshots just before running out
+  # of space and thus make better use of space
+  local reserve="$1"
+  while true
+  do
+    local freespace
+    freespace=$(eval "$(stat --file-system --format="echo \$((%f*%S))" /backingfiles/cam_disk.bin)")
+    if [ "$freespace" -gt "$reserve" ]
+    then
+      exit 0
+    fi
+    # Candidates = snapshot dirs that actually hold a snap.bin, ordered by
+    # the bin's mtime (TRUE age), name as tie-break. Slot numbers are not
+    # time-monotonic in the field — a reflash can leave a stale
+    # high-numbered snapshot above a restarted sequence — and the old
+    # name-order pick (`sort | head -1`) deleted newer footage while
+    # sparing the genuinely oldest snapshot. The same list feeds the
+    # "fewer than two" guard so the count and the pick can't disagree.
+    local candidates
+    # `-regex` (not just snap-*) so a scratch dir like snap-backup/ is
+    # never a deletion candidate — matches the numeric-only rule the
+    # Rust scanners use.
+    candidates=$(
+      LC_ALL=C find /backingfiles/snapshots \
+        -mindepth 2 -maxdepth 2 -type f \
+        -regextype posix-extended -regex '/backingfiles/snapshots/snap-[0-9]+/snap\.bin' \
+        -printf '%T@\t%h\n' 2>/dev/null |
+      LC_ALL=C sort -t $'\t' -k1,1n -k2,2
+    )
+    if [ -z "$candidates" ]
+    then
+      log "Warning: low space for new snapshots, but no snapshots exist."
+      log "Please use a larger storage medium or reduce CAM_SIZE"
+      exit 1
+    fi
+    # if there's only one snapshot then we likely just took it, so don't immediately delete it
+    if [ "$(printf '%s\n' "$candidates" | wc -l)" -lt 2 ]
+    then
+      # there's only one snapshot and yet we're low on space
+      log "Warning: low space for new snapshots, but only one snapshot exists."
+      log "Please use a larger storage medium or reduce CAM_SIZE"
+      exit 1
+    fi
+
+    # Never delete the HIGHEST-numbered snapshot, even if its mtime says
+    # it is the oldest. This board usually has no battery-backed RTC and
+    # archiveloop starts freespacemanager BEFORE timesyncloop, so a boot
+    # can run eviction while the clock still holds a fake-hwclock time in
+    # the past — the snapshot just taken then sorts as oldest and would
+    # be the first deleted. Slot numbers are allocated monotonically, so
+    # the highest number is the most recent creation whatever the clock
+    # said. Mirrors `releasable()` in crates/usb_gadget/src/space.rs.
+    # Withhold BOTH the highest-numbered slot and the newest-by-mtime,
+    # matching releasable() in space.rs. (Protecting only the highest
+    # would still let a long low-space run delete the mtime-newest.)
+    local highest newest
+    highest=$(printf '%s\n' "$candidates" | cut -f2- | sed 's#.*/##' \
+              | grep -E '^snap-[0-9]+$' | LC_ALL=C sort | tail -1)
+    newest=$(printf '%s\n' "$candidates" | tail -1 | cut -f2- | sed 's#.*/##')
+    oldest=$(printf '%s\n' "$candidates" | cut -f2- \
+             | grep -v "/${highest}\$" | grep -v "/${newest}\$" | head -1)
+    if [ -z "$oldest" ]
+    then
+      log "unable to select oldest snapshot (only protected snapshots remain)"
+      exit 1
+    fi
+    log "low space, deleting $oldest (oldest by snap.bin mtime)"
+    /root/bin/release_snapshot.sh "$oldest"
+    rm -rf "$oldest"
+  done
+}
+
+# Normally called by archiveloop's freespacemanager with "10G + 3% of
+# total space". When invoked by hand with no argument, compute the SAME
+# policy rather than falling back to a flat 20G: a size-blind default is
+# harsher than the real policy on small drives and far weaker on
+# multi-TB ones, which is exactly the vintage-dependent divergence this
+# shares with crates/usb_gadget/src/space.rs (default_reserve_bytes).
+reserve="${1:-}"
+if [ -z "$reserve" ]
+then
+  reserve=$(eval "$(stat --file-system --format="echo \$((10737418240 + %b*%S/33))" /backingfiles/cam_disk.bin)")
+fi
+manage_free_space "$reserve"
+MFS_EOF
+    if ! bash -n "$f.new" 2>/dev/null; then
+        err "eviction-by-age: staged replacement failed bash -n — aborting"
+        rm -f "$f.new"
+        return 1
+    fi
+    chmod --reference="$f" "$f.new" 2>/dev/null || chmod 755 "$f.new"
+    if ! mv "$f.new" "$f"; then
+        err "eviction-by-age: rename failed (read-only fs? disk full?) — $f left as-is"
+        rm -f "$f.new"
+        return 1
+    fi
+    log "eviction-by-age: replaced legacy manage_free_space.sh (mtime-ordered eviction)"
+}
+
+apply_snapshot_slot_pick_hardening() {
+    local f=/root/bin/make_snapshot.sh
+    [ -f "$f" ] || { warn "slot-pick: $f missing — skipping"; return 0; }
+    if grep -q 'sentryusb snapshot make' "$f"; then
+        log "slot-pick: thin Rust wrapper — binary carries the fix"
+        return 0
+    fi
+    if grep -q 'slot pick: picker=bash' "$f"; then
+        log "slot-pick: already patched"
+        return 0
+    fi
+    # The picker block is byte-stable since the original port even though
+    # the rest of make_snapshot.sh has drifted across releases; anchor on
+    # its first and last lines and replace just that block.
+    if ! grep -qF 'oldnum=$(find /backingfiles/snapshots/snap-* -maxdepth 1 -name snap.bin | sort | tail -1' "$f"; then
+        warn "slot-pick: unknown local variant of $f — leaving untouched"
+        return 0
+    fi
+    [ -x /root/bin/remountfs_rw ] && /root/bin/remountfs_rw >/dev/null 2>&1 || true
+
+    local result
+    result="$(python3 - "$f" 2>&1 <<'SLOT_PYEOF'
+import sys
+p = sys.argv[1]; s = open(p).read()
+a = s.find("  local oldnum=-1")
+b = s.find("  newsnapdir=/backingfiles/snapshots/snap-", a)
+if a < 0 or b <= a:
+    print("anchor-not-found"); raise SystemExit
+new = """  # Highest slot from snapshot DIRECTORY names, not snap.bin presence
+  # (slot pick hardening — see run/make_snapshot.sh in the repo).
+  local oldnum=-1
+  local newnum=0
+  local maxdir
+  maxdir=$(LC_ALL=C find /backingfiles/snapshots -mindepth 1 -maxdepth 1 \
+             -type d -name 'snap-*' 2>/dev/null |
+           grep -E '/snap-[0-9]+$' | LC_ALL=C sort | tail -1)
+  if [ -n "$maxdir" ]
+  then
+    oldnum=$(basename "$maxdir" | tr -c -d '[:digit:]' | sed 's/^0*//')
+    oldnum=${oldnum:-0}
+    newnum=$((oldnum + 1))
+  fi
+  local oldname
+  local newsnapdir
+  oldname=/backingfiles/snapshots/snap-$(printf "%06d" "$oldnum")/snap.bin
+
+  # check that the previous snapshot is complete (TOC AND bin present)
+  if [ "$oldnum" != "-1" ] && { [ ! -e "${oldname}.toc" ] || [ ! -e "$oldname" ]; }
+  then
+    if grep -q "/backingfiles/snapshots/snap-$(printf "%06d" "$oldnum")/" /proc/mounts 2>/dev/null || \
+       grep -q "/tmp/snapshots/snap-$(printf "%06d" "$oldnum")" /proc/mounts 2>/dev/null
+    then
+      log "previous snapshot snap-$(printf "%06d" "$oldnum") incomplete but mounted — appending instead of reusing"
+      oldnum=$((oldnum - 1))
+      oldname=/backingfiles/snapshots/snap-$(printf "%06d" "$oldnum")/snap.bin
+    else
+      log "previous snapshot was incomplete, deleting"
+      rm -rf "$(dirname "$oldname")"
+      newnum=$((oldnum))
+      oldnum=$((oldnum - 1))
+      oldname=/backingfiles/snapshots/snap-$(printf "%06d" "$oldnum")/snap.bin
+    fi
+  fi
+  log "slot pick: picker=bash max_seen=${maxdir:-none} prev=$oldnum next=$newnum"
+
+"""
+staged = p + ".new"
+open(staged, "w").write(s[:a] + new + s[b:])
+print("staged")
+SLOT_PYEOF
+)" || result="python-error"
+
+    if [ "$result" != "staged" ] || [ ! -f "$f.new" ]; then
+        err "slot-pick: staging failed ($result) — leaving $f untouched"
+        rm -f "$f.new"
+        return 1
+    fi
+    if ! bash -n "$f.new" 2>/dev/null || ! grep -q 'slot pick: picker=bash' "$f.new"; then
+        err "slot-pick: staged file failed verification — aborting"
+        rm -f "$f.new"
+        return 1
+    fi
+    chmod --reference="$f" "$f.new" 2>/dev/null || chmod 755 "$f.new"
+    if ! mv "$f.new" "$f"; then
+        err "slot-pick: rename failed (read-only fs? disk full?) — $f left as-is"
+        rm -f "$f.new"
+        return 1
+    fi
+    log "slot-pick: patched legacy make_snapshot.sh picker (dir-name max + mounted guard)"
+}
+
+# Counts patches that FAILED to apply (as opposed to correctly skipping).
+# The runner deliberately has no `set -e` — one broken patch must not stop
+# the rest from applying — so without an explicit tally a failed write or
+# rename is invisible and the OTA caller records "patches re-applied
+# successfully". Every patch function returns 0 for "applied" AND for
+# "legitimately not applicable" (wrong board, thin wrapper, already
+# patched, file absent); a non-zero return means a REAL failure.
+PATCH_FAILURES=0
+
+# Run one patch function, tallying a hard failure without aborting the
+# rest of the run.
+run_patch() {
+    local fn="$1"
+    if ! "$fn"; then
+        PATCH_FAILURES=$((PATCH_FAILURES + 1))
+        err "$fn: FAILED"
+    fi
+}
+
 # ── Run all patches ─────────────────────────────────────────────────────
 
-apply_ble_nonfatal_adv
-apply_ble_adv_helper
-apply_eatt_disable
-apply_backingfiles_bfq
-apply_hardware_watchdog
-apply_archive_mount_lock_scripts
-apply_rfkill_unblock_wifi
-apply_4cplus_wifi_nvram_fix
-apply_rclone_config_mutable_migration
-apply_rclone_watchdog_fix
+run_patch apply_ble_nonfatal_adv
+run_patch apply_ble_adv_helper
+run_patch apply_eatt_disable
+run_patch apply_backingfiles_bfq
+run_patch apply_hardware_watchdog
+run_patch apply_archive_mount_lock_scripts
+run_patch apply_rfkill_unblock_wifi
+run_patch apply_4cplus_wifi_nvram_fix
+run_patch apply_rclone_config_mutable_migration
+run_patch apply_rclone_watchdog_fix
+run_patch apply_snapshot_eviction_by_age
+run_patch apply_snapshot_slot_pick_hardening
 
 # Future patches that must survive an OTA update get appended here. Each
 # one self-checks board / precondition / marker so the whole script stays
 # a safe no-op on non-applicable systems.
+
+if [ "${PATCH_FAILURES:-0}" -gt 0 ]; then
+    err "$PATCH_FAILURES patch(es) failed to apply — see messages above"
+    exit 1
+fi
+exit 0

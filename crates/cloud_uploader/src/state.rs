@@ -145,24 +145,31 @@ impl CloudStateInner {
     }
 
     pub async fn snapshot_status(&self) -> CloudStatus {
-        let creds_guard = self.creds.lock().await;
-        let pairing_guard = self.pairing.lock().await;
-
-        let pending_route_count = self
-            .store
-            .with_locked_conn(|conn| {
-                conn.query_row(
-                    "SELECT count(*) FROM routes WHERE cloud_uploaded_at IS NULL",
-                    [],
-                    |row| row.get::<_, i64>(0),
-                )
-                .unwrap_or(0)
-            });
-
-        let (total_uploaded_route_count, last_upload_secs) = db_ext::upload_summary(&self.store);
+        // Settings polls this every second while uploads are pending —
+        // both counts run in one blocking-pool hop on the read pool
+        // (pending count previously took the WRITER mutex inline on the
+        // reactor), and the async guards are not held across it.
+        let store = self.store.clone();
+        let (pending_route_count, total_uploaded_route_count, last_upload_secs) =
+            tokio::task::spawn_blocking(move || {
+                let pending = store.with_read_conn(|conn| {
+                    conn.query_row(
+                        "SELECT count(*) FROM routes WHERE cloud_uploaded_at IS NULL",
+                        [],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .unwrap_or(0)
+                });
+                let (total, last) = db_ext::upload_summary(&store);
+                (pending, total, last)
+            })
+            .await
+            .unwrap_or((0, 0, None));
         let last_upload_at = last_upload_secs
             .and_then(|s| chrono::DateTime::<Utc>::from_timestamp(s, 0));
 
+        let creds_guard = self.creds.lock().await;
+        let pairing_guard = self.pairing.lock().await;
         let last_upload_error = self.last_upload_error.lock().await.clone();
         let credentials_load_error = self.credentials_load_error.lock().await.clone();
 

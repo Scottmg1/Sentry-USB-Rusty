@@ -35,6 +35,29 @@ use sentryusb_drives::charging::{
     SESSION_GAP_SECS,
 };
 
+/// /api/charging response cache. The list derives from a full
+/// telemetry_samples scan — 14s+ observed while an archive owns the
+/// disk — and sessions only change as samples land, so a short TTL is
+/// invisible to the UI. Tag/cost/delete mutations clear it so edits
+/// reflect immediately.
+/// Stale-while-revalidate rather than a plain TTL: the underlying scan
+/// measured 4-7s during an archive, and with a blocking cache whichever
+/// request found the entry expired paid that cost. Nothing in the body
+/// is clock-derived, so the finished JSON is safe to store, behind an
+/// Arc so a hit doesn't re-serialise every session.
+static CHARGING_LIST_CACHE: crate::ttl_cache::StaleWhileRevalidate<(), std::sync::Arc<String>> =
+    crate::ttl_cache::StaleWhileRevalidate::new(std::time::Duration::from_secs(15));
+
+fn invalidate_charging_list() {
+    CHARGING_LIST_CACHE.clear();
+}
+
+/// Latest charge-bearing row for the dashboard banner. The sampler
+/// writes at best every 15s, so a 10s TTL costs no freshness while
+/// keeping the poll off a disk that an archive run has saturated.
+static LATEST_CHARGE_CACHE: crate::ttl_cache::StaleWhileRevalidate<(), Option<LatestCharge>> =
+    crate::ttl_cache::StaleWhileRevalidate::new(std::time::Duration::from_secs(10));
+
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -377,45 +400,56 @@ const CHARGE_STALE_SECS: i64 = 86_400;
 /// GET /api/charging
 ///
 /// Charge sessions newest-first. Empty when no charging has been sampled.
-pub async fn list_charging(
-    State(state): State<AppState>,
-) -> (StatusCode, Json<serde_json::Value>) {
+pub async fn list_charging(State(state): State<AppState>) -> axum::response::Response {
+    use axum::response::IntoResponse;
+
     // Whole-table scan + per-session grouping/summarizing + a prefs-file
     // read (RateConfig::load) — all blocking + CPU, so run it on the
     // blocking pool instead of stalling an async worker on the Pi's two
     // cores. Mirrors the spawn_blocking pattern in drives_handler.rs.
     let store = state.drives.store.clone();
-    let result =
-        tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<ChargeSessionSummary>> {
-            let rows = store.with_read_conn(|conn| load_charge_rows(conn, 0, None))?;
-            let rates = RateConfig::load();
-            let tag_map = store.get_all_charge_tags().unwrap_or_default();
-            let cost_map = store.get_all_charge_costs().unwrap_or_default();
-            let mut sessions: Vec<ChargeSessionSummary> = group_sessions(rows)
-                .iter()
-                .map(|s| {
-                    let mut summary = summarize(s);
-                    let tags = tag_map.get(&summary.id).cloned().unwrap_or_default();
-                    let override_cost = cost_map.get(&summary.id).cloned();
-                    apply_rates(&mut summary, s, tags, &rates);
-                    apply_cost_override(&mut summary, override_cost);
-                    summary
-                })
-                .collect();
-            sessions.sort_by(|a, b| b.id.cmp(&a.id));
-            Ok(sessions)
+    let body = CHARGING_LIST_CACHE
+        .get((), move || {
+            let build = || -> anyhow::Result<Vec<ChargeSessionSummary>> {
+                let rows = store.with_read_conn(|conn| load_charge_rows(conn, 0, None))?;
+                let rates = RateConfig::load();
+                let tag_map = store.get_all_charge_tags().unwrap_or_default();
+                let cost_map = store.get_all_charge_costs().unwrap_or_default();
+                let mut sessions: Vec<ChargeSessionSummary> = group_sessions(rows)
+                    .iter()
+                    .map(|s| {
+                        let mut summary = summarize(s);
+                        let tags = tag_map.get(&summary.id).cloned().unwrap_or_default();
+                        let override_cost = cost_map.get(&summary.id).cloned();
+                        apply_rates(&mut summary, s, tags, &rates);
+                        apply_cost_override(&mut summary, override_cost);
+                        summary
+                    })
+                    .collect();
+                sessions.sort_by(|a, b| b.id.cmp(&a.id));
+                Ok(sessions)
+            };
+            // Err -> None: keep the previous list rather than blanking
+            // the charging tab because one read lost a race with rsync.
+            let sessions = build().ok()?;
+            Some(std::sync::Arc::new(
+                serde_json::json!({ "sessions": sessions }).to_string(),
+            ))
         })
         .await;
 
-    match result {
-        Ok(Ok(sessions)) => (
+    match body {
+        Some(json) => (
             StatusCode::OK,
-            Json(serde_json::json!({ "sessions": sessions })),
-        ),
-        Ok(Err(e)) => crate::json_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
-        Err(e) => {
-            crate::json_error(StatusCode::INTERNAL_SERVER_ERROR, &format!("charging task: {}", e))
-        }
+            [(axum::http::header::CONTENT_TYPE, "application/json")],
+            json.as_str().to_owned(),
+        )
+            .into_response(),
+        None => crate::json_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "charging list query failed",
+        )
+        .into_response(),
     }
 }
 
@@ -530,6 +564,7 @@ impl CurrentCharge {
 }
 
 /// The single most-recent telemetry row, charge-relevant columns only.
+#[derive(Clone)]
 struct LatestCharge {
     ts: i64,
     soc: Option<f64>,
@@ -555,14 +590,16 @@ struct LatestCharge {
 pub async fn current_charging(
     State(state): State<AppState>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    // One indexed LIMIT-1 lookup, but it contends for the same connection
-    // mutex as list_charging's whole-table scan; acquiring it on the
-    // reactor would block an async worker behind that scan. Run it on the
-    // blocking pool so a slow concurrent query can't stall the reactor.
+    // The lookup is index-backed and sub-millisecond on an idle disk, but
+    // measured 7.4s mid-archive once the page cache had been flushed by
+    // the video copy. Cache the ROW (not the response) so the derived
+    // freshness below still recomputes against the current clock, and so
+    // a poll during an archive never queues on a read connection.
     let store = state.drives.store.clone();
-    let cur = tokio::task::spawn_blocking(move || {
+    let latest = LATEST_CHARGE_CACHE
+        .get((), move || {
         use rusqlite::OptionalExtension;
-        let latest = store.with_read_conn(|conn| {
+        store.with_read_conn(|conn| {
             conn.query_row(
                 "SELECT ts, battery_pct, charge_limit_soc, charger_power_kw, \
                         charge_rate_mph, charge_minutes_to_full, battery_range_mi, \
@@ -587,10 +624,16 @@ pub async fn current_charging(
                 },
             )
             .optional()
-        });
+        })
+        // Err -> None: a failed read must not overwrite a good cached
+        // row. Ok(None) -> Some(None): queried fine, nothing charging.
+        .ok()
+        })
+        .await
+        .flatten();
 
-        match latest {
-            Ok(Some(l)) => {
+        let cur = match latest {
+            Some(l) => {
                 let now = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .map(|d| d.as_secs() as i64)
@@ -623,11 +666,8 @@ pub async fn current_charging(
                     },
                 }
             }
-            _ => CurrentCharge::idle(),
-        }
-    })
-    .await
-    .unwrap_or_else(|_| CurrentCharge::idle());
+            None => CurrentCharge::idle(),
+        };
     (StatusCode::OK, Json(serde_json::to_value(cur).unwrap()))
 }
 
@@ -663,7 +703,10 @@ pub async fn set_charge_tags(
 ) -> (StatusCode, Json<serde_json::Value>) {
     let store = state.drives.store.clone();
     match tokio::task::spawn_blocking(move || store.set_charge_tags(id, &body.tags)).await {
-        Ok(Ok(())) => crate::json_ok(),
+        Ok(Ok(())) => {
+            invalidate_charging_list();
+            crate::json_ok()
+        }
         Ok(Err(e)) => crate::json_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
         Err(e) => {
             crate::json_error(StatusCode::INTERNAL_SERVER_ERROR, &format!("tags task: {}", e))
@@ -703,7 +746,10 @@ pub async fn set_charge_cost(
     };
     let store = state.drives.store.clone();
     match tokio::task::spawn_blocking(move || store.set_charge_cost(id, cost)).await {
-        Ok(Ok(())) => crate::json_ok(),
+        Ok(Ok(())) => {
+            invalidate_charging_list();
+            crate::json_ok()
+        }
         Ok(Err(e)) => crate::json_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
         Err(e) => {
             crate::json_error(StatusCode::INTERNAL_SERVER_ERROR, &format!("cost task: {}", e))
@@ -776,10 +822,13 @@ pub async fn bulk_delete_charges(
     .await;
 
     match result {
-        Ok(Ok((deleted, sessions))) => (
-            StatusCode::OK,
-            Json(serde_json::json!({ "deleted": deleted, "sessions": sessions })),
-        ),
+        Ok(Ok((deleted, sessions))) => {
+            invalidate_charging_list();
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({ "deleted": deleted, "sessions": sessions })),
+            )
+        }
         Ok(Err(e)) => crate::json_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
         Err(e) => {
             crate::json_error(StatusCode::INTERNAL_SERVER_ERROR, &format!("charging task: {}", e))

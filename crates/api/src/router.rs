@@ -72,6 +72,7 @@ pub fn build_router(state: AppState) -> Router {
             "/api/logs/bluetooth/bundle",
             get(crate::ble_debug::get_ble_bundle),
         )
+        .route("/api/logs/{name}/page", get(crate::logs::get_log_page))
         .route("/api/logs/{name}", get(crate::logs::get_log))
         // Diagnostics & health
         .route("/api/diagnostics/refresh", post(crate::healthcheck::refresh_diagnostics))
@@ -293,6 +294,35 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/cloud/backfill-ble", post(crate::cloud::backfill_ble));
 
     api.with_state(state)
+}
+
+/// Journal any request slower than 500ms with enough context to blame a
+/// subsystem after the fact — episodic slowness on user devices was
+/// unreproducible-on-demand without this. `archiving`/`db_backup` flag
+/// the two known disk-storm windows (the archive status file is deleted
+/// before the post-archive backup runs, so `archiving` alone would
+/// report false during exactly the storm it was meant to mark).
+pub async fn slow_request_log(
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let method = req.method().clone();
+    let path = req.uri().path().to_string();
+    let t0 = std::time::Instant::now();
+    let resp = next.run(req).await;
+    let ms = t0.elapsed().as_millis();
+    if ms >= 500 {
+        tracing::warn!(
+            "slow_request method={} path={} status={} duration_ms={} archiving={} db_backup={}",
+            method,
+            path,
+            resp.status().as_u16(),
+            ms,
+            crate::drives_handler::is_archiving(),
+            crate::backup::DB_BACKUP_IN_FLIGHT.load(std::sync::atomic::Ordering::Acquire),
+        );
+    }
+    resp
 }
 
 /// WebSocket handler.

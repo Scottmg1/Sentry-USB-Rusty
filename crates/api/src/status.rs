@@ -330,24 +330,18 @@ fn status_fs_snapshot() -> PiStatus {
     s.udc_state = read_udc_state();
     s.cam_last_write_secs = cam_last_write_secs();
 
-    // Snapshots
-    let snapshots = find_snapshots();
-    s.num_snapshots = snapshots.len().to_string();
-    if !snapshots.is_empty() {
-        if let Ok(meta) = std::fs::metadata(&snapshots[0]) {
-            if let Ok(t) = meta.modified() {
-                if let Ok(d) = t.duration_since(std::time::UNIX_EPOCH) {
-                    s.snapshot_oldest = d.as_secs().to_string();
-                }
-            }
-        }
-        if let Ok(meta) = std::fs::metadata(snapshots.last().unwrap()) {
-            if let Ok(t) = meta.modified() {
-                if let Ok(d) = t.duration_since(std::time::UNIX_EPOCH) {
-                    s.snapshot_newest = d.as_secs().to_string();
-                }
-            }
-        }
+    // Snapshots. Oldest/newest come from the scan's mtime min/max —
+    // slot numbers are not time-monotonic (a reflash can leave a stale
+    // high-numbered snapshot above a restarted sequence), and reading
+    // the endpoints of the name-sorted list rendered the dashboard's
+    // date range backwards on such devices.
+    let scan = scan_snapshots(std::path::Path::new("/backingfiles/snapshots/"));
+    s.num_snapshots = scan.count.to_string();
+    if let Some(t) = scan.oldest_unix {
+        s.snapshot_oldest = t.to_string();
+    }
+    if let Some(t) = scan.newest_unix {
+        s.snapshot_newest = t.to_string();
     }
 
     s
@@ -563,26 +557,28 @@ pub async fn get_wifi_config(
     let mut connected = false;
     let mut source = String::new();
 
-    // 1. Try nmcli
-    if let Ok(out) = sentryusb_shell::run("nmcli", &["-t", "-f", "active,ssid", "dev", "wifi"]).await {
-        for line in out.lines() {
-            if line.starts_with("yes:") {
-                ssid = line.strip_prefix("yes:").unwrap_or("").to_string();
-                connected = true;
-                source = "networkmanager".into();
-                break;
-            }
+    // 1. Try iwgetid — reads the kernel's association state in
+    // milliseconds. `nmcli dev wifi` triggers a WiFi SCAN (3+ s
+    // observed) and is only needed when iwgetid comes up empty.
+    if let Ok(out) = sentryusb_shell::run("iwgetid", &["-r"]).await {
+        let s = out.trim();
+        if !s.is_empty() {
+            ssid = s.to_string();
+            connected = true;
+            source = "iwgetid".into();
         }
     }
 
-    // 2. Fallback: iwgetid
+    // 2. Fallback: nmcli
     if ssid.is_empty() {
-        if let Ok(out) = sentryusb_shell::run("iwgetid", &["-r"]).await {
-            let s = out.trim();
-            if !s.is_empty() {
-                ssid = s.to_string();
-                connected = true;
-                source = "iwgetid".into();
+        if let Ok(out) = sentryusb_shell::run("nmcli", &["-t", "-f", "active,ssid", "dev", "wifi"]).await {
+            for line in out.lines() {
+                if line.starts_with("yes:") {
+                    ssid = line.strip_prefix("yes:").unwrap_or("").to_string();
+                    connected = true;
+                    source = "networkmanager".into();
+                    break;
+                }
             }
         }
     }
@@ -657,9 +653,18 @@ pub async fn get_wifi_config(
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// List snapshot backing files at the top of `/backingfiles/snapshots/`.
+/// One-pass snapshot summary: count plus the oldest/newest `snap.bin`
+/// mtimes (unix seconds).
+struct SnapshotScan {
+    count: usize,
+    oldest_unix: Option<u64>,
+    newest_unix: Option<u64>,
+}
+
+/// Scan the snapshot backing files at the top of `base`
+/// (`/backingfiles/snapshots/` in production).
 ///
-/// The previous implementation called a generic recursive `walkdir` and
+/// The original implementation called a generic recursive `walkdir` and
 /// filtered for paths ending in `snap.bin`. That descended through every
 /// snapshot's `mnt -> /tmp/snapshots/snap-NNN` symlink, which is backed by
 /// an autofs mount (timeout=300s) that re-mounts the per-snapshot vfat loop
@@ -671,11 +676,10 @@ pub async fn get_wifi_config(
 /// Snapshots always have `snap.bin` directly at the top level
 /// (`/backingfiles/snapshots/snap-NNNNNN/snap.bin`). We only need to scan
 /// that one directory level — no recursion, no symlink follow.
-fn find_snapshots() -> Vec<String> {
-    let mut snaps = Vec::new();
-    let base = std::path::Path::new("/backingfiles/snapshots/");
+fn scan_snapshots(base: &std::path::Path) -> SnapshotScan {
+    let mut scan = SnapshotScan { count: 0, oldest_unix: None, newest_unix: None };
     let Ok(entries) = std::fs::read_dir(base) else {
-        return snaps;
+        return scan;
     };
     for entry in entries.flatten() {
         // Only consider entries that are themselves directories on the
@@ -686,17 +690,111 @@ fn find_snapshots() -> Vec<String> {
         if !ft.is_dir() {
             continue;
         }
+        // Numeric `snap-NNNNNN` only, matching what the eviction and
+        // listing paths consider a snapshot; a tooling/scratch directory
+        // that happens to contain a `snap.bin` must not inflate the
+        // count or skew the dashboard's date range.
+        if !entry
+            .file_name()
+            .to_string_lossy()
+            .strip_prefix("snap-")
+            .is_some_and(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
+        {
+            continue;
+        }
         let snap_bin = entry.path().join("snap.bin");
         // Use symlink_metadata to avoid traversing into anything weird;
         // snap.bin is always a regular file on the parent XFS.
-        if std::fs::symlink_metadata(&snap_bin).is_ok() {
-            if let Some(s) = snap_bin.to_str() {
-                snaps.push(s.to_string());
+        if let Ok(meta) = std::fs::symlink_metadata(&snap_bin) {
+            scan.count += 1;
+            // Fold mtimes into min/max — slot names are NOT
+            // time-monotonic, so name-order endpoints would lie.
+            if let Some(t) = meta
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs())
+            {
+                scan.oldest_unix = Some(scan.oldest_unix.map_or(t, |o| o.min(t)));
+                scan.newest_unix = Some(scan.newest_unix.map_or(t, |n| n.max(t)));
             }
         }
     }
-    snaps.sort();
-    snaps
+    scan
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Snapshot slot numbers are NOT time-monotonic in the field: a
+    /// reflash can leave a stale high-numbered snapshot (real Pi:
+    /// snap-000414 from Jul 9 above snap-000413 from Aug 8, numbering
+    /// restarted at 000000 beneath it), which made the dashboard render
+    /// its date range backwards ("7/29 → 7/21"). The scan must report
+    /// the min/max of the actual mtimes, not the mtimes of the lexical
+    /// first/last names.
+    #[test]
+    fn scan_snapshots_range_is_mtime_min_max_not_name_order() {
+        let base = std::env::temp_dir().join(format!(
+            "sentryusb-snap-scan-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        // Codex's regression fixture: names 000000/000413/000414 with
+        // mtimes Jul 29 / Aug 8 / Jul 21 (as unix secs, order scrambled
+        // relative to names).
+        let fixtures = [
+            ("snap-000000", 1_785_300_000u64), // newer than 414, older than 413
+            ("snap-000413", 1_786_200_000u64), // true newest
+            ("snap-000414", 1_784_600_000u64), // true oldest, highest name
+        ];
+        for (name, mtime) in fixtures {
+            let dir = base.join(name);
+            std::fs::create_dir_all(&dir).unwrap();
+            let bin = dir.join("snap.bin");
+            let f = std::fs::File::create(&bin).unwrap();
+            let t = std::time::UNIX_EPOCH + std::time::Duration::from_secs(mtime);
+            f.set_times(std::fs::FileTimes::new().set_modified(t)).unwrap();
+        }
+        // A non-snapshot stray file and an empty dir must not count.
+        std::fs::File::create(base.join("stray.txt")).unwrap();
+        std::fs::create_dir_all(base.join("not-a-snap")).unwrap();
+        // A tooling/scratch dir that happens to hold a `snap.bin` must
+        // not inflate the count or skew the range: its mtime here is
+        // older than every real snapshot, so a leak would show up as a
+        // wrong "oldest" date.
+        let decoy = base.join("snap-backup-old");
+        std::fs::create_dir_all(&decoy).unwrap();
+        let df = std::fs::File::create(decoy.join("snap.bin")).unwrap();
+        df.set_times(
+            std::fs::FileTimes::new()
+                .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000)),
+        )
+        .unwrap();
+
+        let scan = scan_snapshots(&base);
+        let _ = std::fs::remove_dir_all(&base);
+
+        assert_eq!(scan.count, 3);
+        assert_eq!(scan.oldest_unix, Some(1_784_600_000));
+        assert_eq!(scan.newest_unix, Some(1_786_200_000));
+    }
+
+    #[test]
+    fn scan_snapshots_empty_dir_reports_none() {
+        let base = std::env::temp_dir().join(format!(
+            "sentryusb-snap-scan-empty-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let scan = scan_snapshots(&base);
+        let _ = std::fs::remove_dir_all(&base);
+        assert_eq!(scan.count, 0);
+        assert_eq!(scan.oldest_unix, None);
+        assert_eq!(scan.newest_unix, None);
+    }
 }
 
 fn read_fan_speed() -> String {

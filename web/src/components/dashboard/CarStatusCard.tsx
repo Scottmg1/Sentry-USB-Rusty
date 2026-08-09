@@ -10,10 +10,12 @@ import {
   ExpandLessIcon,
   ExpandMoreIcon,
   MusicNoteIcon,
+  WarningIcon,
 } from "@/components/icons"
 import type { TireHistoryResponse } from "./TirePressureCard"
 import type { CurrentCharge } from "@/types/charging"
 import { fmtRangeUnit, fmtToFull } from "@/lib/charge-format"
+import { presentBleHealth, type BleHealth } from "@/lib/bleHealth"
 
 // Lazy-load the chart only when the user expands the Tires chip —
 // recharts (380 KB) stays out of the dashboard's initial bundle for
@@ -49,6 +51,9 @@ export interface CarStatusSample {
 
 interface CarStatusCardProps {
   sample: CarStatusSample | null
+  // Shared backend health keeps the dashboard aligned with Settings.
+  // A rejected key is red; sleep, contention, and stale data are yellow.
+  bleHealth?: BleHealth | null
   // ISO end-time of the most recent drive — used to derive
   // "Parked Xh Ym". When the value is null the duration row is
   // hidden (no drives recorded yet).
@@ -150,6 +155,7 @@ function staleHint(secs: number | null | undefined): string | null {
  */
 export function CarStatusCard({
   sample,
+  bleHealth,
   latestDriveEnd,
   tireHistory,
   useFahrenheit,
@@ -179,7 +185,26 @@ export function CarStatusCard({
     sample?.seconds_ago != null &&
     sample.seconds_ago >= 0 &&
     sample.seconds_ago <= 120
-  const statusLabel = isDriving ? "Driving" : "Parked"
+  const healthPresentation = presentBleHealth(
+    bleHealth,
+    sample?.seconds_ago ?? null,
+  )
+  const showHealthWarning = healthPresentation.severity !== "green"
+  const statusLabel = showHealthWarning
+    ? healthPresentation.label
+    : isDriving
+      ? "Driving"
+      : "Parked"
+  const statusHalo = healthPresentation.severity === "red"
+    ? "halo-red"
+    : healthPresentation.severity === "yellow"
+      ? "halo-amber"
+      : "halo-accent"
+  const statusColor = healthPresentation.severity === "red"
+    ? "text-rose-300"
+    : healthPresentation.severity === "yellow"
+      ? "text-amber-300"
+      : "text-slate-100"
 
   // Derived parked duration. We treat "latest drive ended in the
   // past" as the parked-since timestamp; if there's no recorded
@@ -231,14 +256,30 @@ export function CarStatusCard({
           for the absolutely-positioned chime chip when present so
           long durations / labels can't slide under it. */}
       <div className={"flex items-center gap-3 " + (lockChimeName ? "pr-32 sm:pr-48" : "")}>
-        <span className="tile-icon halo-accent">
-          <DirectionsCarIcon className="h-4 w-4" />
+        <span className={`tile-icon ${statusHalo}`}>
+          {showHealthWarning ? (
+            <WarningIcon className="h-4 w-4" />
+          ) : (
+            <DirectionsCarIcon className="h-4 w-4" />
+          )}
         </span>
         <div className="min-w-0 flex-1">
-          <div className="text-sm font-semibold text-slate-100">{statusLabel}</div>
-          {parkedDuration && (
+          <div className={`text-sm font-semibold ${statusColor}`}>{statusLabel}</div>
+          {showHealthWarning ? (
+            <div className="mt-0.5 text-[11px] leading-relaxed text-slate-400">
+              {healthPresentation.guidance}
+              {healthPresentation.repairRequired && (
+                <Link
+                  to="/settings?tab=Car%20%26%20Network"
+                  className="ml-1 whitespace-nowrap font-medium text-rose-300 hover:text-rose-200"
+                >
+                  Open settings <ChevronRightIcon className="inline h-3 w-3" />
+                </Link>
+              )}
+            </div>
+          ) : parkedDuration ? (
             <div className="text-[11px] text-slate-500">{parkedDuration}</div>
-          )}
+          ) : null}
         </div>
       </div>
 

@@ -489,15 +489,22 @@ pub async fn test_archive(
             if server.is_empty() || user.is_empty() || path.is_empty() {
                 return crate::json_error(StatusCode::BAD_REQUEST, "Missing required rsync fields");
             }
+            // Reject a bad port instead of ignoring it: probing 22 would
+            // report "Connection successful" for a config the archive job
+            // cannot actually use.
+            let port = match sentryusb_config::validate_rsync_ssh_port(&params) {
+                Ok(p) => sentryusb_shell::SshPort::new(p),
+                Err(e) => return crate::json_error(StatusCode::BAD_REQUEST, &e),
+            };
             let target = format!("{}@{}", user, server);
-            let res = sentryusb_shell::run_with_timeout(
-                timeout, "ssh", &[
-                    "-o", "ConnectTimeout=10",
-                    "-o", "StrictHostKeyChecking=no",
-                    "-o", "BatchMode=yes",
-                    &target, "echo", "ok",
-                ],
-            ).await;
+            let mut args: Vec<&str> = vec![
+                "-o", "ConnectTimeout=10",
+                "-o", "StrictHostKeyChecking=no",
+                "-o", "BatchMode=yes",
+            ];
+            args.extend(port.ssh_args());
+            args.extend_from_slice(&[&target, "echo", "ok"]);
+            let res = sentryusb_shell::run_with_timeout(timeout, "ssh", &args).await;
             res.map(|_| ()).map_err(|e| e.to_string())
         }
         "rclone" => {

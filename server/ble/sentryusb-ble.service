@@ -22,8 +22,14 @@ Type=simple
 # cycle is active, awake_stop's GATT-restore flow depends on the lock
 # being present.  Wiping a fresh lock leaves the GATT daemon down until
 # the next Pi reboot.
-ExecStartPre=-/bin/bash -c 'f=/tmp/ble_keep_awake_active; [ -e "$f" ] && [ $(( $(date +%s) - $(stat -c %Y "$f" 2>/dev/null || echo 0) )) -gt 86400 ] && rm -f "$f"; exit 0'
-ExecStartPre=/usr/sbin/rfkill unblock bluetooth
+# %% doubled: systemd expands bare % as unit specifiers (%s = user shell),
+# which silently garbled this command on every board.
+ExecStartPre=-/bin/bash -c 'f=/tmp/ble_keep_awake_active; [ -e "$f" ] && [ $(( $(date +%%s) - $(stat -c %%Y "$f" 2>/dev/null || echo 0) )) -gt 86400 ] && rm -f "$f"; exit 0'
+# Via shell + PATH, failure-tolerant: rfkill's location varies by distro
+# (/usr/sbin vs /usr/bin) and some boards don't ship it at all. A hard
+# /usr/sbin path 203/EXECs the whole unit into the start limit before
+# the daemon ever runs.
+ExecStartPre=-/bin/bash -c 'command -v rfkill >/dev/null 2>&1 && rfkill unblock bluetooth || true'
 # Bring up all detected hci adapters (onboard + any USB dongles), not
 # just hci0 — when the user has configured BLE_ADAPTER=hci1 in
 # sentryusb.conf the Python script will pick that one, but the
