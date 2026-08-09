@@ -43,9 +43,12 @@ fn home_geofence() -> Option<(f64, f64, f64)> {
     let config_path = sentryusb_config::find_config_path();
     let (active, commented) = sentryusb_config::parse_file(config_path).ok()?;
     let g = |k: &str| sentryusb_config::get_config_value(&active, &commented, k);
+    // Range-checked, not merely finite: a stray KEEP_ACCESSORY_HOME_LAT=1000
+    // would otherwise yield a garbage distance rather than being rejected.
+    // Also subsumes the finite check — NaN and infinities fail `contains`.
     let lat = g("KEEP_ACCESSORY_HOME_LAT")
         .and_then(|s| s.trim().parse::<f64>().ok())
-        .filter(|v| v.is_finite())?;
+        .filter(|v| (-90.0..=90.0).contains(v))?;
     let lon = g("KEEP_ACCESSORY_HOME_LON")
         .and_then(|s| s.trim().parse::<f64>().ok())
         .filter(|v| v.is_finite())
@@ -707,6 +710,12 @@ type LatestSample = (
     Option<f64>,          // tire_rr_psi
     Option<f64>,          // odometer_mi
     Option<String>,       // location_name
+    // Coordinates ride the cache because they are plain DB columns. They are
+    // NEVER serialized — only the derived `at_home` bool is. The geofence
+    // itself is read outside the cache, so moving home still takes effect on
+    // the next request even though the fix behind it may be up to 10s old.
+    Option<f64>,          // latitude
+    Option<f64>,          // longitude
     Option<i64>,          // body_controller ts
 );
 
@@ -900,12 +909,19 @@ pub async fn ble_latest_sample(
             // Privacy-safe "at home" signal: is the car's latest fix inside the
             // configured home geofence? Lets the app show a "Home" label without
             // exposing the address. False when no home is set or there's no GPS.
-            let at_home = match (latitude, longitude, home_geofence()) {
-                (Some(la), Some(lo), Some((hla, hlo, r))) => {
-                    distance_m(la, crate::normalize_lon(lo), hla, hlo) <= r
-                }
-                _ => false,
-            };
+            // `home_geofence()` reads and parses the config file, so it is called
+            // only once there is a fix to test against — a tuple pattern would
+            // evaluate it on every request and discard the result whenever GPS is
+            // absent, which is the common case. Kept outside the sample cache on
+            // purpose: a changed home location then applies on the next request
+            // instead of waiting out the TTL.
+            let at_home = latitude
+                .zip(longitude)
+                .and_then(|(la, lo)| {
+                    home_geofence()
+                        .map(|(hla, hlo, r)| distance_m(la, crate::normalize_lon(lo), hla, hlo) <= r)
+                })
+                .unwrap_or(false);
             (
             StatusCode::OK,
             Json(serde_json::json!({
