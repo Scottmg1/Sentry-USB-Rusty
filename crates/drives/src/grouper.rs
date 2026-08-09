@@ -4286,6 +4286,34 @@ mod tests {
             "map path must not admit what the summary path cannot see",
         );
         assert!(groups[0][0].route.file.starts_with("RecentClips/"));
+
+        // Prove PARITY, not just the map path's verdict: build the same
+        // timeline as summaries (which structurally cannot carry
+        // gear_states) and assert both groupers agree on drive count.
+        let mut states_only_summary = clip_with_gear_runs(
+            "SentryClips/2026-05-28_14-05-00/2026-05-28_14-00-00-front.mp4",
+            &[(1, 60)],
+            400.0,
+        );
+        states_only_summary.gear_runs = Vec::new(); // same legacy shape
+        states_only_summary.raw_park_count = 0;
+        states_only_summary.raw_frame_count = 60;
+        let summaries = vec![
+            clip_with_gear_runs(
+                "RecentClips/2026-05-28/2026-05-28_10-00-00-front.mp4",
+                &[(1, 60)],
+                500.0,
+            ),
+            states_only_summary,
+        ];
+        let summary_groups = group_summary_clips(&summaries);
+        assert_eq!(
+            summary_groups.len(),
+            groups.len(),
+            "list and map must agree on unanchored admission: map={} list={}",
+            groups.len(),
+            summary_groups.len(),
+        );
     }
 
     #[test]

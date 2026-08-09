@@ -479,6 +479,59 @@ pub const MUTABLE_DIRTY_TABLE: &[&str] = &[
 
 /// Bring the DB up to `CURRENT_SCHEMA_VERSION`. Safe on every open â€”
 /// idempotent by construction.
+/// Create a PERFORMANCE index, tolerating operational failures.
+///
+/// Index DDL used to propagate, which aborts `migrate()`, which fails
+/// `DriveStore::open()`, at which point the daemon falls back to an empty
+/// in-memory store: the user's entire drive history looks gone and that
+/// boot's ingest is discarded on reboot. The likeliest trigger is
+/// `SQLITE_FULL` on a nearly-full disk — precisely the condition
+/// free-space management exists to resolve — so "the disk is filling up"
+/// could present as "all my drives vanished".
+///
+/// Indexes are pure performance: without one, queries stay CORRECT and
+/// only get slower, so a resource failure must not cost the store. But
+/// this is deliberately NOT a catch-all: a corrupt database or a
+/// malformed statement is a real defect and must still abort migration
+/// rather than let the daemon limp along on a damaged file.
+fn try_create_index(conn: &Connection, stmt: &str, name: &str) -> Result<()> {
+    use rusqlite::ErrorCode;
+    match conn.execute(stmt, []) {
+        Ok(_) => Ok(()),
+        Err(e) => {
+            let code = match &e {
+                rusqlite::Error::SqliteFailure(err, _) => Some(err.code),
+                _ => None,
+            };
+            // Operational/resource conditions: transient or
+            // environmental, and recoverable on a later boot.
+            let operational = matches!(
+                code,
+                Some(
+                    ErrorCode::DiskFull
+                        | ErrorCode::DatabaseBusy
+                        | ErrorCode::DatabaseLocked
+                        | ErrorCode::ReadOnly
+                        | ErrorCode::SystemIoFailure
+                        | ErrorCode::OutOfMemory
+                )
+            );
+            if operational {
+                tracing::error!(
+                    "schema: could not create {} ({e}); continuing without it — \
+                     queries stay correct, just slower. This usually means the \
+                     disk is full or busy; the index is retried on the next boot.",
+                    name
+                );
+                Ok(())
+            } else {
+                // DatabaseCorrupt, NotADatabase, malformed SQL, etc.
+                Err(e).with_context(|| format!("migrate: creating {}", name))
+            }
+        }
+    }
+}
+
 pub fn migrate(conn: &Connection) -> Result<()> {
     for stmt in V1_SCHEMA {
         conn.execute(stmt, [])
@@ -572,14 +625,9 @@ pub fn migrate(conn: &Connection) -> Result<()> {
             .with_context(|| format!("migrate: adding telemetry_samples.{}", name))?;
     }
 
-    // v3 partial index. Idempotent. Best-effort like the loop below —
-    // an index is pure performance and must never cost the store.
-    if let Err(e) = conn.execute(V3_CLOUD_PENDING_INDEX, []) {
-        tracing::error!(
-            "schema: could not create idx_routes_cloud_pending ({e}); \
-             continuing without it (queries stay correct, just slower)"
-        );
-    }
+    // v3 partial index. Idempotent, and best-effort — see
+    // `try_create_index`.
+    try_create_index(conn, V3_CLOUD_PENDING_INDEX, "idx_routes_cloud_pending")?;
 
     // Partial indexes for cloud-status counts and charge queries.
     // Idempotent, but the FIRST build on a grown DB (hundreds of MB)
@@ -591,31 +639,20 @@ pub fn migrate(conn: &Connection) -> Result<()> {
         (CLOUD_ROUTE_ID_INDEX, "idx_routes_cloud_route_id"),
         (TELEMETRY_TIRE_INDEX, "idx_telemetry_tire_ts"),
     ] {
-        let exists: i64 = conn.query_row(
-            "SELECT count(*) FROM sqlite_master WHERE type='index' AND name=?1",
-            [name],
-            |r| r.get(0),
-        )?;
+        // Existence probe is for LOGGING only — never fail migration on
+        // it. Treat an unreadable catalog as "unknown" and carry on; the
+        // CREATE below is idempotent either way.
+        let exists: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE type='index' AND name=?1",
+                [name],
+                |r| r.get(0),
+            )
+            .unwrap_or(1);
         if exists == 0 {
             tracing::info!("schema: building {} (one-time, may take a while on a large DB)", name);
         }
-        // BEST-EFFORT, deliberately not `?`. These are pure performance
-        // indexes, but a failure here used to abort migrate(), which
-        // fails DriveStore::open(), which makes the daemon fall back to
-        // an EMPTY IN-MEMORY store — the user's whole drive history
-        // appears gone and that boot's ingest is discarded on reboot.
-        // The likeliest trigger is SQLITE_FULL on a nearly-full disk,
-        // i.e. exactly the condition free-space management exists to
-        // resolve, so the old behavior turned "disk is filling up" into
-        // "all your drives vanished". Table/column DDL and data
-        // migrations above stay fail-hard: those are correctness.
-        if let Err(e) = conn.execute(stmt, []) {
-            tracing::error!(
-                "schema: could not create {} ({e}); continuing without it \
-                 (queries stay correct, just slower)",
-                name
-            );
-        }
+        try_create_index(conn, stmt, name)?;
     }
 
     // v5 data cleanup: purge SavedClips/SentryClips routes that pre-v5

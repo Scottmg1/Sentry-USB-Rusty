@@ -358,6 +358,18 @@ apply_backingfiles_bfq() {
     [ -n "${src:-}" ] || { log "bfq: /backingfiles not mounted — udev rule will cover next boot"; return 0; }
     disk="$(lsblk -n -o PKNAME "$src" 2>/dev/null | head -1)"
     [ -n "$disk" ] || disk="$(basename "$src" | sed 's/[0-9]*$//')"
+    # Same device-class gate the udev rule above uses (sd*/mmcblk*).
+    # Without it the LIVE switch would happily set bfq on an NVMe that
+    # the rule deliberately excludes — bfq's fairness machinery costs
+    # more than it returns on a device that fast — leaving the scheduler
+    # inconsistent with the documented policy until the next reboot.
+    case "$disk" in
+        sd[a-z]|mmcblk[0-9]) ;;
+        *)
+            log "bfq: $disk is not sd*/mmcblk* (NVMe?) — excluded by design, leaving its scheduler alone"
+            return 0
+            ;;
+    esac
     sched="/sys/block/$disk/queue/scheduler"
     if [ -w "$sched" ]; then
         if grep -q '\[bfq\]' "$sched"; then

@@ -189,8 +189,41 @@ async fn main() {
     let store = match sentryusb_drives::DriveStore::open(db_path) {
         Ok(s) => Arc::new(s),
         Err(e) => {
-            // Try in-memory if DB path doesn't work (e.g., on dev machine)
-            tracing::warn!("Failed to open drive DB at {}: {}. Using in-memory.", db_path, e);
+            // Dev machines have no /backingfiles, so in-memory is the
+            // correct fallback there. On a REAL device the same fallback
+            // silently serves an empty history and makes that boot's
+            // ingest ephemeral — indistinguishable, in the UI, from
+            // "all my drives were deleted". Log accordingly so the
+            // journal names the actual condition instead of a passing
+            // warning. (Deliberately still non-fatal: exiting would
+            // crash-loop the daemon under systemd's Restart=always and
+            // take the web UI with it, leaving no way to free space or
+            // run recovery on a device that is merely full. Making this
+            // fatal is a real product tradeoff — data-truth versus
+            // remote access — and is tracked separately.)
+            let looks_like_device = std::path::Path::new(db_path)
+                .parent()
+                .is_some_and(|p| p.exists());
+            if looks_like_device {
+                tracing::error!(
+                    "Failed to open drive DB at {}: {}. SERVING AN EMPTY IN-MEMORY STORE: \
+                     the on-disk history is still there, but this boot shows no drives and \
+                     anything ingested now is lost on reboot. Most often the disk is full \
+                     or the DB is locked — free space and restart.",
+                    db_path,
+                    e
+                );
+            } else {
+                tracing::warn!(
+                    "Failed to open drive DB at {}: {}. Using in-memory (no {} — dev machine?).",
+                    db_path,
+                    e,
+                    std::path::Path::new(db_path)
+                        .parent()
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_default()
+                );
+            }
             Arc::new(sentryusb_drives::DriveStore::open_memory().expect("failed to create in-memory DB"))
         }
     };
