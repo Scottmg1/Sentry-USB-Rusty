@@ -128,6 +128,19 @@ impl<R: Read + Seek> XfsFs<R> {
         Ok(dinode.fsize() as u64)
     }
 
+    /// Inode mtime. Used to order snapshots by when their image was
+    /// actually frozen: `snap-NNNNNN` slot numbers are not
+    /// time-monotonic in the field (a reflash can leave a stale
+    /// high-numbered snapshot above a restarted sequence).
+    pub fn file_mtime(&mut self, path: &Path) -> Result<std::time::SystemTime> {
+        let (ino, dinode) = self.dinode_at(path)?;
+        let attr = dinode
+            .di_core
+            .stat(ino)
+            .map_err(|e| anyhow!("stat {path:?}: errno {e}"))?;
+        Ok(attr.mtime)
+    }
+
     fn read_at(&mut self, dinode: &mut Dinode, offset: u64, len: usize) -> Result<Vec<u8>> {
         self.device.set_bufsize(self.sb.sb_blocksize as usize);
         let (buf, ignore) = dinode
