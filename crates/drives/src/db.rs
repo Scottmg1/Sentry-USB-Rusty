@@ -232,6 +232,13 @@ pub struct DriveStore {
     /// Cached `/api/drives/routes` overview JSON; rebuilt lazily on the first
     /// request after a route mutation.
     route_overview_cache: Mutex<Option<RouteOverviewCache>>,
+    /// Serializes overview rebuilds. Without it, concurrent cold misses
+    /// each ran the full-store decode — the single heaviest allocation in
+    /// the process — so two map requests during an archive could stack
+    /// hundreds of MB and OOM a 1GB board. The drive-list caches have had
+    /// `rebuild_lock` for this reason; the overview path never got one.
+    /// Lock order: this BEFORE `route_overview_cache`, never the reverse.
+    overview_rebuild_lock: Mutex<()>,
     /// Bumped on every route mutation. New mutation paths must bump it too.
     route_overview_gen: AtomicU64,
 }
@@ -286,6 +293,7 @@ impl DriveStore {
             drive_cache_dirty: AtomicBool::new(true),
             rebuild_lock: Mutex::new(()),
             route_overview_cache: Mutex::new(None),
+            overview_rebuild_lock: Mutex::new(()),
             route_overview_gen: AtomicU64::new(0),
         };
 
@@ -313,6 +321,7 @@ impl DriveStore {
             drive_cache_dirty: AtomicBool::new(false),
             rebuild_lock: Mutex::new(()),
             route_overview_cache: Mutex::new(None),
+            overview_rebuild_lock: Mutex::new(()),
             route_overview_gen: AtomicU64::new(0),
         };
         // Still run migrate + backfill so tests exercise the real schema.
@@ -1822,6 +1831,22 @@ impl DriveStore {
                 }
             }
         }
+        // Single-flight. The rebuild below decodes every route in the
+        // store; letting two requests do that concurrently multiplies the
+        // process's largest allocation.
+        let _rebuild = self.overview_rebuild_lock.lock().unwrap();
+
+        // Re-check: whoever held the lock may have just built exactly
+        // what this request wants.
+        {
+            let cache = self.route_overview_cache.lock().unwrap();
+            if let Some(c) = cache.as_ref() {
+                if c.max_points == max_points && c.generation == generation {
+                    return Ok(c.json.clone());
+                }
+            }
+        }
+
         let routes = self.with_read_conn(select_all_routes)?;
         let overviews = crate::grouper::route_overviews(routes, max_points);
         let json = serde_json::to_string(&overviews).unwrap_or_else(|_| "[]".to_string());
