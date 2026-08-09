@@ -72,6 +72,13 @@ const ARCHIVE_SYNC_ROUTE_COUNT_KEY: &str = "archive_sync_route_count";
 /// archive backup would never pick up new charging history until the
 /// next drive.
 const ARCHIVE_SYNC_SAMPLE_COUNT_KEY: &str = "archive_sync_sample_count";
+
+/// Meta key: UTC date (`YYYY-MM-DD`) of the last successful archive JSON
+/// export. Gates the multi-minute full-history export to once per day —
+/// same rationale as the daily drive-DB backup gate; on a grown DB the
+/// per-archive-cycle export was a disk storm with no recovery-granularity
+/// gain (rsync ships whole-file anyway; same-day copies overwrite).
+const ARCHIVE_SYNC_EXPORT_DATE_KEY: &str = "archive_sync_export_date";
 // Bump on every drive-list-shape change so existing on-disk caches
 // rebuild on first boot after upgrade.
 //
@@ -324,24 +331,73 @@ impl DriveStore {
     /// Holds the same connection mutex everything else uses, so callers
     /// share WAL serialization with `add_route` / `save` / etc. Keep the
     /// closure short — long-running work blocks all other DB I/O.
+    #[track_caller]
     pub fn with_locked_conn<R>(&self, f: impl FnOnce(&Connection) -> R) -> R {
+        let caller = std::panic::Location::caller();
+        let t0 = std::time::Instant::now();
         let guard = self.conn.lock().unwrap();
-        f(&guard)
+        let waited = t0.elapsed();
+        let t1 = std::time::Instant::now();
+        let out = f(&guard);
+        drop(guard);
+        log_slow_conn("writer", caller, waited, t1.elapsed());
+        out
     }
 
     /// Run a SELECT-only closure on a read-only connection. Under WAL
     /// these see the last committed state and never queue behind the
     /// writer mutex — the processor can batch-ingest clips while API
-    /// reads keep answering. Round-robin over two handles so one slow
-    /// scan doesn't serialize every other read. `:memory:` stores (tests)
-    /// fall back to the writer connection.
+    /// reads keep answering. Tries every handle before blocking so one
+    /// slow scan doesn't head-of-line-block half the reads behind a
+    /// blind round-robin pick. `:memory:` stores (tests) fall back to
+    /// the writer connection.
+    #[track_caller]
     pub fn with_read_conn<R>(&self, f: impl FnOnce(&Connection) -> R) -> R {
+        let caller = std::panic::Location::caller();
         if self.read_conns.is_empty() {
-            return self.with_locked_conn(f);
+            let t0 = std::time::Instant::now();
+            let guard = self.conn.lock().unwrap();
+            let waited = t0.elapsed();
+            let t1 = std::time::Instant::now();
+            let out = f(&guard);
+            drop(guard);
+            log_slow_conn("writer(fallback)", caller, waited, t1.elapsed());
+            return out;
         }
-        let idx = self.read_rr.fetch_add(1, Ordering::Relaxed) as usize % self.read_conns.len();
-        let guard = self.read_conns[idx].lock().unwrap();
-        f(&guard)
+        let start = self.read_rr.fetch_add(1, Ordering::Relaxed) as usize;
+        let n = self.read_conns.len();
+        let t0 = std::time::Instant::now();
+        let guard = 'pick: {
+            for offset in 0..n {
+                if let Ok(g) = self.read_conns[(start + offset) % n].try_lock() {
+                    break 'pick g;
+                }
+            }
+            self.read_conns[start % n].lock().unwrap()
+        };
+        let waited = t0.elapsed();
+        let t1 = std::time::Instant::now();
+        let out = f(&guard);
+        drop(guard);
+        log_slow_conn("read", caller, waited, t1.elapsed());
+        out
+    }
+
+    /// `VACUUM INTO dest` on a DEDICATED connection — SQLite takes only a
+    /// read snapshot of the source, so the daily backup no longer seizes
+    /// the writer mutex for the whole multi-minute copy of a grown DB.
+    /// `:memory:` stores fall back to the shared connection (tests).
+    pub fn vacuum_into(&self, dest: &str) -> Result<()> {
+        if self.path == ":memory:" {
+            return self.with_locked_conn(|conn| {
+                conn.execute("VACUUM INTO ?1", params![dest]).map(|_| ())
+            })
+            .map_err(Into::into);
+        }
+        let conn = Connection::open(&self.path)?;
+        conn.execute_batch("PRAGMA busy_timeout = 5000;")?;
+        conn.execute("VACUUM INTO ?1", params![dest])?;
+        Ok(())
     }
 
     /// Mark the start/end of a processor bulk-ingest pass. While set,
@@ -1505,17 +1561,23 @@ impl DriveStore {
         // sync (samples cover charging-only days). Tag-only edits don't
         // bump either count and stay stale for one cycle — same accepted
         // trade-off as the shell's drives_count check.
-        let (samples_now, last_synced, last_synced_samples) = {
-            let conn = self.conn.lock().unwrap();
-            let samples: i64 = conn
-                .query_row("SELECT COUNT(*) FROM telemetry_samples", [], |r| r.get(0))
-                .unwrap_or(0);
-            let routes: Option<i64> =
-                schema::meta_get(&conn, ARCHIVE_SYNC_ROUTE_COUNT_KEY)?.and_then(|s| s.parse().ok());
-            let samples_baseline: Option<i64> = schema::meta_get(&conn, ARCHIVE_SYNC_SAMPLE_COUNT_KEY)?
-                .and_then(|s| s.parse().ok());
-            (samples, routes, samples_baseline)
-        };
+        // Read pool, not the writer: this runs at the tail of every
+        // processing pass and the COUNT walks the whole samples table.
+        // A COUNT failure propagates — treating it as 0 would spuriously
+        // mismatch the baseline and trigger a full multi-minute export.
+        let (samples_now, last_synced, last_synced_samples, last_export_date) =
+            self.with_read_conn(|conn| -> Result<_> {
+                let samples: i64 = conn
+                    .query_row("SELECT COUNT(*) FROM telemetry_samples", [], |r| r.get(0))
+                    .context("sync_to_archive: telemetry count")?;
+                let routes: Option<i64> = schema::meta_get(conn, ARCHIVE_SYNC_ROUTE_COUNT_KEY)?
+                    .and_then(|s| s.parse().ok());
+                let samples_baseline: Option<i64> =
+                    schema::meta_get(conn, ARCHIVE_SYNC_SAMPLE_COUNT_KEY)?
+                        .and_then(|s| s.parse().ok());
+                let export_date = schema::meta_get(conn, ARCHIVE_SYNC_EXPORT_DATE_KEY)?;
+                Ok((samples, routes, samples_baseline, export_date))
+            })?;
         if last_synced == Some(routes_now)
             && last_synced_samples == Some(samples_now)
             && Path::new(archive).exists()
@@ -1527,12 +1589,25 @@ impl DriveStore {
             return Ok(());
         }
 
+        // Daily gate: counts moved, but an export already ran today. The
+        // count baselines are deliberately NOT advanced, so tomorrow's
+        // first pass exports everything accumulated since this one.
+        let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+        if last_export_date.as_deref() == Some(today.as_str()) && Path::new(archive).exists() {
+            info!(
+                "[drives] archive_json_export_skipped reason=already_today date={}",
+                today
+            );
+            return Ok(());
+        }
+
         self.export_json_to_file(mirror)?;
         sync_to_path(mirror, archive, cache)?;
 
         let conn = self.conn.lock().unwrap();
         schema::meta_set(&conn, ARCHIVE_SYNC_ROUTE_COUNT_KEY, &routes_now.to_string())?;
         schema::meta_set(&conn, ARCHIVE_SYNC_SAMPLE_COUNT_KEY, &samples_now.to_string())?;
+        schema::meta_set(&conn, ARCHIVE_SYNC_EXPORT_DATE_KEY, &today)?;
         Ok(())
     }
 
@@ -1802,6 +1877,28 @@ impl DriveStore {
 // -----------------------------------------------------------------------------
 // SQL helpers (private)
 // -----------------------------------------------------------------------------
+
+/// Journal a DB access whose mutex wait or closure runtime crossed
+/// 100ms — separates "slow SQL" from "queued behind the writer" from
+/// "queued behind another read" without a profiler on the Pi.
+fn log_slow_conn(
+    kind: &str,
+    caller: &'static std::panic::Location<'static>,
+    waited: std::time::Duration,
+    ran: std::time::Duration,
+) {
+    const SLOW: std::time::Duration = std::time::Duration::from_millis(100);
+    if waited >= SLOW || ran >= SLOW {
+        warn!(
+            "slow_db conn={} wait_ms={} run_ms={} at={}:{}",
+            kind,
+            waited.as_millis(),
+            ran.as_millis(),
+            caller.file(),
+            caller.line(),
+        );
+    }
+}
 
 fn open_connection(path: &str) -> Result<Connection> {
     let conn = Connection::open(path)?;
@@ -3841,6 +3938,14 @@ mod tests {
             .unwrap();
     }
 
+    /// Pretend the last archive JSON export ran long ago so the daily
+    /// gate lets the next sync through.
+    fn rewind_export_date(store: &DriveStore) {
+        store.with_locked_conn(|conn| {
+            schema::meta_set(conn, ARCHIVE_SYNC_EXPORT_DATE_KEY, "2000-01-01").unwrap();
+        });
+    }
+
     #[test]
     fn archive_sync_pushes_then_skips_until_new_routes() {
         let dir = TmpDir::new("push-skip");
@@ -3860,8 +3965,14 @@ mod tests {
         store.sync_to_archive_at(&mirror, &archive, &cache).unwrap();
         assert_eq!(std::fs::read_to_string(&archive).unwrap(), "sentinel");
 
-        // New route moves the baseline: archive rewritten.
+        // New route same day: counts moved but the daily gate holds —
+        // archive untouched, baselines not advanced.
         add_test_route(&store, "a/2025-01-15_11-00-00-front.mp4");
+        store.sync_to_archive_at(&mirror, &archive, &cache).unwrap();
+        assert_eq!(std::fs::read_to_string(&archive).unwrap(), "sentinel");
+
+        // Next day: the deferred route exports.
+        rewind_export_date(&store);
         store.sync_to_archive_at(&mirror, &archive, &cache).unwrap();
         let repushed = std::fs::read_to_string(&archive).unwrap();
         assert_ne!(repushed, "sentinel");
@@ -3880,7 +3991,8 @@ mod tests {
         add_test_route(&store, "a/2025-01-15_10-00-00-front.mp4");
         store.sync_to_archive_at(&mirror, &archive, &cache).unwrap();
 
-        // No new routes, but the sampler wrote a row: archive rewritten.
+        // No new routes, but the sampler wrote a row: archive rewritten
+        // (once past the daily gate).
         std::fs::write(&archive, "sentinel").unwrap();
         store.with_locked_conn(|conn| {
             conn.execute(
@@ -3889,6 +4001,7 @@ mod tests {
             )
             .unwrap();
         });
+        rewind_export_date(&store);
         store.sync_to_archive_at(&mirror, &archive, &cache).unwrap();
         let repushed = std::fs::read_to_string(&archive).unwrap();
         assert_ne!(repushed, "sentinel");

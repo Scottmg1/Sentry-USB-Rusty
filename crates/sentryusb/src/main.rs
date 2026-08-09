@@ -400,6 +400,12 @@ async fn main() {
         auth,
         sentryusb_api::auth::auth_middleware,
     ));
+
+    // Slow-request journal — outermost, so its timing covers auth +
+    // compression + handler and login slowness is visible too.
+    app = app.layer(axum::middleware::from_fn(
+        sentryusb_api::router::slow_request_log,
+    ));
     phase!("router_built");
 
     let addr = std::net::SocketAddr::from((std::net::Ipv6Addr::UNSPECIFIED, args.port));

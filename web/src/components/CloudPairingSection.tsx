@@ -66,11 +66,14 @@ export default function CloudPairingSection({ compact = false }: Props) {
 
     function scheduleNext(data: CloudStatus | null) {
       if (timer) clearTimeout(timer)
-      const fast =
+      // Pairing handshake stays at 1s (interactive, short-lived); an
+      // upload backlog polls at 3s — backlogs run for minutes and the
+      // 1s cadence was a measurable load amplifier on the Pi.
+      const pairing =
         data?.pairingState === "handshaking" ||
-        data?.pairingState === "polling" ||
-        (data?.paired && data.pendingRouteCount > 0)
-      timer = setTimeout(refetch, fast ? 1000 : 30000)
+        data?.pairingState === "polling"
+      const uploading = data?.paired && data.pendingRouteCount > 0
+      timer = setTimeout(refetch, pairing ? 1000 : uploading ? 3000 : 30000)
     }
 
     refetch()

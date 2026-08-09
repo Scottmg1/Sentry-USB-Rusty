@@ -194,6 +194,29 @@ const V3_CLOUD_PENDING_INDEX: &str =
     "CREATE INDEX IF NOT EXISTS idx_routes_cloud_pending \
      ON routes(cloud_uploaded_at) WHERE cloud_uploaded_at IS NULL";
 
+/// Positive counterpart: `upload_summary`'s COUNT/MAX over uploaded rows
+/// was a full-table scan once the table outgrew its design size (a user
+/// DB measured 29.8k routes).
+const CLOUD_UPLOADED_INDEX: &str =
+    "CREATE INDEX IF NOT EXISTS idx_routes_cloud_uploaded \
+     ON routes(cloud_uploaded_at) WHERE cloud_uploaded_at > 0";
+
+/// Charge-signal rows are a small fraction of `telemetry_samples` (48k of
+/// 308k on the same measured DB), but `current_charging` reverse-scans and
+/// `load_charge_rows` filters the whole table without this. The predicate
+/// must match those queries verbatim for SQLite to use the partial index.
+const TELEMETRY_CHARGE_INDEX: &str =
+    "CREATE INDEX IF NOT EXISTS idx_telemetry_charge_ts \
+     ON telemetry_samples(ts) \
+     WHERE charging_state IS NOT NULL \
+        OR charger_power_kw IS NOT NULL \
+        OR charge_rate_mph IS NOT NULL";
+
+/// `route_sync_info_by_cloud_id` reverse lookup (cloud sync pull).
+const CLOUD_ROUTE_ID_INDEX: &str =
+    "CREATE INDEX IF NOT EXISTS idx_routes_cloud_route_id \
+     ON routes(cloud_route_id) WHERE cloud_route_id IS NOT NULL";
+
 /// v4 Tessie provenance columns. Preserves `source`, `externalSignature`,
 /// and `tessieAutopilotPercent` through SQLite on import/export so a
 /// round-trip with Sentry-Drive's `drive-data.json` is lossless.
@@ -538,6 +561,27 @@ pub fn migrate(conn: &Connection) -> Result<()> {
     // v3 partial index. Idempotent.
     conn.execute(V3_CLOUD_PENDING_INDEX, [])
         .context("migrate: creating idx_routes_cloud_pending")?;
+
+    // Partial indexes for cloud-status counts and charge queries.
+    // Idempotent, but the FIRST build on a grown DB (hundreds of MB)
+    // can take tens of seconds — log so a slow upgrade boot explains
+    // itself in the journal.
+    for (stmt, name) in [
+        (CLOUD_UPLOADED_INDEX, "idx_routes_cloud_uploaded"),
+        (TELEMETRY_CHARGE_INDEX, "idx_telemetry_charge_ts"),
+        (CLOUD_ROUTE_ID_INDEX, "idx_routes_cloud_route_id"),
+    ] {
+        let exists: i64 = conn.query_row(
+            "SELECT count(*) FROM sqlite_master WHERE type='index' AND name=?1",
+            [name],
+            |r| r.get(0),
+        )?;
+        if exists == 0 {
+            tracing::info!("schema: building {} (one-time, may take a while on a large DB)", name);
+        }
+        conn.execute(stmt, [])
+            .with_context(|| format!("migrate: creating {}", name))?;
+    }
 
     // v5 data cleanup: purge SavedClips/SentryClips routes that pre-v5
     // scans wrote. Gated on the stored schema_version so we only pay the

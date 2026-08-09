@@ -32,6 +32,50 @@ const SAVE_EVERY: usize = 50;
 /// of unreadable files).
 const MAX_ERROR_MESSAGES: usize = 200;
 
+/// Per-candidate result of the summon re-read (see `do_check_summon`).
+struct SummonClipOutcome {
+    scanned: bool,
+    updated: bool,
+    missing: bool,
+}
+
+/// Sync body of one summon-check candidate: re-extract, and refresh the
+/// stored row when the SEI stream yielded flag evidence. Blocking pool.
+fn summon_one_clip(store: &DriveStore, file: &str, full_path: &str) -> SummonClipOutcome {
+    match extract::extract_gps_from_file(full_path) {
+        Ok(gps) => {
+            // Mirrors the JS `extracted.flags.length > 0` gate:
+            // a clip whose SEI stream yielded nothing can't
+            // improve evidence — leave the stored row alone.
+            let mut updated = false;
+            if gps.raw_frame_count > 0 {
+                let date: &str = file.split('/').next().unwrap_or("");
+                match store.add_route(
+                    file,
+                    date,
+                    &gps.points,
+                    &gps.gear_states,
+                    &gps.autopilot_states,
+                    &gps.speeds,
+                    &gps.accel_positions,
+                    gps.raw_park_count,
+                    gps.raw_frame_count,
+                    &gps.gear_runs,
+                    &gps.flag_runs,
+                ) {
+                    Ok(()) => updated = true,
+                    Err(e) => warn!("check summon: save failed for {}: {}", file, e),
+                }
+            }
+            SummonClipOutcome { scanned: true, updated, missing: false }
+        }
+        Err(e) => {
+            warn!("check summon: extract failed for {}: {}", file, e);
+            SummonClipOutcome { scanned: false, updated: false, missing: true }
+        }
+    }
+}
+
 /// Sets the store's bulk-ingest flag for a scope; clears it on drop.
 struct BulkIngestGuard(Arc<DriveStore>);
 
@@ -283,6 +327,10 @@ impl Processor {
     }
 
     async fn do_check_summon(&self) -> Result<SummonCheckOutcome> {
+        // Same cache-debounce treatment as do_process — every refreshed
+        // row re-dirties the drive caches.
+        let _bulk = BulkIngestGuard::new(self.store.clone());
+
         let cands = self
             .store
             .with_route_summaries(crate::grouper::summon_check_candidates)?;
@@ -316,37 +364,19 @@ impl Processor {
                 continue;
             }
 
-            match extract::extract_gps_from_file(&full_path) {
-                Ok(gps) => {
-                    scanned += 1;
-                    // Mirrors the JS `extracted.flags.length > 0` gate:
-                    // a clip whose SEI stream yielded nothing can't
-                    // improve evidence — leave the stored row alone.
-                    if gps.raw_frame_count > 0 {
-                        let date: &str = file.split('/').next().unwrap_or("");
-                        match self.store.add_route(
-                            file,
-                            date,
-                            &gps.points,
-                            &gps.gear_states,
-                            &gps.autopilot_states,
-                            &gps.speeds,
-                            &gps.accel_positions,
-                            gps.raw_park_count,
-                            gps.raw_frame_count,
-                            &gps.gear_runs,
-                            &gps.flag_runs,
-                        ) {
-                            Ok(()) => updated += 1,
-                            Err(e) => warn!("check summon: save failed for {}: {}", file, e),
-                        }
-                    }
-                }
-                Err(e) => {
-                    warn!("check summon: extract failed for {}: {}", file, e);
-                    missing += 1;
-                }
-            }
+            // Blocking pool, same as do_process — sync extract + DB write
+            // must not pin an async worker for the whole candidate sweep.
+            let store = self.store.clone();
+            let clip_file = file.clone();
+            let clip_path = full_path.clone();
+            let outcome = tokio::task::spawn_blocking(move || {
+                summon_one_clip(&store, &clip_file, &clip_path)
+            })
+            .await
+            .unwrap_or(SummonClipOutcome { scanned: false, updated: false, missing: true });
+            scanned += outcome.scanned as usize;
+            updated += outcome.updated as usize;
+            missing += outcome.missing as usize;
 
             // Same WAL + Pi-CPU hygiene as `do_process`.
             if (i + 1) % SAVE_EVERY == 0
