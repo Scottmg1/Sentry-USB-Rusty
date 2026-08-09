@@ -57,6 +57,41 @@ pub fn mutable_dir() -> &'static str {
     })
 }
 
+/// Config key holding the SSH port of the rsync archive server.
+pub const RSYNC_SSH_PORT_KEY: &str = "RSYNC_SSH_PORT";
+
+/// The rsync server's SSH port, rejecting a value that is not a port.
+///
+/// `Ok(None)` is "not configured", which callers must render as no port
+/// argument at all rather than an explicit 22, so existing command lines
+/// are untouched for everyone on the default port.
+///
+/// An unparseable value is an error instead of a fallback to 22: the
+/// fallback would connect somewhere the user never asked for and only
+/// surface much later, as "Connection refused" in the archive log.
+pub fn validate_rsync_ssh_port(config: &SetupConfig) -> std::result::Result<Option<u16>, String> {
+    let raw = config.get(RSYNC_SSH_PORT_KEY).map_or("", |v| v.trim());
+    if raw.is_empty() {
+        return Ok(None);
+    }
+    match raw.parse::<u16>() {
+        Ok(port) if port > 0 => Ok(Some(port)),
+        _ => Err(format!(
+            "{RSYNC_SSH_PORT_KEY} must be a port number between 1 and 65535, got {raw:?}"
+        )),
+    }
+}
+
+/// The rsync server's SSH port, treating a malformed value as unset.
+///
+/// For runtime paths (host-key scan, backup upload) that have no way to
+/// report a config error to anyone. Setup and the wizard's connection test
+/// both call [`validate_rsync_ssh_port`], so a bad value is rejected where
+/// the user can still see it.
+pub fn rsync_ssh_port(config: &SetupConfig) -> Option<u16> {
+    validate_rsync_ssh_port(config).ok().flatten()
+}
+
 /// Reads a sentryusb.conf file and returns both active (exported) and
 /// commented-out variables.
 pub fn parse_file(path: &str) -> Result<(SetupConfig, SetupConfig)> {
@@ -367,5 +402,54 @@ mod tests {
 
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_dir(&dir);
+    }
+
+    // ── rsync SSH port ───────────────────────────────────────────────────
+
+    fn cfg_with_port(raw: &str) -> SetupConfig {
+        let mut cfg = SetupConfig::new();
+        cfg.insert(RSYNC_SSH_PORT_KEY.to_string(), raw.to_string());
+        cfg
+    }
+
+    /// Strict lookup against a config holding just this one key.
+    fn strict(raw: &str) -> std::result::Result<Option<u16>, String> {
+        validate_rsync_ssh_port(&cfg_with_port(raw))
+    }
+
+    #[test]
+    fn ssh_port_unset_means_default() {
+        // None rather than Some(22), so callers emit no port argument and
+        // the existing command lines stay as they were.
+        assert_eq!(validate_rsync_ssh_port(&SetupConfig::new()), Ok(None));
+        // The wizard writes an empty export when the field is cleared.
+        assert_eq!(strict(""), Ok(None));
+        assert_eq!(strict("   "), Ok(None));
+    }
+
+    #[test]
+    fn ssh_port_parses_custom_port() {
+        assert_eq!(strict("23232"), Ok(Some(23232)));
+        assert_eq!(strict("65535"), Ok(Some(65535)));
+        // Values come from a bash-sourced file, so tolerate stray spaces.
+        assert_eq!(strict(" 2222 "), Ok(Some(2222)));
+    }
+
+    #[test]
+    fn ssh_port_rejects_non_ports() {
+        for bad in ["0", "-1", "70000", "22/tcp", "twenty-two"] {
+            assert!(
+                strict(bad).is_err(),
+                "{bad:?} must be rejected, not silently treated as port 22"
+            );
+        }
+    }
+
+    #[test]
+    fn runtime_lookup_is_lenient_on_garbage() {
+        // Runtime callers have nobody to report a config error to, so they
+        // fall back to the default instead of failing the transfer.
+        assert_eq!(rsync_ssh_port(&cfg_with_port("not-a-port")), None);
+        assert_eq!(rsync_ssh_port(&cfg_with_port("23232")), Some(23232));
     }
 }

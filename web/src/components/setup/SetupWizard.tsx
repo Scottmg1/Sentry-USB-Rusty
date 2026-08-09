@@ -8,6 +8,7 @@ import { NetworkStep } from "./steps/NetworkStep"
 import { StorageStep } from "./steps/StorageStep"
 import { CommunityStep } from "./steps/CommunityStep"
 import { ArchiveStep } from "./steps/ArchiveStep"
+import { rsyncSshPortError } from "./rsyncPort"
 import { KeepAwakeStep } from "./steps/KeepAwakeStep"
 import { NotificationsStep } from "./steps/NotificationsStep"
 import { SecurityStep } from "./steps/SecurityStep"
@@ -62,6 +63,10 @@ function archiveError(data: SetupFormData): string | null {
     if (!data.RSYNC_SERVER?.trim()) return "Server is required."
     if (!data.RSYNC_USER?.trim()) return "Username is required."
     if (!data.RSYNC_PATH?.trim()) return "Remote Path is required."
+    // Optional field, but a garbage value reaches the config and breaks
+    // every archive cycle. The setup runner rejects it server-side too.
+    const portError = rsyncSshPortError(data.RSYNC_SSH_PORT)
+    if (portError) return portError
   } else if (system === "rclone") {
     if (!data.RCLONE_DRIVE?.trim()) return "Remote Name is required."
     if (!data.RCLONE_PATH?.trim()) return "Remote Path is required."
