@@ -80,10 +80,22 @@ function manage_free_space {
       exit 1
     fi
 
-    oldest=$(printf '%s\n' "$candidates" | head -1 | cut -f2-)
+    # Never delete the HIGHEST-numbered snapshot, even if its mtime says
+    # it is the oldest. This board usually has no battery-backed RTC and
+    # archiveloop starts freespacemanager BEFORE timesyncloop, so a boot
+    # can run eviction while the clock still holds a fake-hwclock time in
+    # the past — the snapshot just taken then sorts as oldest and would
+    # be the first deleted. Slot numbers are allocated monotonically, so
+    # the highest number is the most recent creation whatever the clock
+    # said. Mirrors `releasable()` in crates/usb_gadget/src/space.rs.
+    local highest
+    highest=$(printf '%s\n' "$candidates" | cut -f2- | sed 's#.*/##' \
+              | grep -E '^snap-[0-9]+$' | LC_ALL=C sort | tail -1)
+    oldest=$(printf '%s\n' "$candidates" | cut -f2- \
+             | grep -v "/${highest}\$" | head -1)
     if [ -z "$oldest" ]
     then
-      log "unable to select oldest snapshot"
+      log "unable to select oldest snapshot (only protected snapshots remain)"
       exit 1
     fi
     log "low space, deleting $oldest (oldest by snap.bin mtime)"

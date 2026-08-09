@@ -33,6 +33,51 @@ fn default_reserve_bytes(total: u64) -> u64 {
     FIXED_RESERVE_BYTES.saturating_add(total / RESERVE_PCT_DIVISOR)
 }
 
+/// Numeric slot of a `snap-NNNNNN` name, if it has one.
+fn slot_num(name: &str) -> Option<u32> {
+    name.strip_prefix("snap-")
+        .filter(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
+        .and_then(|s| s.parse().ok())
+}
+
+/// Given snapshots in ascending AGE order (oldest `snap.bin` mtime
+/// first), return those eligible for release — everything except the
+/// two we must never drop:
+///
+/// * the newest by mtime (the one most likely just taken, and the
+///   source the current farm links point at), and
+/// * the HIGHEST SLOT NUMBER.
+///
+/// The second guard exists because mtime is wall-clock and the Pi
+/// usually has no battery-backed RTC: archiveloop starts
+/// `freespacemanager` before `timesyncloop`, so a boot can evict while
+/// the clock still holds a fake-hwclock time from the past. A snapshot
+/// created in that window sorts as the OLDEST and would be released
+/// first — deleting the footage just captured. Slot allocation is
+/// monotonic (max+1), so the highest number is the most recent creation
+/// no matter what the clock claimed. At most two snapshots are withheld;
+/// in the healthy case they are the same one.
+fn releasable(mut in_age_order: Vec<String>) -> Vec<String> {
+    if in_age_order.len() < 2 {
+        return Vec::new();
+    }
+    // Highest slot across the WHOLE set, computed before popping: when
+    // the clock is healthy this is the same snapshot as the mtime-newest
+    // and only one is withheld. Computing it after the pop would shield
+    // a second, arbitrarily old snapshot (e.g. a stale reflash leftover
+    // carrying the highest number) for no reason.
+    let highest = in_age_order
+        .iter()
+        .filter_map(|n| slot_num(n).map(|s| (s, n.clone())))
+        .max_by_key(|(s, _)| *s)
+        .map(|(_, n)| n);
+    in_age_order.pop(); // newest by mtime
+    if let Some(highest) = highest {
+        in_age_order.retain(|n| *n != highest);
+    }
+    in_age_order
+}
+
 /// Release old snapshots until `free >= reserve`.
 ///
 /// `reserve_bytes` is the caller's target (archiveloop forwards its
@@ -94,15 +139,16 @@ pub async fn manage_free_space(reserve_bytes: Option<u64>) -> Result<()> {
         );
     }
 
-    // Never release the newest snapshot (mirrors the bash script's
-    // refusal to delete the last one — it is likely the one just taken,
-    // and the only remaining source for the current farm links).
-    let newest = snapshots.pop();
+    // Withhold the newest-by-mtime AND the highest slot number — see
+    // `releasable`: a clock rollback (no RTC; eviction starts before
+    // timesync) can make the snapshot just taken look oldest.
+    let total_snaps = snapshots.len();
+    let snapshots = releasable(snapshots);
     if snapshots.is_empty() {
         anyhow::bail!(
-            "low space for new snapshots, but only one snapshot ({}) exists — \
-             use a larger storage medium or reduce CAM_SIZE",
-            newest.as_deref().unwrap_or("?")
+            "low space for new snapshots, but the only {} snapshot(s) present are the \
+             protected newest/highest — use a larger storage medium or reduce CAM_SIZE",
+            total_snaps
         );
     }
 
@@ -175,6 +221,61 @@ mod tests {
     use super::*;
 
     const GIB: u64 = 1024 * 1024 * 1024;
+
+    /// The Pi has no battery-backed clock on most boards (the RTC is
+    /// opt-in and Pi 5 only), and archiveloop starts `freespacemanager`
+    /// BEFORE `timesyncloop`, so a boot can run eviction while the clock
+    /// still holds whatever fake-hwclock restored — a time in the past.
+    /// A snapshot created in that window carries a past mtime and sorts
+    /// as the OLDEST, so protecting only the mtime-newest would release
+    /// the snapshot that was just taken. Slot numbers are allocated
+    /// monotonically (max+1), so the highest number is the most recent
+    /// creation regardless of what the clock said.
+    #[test]
+    fn releasable_protects_highest_slot_when_clock_rolled_back() {
+        // Age order says the just-created snap-000042 is "oldest"
+        // because the clock was rolled back when it was written.
+        let age_order = vec![
+            "snap-000042".to_string(), // just created, past-dated mtime
+            "snap-000010".to_string(),
+            "snap-000011".to_string(),
+            "snap-000012".to_string(), // newest by mtime
+        ];
+        let out = releasable(age_order);
+        assert!(
+            !out.contains(&"snap-000042".to_string()),
+            "highest slot number must never be released: {:?}",
+            out
+        );
+        assert!(
+            !out.contains(&"snap-000012".to_string()),
+            "newest by mtime must never be released: {:?}",
+            out
+        );
+        assert_eq!(out, vec!["snap-000010".to_string(), "snap-000011".to_string()]);
+    }
+
+    /// Normal (healthy clock) case: highest slot IS the mtime-newest, so
+    /// exactly one snapshot is withheld and everything older is fair game
+    /// in true age order — including a stale high-mtime-old leftover.
+    #[test]
+    fn releasable_normal_clock_withholds_only_the_newest() {
+        let age_order = vec![
+            "snap-000414".to_string(), // stale reflash leftover, truly oldest
+            "snap-000010".to_string(),
+            "snap-000421".to_string(), // newest by mtime AND highest slot
+        ];
+        assert_eq!(
+            releasable(age_order),
+            vec!["snap-000414".to_string(), "snap-000010".to_string()],
+        );
+    }
+
+    #[test]
+    fn releasable_empty_when_one_or_zero_snapshots() {
+        assert!(releasable(vec![]).is_empty());
+        assert!(releasable(vec!["snap-000001".to_string()]).is_empty());
+    }
 
     /// The unified reserve must reproduce archiveloop's own arithmetic
     /// (`10G` + `total/33`) exactly, including its integer truncation —

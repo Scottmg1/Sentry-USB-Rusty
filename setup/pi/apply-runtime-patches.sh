@@ -1014,10 +1014,22 @@ function manage_free_space {
       exit 1
     fi
 
-    oldest=$(printf '%s\n' "$candidates" | head -1 | cut -f2-)
+    # Never delete the HIGHEST-numbered snapshot, even if its mtime says
+    # it is the oldest. This board usually has no battery-backed RTC and
+    # archiveloop starts freespacemanager BEFORE timesyncloop, so a boot
+    # can run eviction while the clock still holds a fake-hwclock time in
+    # the past — the snapshot just taken then sorts as oldest and would
+    # be the first deleted. Slot numbers are allocated monotonically, so
+    # the highest number is the most recent creation whatever the clock
+    # said. Mirrors `releasable()` in crates/usb_gadget/src/space.rs.
+    local highest
+    highest=$(printf '%s\n' "$candidates" | cut -f2- | sed 's#.*/##' \
+              | grep -E '^snap-[0-9]+$' | LC_ALL=C sort | tail -1)
+    oldest=$(printf '%s\n' "$candidates" | cut -f2- \
+             | grep -v "/${highest}\$" | head -1)
     if [ -z "$oldest" ]
     then
-      log "unable to select oldest snapshot"
+      log "unable to select oldest snapshot (only protected snapshots remain)"
       exit 1
     fi
     log "low space, deleting $oldest (oldest by snap.bin mtime)"
@@ -1042,10 +1054,16 @@ MFS_EOF
     if ! bash -n "$f.new" 2>/dev/null; then
         err "eviction-by-age: staged replacement failed bash -n — aborting"
         rm -f "$f.new"
+        PATCH_FAILURES=$((PATCH_FAILURES + 1))
         return 0
     fi
     chmod --reference="$f" "$f.new" 2>/dev/null || chmod 755 "$f.new"
-    mv "$f.new" "$f"
+    if ! mv "$f.new" "$f"; then
+        err "eviction-by-age: rename failed (read-only fs? disk full?) — $f left as-is"
+        rm -f "$f.new"
+        PATCH_FAILURES=$((PATCH_FAILURES + 1))
+        return 0
+    fi
     log "eviction-by-age: replaced legacy manage_free_space.sh (mtime-ordered eviction)"
 }
 
@@ -1124,17 +1142,29 @@ SLOT_PYEOF
     if [ "$result" != "staged" ] || [ ! -f "$f.new" ]; then
         err "slot-pick: staging failed ($result) — leaving $f untouched"
         rm -f "$f.new"
+        PATCH_FAILURES=$((PATCH_FAILURES + 1))
         return 0
     fi
     if ! bash -n "$f.new" 2>/dev/null || ! grep -q 'slot pick: picker=bash' "$f.new"; then
         err "slot-pick: staged file failed verification — aborting"
         rm -f "$f.new"
+        PATCH_FAILURES=$((PATCH_FAILURES + 1))
         return 0
     fi
     chmod --reference="$f" "$f.new" 2>/dev/null || chmod 755 "$f.new"
-    mv "$f.new" "$f"
+    if ! mv "$f.new" "$f"; then
+        err "slot-pick: rename failed (read-only fs? disk full?) — $f left as-is"
+        rm -f "$f.new"
+        PATCH_FAILURES=$((PATCH_FAILURES + 1))
+        return 0
+    fi
     log "slot-pick: patched legacy make_snapshot.sh picker (dir-name max + mounted guard)"
 }
+
+# Counts patches that FAILED to apply (as opposed to correctly skipping).
+# The runner has no `set -e`, so without this a failed write/rename is
+# invisible and the OTA caller records "patches re-applied successfully".
+PATCH_FAILURES=0
 
 # ── Run all patches ─────────────────────────────────────────────────────
 
@@ -1154,3 +1184,9 @@ apply_snapshot_slot_pick_hardening
 # Future patches that must survive an OTA update get appended here. Each
 # one self-checks board / precondition / marker so the whole script stays
 # a safe no-op on non-applicable systems.
+
+if [ "${PATCH_FAILURES:-0}" -gt 0 ]; then
+    err "$PATCH_FAILURES patch(es) failed to apply — see messages above"
+    exit 1
+fi
+exit 0
