@@ -924,12 +924,24 @@ apply_snapshot_eviction_by_age() {
         log "eviction-by-age: thin Rust wrapper — binary carries the fix"
         return 0
     fi
-    if grep -q 'oldest by snap.bin mtime' "$f"; then
-        log "eviction-by-age: already patched"
+    # Marker must name the CURRENT body, not just "some mtime patch".
+    # The first shipped version of this patch only had the mtime
+    # ordering; a device that received it would match a generic marker
+    # and never get the clock-rollback guard added later — which is the
+    # data-loss fix. Key on text unique to the newest body.
+    if grep -q 'HIGHEST-numbered snapshot' "$f"; then
+        log "eviction-by-age: already patched (current version)"
         return 0
     fi
-    # Known legacy body fingerprint (unchanged since the original port).
-    if ! grep -qF "oldest=\$(find /backingfiles/snapshots -maxdepth 1 -name 'snap-*' | sort | head -1)" "$f"; then
+    # Two accepted inputs: the ORIGINAL legacy body, or the earlier
+    # mtime-only patched body (needs upgrading to add the clock guard).
+    # Both are byte-stable shipped artifacts, so a whole-file replace is
+    # safe; anything else is a local fork and is left alone.
+    if grep -qF "oldest=\$(find /backingfiles/snapshots -maxdepth 1 -name 'snap-*' | sort | head -1)" "$f"; then
+        log "eviction-by-age: upgrading original legacy body"
+    elif grep -q 'oldest by snap.bin mtime' "$f"; then
+        log "eviction-by-age: upgrading earlier mtime-only patch to add the clock-rollback guard"
+    else
         warn "eviction-by-age: unknown local variant of $f — leaving untouched"
         return 0
     fi
@@ -999,10 +1011,13 @@ function manage_free_space {
     # sparing the genuinely oldest snapshot. The same list feeds the
     # "fewer than two" guard so the count and the pick can't disagree.
     local candidates
+    # `-regex` (not just snap-*) so a scratch dir like snap-backup/ is
+    # never a deletion candidate — matches the numeric-only rule the
+    # Rust scanners use.
     candidates=$(
       LC_ALL=C find /backingfiles/snapshots \
         -mindepth 2 -maxdepth 2 -type f \
-        -path '/backingfiles/snapshots/snap-*/snap.bin' \
+        -regex '/backingfiles/snapshots/snap-[0-9]+/snap\.bin' -regextype posix-extended \
         -printf '%T@\t%h\n' 2>/dev/null |
       LC_ALL=C sort -t $'\t' -k1,1n -k2,2
     )
@@ -1029,11 +1044,15 @@ function manage_free_space {
     # be the first deleted. Slot numbers are allocated monotonically, so
     # the highest number is the most recent creation whatever the clock
     # said. Mirrors `releasable()` in crates/usb_gadget/src/space.rs.
-    local highest
+    # Withhold BOTH the highest-numbered slot and the newest-by-mtime,
+    # matching releasable() in space.rs. (Protecting only the highest
+    # would still let a long low-space run delete the mtime-newest.)
+    local highest newest
     highest=$(printf '%s\n' "$candidates" | cut -f2- | sed 's#.*/##' \
               | grep -E '^snap-[0-9]+$' | LC_ALL=C sort | tail -1)
+    newest=$(printf '%s\n' "$candidates" | tail -1 | cut -f2- | sed 's#.*/##')
     oldest=$(printf '%s\n' "$candidates" | cut -f2- \
-             | grep -v "/${highest}\$" | head -1)
+             | grep -v "/${highest}\$" | grep -v "/${newest}\$" | head -1)
     if [ -z "$oldest" ]
     then
       log "unable to select oldest snapshot (only protected snapshots remain)"

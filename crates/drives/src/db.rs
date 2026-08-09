@@ -792,10 +792,20 @@ impl DriveStore {
     /// in the drive list — exactly the parked presence 60c5602 removed —
     /// so the driving filter stays.
     ///
-    /// The predicate is `grouper::row_has_driving` — the SAME one the
-    /// grouper applies to stored rows when admitting gap-fills — so the
-    /// manifest and the drive list never disagree on which event clips are
-    /// part of a drive.
+    /// The predicate is `grouper::row_has_driving`, which is what the
+    /// grouper applies to stored rows for ANCHORED gap-fill admission
+    /// (interior holes and chains) — those agree exactly.
+    ///
+    /// It is deliberately NOT the stricter `telemetry_gear_driving` the
+    /// grouper requires for UNANCHORED clusters. A row whose only
+    /// evidence is a speed sample or raw frame counters (legacy builds,
+    /// drive-data.json imports) can therefore reach the playback
+    /// manifest while staying out of the drive list. That asymmetry is
+    /// intended: cross-linking a clip into RecentClips only affects
+    /// playback continuity, whereas minting a drive from weak evidence
+    /// puts a phantom trip in the user's history. Do not "restore
+    /// parity" by gear-gating here — anchored speed/raw evidence is
+    /// legitimate for playback.
     pub fn gap_fill_files(&self) -> Result<Vec<String>> {
         self.with_read_conn(|conn| {
         let mut stmt = conn.prepare(

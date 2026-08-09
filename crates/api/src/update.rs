@@ -786,7 +786,14 @@ async fn self_update(
         "https://raw.githubusercontent.com/{}/main/setup/pi/apply-runtime-patches.sh",
         repo
     );
-    let patches_tmp = "/tmp/sentryusb-apply-runtime-patches.new";
+    // Stage NEXT TO the target, not in /tmp: /tmp is a tmpfs (see
+    // setup/readonly.rs) while /usr/local/bin lives on the root
+    // filesystem, so `rename` across them fails with EXDEV. That failure
+    // used to be discarded, and the log still said "refreshed" — devices
+    // could keep re-running a stale patch script indefinitely while every
+    // update reported success. Same-filesystem staging keeps the swap
+    // atomic (no torn script if power drops mid-write).
+    let patches_tmp = "/usr/local/bin/.sentryusb-apply-runtime-patches.new";
     tracing::info!(
         "update.rs: refreshing runtime-patches script from {}",
         patches_url
@@ -812,9 +819,26 @@ async fn self_update(
                 .map(|m| m.len() > 0)
                 .unwrap_or(false)
             {
-                let _ = std::fs::rename(patches_tmp, patches_path);
-                let _ = sentryusb_shell::run("chmod", &["+x", patches_path]).await;
-                tracing::info!("update.rs: runtime-patches script refreshed");
+                match std::fs::rename(patches_tmp, patches_path) {
+                    Ok(()) => {
+                        let _ = sentryusb_shell::run("chmod", &["+x", patches_path]).await;
+                        tracing::info!("update.rs: runtime-patches script refreshed");
+                    }
+                    Err(e) => {
+                        // Never claim success on a failed swap: the whole
+                        // point of this refresh is that NEW patches reach
+                        // existing installs.
+                        let _ = std::fs::remove_file(patches_tmp);
+                        tracing::error!(
+                            "update.rs: runtime-patches swap FAILED ({e}); keeping existing script"
+                        );
+                        install_warnings.push(format!(
+                            "runtime-patches script could not be replaced ({e}): this device will \
+                             re-run its EXISTING patch script, so fixes added in this release may \
+                             not apply. Re-run install-pi.sh manually."
+                        ));
+                    }
+                }
             } else {
                 let _ = std::fs::remove_file(patches_tmp);
                 if !std::path::Path::new(patches_path).exists() {

@@ -697,8 +697,10 @@ fn pick_next_snapshot_slot_with(
                 .strip_prefix("snap-")
                 .filter(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
                 .and_then(|s| s.parse::<u32>().ok());
+            // file_type() does not follow symlinks: a planted
+            // `snap-NNNNNN` link must not drive slot allocation.
             if let Some(num) = num
-                && entry.path().is_dir()
+                && entry.file_type().is_ok_and(|ft| ft.is_dir())
                 && max_num.is_none_or(|m| num > m)
             {
                 max_num = Some(num);
