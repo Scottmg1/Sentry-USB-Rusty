@@ -40,26 +40,16 @@ use sentryusb_drives::charging::{
 /// disk — and sessions only change as samples land, so a short TTL is
 /// invisible to the UI. Tag/cost/delete mutations clear it so edits
 /// reflect immediately.
-const CHARGING_LIST_TTL: std::time::Duration = std::time::Duration::from_secs(15);
-
-static CHARGING_LIST_CACHE: std::sync::Mutex<
-    Option<(std::time::Instant, serde_json::Value)>,
-> = std::sync::Mutex::new(None);
-
-fn cached_charging_list() -> Option<serde_json::Value> {
-    let guard = CHARGING_LIST_CACHE.lock().unwrap();
-    guard
-        .as_ref()
-        .filter(|(at, _)| at.elapsed() < CHARGING_LIST_TTL)
-        .map(|(_, v)| v.clone())
-}
-
-fn store_charging_list(v: &serde_json::Value) {
-    *CHARGING_LIST_CACHE.lock().unwrap() = Some((std::time::Instant::now(), v.clone()));
-}
+/// Stale-while-revalidate rather than a plain TTL: the underlying scan
+/// measured 4-7s during an archive, and with a blocking cache whichever
+/// request found the entry expired paid that cost. Nothing in the body
+/// is clock-derived, so the finished JSON is safe to store, behind an
+/// Arc so a hit doesn't re-serialise every session.
+static CHARGING_LIST_CACHE: crate::ttl_cache::StaleWhileRevalidate<(), std::sync::Arc<String>> =
+    crate::ttl_cache::StaleWhileRevalidate::new(std::time::Duration::from_secs(15));
 
 fn invalidate_charging_list() {
-    *CHARGING_LIST_CACHE.lock().unwrap() = None;
+    CHARGING_LIST_CACHE.clear();
 }
 
 /// Latest charge-bearing row for the dashboard banner. The sampler
@@ -410,49 +400,56 @@ const CHARGE_STALE_SECS: i64 = 86_400;
 /// GET /api/charging
 ///
 /// Charge sessions newest-first. Empty when no charging has been sampled.
-pub async fn list_charging(
-    State(state): State<AppState>,
-) -> (StatusCode, Json<serde_json::Value>) {
-    if let Some(v) = cached_charging_list() {
-        return (StatusCode::OK, Json(v));
-    }
+pub async fn list_charging(State(state): State<AppState>) -> axum::response::Response {
+    use axum::response::IntoResponse;
+
     // Whole-table scan + per-session grouping/summarizing + a prefs-file
     // read (RateConfig::load) — all blocking + CPU, so run it on the
     // blocking pool instead of stalling an async worker on the Pi's two
     // cores. Mirrors the spawn_blocking pattern in drives_handler.rs.
     let store = state.drives.store.clone();
-    let result =
-        tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<ChargeSessionSummary>> {
-            let rows = store.with_read_conn(|conn| load_charge_rows(conn, 0, None))?;
-            let rates = RateConfig::load();
-            let tag_map = store.get_all_charge_tags().unwrap_or_default();
-            let cost_map = store.get_all_charge_costs().unwrap_or_default();
-            let mut sessions: Vec<ChargeSessionSummary> = group_sessions(rows)
-                .iter()
-                .map(|s| {
-                    let mut summary = summarize(s);
-                    let tags = tag_map.get(&summary.id).cloned().unwrap_or_default();
-                    let override_cost = cost_map.get(&summary.id).cloned();
-                    apply_rates(&mut summary, s, tags, &rates);
-                    apply_cost_override(&mut summary, override_cost);
-                    summary
-                })
-                .collect();
-            sessions.sort_by(|a, b| b.id.cmp(&a.id));
-            Ok(sessions)
+    let body = CHARGING_LIST_CACHE
+        .get((), move || {
+            let build = || -> anyhow::Result<Vec<ChargeSessionSummary>> {
+                let rows = store.with_read_conn(|conn| load_charge_rows(conn, 0, None))?;
+                let rates = RateConfig::load();
+                let tag_map = store.get_all_charge_tags().unwrap_or_default();
+                let cost_map = store.get_all_charge_costs().unwrap_or_default();
+                let mut sessions: Vec<ChargeSessionSummary> = group_sessions(rows)
+                    .iter()
+                    .map(|s| {
+                        let mut summary = summarize(s);
+                        let tags = tag_map.get(&summary.id).cloned().unwrap_or_default();
+                        let override_cost = cost_map.get(&summary.id).cloned();
+                        apply_rates(&mut summary, s, tags, &rates);
+                        apply_cost_override(&mut summary, override_cost);
+                        summary
+                    })
+                    .collect();
+                sessions.sort_by(|a, b| b.id.cmp(&a.id));
+                Ok(sessions)
+            };
+            // Err -> None: keep the previous list rather than blanking
+            // the charging tab because one read lost a race with rsync.
+            let sessions = build().ok()?;
+            Some(std::sync::Arc::new(
+                serde_json::json!({ "sessions": sessions }).to_string(),
+            ))
         })
         .await;
 
-    match result {
-        Ok(Ok(sessions)) => {
-            let v = serde_json::json!({ "sessions": sessions });
-            store_charging_list(&v);
-            (StatusCode::OK, Json(v))
-        }
-        Ok(Err(e)) => crate::json_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
-        Err(e) => {
-            crate::json_error(StatusCode::INTERNAL_SERVER_ERROR, &format!("charging task: {}", e))
-        }
+    match body {
+        Some(json) => (
+            StatusCode::OK,
+            [(axum::http::header::CONTENT_TYPE, "application/json")],
+            json.as_str().to_owned(),
+        )
+            .into_response(),
+        None => crate::json_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "charging list query failed",
+        )
+        .into_response(),
     }
 }
 
@@ -628,10 +625,12 @@ pub async fn current_charging(
             )
             .optional()
         })
+        // Err -> None: a failed read must not overwrite a good cached
+        // row. Ok(None) -> Some(None): queried fine, nothing charging.
         .ok()
-        .flatten()
         })
-        .await;
+        .await
+        .flatten();
 
         let cur = match latest {
             Some(l) => {

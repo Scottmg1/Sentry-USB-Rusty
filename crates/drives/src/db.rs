@@ -1947,8 +1947,11 @@ fn api_reader_cache_kb() -> i64 {
     match mem_total_kb() {
         // Unreadable /proc/meminfo — assume the smallest supported board.
         None => 4_000,
-        // Zero 2 W and friends (512 MB).
-        Some(kb) if kb <= 600_000 => 8_000,
+        // Zero 2 W and friends (512 MB). The hot set here is the tails
+        // of two small partial indexes plus a few leaves, which fits
+        // well inside this; anything larger is unjustified on a board
+        // whose image ships without swap.
+        Some(kb) if kb <= 600_000 => 4_000,
         // 1 GB Pi 4/5.
         Some(kb) if kb <= 1_200_000 => 16_000,
         Some(kb) if kb <= 2_500_000 => 24_000,

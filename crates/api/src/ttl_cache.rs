@@ -51,12 +51,18 @@ where
     /// expiry would hand a single slow read (7s+ during an archive) to
     /// whichever poll drew the short straw — the symptom this exists to
     /// remove. Only the very first call, with nothing cached, waits.
-    pub async fn get<F>(&'static self, key: K, load: F) -> T
+    ///
+    /// `load` returns `None` to mean **the load failed**, which never
+    /// replaces a good cached value — a transient DB error during an
+    /// archive must not blank a working dashboard. Encode "queried fine,
+    /// no rows" inside `T` instead. `None` comes back only when the
+    /// cache is cold and the load failed.
+    pub async fn get<F>(&'static self, key: K, load: F) -> Option<T>
     where
-        F: FnOnce() -> T + Send + 'static,
+        F: FnOnce() -> Option<T> + Send + 'static,
     {
         if let Some(v) = self.fresh(&key) {
-            return v;
+            return Some(v);
         }
 
         if let Some(stale) = self.stale(&key) {
@@ -65,25 +71,23 @@ where
             if let Ok(guard) = self.refreshing.try_lock() {
                 tokio::spawn(async move {
                     let _guard = guard;
-                    if let Ok(v) = tokio::task::spawn_blocking(load).await {
+                    if let Ok(Some(v)) = tokio::task::spawn_blocking(load).await {
                         *self.slot.lock().unwrap() = Some((key, Instant::now(), v));
                     }
                 });
             }
-            return stale;
+            return Some(stale);
         }
 
         // Cold: nothing cached for this key, so this caller has to load.
         // Serialized so a burst of first-hits makes one query, not N.
         let _guard = self.refreshing.lock().await;
         if let Some(v) = self.fresh(&key) {
-            return v;
+            return Some(v);
         }
-        let value = tokio::task::spawn_blocking(load)
-            .await
-            .expect("ttl_cache loader task failed");
+        let value = tokio::task::spawn_blocking(load).await.ok().flatten()?;
         *self.slot.lock().unwrap() = Some((key, Instant::now(), value.clone()));
-        value
+        Some(value)
     }
 
     /// Invalidate whatever is stored, so the next `get` reloads.
@@ -119,8 +123,8 @@ mod tests {
             StaleWhileRevalidate::new(Duration::from_secs(60));
         LOADS.store(0, Ordering::SeqCst);
 
-        assert_eq!(C.get((), || { LOADS.fetch_add(1, Ordering::SeqCst); 7 }).await, 7);
-        assert_eq!(C.get((), || { LOADS.fetch_add(1, Ordering::SeqCst); 9 }).await, 7);
+        assert_eq!(C.get((), || { LOADS.fetch_add(1, Ordering::SeqCst); Some(7) }).await, Some(7));
+        assert_eq!(C.get((), || { LOADS.fetch_add(1, Ordering::SeqCst); Some(9) }).await, Some(7));
         assert_eq!(LOADS.load(Ordering::SeqCst), 1, "second call must not reload");
     }
 
@@ -131,16 +135,16 @@ mod tests {
         static C: StaleWhileRevalidate<(), u32> =
             StaleWhileRevalidate::new(Duration::from_millis(10));
 
-        assert_eq!(C.get((), || 1).await, 1);
+        assert_eq!(C.get((), || Some(1)).await, Some(1));
         tokio::time::sleep(Duration::from_millis(30)).await;
 
         let started = Instant::now();
         let v = C.get((), || {
             std::thread::sleep(Duration::from_millis(600));
-            2
+            Some(2)
         })
         .await;
-        assert_eq!(v, 1, "must serve the previous value, not the slow reload");
+        assert_eq!(v, Some(1), "must serve the previous value, not the slow reload");
         assert!(
             started.elapsed() < Duration::from_millis(300),
             "must not wait on the refresh, took {:?}",
@@ -149,7 +153,32 @@ mod tests {
 
         // The background refresh eventually lands.
         tokio::time::sleep(Duration::from_millis(900)).await;
-        assert_eq!(C.get((), || 3).await, 2);
+        assert_eq!(C.get((), || Some(3)).await, Some(2));
+    }
+
+    /// A failed refresh must never blank a working value — during an
+    /// archive the DB read is exactly what's flaky.
+    #[tokio::test]
+    async fn failed_refresh_retains_stale() {
+        static C: StaleWhileRevalidate<(), u32> =
+            StaleWhileRevalidate::new(Duration::from_millis(10));
+
+        assert_eq!(C.get((), || Some(5)).await, Some(5));
+        tokio::time::sleep(Duration::from_millis(30)).await;
+
+        // Expired: serves stale and kicks off a refresh that fails.
+        assert_eq!(C.get((), || None).await, Some(5));
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        // The failure must not have replaced the good value.
+        assert_eq!(C.get((), || None).await, Some(5));
+    }
+
+    #[tokio::test]
+    async fn cold_load_failure_reports_none() {
+        static C: StaleWhileRevalidate<(), u32> =
+            StaleWhileRevalidate::new(Duration::from_secs(60));
+        assert_eq!(C.get((), || None).await, None);
     }
 
     #[tokio::test]
@@ -157,8 +186,8 @@ mod tests {
         static C: StaleWhileRevalidate<u32, u32> =
             StaleWhileRevalidate::new(Duration::from_secs(60));
 
-        assert_eq!(C.get(1, || 10).await, 10);
-        assert_eq!(C.get(2, || 20).await, 20, "a new key must reload");
-        assert_eq!(C.get(2, || 99).await, 20);
+        assert_eq!(C.get(1, || Some(10)).await, Some(10));
+        assert_eq!(C.get(2, || Some(20)).await, Some(20), "a new key must reload");
+        assert_eq!(C.get(2, || Some(99)).await, Some(20));
     }
 }

@@ -1366,16 +1366,30 @@ pub struct TireHistoryQuery {
 /// ```
 ///
 /// A 30-day pressure chart doesn't change meaningfully inside a minute,
-/// but the scan measured 5.2s mid-archive and held one of the two read
-/// connections for that whole time — long enough to queue every other
-/// telemetry poll behind it. Cached per `days` value.
-static TIRE_HISTORY_CACHE: crate::ttl_cache::StaleWhileRevalidate<u32, Option<Vec<serde_json::Value>>> =
+/// but the scan measured 5.2s mid-archive (19.6s once) and held one of
+/// the two read connections for that whole time — long enough to queue
+/// every other telemetry poll behind it. Cached per `days` value.
+///
+/// Stores the finished body, which is safe here because nothing in it
+/// is derived from the current clock, and behind an `Arc` so a cache hit
+/// is a pointer copy rather than a deep clone of thousands of JSON
+/// objects — that clone, unbounded at `days=365`, was a credible OOM on
+/// a 512 MB board.
+static TIRE_HISTORY_CACHE: crate::ttl_cache::StaleWhileRevalidate<u32, std::sync::Arc<String>> =
     crate::ttl_cache::StaleWhileRevalidate::new(std::time::Duration::from_secs(60));
+
+/// Upper bound on returned points. A chart can't render more than a few
+/// thousand meaningfully, and `days=365` on a busy car would otherwise
+/// materialise the whole year. Excess is decimated by even stride,
+/// which suits slowly-varying tyre pressure.
+const TIRE_HISTORY_MAX_POINTS: usize = 2_000;
 
 pub async fn tire_history(
     State(state): State<AppState>,
     Query(q): Query<TireHistoryQuery>,
-) -> (StatusCode, Json<serde_json::Value>) {
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+
     let days = q.days.unwrap_or(30).clamp(1, 365);
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1384,62 +1398,73 @@ pub async fn tire_history(
     let cutoff = now - (days as i64) * 86_400;
 
     let store = state.drives.store.clone();
-    let result = TIRE_HISTORY_CACHE
+    let body = TIRE_HISTORY_CACHE
         .get(days, move || {
-        store.with_read_conn(|conn| {
-            let mut stmt = conn.prepare(
-                "SELECT ts, tire_fl_psi, tire_fr_psi, tire_rl_psi, tire_rr_psi \
-                 FROM telemetry_samples \
-                 WHERE ts >= ?1 \
-                   AND (tire_fl_psi IS NOT NULL OR tire_fr_psi IS NOT NULL \
-                        OR tire_rl_psi IS NOT NULL OR tire_rr_psi IS NOT NULL) \
-                 ORDER BY ts ASC",
-            )?;
-            let rows = stmt.query_map(rusqlite::params![cutoff], |r| {
-                Ok((
-                    r.get::<_, i64>(0)?,
-                    r.get::<_, Option<f64>>(1)?,
-                    r.get::<_, Option<f64>>(2)?,
-                    r.get::<_, Option<f64>>(3)?,
-                    r.get::<_, Option<f64>>(4)?,
-                ))
-            })?;
-            let mut out: Vec<serde_json::Value> = Vec::new();
-            for row in rows {
-                let (ts, fl, fr, rl, rr) = row?;
+            // Compact tuples while scanning; the JSON is built once here
+            // and every cache hit just clones an Arc.
+            let rows: Vec<(i64, Option<f32>, Option<f32>, Option<f32>, Option<f32>)> = store
+                .with_read_conn(|conn| {
+                    let mut stmt = conn.prepare(
+                        "SELECT ts, tire_fl_psi, tire_fr_psi, tire_rl_psi, tire_rr_psi \
+                         FROM telemetry_samples \
+                         WHERE ts >= ?1 \
+                           AND (tire_fl_psi IS NOT NULL OR tire_fr_psi IS NOT NULL \
+                                OR tire_rl_psi IS NOT NULL OR tire_rr_psi IS NOT NULL) \
+                         ORDER BY ts ASC",
+                    )?;
+                    let mapped = stmt.query_map(rusqlite::params![cutoff], |r| {
+                        Ok((
+                            r.get::<_, i64>(0)?,
+                            r.get::<_, Option<f32>>(1)?,
+                            r.get::<_, Option<f32>>(2)?,
+                            r.get::<_, Option<f32>>(3)?,
+                            r.get::<_, Option<f32>>(4)?,
+                        ))
+                    })?;
+                    let mut out = Vec::new();
+                    for row in mapped {
+                        out.push(row?);
+                    }
+                    Ok::<_, anyhow::Error>(out)
+                })
+                // Err -> None: a failed read keeps the previous chart
+                // rather than blanking it.
+                .ok()?;
+
+            let stride = (rows.len() / TIRE_HISTORY_MAX_POINTS).max(1);
+            let mut points = Vec::with_capacity(rows.len().min(TIRE_HISTORY_MAX_POINTS) + 1);
+            for (i, (ts, fl, fr, rl, rr)) in rows.iter().enumerate() {
+                // Keep the newest sample regardless of stride so the
+                // chart always ends at the latest reading.
+                if i % stride != 0 && i + 1 != rows.len() {
+                    continue;
+                }
                 let mut obj = serde_json::Map::new();
                 obj.insert("ts".to_string(), serde_json::json!(ts * 1000));
-                if let Some(v) = fl {
-                    obj.insert("fl".to_string(), serde_json::json!(v));
+                for (name, v) in [("fl", fl), ("fr", fr), ("rl", rl), ("rr", rr)] {
+                    if let Some(v) = v {
+                        obj.insert(name.to_string(), serde_json::json!(v));
+                    }
                 }
-                if let Some(v) = fr {
-                    obj.insert("fr".to_string(), serde_json::json!(v));
-                }
-                if let Some(v) = rl {
-                    obj.insert("rl".to_string(), serde_json::json!(v));
-                }
-                if let Some(v) = rr {
-                    obj.insert("rr".to_string(), serde_json::json!(v));
-                }
-                out.push(serde_json::Value::Object(obj));
+                points.push(serde_json::Value::Object(obj));
             }
-            Ok::<_, anyhow::Error>(out)
-        })
-        .ok()
+
+            let doc = serde_json::json!({ "points": points, "days": days });
+            Some(std::sync::Arc::new(doc.to_string()))
         })
         .await;
 
-    match result {
-        Some(points) => (
+    match body {
+        Some(json) => (
             StatusCode::OK,
-            Json(serde_json::json!({
-                "points": points,
-                "days": days,
-            })),
-        ),
+            [(axum::http::header::CONTENT_TYPE, "application/json")],
+            json.as_str().to_owned(),
+        )
+            .into_response(),
         None => crate::json_error(
             StatusCode::INTERNAL_SERVER_ERROR,
             "tire-history query failed",
-        ),
+        )
+        .into_response(),
     }
 }

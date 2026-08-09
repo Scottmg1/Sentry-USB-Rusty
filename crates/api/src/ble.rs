@@ -696,7 +696,8 @@ pub async fn ble_latest_sample(
         - LATEST_SAMPLE_WINDOW_SECS;
     let result = LATEST_SAMPLE_CACHE
         .get((), move || {
-        store.with_read_conn(|conn| {
+        // Some(..) = the read completed; the inner Option is "no rows".
+        Some(store.with_read_conn(|conn| {
             // Pull two things:
             //   1. The "envelope" — `ts` + `source` of the most recent
             //      sample, used by the UI to render "polled Xs ago"
@@ -827,9 +828,10 @@ pub async fn ble_latest_sample(
                     body_controller_ts,
                 )
             })
+        }))
         })
-        })
-        .await;
+        .await
+        .flatten();
 
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
