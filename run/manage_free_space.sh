@@ -64,7 +64,7 @@ function manage_free_space {
     candidates=$(
       LC_ALL=C find /backingfiles/snapshots \
         -mindepth 2 -maxdepth 2 -type f \
-        -regex '/backingfiles/snapshots/snap-[0-9]+/snap\.bin' -regextype posix-extended \
+        -regextype posix-extended -regex '/backingfiles/snapshots/snap-[0-9]+/snap\.bin' \
         -printf '%T@\t%h\n' 2>/dev/null |
       LC_ALL=C sort -t $'\t' -k1,1n -k2,2
     )

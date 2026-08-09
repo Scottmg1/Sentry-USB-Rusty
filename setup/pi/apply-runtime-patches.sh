@@ -357,7 +357,18 @@ apply_backingfiles_bfq() {
     src="$(findmnt -n -o SOURCE /backingfiles 2>/dev/null)" || true
     [ -n "${src:-}" ] || { log "bfq: /backingfiles not mounted — udev rule will cover next boot"; return 0; }
     disk="$(lsblk -n -o PKNAME "$src" 2>/dev/null | head -1)"
-    [ -n "$disk" ] || disk="$(basename "$src" | sed 's/[0-9]*$//')"
+    # Fallback when lsblk can't resolve the parent. mmcblk/nvme name their
+    # partitions <disk>p<N>, so stripping only trailing digits leaves
+    # "mmcblk0p" — a device that does not exist, which then fails the
+    # class gate below and silently skips the live switch. Strip the
+    # partition suffix per naming scheme instead.
+    if [ -z "$disk" ]; then
+        disk="$(basename "$src")"
+        case "$disk" in
+            mmcblk*|nvme*) disk="$(echo "$disk" | sed 's/p[0-9]*$//')" ;;
+            *)             disk="$(echo "$disk" | sed 's/[0-9]*$//')" ;;
+        esac
+    fi
     # Same device-class gate the udev rule above uses (sd*/mmcblk*).
     # Without it the LIVE switch would happily set bfq on an NVMe that
     # the rule deliberately excludes — bfq's fairness machinery costs
@@ -1029,7 +1040,7 @@ function manage_free_space {
     candidates=$(
       LC_ALL=C find /backingfiles/snapshots \
         -mindepth 2 -maxdepth 2 -type f \
-        -regex '/backingfiles/snapshots/snap-[0-9]+/snap\.bin' -regextype posix-extended \
+        -regextype posix-extended -regex '/backingfiles/snapshots/snap-[0-9]+/snap\.bin' \
         -printf '%T@\t%h\n' 2>/dev/null |
       LC_ALL=C sort -t $'\t' -k1,1n -k2,2
     )

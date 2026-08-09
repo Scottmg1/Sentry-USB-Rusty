@@ -767,16 +767,18 @@ async fn self_update(
     // is idempotent + detection-gated, so it's a no-op on non-applicable
     // boards and a no-op on already-patched files.
     //
-    // Always refresh the script body from the repo before running.
+    // Refresh the script body from the repo before running it.
     //
-    // Bootstrap-only (the old behavior) had a fatal hole: if a user already
-    // had a stale on-disk copy from an earlier release, new patches we add
-    // to apply-runtime-patches.sh would never reach them — update.rs would
-    // skip the download and invoke the rotten old script. We fix that by
-    // ALWAYS downloading; a failed download falls back to whatever is
-    // already on disk (warn-only). The script lives at a stable URL
-    // (main branch, setup/pi/) so it's fetchable as long as the repo is
-    // reachable.
+    // Bootstrap-only (the original behavior) had a fatal hole: a user with
+    // a stale on-disk copy from an earlier release would never receive new
+    // patches — update.rs skipped the download and invoked the rotten old
+    // script. So we re-download whenever we can, falling back to whatever
+    // is already on disk (warn-only) if that fails.
+    //
+    // The ref is the TAG WE JUST INSTALLED, not `main`: the script and the
+    // binary are one artifact. Pulling main next to a tagged binary can
+    // apply patches for shapes this binary does not implement, or drop a
+    // heal it still needs. See the fallback ladder just below.
     hub.broadcast(
         "update_status",
         &serde_json::json!({"status": "updating_scripts", "message": "Updating scripts…"}),
