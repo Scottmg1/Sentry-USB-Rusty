@@ -782,10 +782,31 @@ async fn self_update(
         &serde_json::json!({"status": "updating_scripts", "message": "Updating scripts…"}),
     );
     let patches_path = "/usr/local/bin/sentryusb-apply-runtime-patches";
-    let patches_url = format!(
-        "https://raw.githubusercontent.com/{}/main/setup/pi/apply-runtime-patches.sh",
-        repo
-    );
+    // PIN TO THE TAG WE JUST INSTALLED. Fetching from `main` shipped the
+    // binary from release X alongside whatever patch script main happened
+    // to have — a script that may patch shapes this binary doesn't
+    // implement, or drop a heal this binary still needs. The script and
+    // the binary are one artifact and must come from one ref.
+    //
+    // Fallbacks, in order:
+    //   * tag known                → that tag (never main: a mismatched
+    //                                script is worse than an older one)
+    //   * tag unknown, script on disk → keep it, skip the download
+    //   * tag unknown, no script      → bootstrap from main so a device
+    //                                   with nothing still gets patches
+    let patches_ref = if !tag.is_empty() {
+        Some(tag.clone())
+    } else if std::path::Path::new(patches_path).exists() {
+        None
+    } else {
+        Some("main".to_string())
+    };
+    let patches_url = patches_ref.as_ref().map(|r| {
+        format!(
+            "https://raw.githubusercontent.com/{}/{}/setup/pi/apply-runtime-patches.sh",
+            repo, r
+        )
+    });
     // Stage NEXT TO the target, not in /tmp: /tmp is a tmpfs (see
     // setup/readonly.rs) while /usr/local/bin lives on the root
     // filesystem, so `rename` across them fails with EXDEV. That failure
@@ -794,25 +815,36 @@ async fn self_update(
     // update reported success. Same-filesystem staging keeps the swap
     // atomic (no torn script if power drops mid-write).
     let patches_tmp = "/usr/local/bin/.sentryusb-apply-runtime-patches.new";
-    tracing::info!(
-        "update.rs: refreshing runtime-patches script from {}",
-        patches_url
-    );
-    match sentryusb_shell::run_with_timeout(
-        std::time::Duration::from_secs(20),
-        "curl",
-        &[
-            "-fsSL",
-            "--max-time",
-            "15",
-            "-o",
-            patches_tmp,
-            &patches_url,
-        ],
-    )
-    .await
-    {
-        Ok(_) => {
+    // `None` = tag unknown AND a script is already on disk: skip the
+    // download and run what we have, rather than pulling an unpinned
+    // copy of main that may not match this binary.
+    let download = match &patches_url {
+        Some(url) => {
+            tracing::info!("update.rs: refreshing runtime-patches script from {}", url);
+            Some(
+                sentryusb_shell::run_with_timeout(
+                    std::time::Duration::from_secs(20),
+                    "curl",
+                    &["-fsSL", "--max-time", "15", "-o", patches_tmp, url],
+                )
+                .await,
+            )
+        }
+        None => {
+            tracing::warn!(
+                "update.rs: release tag unknown — keeping the existing runtime-patches \
+                 script rather than pulling an unpinned copy from main"
+            );
+            install_warnings.push(
+                "could not determine the release tag, so the existing runtime-patches \
+                 script was kept; fixes added in this release may not have applied."
+                    .to_string(),
+            );
+            None
+        }
+    };
+    match download {
+        Some(Ok(_)) => {
             // Only swap the live script if the download produced a non-empty
             // file (catches "200 OK + empty body" rare github edge cases).
             if std::fs::metadata(patches_tmp)
@@ -850,7 +882,7 @@ async fn self_update(
                 }
             }
         }
-        Err(e) => {
+        Some(Err(e)) => {
             let _ = std::fs::remove_file(patches_tmp);
             if !std::path::Path::new(patches_path).exists() {
                 install_warnings.push(format!(
@@ -864,6 +896,9 @@ async fn self_update(
                 );
             }
         }
+        // Download deliberately skipped (tag unknown, script already on
+        // disk) — the warning was recorded above.
+        None => {}
     }
 
     if std::path::Path::new(patches_path).exists() {
