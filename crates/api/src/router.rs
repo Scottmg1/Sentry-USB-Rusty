@@ -72,6 +72,7 @@ pub fn build_router(state: AppState) -> Router {
             "/api/logs/bluetooth/bundle",
             get(crate::ble_debug::get_ble_bundle),
         )
+        .route("/api/logs/{name}/page", get(crate::logs::get_log_page))
         .route("/api/logs/{name}", get(crate::logs::get_log))
         // Diagnostics & health
         .route("/api/diagnostics/refresh", post(crate::healthcheck::refresh_diagnostics))
