@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react"
-import { Wifi, WifiOff, Loader2, X } from "lucide-react"
+import { CloseIcon, ProgressActivityIcon, WifiIcon, WifiOffIcon } from "@/components/icons"
 import { cn } from "@/lib/utils"
 import { useConnectionStatus, type ConnectionState } from "@/hooks/useConnectionStatus"
 import { getStoredAwayMode } from "@/hooks/useAwayMode"
@@ -47,7 +47,7 @@ export function ConnectionBanner() {
 
     return (
       <div className="mb-4 flex items-start gap-3 rounded-lg border border-amber-500/30 bg-amber-500/10 px-4 py-3 text-sm text-amber-300">
-        <Wifi className="h-4 w-4 shrink-0 mt-0.5" />
+        <WifiIcon className="h-4 w-4 shrink-0 mt-0.5" />
         <div className="flex-1 space-y-1">
           <p className="font-medium">Away Mode is active</p>
           <p className="text-xs text-amber-400/70">
@@ -66,7 +66,7 @@ export function ConnectionBanner() {
           onClick={() => setDismissed(true)}
           className="shrink-0 rounded p-0.5 opacity-50 transition-opacity hover:opacity-100"
         >
-          <X className="h-3.5 w-3.5" />
+          <CloseIcon className="h-3.5 w-3.5" />
         </button>
       </div>
     )
@@ -82,13 +82,13 @@ export function ConnectionBanner() {
       )}
     >
       {displayState === "reconnecting" && (
-        <Loader2 className="h-4 w-4 shrink-0 animate-spin" />
+        <ProgressActivityIcon className="h-4 w-4 shrink-0 animate-spin" />
       )}
       {displayState === "disconnected" && (
-        <WifiOff className="h-4 w-4 shrink-0" />
+        <WifiOffIcon className="h-4 w-4 shrink-0" />
       )}
       {displayState === "connected-flash" && (
-        <Wifi className="h-4 w-4 shrink-0" />
+        <WifiIcon className="h-4 w-4 shrink-0" />
       )}
 
       <span className="flex-1">
@@ -111,7 +111,7 @@ export function ConnectionBanner() {
         onClick={() => setDismissed(true)}
         className="shrink-0 rounded p-0.5 opacity-50 transition-opacity hover:opacity-100"
       >
-        <X className="h-3.5 w-3.5" />
+        <CloseIcon className="h-3.5 w-3.5" />
       </button>
     </div>
   )

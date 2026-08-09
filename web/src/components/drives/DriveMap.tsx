@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react"
 import L from "leaflet"
 import "leaflet/dist/leaflet.css"
-import { Layers } from "lucide-react"
+import { LayersIcon } from "@/components/icons"
 import { useScrubberState } from "@/hooks/useScrubberSync"
 import type { FsdEvent } from "@/types/drives"
 
@@ -495,7 +495,7 @@ export function DriveMap({
       <div ref={containerRef} className="absolute inset-0 bg-slate-900" />
       <div className="absolute right-2 top-2 z-[400] flex flex-col gap-1">
         <ControlBtn label={`Map style: ${style}`} onClick={cycleStyle}>
-          <Layers className="h-4 w-4" />
+          <LayersIcon className="h-4 w-4" />
         </ControlBtn>
       </div>
     </div>

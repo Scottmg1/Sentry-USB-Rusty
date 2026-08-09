@@ -1,5 +1,5 @@
 import { useState, useEffect } from "react"
-import { Bell, Loader2 } from "lucide-react"
+import { NotificationsIcon, ProgressActivityIcon } from "@/components/icons"
 import { cn } from "@/lib/utils"
 import { PrefCard } from "@/components/settings/PrefCard"
 
@@ -101,7 +101,7 @@ export function MobileNotificationsSection() {
   }
 
   return (
-    <PrefCard icon={<Bell className="h-3.5 w-3.5" />} halo="violet" title="Mobile Notifications">
+    <PrefCard icon={<NotificationsIcon className="h-3.5 w-3.5" />} halo="violet" title="Mobile Notifications">
       <div className="flex items-center gap-3">
         {pairingCode ? (
           <div className="flex items-center gap-4">
@@ -119,7 +119,7 @@ export function MobileNotificationsSection() {
             disabled={loading}
             className="rounded-lg bg-blue-500 px-3 py-2 text-xs font-medium text-white transition-colors hover:bg-blue-600 disabled:opacity-50"
           >
-            {loading && <Loader2 className="mr-1 inline h-3.5 w-3.5 animate-spin" />}
+            {loading && <ProgressActivityIcon className="mr-1 inline h-3.5 w-3.5 animate-spin" />}
             Generate Code
           </button>
         )}

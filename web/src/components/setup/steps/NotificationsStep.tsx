@@ -1,4 +1,4 @@
-import { Bell, ChevronDown, ChevronUp } from "lucide-react"
+import { ExpandLessIcon, ExpandMoreIcon, NotificationsIcon } from "@/components/icons"
 import { useState } from "react"
 import type { StepProps } from "../SetupWizard"
 import { SecretInput } from "../SecretInput"
@@ -135,7 +135,7 @@ function ProviderCard({ provider, data, onChange, errorFields }: { provider: Not
         <span className={cn("text-sm font-medium", enabled ? "text-slate-200" : "text-slate-400")}>
           {provider.label}
         </span>
-        {expanded ? <ChevronUp className="h-4 w-4 text-slate-600" /> : <ChevronDown className="h-4 w-4 text-slate-600" />}
+        {expanded ? <ExpandLessIcon className="h-4 w-4 text-slate-600" /> : <ExpandMoreIcon className="h-4 w-4 text-slate-600" />}
       </button>
 
       {expanded && isMobile && (
@@ -207,7 +207,7 @@ export function NotificationsStep({ data, onChange }: StepProps) {
   return (
     <div className="space-y-4">
       <div className="flex items-center gap-2">
-        <Bell className="h-4 w-4 text-blue-400" />
+        <NotificationsIcon className="h-4 w-4 text-blue-400" />
         <h3 className="text-sm font-semibold uppercase tracking-wider text-slate-400">
           Push Notifications
         </h3>

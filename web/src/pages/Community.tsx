@@ -1,5 +1,12 @@
 import { useState, useRef, useCallback } from "react"
-import { Users, Paintbrush, Volume2, Shield, X, Loader2 } from "lucide-react"
+import {
+  BrushIcon,
+  CloseIcon,
+  GroupIcon,
+  ProgressActivityIcon,
+  ShieldIcon,
+  VolumeUpIcon,
+} from "@/components/icons"
 import { Link, useSearchParams } from "react-router-dom"
 import CommunityWraps from "./CommunityWraps"
 import LockChime from "./LockChime"
@@ -49,7 +56,7 @@ export default function Community() {
   if (loading) {
     return (
       <div className="flex items-center justify-center py-16">
-        <Loader2 className="h-5 w-5 animate-spin text-slate-500" />
+        <ProgressActivityIcon className="h-5 w-5 animate-spin text-slate-500" />
       </div>
     )
   }
@@ -59,7 +66,7 @@ export default function Community() {
       <div className="space-y-6">
         <div className="flex items-center gap-3">
           <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-slate-500/10">
-            <Users className="h-5 w-5 text-slate-500" />
+            <GroupIcon className="h-5 w-5 text-slate-500" />
           </div>
           <div>
             <h1 className="text-xl font-semibold text-slate-100">Community</h1>
@@ -102,10 +109,10 @@ export default function Community() {
       : "Wraps & Chimes"
 
   const HeadingIcon = mode === "wraps-only"
-    ? Paintbrush
+    ? BrushIcon
     : mode === "chimes-only"
-      ? Volume2
-      : Users
+      ? VolumeUpIcon
+      : GroupIcon
 
   return (
     <div className="space-y-6">
@@ -125,10 +132,10 @@ export default function Community() {
         </div>
         {adminPasscode && (
           <div className="flex items-center gap-1.5 rounded bg-red-500/10 border border-red-500/20 px-2.5 py-1 text-xs text-red-400">
-            <Shield className="h-3 w-3" />
+            <ShieldIcon className="h-3 w-3" />
             Admin Mode
             <button onClick={() => setAdminPasscode(null)} className="ml-1 hover:text-red-300">
-              <X className="h-3 w-3" />
+              <CloseIcon className="h-3 w-3" />
             </button>
           </div>
         )}
@@ -145,7 +152,7 @@ export default function Community() {
                 : "text-slate-400 hover:text-slate-200"
             }`}
           >
-            <Paintbrush className="h-4 w-4" />
+            <BrushIcon className="h-4 w-4" />
             Wraps
           </button>
           <button
@@ -156,7 +163,7 @@ export default function Community() {
                 : "text-slate-400 hover:text-slate-200"
             }`}
           >
-            <Volume2 className="h-4 w-4" />
+            <VolumeUpIcon className="h-4 w-4" />
             Chimes
           </button>
         </div>
@@ -237,7 +244,7 @@ function PasscodeModal({ view, onSuccess, onClose }: { view: CommunityView; onSu
             disabled={!input.trim() || validating}
             className="flex flex-1 items-center justify-center gap-2 rounded-lg bg-blue-600 px-4 py-2.5 text-sm font-medium text-white transition-colors hover:bg-blue-500 disabled:opacity-50"
           >
-            {validating && <Loader2 className="h-4 w-4 animate-spin" />}
+            {validating && <ProgressActivityIcon className="h-4 w-4 animate-spin" />}
             Validate
           </button>
           <button

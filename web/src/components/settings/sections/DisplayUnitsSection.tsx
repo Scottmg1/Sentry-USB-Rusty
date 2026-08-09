@@ -1,4 +1,4 @@
-import { Thermometer } from "lucide-react"
+import { DeviceThermostatIcon } from "@/components/icons"
 import { PrefCard } from "@/components/settings/PrefCard"
 import { Toggle } from "@/components/ui/Toggle"
 import { useUnits } from "@/lib/units"
@@ -16,7 +16,7 @@ export function DisplayUnitsSection() {
 
   return (
     <PrefCard
-      icon={<Thermometer className="h-3.5 w-3.5" />}
+      icon={<DeviceThermostatIcon className="h-3.5 w-3.5" />}
       halo="violet"
       title="Display & Units"
       badge={

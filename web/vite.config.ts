@@ -24,7 +24,10 @@ export default defineConfig({
           if (/[\\/]node_modules[\\/]recharts[\\/]/.test(id)) return 'vendor-charts'
           if (/[\\/]node_modules[\\/]leaflet[\\/]/.test(id)) return 'vendor-maps'
           if (/[\\/]node_modules[\\/]@xterm[\\/]/.test(id)) return 'vendor-term'
-          if (/[\\/]node_modules[\\/]lucide-react[\\/]/.test(id)) return 'vendor-icons'
+          // Icons are vendored app source (src/components/icons.tsx) rather
+          // than a package, but they change far less often than the views
+          // that use them, so keep them in their own cacheable chunk.
+          if (/[\\/]src[\\/]components[\\/]icons\.tsx$/.test(id)) return 'vendor-icons'
         },
       },
     },

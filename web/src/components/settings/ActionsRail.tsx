@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react"
 import type { ReactNode, ComponentType } from "react"
-import { Loader2, CheckCircle, AlertCircle } from "lucide-react"
+import { CheckCircleIcon, ErrorIcon, ProgressActivityIcon } from "@/components/icons"
 import { cn } from "@/lib/utils"
 
 type IconType = ComponentType<{ className?: string }>
@@ -83,11 +83,11 @@ function ActionChip({
 
   const ActiveIcon =
     state === "loading"
-      ? Loader2
+      ? ProgressActivityIcon
       : state === "success"
-      ? CheckCircle
+      ? CheckCircleIcon
       : state === "error"
-      ? AlertCircle
+      ? ErrorIcon
       : Icon
 
   return (

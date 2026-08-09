@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react"
-import { Calendar } from "lucide-react"
+import { CalendarMonthIcon } from "@/components/icons"
 import { cn } from "@/lib/utils"
 import type { DatePreset, DateRange } from "@/hooks/useDrivesList"
 
@@ -64,7 +64,7 @@ export function DatePopover({ range, onChange }: DatePopoverProps) {
         onClick={() => setOpen((o) => !o)}
         className="inline-flex items-center gap-2 rounded-full bg-emerald-500/95 px-3.5 py-1.5 text-sm font-medium text-slate-950 transition-colors hover:bg-emerald-400"
       >
-        <Calendar className="h-4 w-4" />
+        <CalendarMonthIcon className="h-4 w-4" />
         {presetLabel(range)}
       </button>
       {open && (

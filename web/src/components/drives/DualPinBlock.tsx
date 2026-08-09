@@ -1,4 +1,4 @@
-import { Battery } from "lucide-react"
+import { BatteryFullAltIcon } from "@/components/icons"
 import { cn } from "@/lib/utils"
 import { formatRelativeTime } from "@/lib/drive-format"
 
@@ -58,7 +58,7 @@ function Row({ label, batteryPct, timestamp, labelClass }: RowProps) {
       <div className="mt-0.5 flex items-center gap-1.5 text-xs text-slate-500">
         {batteryPct !== undefined && (
           <span className="flex items-center gap-1">
-            <Battery className="h-3 w-3" aria-hidden />
+            <BatteryFullAltIcon className="h-3 w-3" aria-hidden />
             {Math.round(batteryPct)}%
           </span>
         )}

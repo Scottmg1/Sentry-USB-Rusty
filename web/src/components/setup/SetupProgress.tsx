@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react"
-import { AlertCircle, Check, Loader2, Terminal } from "lucide-react"
+import { CheckIcon, ErrorIcon, ProgressActivityIcon, Terminal2Icon } from "@/components/icons"
 import { cn } from "@/lib/utils"
 
 // ── Log line parser ────────────────────────────────────────────────────────
@@ -245,10 +245,10 @@ export function SetupProgress({ complete, phase = "running", deviceIp }: SetupPr
       <div className="flex items-center justify-center gap-2.5 text-center">
         {isDone ? (
           <div className="flex h-7 w-7 shrink-0 items-center justify-center rounded-full bg-emerald-500/20">
-            <Check className="h-3.5 w-3.5 text-emerald-400" />
+            <CheckIcon className="h-3.5 w-3.5 text-emerald-400" />
           </div>
         ) : (
-          <Loader2 className="h-5 w-5 shrink-0 animate-spin text-blue-400" />
+          <ProgressActivityIcon className="h-5 w-5 shrink-0 animate-spin text-blue-400" />
         )}
         <div className="min-w-0">
           <div className="text-sm font-medium text-slate-200 truncate">
@@ -265,7 +265,7 @@ export function SetupProgress({ complete, phase = "running", deviceIp }: SetupPr
       {/* Stale warning — full width above both columns */}
       {stale && !isDone && (
         <div className="flex items-start gap-2 rounded-xl border border-yellow-500/20 bg-yellow-500/5 px-3 py-2.5">
-          <AlertCircle className="mt-0.5 h-3.5 w-3.5 shrink-0 text-yellow-400" />
+          <ErrorIcon className="mt-0.5 h-3.5 w-3.5 shrink-0 text-yellow-400" />
           <p className="text-xs text-yellow-300/80">
             No new progress in the last 5 minutes. Setup may be waiting on a slow
             operation (package install, large partition format), or it may be stuck.
@@ -314,9 +314,9 @@ export function SetupProgress({ complete, phase = "running", deviceIp }: SetupPr
                           : "bg-white/5"
                     )}>
                       {done ? (
-                        <Check className="h-3 w-3 text-emerald-400" />
+                        <CheckIcon className="h-3 w-3 text-emerald-400" />
                       ) : active ? (
-                        <Loader2 className="h-3 w-3 animate-spin text-blue-400" />
+                        <ProgressActivityIcon className="h-3 w-3 animate-spin text-blue-400" />
                       ) : (
                         <span className="h-1 w-1 rounded-full bg-white/20" />
                       )}
@@ -337,7 +337,7 @@ export function SetupProgress({ complete, phase = "running", deviceIp }: SetupPr
         {/* Setup log — right column */}
         <div className="overflow-hidden rounded-xl border border-white/8 bg-black/30">
           <div className="flex items-center gap-2 border-b border-white/5 px-3 py-2">
-            <Terminal className="h-3.5 w-3.5 text-slate-500" />
+            <Terminal2Icon className="h-3.5 w-3.5 text-slate-500" />
             <span className="text-xs font-medium text-slate-500">Setup Log</span>
             {logLines.length > 0 && (
               <span className="ml-auto text-[10px] tabular-nums text-slate-600">
@@ -351,7 +351,7 @@ export function SetupProgress({ complete, phase = "running", deviceIp }: SetupPr
           >
             {logLines.length === 0 ? (
               <div className="flex items-center gap-2 text-slate-600">
-                <Loader2 className="h-3 w-3 animate-spin" />
+                <ProgressActivityIcon className="h-3 w-3 animate-spin" />
                 Waiting for setup log...
               </div>
             ) : (

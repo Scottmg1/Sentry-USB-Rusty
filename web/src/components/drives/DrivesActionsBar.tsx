@@ -1,14 +1,14 @@
 import { useEffect, useRef, useState } from "react"
 import {
-  ChevronDown,
-  Download,
-  Loader2,
-  Play,
-  Radio,
-  RefreshCw,
-  Trash2,
-  Upload,
-} from "lucide-react"
+  CachedIcon,
+  DeleteIcon,
+  DownloadIcon,
+  ExpandMoreIcon,
+  PlayArrowIcon,
+  ProgressActivityIcon,
+  SensorsIcon,
+  UploadIcon,
+} from "@/components/icons"
 import { cn } from "@/lib/utils"
 import { api } from "@/lib/api"
 import { wsClient } from "@/lib/ws"
@@ -157,31 +157,31 @@ export function DrivesActionsBar({ onChanged }: DrivesActionsBarProps) {
             className="inline-flex items-center gap-1.5 rounded-lg border border-white/10 bg-white/[0.03] px-3 py-1.5 text-xs font-medium text-slate-200 transition-colors hover:bg-white/[0.06] disabled:opacity-50"
           >
             {processing || backendProcessing ? (
-              <Loader2 className="h-3.5 w-3.5 animate-spin" />
+              <ProgressActivityIcon className="h-3.5 w-3.5 animate-spin" />
             ) : (
-              <RefreshCw className="h-3.5 w-3.5" />
+              <CachedIcon className="h-3.5 w-3.5" />
             )}
             {processing || backendProcessing ? "Processing" : "Process"}
             {!(processing || backendProcessing) && (
-              <ChevronDown className="h-3 w-3" />
+              <ExpandMoreIcon className="h-3 w-3" />
             )}
           </button>
           {processMenuOpen && !(processing || backendProcessing) && (
             <div className="absolute right-0 z-50 mt-1 w-60 rounded-lg border border-white/10 bg-slate-950/95 py-1 shadow-2xl backdrop-blur">
               <MenuItem
-                icon={<Play className="h-3.5 w-3.5 text-emerald-400" />}
+                icon={<PlayArrowIcon className="h-3.5 w-3.5 text-emerald-400" />}
                 title="Process new drives"
                 hint="Extract GPS from unprocessed clips"
                 onClick={() => runProcess("new")}
               />
               <MenuItem
-                icon={<RefreshCw className="h-3.5 w-3.5 text-amber-400" />}
+                icon={<CachedIcon className="h-3.5 w-3.5 text-amber-400" />}
                 title="Reprocess all drives"
                 hint="Re-extract every existing clip on disk"
                 onClick={() => runProcess("all")}
               />
               <MenuItem
-                icon={<Radio className="h-3.5 w-3.5 text-violet-400" />}
+                icon={<SensorsIcon className="h-3.5 w-3.5 text-violet-400" />}
                 title="Scan for Summon drives"
                 hint="Re-read slow clips for summon evidence"
                 onClick={() => runProcess("summon")}
@@ -194,7 +194,7 @@ export function DrivesActionsBar({ onChanged }: DrivesActionsBarProps) {
           href="/api/drives/data/download"
           className="inline-flex items-center gap-1.5 rounded-lg border border-white/10 bg-white/[0.03] px-3 py-1.5 text-xs font-medium text-slate-200 transition-colors hover:bg-white/[0.06]"
         >
-          <Download className="h-3.5 w-3.5" /> Export
+          <DownloadIcon className="h-3.5 w-3.5" /> Export
         </a>
 
         <button
@@ -204,9 +204,9 @@ export function DrivesActionsBar({ onChanged }: DrivesActionsBarProps) {
           className="inline-flex items-center gap-1.5 rounded-lg border border-white/10 bg-white/[0.03] px-3 py-1.5 text-xs font-medium text-slate-200 transition-colors hover:bg-white/[0.06] disabled:opacity-50"
         >
           {importing ? (
-            <Loader2 className="h-3.5 w-3.5 animate-spin" />
+            <ProgressActivityIcon className="h-3.5 w-3.5 animate-spin" />
           ) : (
-            <Upload className="h-3.5 w-3.5" />
+            <UploadIcon className="h-3.5 w-3.5" />
           )}
           {importing ? "Importing…" : "Import"}
         </button>
@@ -227,7 +227,7 @@ export function DrivesActionsBar({ onChanged }: DrivesActionsBarProps) {
           onClick={() => setConfirmingDelete(true)}
           className="inline-flex items-center gap-1.5 rounded-lg border border-rose-400/30 bg-rose-500/10 px-3 py-1.5 text-xs font-medium text-rose-200 transition-colors hover:bg-rose-500/20 disabled:opacity-50"
         >
-          <Trash2 className="h-3.5 w-3.5" /> Delete all
+          <DeleteIcon className="h-3.5 w-3.5" /> Delete all
         </button>
       </div>
 
@@ -266,9 +266,9 @@ export function DrivesActionsBar({ onChanged }: DrivesActionsBarProps) {
                 )}
               >
                 {deleting ? (
-                  <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                  <ProgressActivityIcon className="h-3.5 w-3.5 animate-spin" />
                 ) : (
-                  <Trash2 className="h-3.5 w-3.5" />
+                  <DeleteIcon className="h-3.5 w-3.5" />
                 )}
                 {deleting ? "Deleting…" : "Delete everything"}
               </button>

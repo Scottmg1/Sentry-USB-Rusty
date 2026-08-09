@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState, memo } from "react"
 import L from "leaflet"
 import "leaflet/dist/leaflet.css"
-import { MapPin, Minimize2, Maximize2 } from "lucide-react"
+import { CloseFullscreenIcon, LocationOnIcon, OpenInFullIcon } from "@/components/icons"
 import type { ClipTelemetry, TelemetryFrame } from "@/lib/api"
 import { useDraggable } from "@/hooks/useDraggable"
 
@@ -110,7 +110,7 @@ export default memo(function MiniMap({ telemetry, currentFrame }: MiniMapProps) 
       {/* Header — drag handle */}
       <div className="flex items-center justify-between bg-black/40 px-2 py-1 cursor-grab">
         <div className="flex items-center gap-1">
-          <MapPin className="h-3 w-3 text-blue-400" />
+          <LocationOnIcon className="h-3 w-3 text-blue-400" />
           <span className="text-[10px] font-medium text-slate-300">Map</span>
           {telemetry.has_autopilot && (
             <span className="ml-1 flex items-center gap-0.5 text-[9px] text-slate-500">
@@ -123,7 +123,7 @@ export default memo(function MiniMap({ telemetry, currentFrame }: MiniMapProps) 
           onClick={() => setCollapsed(!collapsed)}
           className="rounded p-0.5 text-slate-500 hover:text-slate-300"
         >
-          {collapsed ? <Maximize2 className="h-3 w-3" /> : <Minimize2 className="h-3 w-3" />}
+          {collapsed ? <OpenInFullIcon className="h-3 w-3" /> : <CloseFullscreenIcon className="h-3 w-3" />}
         </button>
       </div>
       {!collapsed && (

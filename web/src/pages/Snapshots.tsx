@@ -1,5 +1,12 @@
 import { useCallback, useEffect, useMemo, useState } from "react"
-import { Trash2, Loader2, AlertTriangle, Clock, HardDrive, ArrowUpDown } from "lucide-react"
+import {
+  DeleteIcon,
+  HardDriveIcon,
+  ProgressActivityIcon,
+  ScheduleIcon,
+  SwapVertIcon,
+  WarningIcon,
+} from "@/components/icons"
 
 interface SnapshotEntry {
   id: string
@@ -139,7 +146,7 @@ export default function Snapshots() {
         <div className="glass-card mb-6 p-4">
           <div className="mb-2 flex items-center justify-between text-sm">
             <span className="flex items-center gap-2 text-slate-300">
-              <HardDrive className="h-4 w-4" />
+              <HardDriveIcon className="h-4 w-4" />
               Backingfiles partition
             </span>
             <span className="text-slate-400">
@@ -171,7 +178,7 @@ export default function Snapshots() {
 
       {error && (
         <div className="mb-4 flex items-start gap-2 rounded-lg border border-red-500/30 bg-red-500/10 p-3 text-sm">
-          <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-red-400" />
+          <WarningIcon className="mt-0.5 h-4 w-4 shrink-0 text-red-400" />
           <p className="text-red-300">{error}</p>
         </div>
       )}
@@ -183,7 +190,7 @@ export default function Snapshots() {
             {snapshots.length} {snapshots.length === 1 ? "snapshot" : "snapshots"}
           </p>
           <label className="flex items-center gap-2 text-xs text-slate-400">
-            <ArrowUpDown className="h-3 w-3" />
+            <SwapVertIcon className="h-3 w-3" />
             <select
               value={sortMode}
               onChange={(e) => setSortMode(e.target.value as SortMode)}
@@ -200,11 +207,11 @@ export default function Snapshots() {
       {/* Snapshot list */}
       {loading ? (
         <div className="flex justify-center py-12">
-          <Loader2 className="h-6 w-6 animate-spin text-slate-500" />
+          <ProgressActivityIcon className="h-6 w-6 animate-spin text-slate-500" />
         </div>
       ) : snapshots.length === 0 ? (
         <div className="glass-card flex flex-col items-center gap-2 px-4 py-12 text-center">
-          <Clock className="h-8 w-8 text-slate-600" />
+          <ScheduleIcon className="h-8 w-8 text-slate-600" />
           <p className="text-sm text-slate-400">No snapshots on this device.</p>
           <p className="text-xs text-slate-500">
             Snapshots are created automatically by the archive loop while you drive.
@@ -244,7 +251,7 @@ export default function Snapshots() {
                       disabled={isDeleting}
                       className="flex items-center gap-1 rounded bg-red-500/80 px-3 py-1 text-xs font-medium text-white transition-colors hover:bg-red-500 disabled:opacity-50"
                     >
-                      {isDeleting && <Loader2 className="h-3 w-3 animate-spin" />}
+                      {isDeleting && <ProgressActivityIcon className="h-3 w-3 animate-spin" />}
                       Delete forever
                     </button>
                   </div>
@@ -255,7 +262,7 @@ export default function Snapshots() {
                     className="flex shrink-0 items-center gap-1 rounded-lg border border-white/10 bg-white/5 px-3 py-1.5 text-xs text-slate-400 transition-colors hover:border-red-500/30 hover:bg-red-500/10 hover:text-red-300 disabled:opacity-50"
                     aria-label={`Delete snapshot ${s.id}`}
                   >
-                    <Trash2 className="h-3.5 w-3.5" />
+                    <DeleteIcon className="h-3.5 w-3.5" />
                     Delete
                   </button>
                 )}

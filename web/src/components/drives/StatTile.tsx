@@ -1,5 +1,5 @@
 import { useState } from "react"
-import { Info } from "lucide-react"
+import { InfoIcon } from "@/components/icons"
 import { cn } from "@/lib/utils"
 
 interface StatTileProps {
@@ -38,7 +38,7 @@ export function StatTile({ label, value, icon, info, star, size = "section" }: S
                 onClick={() => setTipOpen((o) => !o)}
                 className="inline-flex h-3 w-3 items-center justify-center text-slate-600 hover:text-slate-400"
               >
-                <Info className="h-3 w-3" />
+                <InfoIcon className="h-3 w-3" />
               </button>
               {tipOpen && (
                 <span className="absolute left-1/2 top-full z-50 mt-1 w-48 -translate-x-1/2 rounded-md border border-white/10 bg-slate-900/95 px-2 py-1 text-[11px] normal-case tracking-normal text-slate-300 shadow-2xl">

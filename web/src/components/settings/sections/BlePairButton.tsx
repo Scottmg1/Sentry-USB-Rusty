@@ -1,5 +1,19 @@
 import { useState, useEffect, useRef, useCallback } from "react"
-import { Bluetooth, Check, CheckCircle, AlertCircle, Loader2, Wifi, WifiOff, ChevronDown, ChevronUp, Eye, EyeOff, Usb, Cpu } from "lucide-react"
+import {
+  BluetoothIcon,
+  CheckCircleIcon,
+  CheckIcon,
+  ErrorIcon,
+  ExpandLessIcon,
+  ExpandMoreIcon,
+  MemoryIcon,
+  ProgressActivityIcon,
+  UsbIcon,
+  VisibilityIcon,
+  VisibilityOffIcon,
+  WifiIcon,
+  WifiOffIcon,
+} from "@/components/icons"
 import { cn } from "@/lib/utils"
 import { wsClient } from "@/lib/ws"
 import { PrefCard } from "@/components/settings/PrefCard"
@@ -591,15 +605,15 @@ export function BlePairButton() {
 
   const icon =
     bleState === "loading" ? (
-      <Loader2 className="h-3.5 w-3.5 animate-spin" />
+      <ProgressActivityIcon className="h-3.5 w-3.5 animate-spin" />
     ) : isActive ? (
-      <Loader2 className="h-3.5 w-3.5 animate-spin" />
+      <ProgressActivityIcon className="h-3.5 w-3.5 animate-spin" />
     ) : bleState === "paired" ? (
-      <CheckCircle className="h-3.5 w-3.5" />
+      <CheckCircleIcon className="h-3.5 w-3.5" />
     ) : bleState === "error" ? (
-      <AlertCircle className="h-3.5 w-3.5" />
+      <ErrorIcon className="h-3.5 w-3.5" />
     ) : (
-      <Bluetooth className="h-3.5 w-3.5" />
+      <BluetoothIcon className="h-3.5 w-3.5" />
     )
 
   // ── Live connection indicator ──────────────────────────────────────────────
@@ -638,13 +652,13 @@ export function BlePairButton() {
         ? "sky"
         : "slate"
   const liveIcon = showPaused ? (
-    <Loader2 className="h-3 w-3 animate-spin" />
+    <ProgressActivityIcon className="h-3 w-3 animate-spin" />
   ) : secondsAgo !== null && secondsAgo < 60 ? (
     <LiveDot />
   ) : secondsAgo !== null && secondsAgo < 600 ? (
-    <Wifi className="h-3 w-3" />
+    <WifiIcon className="h-3 w-3" />
   ) : (
-    <WifiOff className="h-3 w-3" />
+    <WifiOffIcon className="h-3 w-3" />
   )
 
   // ── Top-right badge: shows pair status + live connection ───────────────────
@@ -734,7 +748,7 @@ export function BlePairButton() {
               aria-label={vinRevealed ? "Hide VIN" : "Reveal VIN"}
               className="absolute right-1.5 top-1/2 -translate-y-1/2 rounded p-1 text-slate-500 transition-colors hover:bg-white/5 hover:text-slate-300 disabled:opacity-50"
             >
-              {vinRevealed ? <EyeOff className="h-3.5 w-3.5" /> : <Eye className="h-3.5 w-3.5" />}
+              {vinRevealed ? <VisibilityOffIcon className="h-3.5 w-3.5" /> : <VisibilityIcon className="h-3.5 w-3.5" />}
             </button>
           )}
         </div>
@@ -779,7 +793,7 @@ export function BlePairButton() {
               onClick={() => setOutputOpen((v) => !v)}
               className="inline-flex items-center gap-1 self-start rounded-lg bg-white/5 px-3 py-1.5 text-xs font-medium text-slate-300 transition-colors hover:bg-white/10"
             >
-              {outputOpen ? <ChevronUp className="h-3 w-3" /> : <ChevronDown className="h-3 w-3" />}
+              {outputOpen ? <ExpandLessIcon className="h-3 w-3" /> : <ExpandMoreIcon className="h-3 w-3" />}
               {outputOpen ? "Hide output" : "Show output"}
             </button>
           )}
@@ -799,7 +813,7 @@ export function BlePairButton() {
       {clockStatus?.show_warning && (
         <div className="rounded-lg border border-blue-500/20 bg-blue-500/[0.04] p-3 text-xs">
           <div className="flex items-start gap-2">
-            <AlertCircle className="mt-0.5 h-4 w-4 shrink-0 text-blue-400" />
+            <ErrorIcon className="mt-0.5 h-4 w-4 shrink-0 text-blue-400" />
             <div>
               <p className="font-semibold text-blue-300">
                 Setting Pi clock from car
@@ -882,7 +896,7 @@ function AdapterPicker({
   return (
     <div className="rounded-lg border border-blue-500/20 bg-blue-500/[0.04] p-3 text-xs">
       <div className="mb-2 flex items-center gap-2">
-        <Usb className="h-3.5 w-3.5 text-blue-400" />
+        <UsbIcon className="h-3.5 w-3.5 text-blue-400" />
         <span className="font-semibold text-slate-200">Bluetooth adapter</span>
       </div>
       <p className="mb-2 text-[11px] leading-relaxed text-slate-400">
@@ -909,9 +923,9 @@ function AdapterPicker({
             >
               <span className="flex items-center gap-2">
                 {a.source === "external" ? (
-                  <Usb className="h-3 w-3 text-blue-400" />
+                  <UsbIcon className="h-3 w-3 text-blue-400" />
                 ) : (
-                  <Cpu className="h-3 w-3 text-slate-400" />
+                  <MemoryIcon className="h-3 w-3 text-slate-400" />
                 )}
                 <span className="font-medium text-slate-200">
                   {a.source === "external" ? "USB Bluetooth dongle" : "Pi built-in Bluetooth"}
@@ -922,7 +936,7 @@ function AdapterPicker({
               </span>
               {isCurrent && (
                 <span className="inline-flex items-center gap-1 text-[10px] font-semibold text-blue-400">
-                  <Check className="h-3 w-3" /> In use
+                  <CheckIcon className="h-3 w-3" /> In use
                 </span>
               )}
             </button>
@@ -942,7 +956,7 @@ function AdapterPicker({
       )}
       {switching && (
         <p className="mt-1.5 inline-flex items-center gap-1 text-[10px] text-slate-400">
-          <Loader2 className="h-3 w-3 animate-spin" /> Switching Bluetooth adapter…
+          <ProgressActivityIcon className="h-3 w-3 animate-spin" /> Switching Bluetooth adapter…
         </p>
       )}
       {error && (
@@ -1030,7 +1044,7 @@ function TelemetryOutputPanel({
             title="Ask the Pi to read your car's data right now"
             className="inline-flex items-center gap-1 rounded bg-blue-500/15 px-2 py-0.5 text-[10px] font-medium text-blue-400 hover:bg-blue-500/25 disabled:opacity-50"
           >
-            {polling ? <Loader2 className="h-3 w-3 animate-spin" /> : null}
+            {polling ? <ProgressActivityIcon className="h-3 w-3 animate-spin" /> : null}
             Poll now
           </button>
           <button
@@ -1039,7 +1053,7 @@ function TelemetryOutputPanel({
             title="Reload the values from the Pi's database"
             className="inline-flex items-center gap-1 rounded bg-white/5 px-2 py-0.5 text-[10px] text-slate-400 hover:bg-white/10 disabled:opacity-50"
           >
-            {loading ? <Loader2 className="h-3 w-3 animate-spin" /> : null}
+            {loading ? <ProgressActivityIcon className="h-3 w-3 animate-spin" /> : null}
             Refresh
           </button>
         </div>

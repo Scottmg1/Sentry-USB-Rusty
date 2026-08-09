@@ -1,4 +1,11 @@
-import { BatteryCharging, Clock, DollarSign, Gauge, Leaf, Zap } from "lucide-react"
+import {
+  AttachMoneyIcon,
+  BatteryAndroidFrameBoltIcon,
+  BoltIcon,
+  NestEcoLeafIcon,
+  ScheduleIcon,
+  SpeedIcon,
+} from "@/components/icons"
 import { fmtDuration, fmtMoney, fmtPercent } from "@/lib/charge-format"
 
 export interface ChargingStats {
@@ -42,19 +49,19 @@ export function ChargingSummaryStrip({
     // hidden below sm so they don't take grid cells.
     <div className="grid grid-cols-2 gap-x-4 gap-y-3 sm:flex sm:flex-wrap sm:items-center sm:gap-x-5 sm:gap-y-2">
       <StatCell
-        icon={<BatteryCharging className="h-3.5 w-3.5" />}
+        icon={<BatteryAndroidFrameBoltIcon className="h-3.5 w-3.5" />}
         label="Sessions"
         value={stats.count.toLocaleString()}
       />
       <Divider />
       <StatCell
-        icon={<Zap className="h-3.5 w-3.5 text-emerald-300" />}
+        icon={<BoltIcon className="h-3.5 w-3.5 text-emerald-300" />}
         label="Energy added"
         value={`${stats.totalEnergyKwh.toFixed(1)} kWh`}
       />
       <Divider />
       <StatCell
-        icon={<Clock className="h-3.5 w-3.5" />}
+        icon={<ScheduleIcon className="h-3.5 w-3.5" />}
         label="Time charging"
         value={fmtDuration(stats.totalDurationSecs)}
       />
@@ -62,7 +69,7 @@ export function ChargingSummaryStrip({
         <>
           <Divider />
           <StatCell
-            icon={<Gauge className="h-3.5 w-3.5" />}
+            icon={<SpeedIcon className="h-3.5 w-3.5" />}
             label="Avg / session"
             value={`${avgKwh.toFixed(1)} kWh`}
           />
@@ -72,7 +79,7 @@ export function ChargingSummaryStrip({
         <>
           <Divider />
           <StatCell
-            icon={<Leaf className="h-3.5 w-3.5 text-emerald-300" />}
+            icon={<NestEcoLeafIcon className="h-3.5 w-3.5 text-emerald-300" />}
             label="Avg efficiency"
             value={fmtPercent(stats.avgEfficiency)}
           />
@@ -82,7 +89,7 @@ export function ChargingSummaryStrip({
         <>
           <Divider />
           <StatCell
-            icon={<DollarSign className="h-3.5 w-3.5 text-emerald-300" />}
+            icon={<AttachMoneyIcon className="h-3.5 w-3.5 text-emerald-300" />}
             label="Total cost"
             value={fmtMoney(stats.totalCost, stats.currency)}
           />

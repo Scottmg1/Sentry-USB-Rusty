@@ -1,5 +1,12 @@
 import { useState, useRef, useEffect } from "react"
-import { AlertTriangle, Clock, Wifi, MapPin, Loader2, Plane } from "lucide-react"
+import {
+  LocationOnIcon,
+  ProgressActivityIcon,
+  ScheduleIcon,
+  TravelIcon,
+  WarningIcon,
+  WifiIcon,
+} from "@/components/icons"
 import { cn } from "@/lib/utils"
 import { useAwayMode } from "@/hooks/useAwayMode"
 import type { AwayModeKind } from "@/hooks/useAwayMode"
@@ -149,7 +156,7 @@ export function AwayModeControl({ onOpenWizard }: Props = {}) {
     }
     return (
       <div className="flex items-center gap-2 text-xs">
-        <MapPin className="h-3 w-3 text-blue-400" />
+        <LocationOnIcon className="h-3 w-3 text-blue-400" />
         <span className="text-slate-300">
           Currently <span className="font-medium">{status.is_home ? "home" : "away"}</span> —
           access point{" "}
@@ -165,7 +172,7 @@ export function AwayModeControl({ onOpenWizard }: Props = {}) {
     <PrefCard
       icon={
         <span onClick={handleSecretTap} className="cursor-default select-none" role="presentation">
-          <Wifi className="h-3.5 w-3.5" />
+          <WifiIcon className="h-3.5 w-3.5" />
         </span>
       }
       halo="blue"
@@ -175,7 +182,7 @@ export function AwayModeControl({ onOpenWizard }: Props = {}) {
           <span className="flex items-center gap-1.5">
             {travelOn && (
               <Pill kind="accent">
-                <Plane className="h-3 w-3" /> Travel
+                <TravelIcon className="h-3 w-3" /> Travel
               </Pill>
             )}
             {apUp && (
@@ -215,7 +222,7 @@ export function AwayModeControl({ onOpenWizard }: Props = {}) {
               without it. Mirrors the keep-accessory dependency warning. */}
           {status.ble_ready === false && (
             <div className="flex items-start gap-2 rounded-lg border border-amber-500/30 bg-amber-500/10 p-3">
-              <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-amber-400" />
+              <WarningIcon className="mt-0.5 h-4 w-4 shrink-0 text-amber-400" />
               <div className="space-y-2">
                 <p className="text-xs text-amber-200/90">
                   <span className="font-medium">Automatic needs BLE telemetry.</span> The car’s
@@ -228,7 +235,7 @@ export function AwayModeControl({ onOpenWizard }: Props = {}) {
                   disabled={enablingBle}
                   className="inline-flex items-center gap-1.5 rounded-md border border-amber-500/40 bg-amber-500/15 px-2.5 py-1 text-xs font-medium text-amber-100 transition-colors hover:bg-amber-500/25 disabled:opacity-50"
                 >
-                  {enablingBle && <Loader2 className="h-3 w-3 animate-spin" />}
+                  {enablingBle && <ProgressActivityIcon className="h-3 w-3 animate-spin" />}
                   Turn on BLE telemetry
                 </button>
               </div>
@@ -256,7 +263,7 @@ export function AwayModeControl({ onOpenWizard }: Props = {}) {
         <>
           {status.has_rtc === false && (
             <div className="flex gap-2 rounded-lg border border-amber-500/20 bg-amber-500/5 p-2 text-[10px] text-amber-400/80">
-              <AlertTriangle className="mt-0.5 h-3 w-3 shrink-0" />
+              <WarningIcon className="mt-0.5 h-3 w-3 shrink-0" />
               <p>No RTC detected — timer saved every 30s, may lose accuracy on reboot.</p>
             </div>
           )}
@@ -265,7 +272,7 @@ export function AwayModeControl({ onOpenWizard }: Props = {}) {
             <>
               <div className="flex items-center justify-between">
                 <div className="flex items-center gap-2 text-xs text-blue-400">
-                  <Clock className="h-3 w-3" />
+                  <ScheduleIcon className="h-3 w-3" />
                   <span className="font-medium">{formatRemaining(status.remaining_sec ?? 0)}</span>
                 </div>
                 <button
@@ -352,7 +359,7 @@ export function AwayModeControl({ onOpenWizard }: Props = {}) {
               {confirmOpen && (
                 <div className="space-y-3 rounded-xl border border-amber-500/30 bg-amber-500/5 p-4">
                   <div className="flex items-start gap-2">
-                    <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-amber-400" />
+                    <WarningIcon className="mt-0.5 h-4 w-4 shrink-0 text-amber-400" />
                     <div className="space-y-1 text-xs text-amber-300/90">
                       <p className="font-semibold">You may lose connection to this page</p>
                       <p className="text-amber-400/70">

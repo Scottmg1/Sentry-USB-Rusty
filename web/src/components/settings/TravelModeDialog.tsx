@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react"
 import { createPortal } from "react-dom"
-import { Plane, Loader2 } from "lucide-react"
+import { ProgressActivityIcon, TravelIcon } from "@/components/icons"
 import { Modal } from "@/components/ui/Modal"
 import { Toggle } from "@/components/ui/Toggle"
 import { api } from "@/lib/api"
@@ -125,7 +125,7 @@ export function TravelModeDialog({ onClose, onChange }: Props) {
     <Modal
       title={
         <span className="flex items-center gap-2">
-          <Plane className="h-4 w-4 text-sky-400" />
+          <TravelIcon className="h-4 w-4 text-sky-400" />
           Travel Mode
         </span>
       }
@@ -182,7 +182,7 @@ export function TravelModeDialog({ onClose, onChange }: Props) {
 
         {archiving && (
           <div className="flex items-start gap-2 rounded-lg border border-amber-500/30 bg-amber-500/10 p-3">
-            <Loader2 className="mt-0.5 h-4 w-4 shrink-0 animate-spin text-amber-400" />
+            <ProgressActivityIcon className="mt-0.5 h-4 w-4 shrink-0 animate-spin text-amber-400" />
             <p className="text-xs text-amber-200/90">
               An archive cycle is running right now. To avoid interrupting it mid-cycle, Travel Mode
               can’t be changed until it finishes — this unlocks automatically in a moment.

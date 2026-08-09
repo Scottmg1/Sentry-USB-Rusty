@@ -1,4 +1,4 @@
-import { HeartPulse } from "lucide-react"
+import { CardiologyIcon } from "@/components/icons"
 import { useKeepAwake } from "@/hooks/useKeepAwake"
 import { PrefCard } from "@/components/settings/PrefCard"
 import { SegPicker } from "@/components/ui/SegPicker"
@@ -18,7 +18,7 @@ export function KeepAwakePreference() {
 
   return (
     <PrefCard
-      icon={<HeartPulse className="h-3.5 w-3.5" />}
+      icon={<CardiologyIcon className="h-3.5 w-3.5" />}
       halo="rose"
       title="Keep Awake"
     >

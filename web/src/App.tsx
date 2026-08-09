@@ -1,6 +1,6 @@
 import { useEffect, useState, lazy, Suspense } from "react"
 import { BrowserRouter, Routes, Route } from "react-router-dom"
-import { Loader2, AlertTriangle } from "lucide-react"
+import { ProgressActivityIcon, WarningIcon } from "@/components/icons"
 import { AppShell } from "@/components/layout/AppShell"
 import { SetupWizard } from "@/components/setup/SetupWizard"
 import { SetupProgress } from "@/components/setup/SetupProgress"
@@ -165,7 +165,7 @@ function AppContent() {
       <div className="flex min-h-screen items-center justify-center bg-slate-950 p-4">
         <div className="flex w-full max-w-lg flex-col items-center gap-6 rounded-2xl border border-amber-500/20 bg-white/[0.03] p-10 text-center">
           <div className="flex h-16 w-16 items-center justify-center rounded-full bg-amber-500/20">
-            <AlertTriangle className="h-8 w-8 text-amber-400" />
+            <WarningIcon className="h-8 w-8 text-amber-400" />
           </div>
           <div>
             <h2 className="text-xl font-semibold text-slate-100">
@@ -215,7 +215,7 @@ function AppContent() {
       <div className="flex h-screen items-center justify-center bg-slate-950">
         <div className="flex w-full max-w-lg flex-col items-center gap-6 rounded-2xl border border-white/10 bg-white/[0.03] p-10 text-center">
           <div className="flex h-16 w-16 items-center justify-center rounded-full bg-blue-500/20">
-            <Loader2 className="h-8 w-8 animate-spin text-blue-400" />
+            <ProgressActivityIcon className="h-8 w-8 animate-spin text-blue-400" />
           </div>
           <div>
             <h2 className="text-xl font-semibold text-slate-100">Setting Up Sentry USB</h2>
@@ -241,7 +241,7 @@ function AppContent() {
       <div className="flex h-screen items-center justify-center bg-slate-950">
         <div className="flex w-full max-w-lg flex-col items-center gap-6 rounded-2xl border border-white/10 bg-white/[0.03] p-10 text-center">
           <div className="flex h-16 w-16 items-center justify-center rounded-full bg-emerald-500/20">
-            <Loader2 className="h-8 w-8 animate-spin text-emerald-400" />
+            <ProgressActivityIcon className="h-8 w-8 animate-spin text-emerald-400" />
           </div>
           <div>
             <h2 className="text-xl font-semibold text-slate-100">Almost Done!</h2>
@@ -314,7 +314,7 @@ function AppContent() {
 function RouteFallback() {
   return (
     <div className="flex h-screen items-center justify-center bg-slate-950">
-      <Loader2 className="h-6 w-6 animate-spin text-blue-400" />
+      <ProgressActivityIcon className="h-6 w-6 animate-spin text-blue-400" />
     </div>
   )
 }
