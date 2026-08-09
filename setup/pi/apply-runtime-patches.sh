@@ -956,6 +956,18 @@ then
   fi
 fi
 
+# archiveloop exports its own `log` to children (export -f log), so the
+# normal path inherits it. A HAND invocation does not, and every log
+# call would then abort the script under `set -e` — right before the
+# delete, so a troubleshooting operator got `log: command not found` and
+# no cleanup. Define a stdout fallback only when nothing was inherited.
+if ! declare -F log > /dev/null 2>&1
+then
+  function log () {
+    echo "$( date ):" "$@"
+  }
+fi
+
 function manage_free_space {
   # Try to make free space equal to 10 GB plus three percent of the total
   # available space. This should be enough to hold the next hour of
