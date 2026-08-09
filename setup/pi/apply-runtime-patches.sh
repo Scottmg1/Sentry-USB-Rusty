@@ -1080,15 +1080,13 @@ MFS_EOF
     if ! bash -n "$f.new" 2>/dev/null; then
         err "eviction-by-age: staged replacement failed bash -n — aborting"
         rm -f "$f.new"
-        PATCH_FAILURES=$((PATCH_FAILURES + 1))
-        return 0
+        return 1
     fi
     chmod --reference="$f" "$f.new" 2>/dev/null || chmod 755 "$f.new"
     if ! mv "$f.new" "$f"; then
         err "eviction-by-age: rename failed (read-only fs? disk full?) — $f left as-is"
         rm -f "$f.new"
-        PATCH_FAILURES=$((PATCH_FAILURES + 1))
-        return 0
+        return 1
     fi
     log "eviction-by-age: replaced legacy manage_free_space.sh (mtime-ordered eviction)"
 }
@@ -1168,44 +1166,55 @@ SLOT_PYEOF
     if [ "$result" != "staged" ] || [ ! -f "$f.new" ]; then
         err "slot-pick: staging failed ($result) — leaving $f untouched"
         rm -f "$f.new"
-        PATCH_FAILURES=$((PATCH_FAILURES + 1))
-        return 0
+        return 1
     fi
     if ! bash -n "$f.new" 2>/dev/null || ! grep -q 'slot pick: picker=bash' "$f.new"; then
         err "slot-pick: staged file failed verification — aborting"
         rm -f "$f.new"
-        PATCH_FAILURES=$((PATCH_FAILURES + 1))
-        return 0
+        return 1
     fi
     chmod --reference="$f" "$f.new" 2>/dev/null || chmod 755 "$f.new"
     if ! mv "$f.new" "$f"; then
         err "slot-pick: rename failed (read-only fs? disk full?) — $f left as-is"
         rm -f "$f.new"
-        PATCH_FAILURES=$((PATCH_FAILURES + 1))
-        return 0
+        return 1
     fi
     log "slot-pick: patched legacy make_snapshot.sh picker (dir-name max + mounted guard)"
 }
 
 # Counts patches that FAILED to apply (as opposed to correctly skipping).
-# The runner has no `set -e`, so without this a failed write/rename is
-# invisible and the OTA caller records "patches re-applied successfully".
+# The runner deliberately has no `set -e` — one broken patch must not stop
+# the rest from applying — so without an explicit tally a failed write or
+# rename is invisible and the OTA caller records "patches re-applied
+# successfully". Every patch function returns 0 for "applied" AND for
+# "legitimately not applicable" (wrong board, thin wrapper, already
+# patched, file absent); a non-zero return means a REAL failure.
 PATCH_FAILURES=0
+
+# Run one patch function, tallying a hard failure without aborting the
+# rest of the run.
+run_patch() {
+    local fn="$1"
+    if ! "$fn"; then
+        PATCH_FAILURES=$((PATCH_FAILURES + 1))
+        err "$fn: FAILED"
+    fi
+}
 
 # ── Run all patches ─────────────────────────────────────────────────────
 
-apply_ble_nonfatal_adv
-apply_ble_adv_helper
-apply_eatt_disable
-apply_backingfiles_bfq
-apply_hardware_watchdog
-apply_archive_mount_lock_scripts
-apply_rfkill_unblock_wifi
-apply_4cplus_wifi_nvram_fix
-apply_rclone_config_mutable_migration
-apply_rclone_watchdog_fix
-apply_snapshot_eviction_by_age
-apply_snapshot_slot_pick_hardening
+run_patch apply_ble_nonfatal_adv
+run_patch apply_ble_adv_helper
+run_patch apply_eatt_disable
+run_patch apply_backingfiles_bfq
+run_patch apply_hardware_watchdog
+run_patch apply_archive_mount_lock_scripts
+run_patch apply_rfkill_unblock_wifi
+run_patch apply_4cplus_wifi_nvram_fix
+run_patch apply_rclone_config_mutable_migration
+run_patch apply_rclone_watchdog_fix
+run_patch apply_snapshot_eviction_by_age
+run_patch apply_snapshot_slot_pick_hardening
 
 # Future patches that must survive an OTA update get appended here. Each
 # one self-checks board / precondition / marker so the whole script stays

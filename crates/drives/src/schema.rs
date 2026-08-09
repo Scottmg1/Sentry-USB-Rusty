@@ -572,9 +572,14 @@ pub fn migrate(conn: &Connection) -> Result<()> {
             .with_context(|| format!("migrate: adding telemetry_samples.{}", name))?;
     }
 
-    // v3 partial index. Idempotent.
-    conn.execute(V3_CLOUD_PENDING_INDEX, [])
-        .context("migrate: creating idx_routes_cloud_pending")?;
+    // v3 partial index. Idempotent. Best-effort like the loop below —
+    // an index is pure performance and must never cost the store.
+    if let Err(e) = conn.execute(V3_CLOUD_PENDING_INDEX, []) {
+        tracing::error!(
+            "schema: could not create idx_routes_cloud_pending ({e}); \
+             continuing without it (queries stay correct, just slower)"
+        );
+    }
 
     // Partial indexes for cloud-status counts and charge queries.
     // Idempotent, but the FIRST build on a grown DB (hundreds of MB)
@@ -594,8 +599,23 @@ pub fn migrate(conn: &Connection) -> Result<()> {
         if exists == 0 {
             tracing::info!("schema: building {} (one-time, may take a while on a large DB)", name);
         }
-        conn.execute(stmt, [])
-            .with_context(|| format!("migrate: creating {}", name))?;
+        // BEST-EFFORT, deliberately not `?`. These are pure performance
+        // indexes, but a failure here used to abort migrate(), which
+        // fails DriveStore::open(), which makes the daemon fall back to
+        // an EMPTY IN-MEMORY store — the user's whole drive history
+        // appears gone and that boot's ingest is discarded on reboot.
+        // The likeliest trigger is SQLITE_FULL on a nearly-full disk,
+        // i.e. exactly the condition free-space management exists to
+        // resolve, so the old behavior turned "disk is filling up" into
+        // "all your drives vanished". Table/column DDL and data
+        // migrations above stay fail-hard: those are correctness.
+        if let Err(e) = conn.execute(stmt, []) {
+            tracing::error!(
+                "schema: could not create {} ({e}); continuing without it \
+                 (queries stay correct, just slower)",
+                name
+            );
+        }
     }
 
     // v5 data cleanup: purge SavedClips/SentryClips routes that pre-v5

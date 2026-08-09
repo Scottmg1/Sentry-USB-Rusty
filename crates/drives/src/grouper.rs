@@ -989,7 +989,15 @@ fn group_clips(routes: Vec<Route>) -> Vec<Vec<TimedRoute>> {
                     ts: *ts,
                     file: r.file.as_str(),
                     driving: Some(route_has_driving(r)),
-                    gear_driving: telemetry_gear_driving(&r.gear_runs, &r.gear_states),
+                    // gear_runs ONLY — deliberately ignoring the
+                    // per-frame gear_states this path happens to have.
+                    // The drives list is built from RouteSummary, which
+                    // carries no gear_states, so consulting them here
+                    // would admit unanchored clusters the list rejects
+                    // (map shows a drive the list lacks). Anchored
+                    // admission still uses the broader `driving` gate
+                    // below, which keeps the richer evidence.
+                    gear_driving: telemetry_gear_driving(&r.gear_runs, &[]),
                 }
             })
             .collect();
@@ -4248,6 +4256,36 @@ mod tests {
         let groups = group_clips(routes);
         assert_eq!(groups.len(), 1, "event-only driving routes must form a drive");
         assert_eq!(groups[0].len(), 2);
+    }
+
+    #[test]
+    fn test_gap_fill_unanchored_gear_evidence_matches_summary_path() {
+        // The drives LIST is built from RouteSummary, which carries
+        // gear_runs but NOT gear_states, so its unanchored gate can only
+        // ever see gear_runs. The map/overview path walks full Routes and
+        // could see gear_states too — so a legacy/imported row with
+        // gear_states populated but gear_runs empty (gear_runs was added
+        // later and is backfilled) would be admitted by the MAP while the
+        // LIST rejected it: a drive visible on the map that does not
+        // exist in the list, and a 404 when clicked. Both paths must
+        // judge unanchored admission on the same evidence.
+        let mut states_only = test_route(
+            "SentryClips/2026-05-28_14-05-00/2026-05-28_14-00-00-front.mp4",
+            vec![[37.1, -122.1]],
+        );
+        states_only.gear_runs = Vec::new(); // legacy row: never RLE'd
+        states_only.gear_states = vec![1]; // non-Park frames present
+        let routes = vec![
+            test_route("RecentClips/2026-05-28/2026-05-28_10-00-00-front.mp4", vec![[37.0, -122.0]]),
+            states_only,
+        ];
+        let groups = group_clips(routes);
+        assert_eq!(
+            groups.len(),
+            1,
+            "map path must not admit what the summary path cannot see",
+        );
+        assert!(groups[0][0].route.file.starts_with("RecentClips/"));
     }
 
     #[test]
