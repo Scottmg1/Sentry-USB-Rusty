@@ -193,26 +193,49 @@ function purge_event_links_from_recentclips {
 function snapshot {
   # since taking a snapshot doesn't take much extra space, do that first,
   # before cleaning up old snapshots to maintain free space.
+  # Highest slot from snapshot DIRECTORY names, not snap.bin presence:
+  # a leftover snap dir whose bin was lost must still hold the
+  # high-water mark, and "no snap.bin anywhere" must not restart
+  # numbering at 0 while snap dirs exist (a restarted sequence beneath
+  # a stale high slot is what broke age assumptions fleet-wide).
+  # Matches the Rust picker (usb_gadget/snapshot.rs).
   local oldnum=-1
   local newnum=0
-  if stat /backingfiles/snapshots/snap-*/snap.bin > /dev/null 2>&1
+  local maxdir
+  maxdir=$(LC_ALL=C find /backingfiles/snapshots -mindepth 1 -maxdepth 1 \
+             -type d -name 'snap-*' 2>/dev/null |
+           grep -E '/snap-[0-9]+$' | LC_ALL=C sort | tail -1)
+  if [ -n "$maxdir" ]
   then
-    oldnum=$(find /backingfiles/snapshots/snap-* -maxdepth 1 -name snap.bin | sort | tail -1 | tr -c -d '[:digit:]' | sed 's/^0*//' )
+    oldnum=$(basename "$maxdir" | tr -c -d '[:digit:]' | sed 's/^0*//')
+    oldnum=${oldnum:-0}
     newnum=$((oldnum + 1))
   fi
   local oldname
   local newsnapdir
   oldname=/backingfiles/snapshots/snap-$(printf "%06d" "$oldnum")/snap.bin
 
-  # check that the previous snapshot is complete
-  if [ ! -e "${oldname}.toc" ] && [ "$oldnum" != "-1" ]
+  # check that the previous snapshot is complete (TOC committed AND the
+  # bin still present — aligned with the Rust picker's abandonment test)
+  if [ "$oldnum" != "-1" ] && { [ ! -e "${oldname}.toc" ] || [ ! -e "$oldname" ]; }
   then
-    log "previous snapshot was incomplete, deleting"
-    rm -rf "$(dirname "$oldname")"
-    newnum=$((oldnum))
-    oldnum=$((oldnum - 1))
-    oldname=/backingfiles/snapshots/snap-$(printf "%06d" "$oldnum")/snap.bin
+    # Never wipe a dir with something mounted under it (a stuck autofs
+    # mnt); skip the reuse and just append after it instead.
+    if grep -q "/backingfiles/snapshots/snap-$(printf "%06d" "$oldnum")/" /proc/mounts 2>/dev/null || \
+       grep -q "/tmp/snapshots/snap-$(printf "%06d" "$oldnum")" /proc/mounts 2>/dev/null
+    then
+      log "previous snapshot snap-$(printf "%06d" "$oldnum") incomplete but mounted — appending instead of reusing"
+      oldnum=$((oldnum - 1))
+      oldname=/backingfiles/snapshots/snap-$(printf "%06d" "$oldnum")/snap.bin
+    else
+      log "previous snapshot was incomplete, deleting"
+      rm -rf "$(dirname "$oldname")"
+      newnum=$((oldnum))
+      oldnum=$((oldnum - 1))
+      oldname=/backingfiles/snapshots/snap-$(printf "%06d" "$oldnum")/snap.bin
+    fi
   fi
+  log "slot pick: picker=bash max_seen=${maxdir:-none} prev=$oldnum next=$newnum"
 
   newsnapdir=/backingfiles/snapshots/snap-$(printf "%06d" $newnum)
   newsnapmnt=/tmp/snapshots/snap-$(printf "%06d" $newnum)

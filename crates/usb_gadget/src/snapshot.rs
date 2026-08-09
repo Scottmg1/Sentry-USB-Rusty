@@ -598,6 +598,45 @@ pub fn list_snapshots() -> Vec<String> {
     snaps
 }
 
+/// Snapshot names ordered by ACTUAL AGE — `snap.bin` mtime ascending,
+/// name as tie-break — for eviction. Slot names are NOT time-monotonic
+/// in the field (a reflash can leave a stale high-numbered snapshot
+/// above a restarted sequence — real device: snap-000414 from Jul 9
+/// over snap-000413 from Aug 8), so releasing in name order can delete
+/// newer footage while sparing the genuinely oldest snapshot.
+///
+/// Only physical `snap-<numeric>` directories that contain a readable
+/// `snap.bin` qualify: dirs without one hold no reclaimable footage,
+/// and an unreadable mtime fails closed (excluded) rather than being
+/// nominated for deletion with epoch-zero age.
+pub fn list_snapshots_by_age() -> Vec<String> {
+    list_snapshots_by_age_in(Path::new(SNAPSHOTS_DIR))
+}
+
+fn list_snapshots_by_age_in(base: &Path) -> Vec<String> {
+    let mut aged: Vec<(std::time::SystemTime, String)> = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(base) {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            let numeric = name
+                .strip_prefix("snap-")
+                .is_some_and(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()));
+            if !numeric || !entry.path().is_dir() {
+                continue;
+            }
+            let Ok(meta) = std::fs::symlink_metadata(entry.path().join("snap.bin")) else {
+                continue;
+            };
+            let Ok(mtime) = meta.modified() else {
+                continue;
+            };
+            aged.push((mtime, name));
+        }
+    }
+    aged.sort();
+    aged.into_iter().map(|(_, n)| n).collect()
+}
+
 // ─────────────────────────────────────────────────────────────────────
 // Helpers
 // ─────────────────────────────────────────────────────────────────────
@@ -609,43 +648,66 @@ pub fn list_snapshots() -> Vec<String> {
 /// Returns `(snap_num, Option<previous_toc_path>)`. The previous TOC
 /// is `None` on a brand-new install (no completed snapshots yet).
 fn pick_next_snapshot_slot() -> Result<(u32, Option<String>)> {
-    let mut max_num: u32 = 0;
-    if let Ok(entries) = std::fs::read_dir(SNAPSHOTS_DIR) {
+    pick_next_snapshot_slot_in(Path::new(SNAPSHOTS_DIR))
+}
+
+fn pick_next_snapshot_slot_in(base: &Path) -> Result<(u32, Option<String>)> {
+    // Option, not a 0 sentinel: "only snap-000000 exists" used to be
+    // indistinguishable from "no snapshots at all", which skipped the
+    // identical-snapshot TOC compare against a real snap-000000 (bash
+    // numbering starts at 0, so bash-era stores hit this).
+    let mut max_num: Option<u32> = None;
+    if let Ok(entries) = std::fs::read_dir(base) {
         for entry in entries.flatten() {
             let name = entry.file_name().to_string_lossy().to_string();
-            if let Some(num_str) = name.strip_prefix("snap-") {
-                if let Ok(num) = num_str.parse::<u32>() {
-                    if num > max_num {
-                        max_num = num;
-                    }
-                }
+            // Physical numeric dirs only — `snap-000508.bak` files or
+            // stray non-directories must not drive slot allocation.
+            let num = name
+                .strip_prefix("snap-")
+                .filter(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
+                .and_then(|s| s.parse::<u32>().ok());
+            if let Some(num) = num
+                && entry.path().is_dir()
+                && max_num.is_none_or(|m| num > m)
+            {
+                max_num = Some(num);
             }
         }
     }
 
-    if max_num == 0 {
+    let Some(max_num) = max_num else {
+        info!("slot pick: picker=rust max_seen=none action=fresh next=1");
         return Ok((1, None));
-    }
+    };
 
-    let prev_dir = format!("{}/snap-{:06}", SNAPSHOTS_DIR, max_num);
-    let prev_toc = format!("{}/snap.bin.toc", prev_dir);
-    let prev_bin = format!("{}/snap.bin", prev_dir);
+    let prev_dir = base.join(format!("snap-{:06}", max_num));
+    let prev_toc = prev_dir.join("snap.bin.toc");
+    let prev_bin = prev_dir.join("snap.bin");
 
     // Abandoned: no TOC was committed → reuse this slot.
-    if !Path::new(&prev_toc).exists() || !Path::new(&prev_bin).exists() {
+    if !prev_toc.exists() || !prev_bin.exists() {
         let _ = std::fs::remove_dir_all(&prev_dir);
         let next = max_num;
         // Look one further back for a usable previous TOC.
-        let backstop = if next > 1 {
-            let p = format!("{}/snap-{:06}/snap.bin.toc", SNAPSHOTS_DIR, next - 1);
-            if Path::new(&p).exists() { Some(p) } else { None }
+        let backstop = if next > 0 {
+            let p = base.join(format!("snap-{:06}/snap.bin.toc", next - 1));
+            if p.exists() { Some(p.to_string_lossy().into_owned()) } else { None }
         } else {
             None
         };
+        info!(
+            "slot pick: picker=rust max_seen={} action=reuse-incomplete next={}",
+            max_num, next
+        );
         return Ok((next, backstop));
     }
 
-    Ok((max_num + 1, Some(prev_toc)))
+    info!(
+        "slot pick: picker=rust max_seen={} action=append next={}",
+        max_num,
+        max_num + 1
+    );
+    Ok((max_num + 1, Some(prev_toc.to_string_lossy().into_owned())))
 }
 
 /// fsck the snapshot's filesystem partition via a temporary loop device.
@@ -1876,5 +1938,91 @@ mod tests {
         let autofs = tmp.path().join("autofs");
         assert!(sweep_dangling_links_in(&farm, &snaps, &autofs, &|| true, false).is_err());
         assert!(std::fs::symlink_metadata(&dead508).is_ok());
+    }
+
+    /// Build `<base>/snap-<name>` with an optional snap.bin (at the given
+    /// unix mtime) and optional TOC.
+    fn mk_snap(base: &std::path::Path, name: &str, bin_mtime: Option<u64>, toc: bool) {
+        let dir = base.join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        if let Some(mtime) = bin_mtime {
+            let f = std::fs::File::create(dir.join("snap.bin")).unwrap();
+            let t = std::time::UNIX_EPOCH + std::time::Duration::from_secs(mtime);
+            f.set_times(std::fs::FileTimes::new().set_modified(t)).unwrap();
+        }
+        if toc {
+            std::fs::File::create(dir.join("snap.bin.toc")).unwrap();
+        }
+    }
+
+    fn scratch(tag: &str) -> std::path::PathBuf {
+        let base = std::env::temp_dir().join(format!("sentryusb-{}-{}", tag, std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        base
+    }
+
+    /// Real-device fixture: slot names are not time-monotonic (stale
+    /// snap-000414 from Jul 9 above snap-000413 from Aug 8). Eviction
+    /// order must follow snap.bin mtimes, with name as tie-break, and
+    /// exclude junk (no snap.bin, non-numeric suffix, plain files).
+    #[test]
+    fn list_snapshots_by_age_orders_by_mtime_not_name() {
+        let base = scratch("age-order");
+        mk_snap(&base, "snap-000000", Some(1_785_300_000), true); // middle age
+        mk_snap(&base, "snap-000413", Some(1_786_200_000), true); // newest
+        mk_snap(&base, "snap-000414", Some(1_784_600_000), true); // oldest, highest name
+        mk_snap(&base, "snap-000500", None, false); // no snap.bin → excluded
+        mk_snap(&base, "snap-junk", Some(1_000_000_000), false); // non-numeric → excluded
+        std::fs::File::create(base.join("snap-000900")).unwrap(); // a FILE → excluded
+        // Equal-mtime pair: name breaks the tie.
+        mk_snap(&base, "snap-000202", Some(1_785_900_000), true);
+        mk_snap(&base, "snap-000201", Some(1_785_900_000), true);
+
+        let order = list_snapshots_by_age_in(&base);
+        let _ = std::fs::remove_dir_all(&base);
+        assert_eq!(
+            order,
+            vec!["snap-000414", "snap-000000", "snap-000201", "snap-000202", "snap-000413"],
+        );
+    }
+
+    #[test]
+    fn pick_next_slot_distinguishes_only_snap_000000_from_empty() {
+        let base = scratch("slot-zero");
+        // Empty dir → fresh start at 1, no previous TOC.
+        assert_eq!(pick_next_snapshot_slot_in(&base).unwrap(), (1, None));
+
+        // Only a COMPLETE snap-000000 (bash numbering starts at 0): the
+        // next slot is 1 and its TOC must be carried for the
+        // identical-snapshot compare — this used to be conflated with
+        // the empty case and skipped the compare.
+        mk_snap(&base, "snap-000000", Some(1_785_000_000), true);
+        let (num, toc) = pick_next_snapshot_slot_in(&base).unwrap();
+        let _ = std::fs::remove_dir_all(&base);
+        assert_eq!(num, 1);
+        assert!(
+            toc.as_deref().is_some_and(|t| t.ends_with("snap.bin.toc")),
+            "previous TOC must be carried: {:?}",
+            toc
+        );
+    }
+
+    #[test]
+    fn pick_next_slot_ignores_non_dirs_and_reuses_incomplete_max() {
+        let base = scratch("slot-reuse");
+        mk_snap(&base, "snap-000010", Some(1_785_000_000), true);
+        // Stray FILE with a higher number must not drive allocation.
+        std::fs::File::create(base.join("snap-000999")).unwrap();
+        // Incomplete (no TOC) highest dir → wiped and its slot reused,
+        // with the previous complete snapshot's TOC as backstop.
+        mk_snap(&base, "snap-000011", Some(1_785_000_100), false);
+
+        let (num, toc) = pick_next_snapshot_slot_in(&base).unwrap();
+        let dir_gone = !base.join("snap-000011").exists();
+        let _ = std::fs::remove_dir_all(&base);
+        assert_eq!(num, 11, "incomplete max slot is reused");
+        assert!(dir_gone, "incomplete snapshot dir is wiped");
+        assert!(toc.as_deref().is_some_and(|t| t.contains("snap-000010")));
     }
 }

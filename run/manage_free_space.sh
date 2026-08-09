@@ -38,14 +38,29 @@ function manage_free_space {
     then
       exit 0
     fi
-    if ! stat /backingfiles/snapshots/snap-*/snap.bin > /dev/null 2>&1
+    # Candidates = snapshot dirs that actually hold a snap.bin, ordered by
+    # the bin's mtime (TRUE age), name as tie-break. Slot numbers are not
+    # time-monotonic in the field — a reflash can leave a stale
+    # high-numbered snapshot above a restarted sequence — and the old
+    # name-order pick (`sort | head -1`) deleted newer footage while
+    # sparing the genuinely oldest snapshot. The same list feeds the
+    # "fewer than two" guard so the count and the pick can't disagree.
+    local candidates
+    candidates=$(
+      LC_ALL=C find /backingfiles/snapshots \
+        -mindepth 2 -maxdepth 2 -type f \
+        -path '/backingfiles/snapshots/snap-*/snap.bin' \
+        -printf '%T@\t%h\n' 2>/dev/null |
+      LC_ALL=C sort -t $'\t' -k1,1n -k2,2
+    )
+    if [ -z "$candidates" ]
     then
       log "Warning: low space for new snapshots, but no snapshots exist."
       log "Please use a larger storage medium or reduce CAM_SIZE"
       exit 1
     fi
     # if there's only one snapshot then we likely just took it, so don't immediately delete it
-    if [ "$(find /backingfiles/snapshots/ -name snap.bin 2> /dev/null | wc -l)" -lt 2 ]
+    if [ "$(printf '%s\n' "$candidates" | wc -l)" -lt 2 ]
     then
       # there's only one snapshot and yet we're low on space
       log "Warning: low space for new snapshots, but only one snapshot exists."
@@ -53,8 +68,13 @@ function manage_free_space {
       exit 1
     fi
 
-    oldest=$(find /backingfiles/snapshots -maxdepth 1 -name 'snap-*' | sort | head -1)
-    log "low space, deleting $oldest"
+    oldest=$(printf '%s\n' "$candidates" | head -1 | cut -f2-)
+    if [ -z "$oldest" ]
+    then
+      log "unable to select oldest snapshot"
+      exit 1
+    fi
+    log "low space, deleting $oldest (oldest by snap.bin mtime)"
     /root/bin/release_snapshot.sh "$oldest"
     rm -rf "$oldest"
   done

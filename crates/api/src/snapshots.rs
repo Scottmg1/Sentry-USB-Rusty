@@ -71,9 +71,9 @@ pub async fn list_snapshots(
             continue;
         }
 
-        // mtime as the "created" timestamp — matches what
-        // manage_free_space.sh sorts by (alphabetic snap-<id>) closely
-        // enough for UI purposes, and is what users actually see.
+        // mtime as the "created" timestamp — the same clock free-space
+        // eviction now orders by (slot names are not time-monotonic, so
+        // alphabetic order is deliberately not used anywhere for age).
         let created_unix = entry
             .metadata()
             .and_then(|m| m.modified())

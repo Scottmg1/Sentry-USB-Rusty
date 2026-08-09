@@ -28,13 +28,31 @@ pub async fn manage_free_space() -> Result<()> {
 
     info!("Free space below {}%, releasing old snapshots...", MIN_FREE_PCT);
 
-    let snapshots = super::snapshot::list_snapshots();
+    // ACTUAL age order (snap.bin mtime), not name order — slot numbers
+    // are not time-monotonic in the field (a reflash can leave a stale
+    // high-numbered snapshot above a restarted sequence), and releasing
+    // by name deleted newer footage while sparing the truly oldest.
+    let mut snapshots = super::snapshot::list_snapshots_by_age();
     if snapshots.is_empty() {
         warn!("No snapshots to release, disk is full");
         return Ok(());
     }
 
+    // Never release the newest snapshot (mirrors the bash script's
+    // refusal to delete the last one — it is likely the one just taken,
+    // and the only remaining source for the current farm links).
+    let newest = snapshots.pop();
+    if snapshots.is_empty() {
+        warn!(
+            "Low space but only one snapshot ({}) exists — not releasing it. \
+             Use a larger storage medium or reduce CAM_SIZE.",
+            newest.as_deref().unwrap_or("?")
+        );
+        return Ok(());
+    }
+
     // Release oldest snapshots first until we're above the threshold
+    let mut recovered = false;
     for snap in &snapshots {
         if let Err(e) = super::snapshot::release_snapshot_locked(snap).await {
             warn!("Failed to release {}: {}", snap, e);
@@ -46,8 +64,15 @@ pub async fn manage_free_space() -> Result<()> {
         info!("After releasing {}: {:.1}% free", snap, new_pct);
 
         if new_pct >= MIN_FREE_PCT {
+            recovered = true;
             break;
         }
+    }
+    if !recovered {
+        warn!(
+            "Free space still below {}% with only the newest snapshot retained",
+            MIN_FREE_PCT
+        );
     }
 
     Ok(())
