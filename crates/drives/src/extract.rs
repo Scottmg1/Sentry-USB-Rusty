@@ -94,16 +94,20 @@ fn assemble_extracted(
 ///
 /// Returns the raw frame arrays with 1:1 index-to-frame correspondence.
 /// Use when frame-accurate timestamps matter (e.g. telemetry overlay).
-pub fn extract_gps_from_file_raw(path: &str) -> Result<(Vec<GpsPoint>, Vec<u8>, Vec<u8>, Vec<f32>, Vec<f32>)> {
+///
+/// The trailing array is the per-frame flags byte (FLAG_BLINKER_LEFT etc.).
+/// It was previously dropped here, which is why the clip telemetry endpoint
+/// could not report turn signals or braking despite both being decoded.
+pub fn extract_gps_from_file_raw(
+    path: &str,
+) -> Result<(Vec<GpsPoint>, Vec<u8>, Vec<u8>, Vec<f32>, Vec<f32>, Vec<u8>)> {
     let mut f = File::open(path)
         .with_context(|| format!("failed to open MP4 file: {}", path))?;
     let (mdat_offset, mdat_size) = find_mdat_box(&mut f)?;
     if mdat_size == 0 {
-        return Ok((Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new()));
+        return Ok((Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new()));
     }
-    let (points, gears, ap_states, speeds, accel_positions, _flags) =
-        extract_from_mdat(&mut f, mdat_offset, mdat_size)?;
-    Ok((points, gears, ap_states, speeds, accel_positions))
+    extract_from_mdat(&mut f, mdat_offset, mdat_size)
 }
 
 /// Scan MP4 top-level boxes to find the mdat box.
