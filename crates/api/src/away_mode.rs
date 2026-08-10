@@ -1173,6 +1173,10 @@ pub async fn config_set(
     State(_s): State<AppState>,
     Json(body): Json<AwayConfigBody>,
 ) -> (StatusCode, Json<serde_json::Value>) {
+    // Shares the home CENTER with the charging "Home" tag, so a move here must
+    // invalidate the cached charging list. Radius is not shared (Away Mode uses
+    // AWAY_MODE_HOME_RADIUS_M, charging KEEP_ACCESSORY_HOME_RADIUS_M).
+    let home_moving = body.home_lat.is_some() || body.home_lon.is_some();
     let result = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
         let config_path = sentryusb_config::find_config_path();
         let (mut active, _) = sentryusb_config::parse_file(config_path)?;
@@ -1201,6 +1205,9 @@ pub async fn config_set(
     match result {
         Ok(Ok(())) => {
             info!("[away-mode] geofence config updated");
+            if home_moving {
+                crate::charging::invalidate_charging_list();
+            }
             (StatusCode::OK, Json(serde_json::json!({ "ok": true })))
         }
         Ok(Err(e)) => crate::json_error(

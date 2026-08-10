@@ -165,6 +165,12 @@ pub struct KeepAccessoryConfigBody {
     pub home_lat: Option<f64>,
     pub home_lon: Option<f64>,
     pub home_radius_m: Option<f64>,
+    /// Before moving home, freeze the sessions inside the OLD geofence under
+    /// this stored tag (e.g. "Old House"). The Home tag is derived, so without
+    /// this a move un-tags every past charge there and drops any cost that came
+    /// from the Home rate. Must run BEFORE the geofence moves — afterwards the
+    /// old set cannot be identified. Ignored when home is not changing.
+    pub freeze_home_as: Option<String>,
 }
 
 /// PUT /api/system/keep-accessory-config → persist the keep-accessory
@@ -174,6 +180,52 @@ pub async fn keep_accessory_config_set(
     State(_s): State<AppState>,
     Json(body): Json<KeepAccessoryConfigBody>,
 ) -> (StatusCode, Json<serde_json::Value>) {
+    // Radius resizes the same circle, so it re-derives the Home set exactly
+    // as a center move does — invalidate on either.
+    let freeze_as = body.freeze_home_as.clone().filter(|t| !t.trim().is_empty());
+    let home_moving =
+        body.home_lat.is_some() || body.home_lon.is_some() || body.home_radius_m.is_some();
+
+    let mut frozen = 0usize;
+    if home_moving {
+        if let Some(tag) = freeze_as {
+            let store = _s.drives.store.clone();
+            match tokio::task::spawn_blocking(move || {
+                crate::charging::freeze_home_sessions(&store, &tag)
+            })
+            .await
+            {
+                Ok(Ok(f)) => {
+                    frozen = f.tagged;
+                    // The copied rate is part of the synced rate document, so
+                    // it has to reach the cloud like any other rate edit —
+                    // otherwise a restore brings back the tags without the price.
+                    if f.rates_changed {
+                        if let Err(e) = _s.drives.store.mark_rate_config_dirty() {
+                            tracing::warn!("[keep-accessory] mark_rate_config_dirty failed: {e}");
+                        }
+                        _s.cloud.uploader.nudge();
+                    }
+                }
+                // ABORT: the caller asked to preserve history first. Moving
+                // anyway would destroy exactly what they were protecting, and
+                // an ok:true would hide it. Leave the geofence alone.
+                Ok(Err(e)) => {
+                    return crate::json_error(
+                        StatusCode::BAD_REQUEST,
+                        &format!("home not moved — could not preserve past charges: {e}"),
+                    )
+                }
+                Err(e) => {
+                    return crate::json_error(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        &format!("home not moved — freeze task failed: {e}"),
+                    )
+                }
+            }
+        }
+    }
+
     let result = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
         let config_path = sentryusb_config::find_config_path();
         let (mut active, _) = sentryusb_config::parse_file(config_path)?;
@@ -210,7 +262,17 @@ pub async fn keep_accessory_config_set(
     match result {
         Ok(Ok(())) => {
             info!("[keep-accessory] config updated");
-            (StatusCode::OK, Json(serde_json::json!({ "ok": true })))
+            if home_moving {
+                // The "Home" tag is derived from this geofence, so every cached
+                // charging summary is now stale. Without this the user saves a
+                // new home and the tags stay wrong for up to the cache TTL,
+                // which reads as "it didn't work".
+                crate::charging::invalidate_charging_list();
+            }
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({ "ok": true, "frozen": frozen })),
+            )
         }
         Ok(Err(e)) => crate::json_error(
             StatusCode::INTERNAL_SERVER_ERROR,
