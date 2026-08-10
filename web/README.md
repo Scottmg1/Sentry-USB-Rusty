@@ -24,6 +24,24 @@ cd ../server
 make dev        # Starts Go API on :8788
 ```
 
+## Icons
+
+Icons are Google Material Symbols, vendored as inline SVG in
+`src/components/icons.tsx` so the app ships no icon font and makes no external
+request. That file is generated — don't edit it by hand.
+
+To add or remove one, put its name (exactly as shown on
+[fonts.google.com/icons](https://fonts.google.com/icons)) in
+`scripts/icons/symbols.mjs`, then regenerate:
+
+```bash
+npm run icons             # rewrites src/components/icons.tsx
+npm run icons -- --check  # CI: fails if the committed file is stale
+```
+
+Each symbol becomes a component named after it (`delete` → `DeleteIcon`), taking
+the same props as any `<svg>`, so Tailwind sizing (`h-4 w-4`) works as usual.
+
 ## Production Build
 
 ```bash

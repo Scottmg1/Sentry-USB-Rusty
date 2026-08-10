@@ -1,4 +1,6 @@
-// Code-generated icon set — do not edit by hand.
+// Code-generated — do not edit by hand.
+// Run `npm run icons` to regenerate; add or remove symbols in
+// scripts/icons/symbols.mjs.
 //
 // Google Material Symbols (outlined, weight 400), vendored as inline SVG so the
 // UI ships no icon font and makes no network request. Sourced from
@@ -439,10 +441,10 @@ export const HardDriveIcon = (props: SVGProps<SVGSVGElement>) => (
     </svg>
 )
 
-/** Material Symbols `home` (was Lucide Home). */
+/** Material Symbols `home`. */
 export const HomeIcon = (props: SVGProps<SVGSVGElement>) => (
   <svg viewBox="0 -960 960 960" width="24" height="24" fill="currentColor" {...props}>
-      <path d="M240-200h120v-240h240v240h120v-360L480-740 240-560v360Zm-80 80v-480l320-240 320 240v480H520v-240h-80v240H160Zm320-350Z"/>
+      <path d="M220-180h150v-250h220v250h150v-390L480-765 220-570v390Zm-60 60v-480l320-240 320 240v480H530v-250H430v250H160Zm320-353Z"/>
     </svg>
 )
 
