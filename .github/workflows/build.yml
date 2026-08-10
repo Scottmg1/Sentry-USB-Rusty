@@ -340,6 +340,15 @@ jobs:
           cd web
           npm ci
           npx eslint . --max-warnings 30
+      - name: Icons up to date
+        # src/components/icons.tsx is generated from scripts/icons/symbols.mjs.
+        # Hand-editing it silently drifts from the Material Symbols source (a
+        # glyph pasted from a different optical size renders unlike the rest of
+        # the set), so re-generate and fail if the committed file differs.
+        # Downloads the glyphs from jsDelivr, so this step needs network.
+        run: |
+          cd web
+          npm run icons -- --check
 
   release:
     name: Create Release
