@@ -197,13 +197,13 @@ pub async fn keep_accessory_config_set(
             {
                 Ok(Ok(f)) => {
                     frozen = f.tagged;
-                    // The copied rate is part of the synced rate document, so
-                    // it has to reach the cloud like any other rate edit —
-                    // otherwise a restore brings back the tags without the price.
-                    if f.rates_changed {
-                        if let Err(e) = _s.drives.store.mark_rate_config_dirty() {
-                            tracing::warn!("[keep-accessory] mark_rate_config_dirty failed: {e}");
-                        }
+                    // The copied rate is part of the synced rate document, so it
+                    // has to reach the cloud like any other rate edit. The dirty
+                    // mark itself happens at write time inside the freeze — doing
+                    // it only here would leave the rate unmarked whenever the
+                    // freeze failed after writing it, and a pull would then drop
+                    // the copy. All that is left is waking the sweep.
+                    if f.rates_dirty {
                         _s.cloud.uploader.nudge();
                     }
                 }

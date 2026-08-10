@@ -590,14 +590,14 @@ pub(crate) fn freeze_home_sessions(
     }
     let ids = sessions_at_home(store)?;
     if ids.is_empty() {
-        return Ok(Frozen { tagged: 0, rates_changed: false });
+        return Ok(Frozen { tagged: 0, rates_dirty: false });
     }
     // Rate first: it is the half that can conflict, and a conflict must abort
     // before anything is written. The in-use check runs inside that step (see
     // copy_home_rate_to); with the label unused, a rate left behind by a later
     // failure prices nothing. Exact tag match, mirroring `apply_rates`.
     let id_set: std::collections::HashSet<i64> = ids.iter().copied().collect();
-    let rates_changed = RateConfig::copy_home_rate_to(tag, || {
+    RateConfig::copy_home_rate_to(tag, || {
         // Propagates: treating a failed read as "no labels in use" would let the
         // repricing through on exactly the request that could not check.
         //
@@ -611,14 +611,38 @@ pub(crate) fn freeze_home_sessions(
             .iter()
             .any(|(id, tags)| !id_set.contains(id) && tags.iter().any(|t| t == tag)))
     })?;
+    // Mark BEFORE the tag write, and on "the label is priced" rather than "this
+    // call changed the map". A sync pull with no dirty row replaces the rate map
+    // wholesale, so an unmarked copy is not merely unsynced — it is deleted, and
+    // the frozen sessions lose exactly the cost this is preserving. Marking only
+    // on change leaves that hole open: if the tag write below fails after the
+    // rate landed, the retry plans `Nothing` and would never mark it.
+    //
+    // Hard error, not a warning: aborting here leaves an orphan rate on a label
+    // no session carries, which prices nothing.
+    let rates_dirty = tag_is_priced(&crate::preferences::load_prefs(), tag);
+    if rates_dirty {
+        store.mark_rate_config_dirty()?;
+    }
     let n = store.add_charge_tag_bulk(&ids, tag)?;
-    Ok(Frozen { tagged: n, rates_changed })
+    Ok(Frozen { tagged: n, rates_dirty })
 }
 
-/// Freeze outcome. `rates_changed` drives the cloud-sync nudge.
+/// Whether `tag` resolves to a configured rate, matched EXACTLY as
+/// `apply_rates` looks it up. Pure so the sync-marking decision is testable:
+/// getting it wrong loses the frozen sessions' cost on the next pull, silently.
+fn tag_is_priced(prefs: &serde_json::Map<String, serde_json::Value>, tag: &str) -> bool {
+    prefs
+        .get("charging_tag_rates")
+        .and_then(|v| v.as_object())
+        .and_then(|m| m.get(tag))
+        .is_some_and(|v| parse_tag_rate(v).is_configured())
+}
+
+/// Freeze outcome. `rates_dirty` drives the cloud-sync nudge.
 pub(crate) struct Frozen {
     pub tagged: usize,
-    pub rates_changed: bool,
+    pub rates_dirty: bool,
 }
 
 /// True when a session's charge location falls inside the home geofence.
@@ -1864,6 +1888,56 @@ mod tests {
                 RateCopy::Nothing,
                 "junk Home rate {junk} must not be copied"
             );
+        }
+    }
+
+    /// The freeze marks the rate document dirty on this predicate. A false
+    /// negative is silent and destructive: an unmarked rate loses to the next
+    /// pull, which replaces the rate map wholesale, so the frozen sessions keep
+    /// the label and lose the cost the freeze existed to preserve.
+    #[test]
+    fn a_priced_freeze_label_is_recognised_for_sync() {
+        let mk = |json: &str| -> serde_json::Map<String, serde_json::Value> {
+            serde_json::from_str(json).unwrap()
+        };
+
+        // Just-copied: the case that must sync.
+        let p = mk(r#"{"charging_tag_rates":{"Home":0.12,"Old House":0.12}}"#);
+        assert!(tag_is_priced(&p, "Old House"));
+
+        // The retry hole. A tag write that fails after the rate landed leaves
+        // this state; the retry plans `Nothing`, so marking on "the map changed"
+        // would never fire and the copy would be dropped on the next pull.
+        assert_eq!(home_rate_copy_plan(&p, "Old House"), RateCopy::Nothing);
+        assert!(tag_is_priced(&p, "Old House"), "an equal rate still needs marking");
+
+        // Schedule-only pricing counts: no flat rate, but the windows price it.
+        let p = mk(
+            r#"{"charging_tag_rates":{"Old House":{"schedules":[
+                {"start":"22:00","end":"06:00","rate":"0.08"}
+            ]}}}"#,
+        );
+        assert!(tag_is_priced(&p, "Old House"));
+
+        // A schedule the parser drops (no time bounds) prices nothing, so the
+        // label is not priced by it — matching `is_configured`.
+        let p = mk(r#"{"charging_tag_rates":{"Old House":{"schedules":[{"rate":0.05}]}}}"#);
+        assert!(!tag_is_priced(&p, "Old House"));
+
+        // Nothing was preserved, so there is nothing to sync.
+        assert!(!tag_is_priced(&mk("{}"), "Old House"));
+        let p = mk(r#"{"charging_tag_rates":{"Home":0.12}}"#);
+        assert!(!tag_is_priced(&p, "Old House"));
+
+        // Exact match, mirroring the render-time lookup: a differently-cased key
+        // is a different tag and does not price this one.
+        let p = mk(r#"{"charging_tag_rates":{"old house":0.12}}"#);
+        assert!(!tag_is_priced(&p, "Old House"));
+
+        // Junk prices nothing, so it is not worth a push.
+        for junk in [r#""NaN""#, r#""-1""#, "{}", r#"{"flat":null}"#] {
+            let p = mk(&format!(r#"{{"charging_tag_rates":{{"Old House":{junk}}}}}"#));
+            assert!(!tag_is_priced(&p, "Old House"), "junk rate {junk} is not a price");
         }
     }
 }

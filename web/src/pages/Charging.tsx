@@ -145,10 +145,10 @@ export default function Charging() {
       // still has to be confirmed in the dialog, because it re-tags history.
       const isHome = (t: string) => t.trim().toLowerCase() === "home"
       const sess = sessions.find((x) => x.id === id)
-      // Only when Home is NEWLY added. The API already injects "Home" into the
-      // tags of an at-home charge for display, so testing `next` alone fired on
-      // every unrelated tag edit — adding "Work" to a home charge popped the
-      // relocation dialog.
+      // "Home" is never in a session's stored tags (it is derived into `atHome`,
+      // and the store strips it), so its presence here means the user just typed
+      // or picked it. Unrelated edits carry it in neither list and never open the
+      // dialog. Still filtered out below rather than trusted to that.
       const asksHome = next.some(isHome) && !(sess?.tags ?? []).some(isHome)
       if (asksHome && sess?.locationLat != null && sess?.locationLon != null) {
         setHomeSeed({ lat: sess.locationLat, lon: sess.locationLon })
