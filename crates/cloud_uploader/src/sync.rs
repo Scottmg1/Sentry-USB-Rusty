@@ -575,7 +575,16 @@ async fn pull_changes(
                         }
                     }
                 };
-                if let Err(e) = store.set_charge_tags_from_sync(session_ts, &mutable.tags) {
+                // "Home" is a reserved, derived tag — strip any casing pulled from
+                // the cloud so a synced envelope can't reintroduce it as a stored tag.
+                // Reserved tags are DERIVED on read and must never be stored.
+                // The local write handler already enforces this; a tag arriving
+                // from the cloud has to clear the same bar, or a peer running an
+                // older build could reintroduce one as a real stored tag. Uses
+                // the shared vocabulary so this can't drift from the API's copy.
+                let synced_tags: Vec<String> =
+                    sentryusb_drives::charging::strip_reserved_tags(mutable.tags.clone());
+                if let Err(e) = store.set_charge_tags_from_sync(session_ts, &synced_tags) {
                     warn!("sync pull: set charge tags {} failed: {}", session_ts, e);
                 }
                 let cost = mutable.cost_override.map(|c| (c.amount, c.currency));
