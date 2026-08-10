@@ -15,7 +15,13 @@ const RADIUS_MIN = 20
 const RADIUS_MAX = 2000
 
 function formatCoords(lat: number | null, lon: number | null): string {
-  if (lat == null || lon == null) return ""
+  // Number.isFinite, not `== null`: a NaN coordinate (the parent does
+  // `Number(cfg)` on a junk config string, which yields NaN) is not null and
+  // would reach `.toFixed(5)` below, rendering the literal text "NaN, ..."
+  // in the field — while haveHome's own Number.isFinite check correctly
+  // hides the "No home set" hint for the same value, so the two would
+  // disagree.
+  if (lat == null || lon == null || !Number.isFinite(lat) || !Number.isFinite(lon)) return ""
   return `${lat.toFixed(5)}, ${normalizeLon(lon).toFixed(5)}`
 }
 
@@ -72,15 +78,29 @@ export function HomeGeofencePicker({
   // + commit-on-blur/Enter pattern as the radius field above.
   const [coordText, setCoordText] = useState(() => formatCoords(values.homeLat, values.homeLon))
   const [coordError, setCoordError] = useState<string | null>(null)
+  // A geofence needs BOTH halves as real numbers: {lat: 53, lon: null} is not
+  // a home, and neither is a NaN the parent produced by `Number(cfg)` on a
+  // junk config string — `NaN != null` is true, so a null-only test would call
+  // that "set", hide the hint, and render "NaN, ..." in the field.
+  // `Number.isFinite` rejects null and NaN alike. Kept independent of
+  // coordError — an unparseable entry and an unset home are different states
+  // that can hold at the same time.
+  const haveHome = Number.isFinite(values.homeLat) && Number.isFinite(values.homeLon)
   // Re-sync while rendering rather than from an effect: every map click and
   // pin drag pushes new coords through onChange, and an effect would make
   // each one cost a second render pass. This is React's documented "adjust
   // state when a prop changes" shape, and it keeps the file clear of the
   // repo's react-hooks/set-state-in-effect warning budget.
+  // `Object.is`, not `!==`: a NaN coord (the parent does `Number(cfg)` on a
+  // truthy config string, which yields NaN for junk) never equals itself
+  // under `!==`, so the condition would hold on every render and re-enter
+  // setState forever. `Object.is(NaN, NaN)` is true, so this converges.
   const [syncedFrom, setSyncedFrom] = useState({ lat: values.homeLat, lon: values.homeLon })
-  if (values.homeLat !== syncedFrom.lat || values.homeLon !== syncedFrom.lon) {
+  if (!Object.is(values.homeLat, syncedFrom.lat) || !Object.is(values.homeLon, syncedFrom.lon)) {
     setSyncedFrom({ lat: values.homeLat, lon: values.homeLon })
     setCoordText(formatCoords(values.homeLat, values.homeLon))
+    // Stale parse error must not survive a coordinate change from the map.
+    setCoordError(null)
   }
 
   function commitCoords() {
@@ -90,17 +110,46 @@ export function HomeGeofencePicker({
       setCoordText(formatCoords(values.homeLat, values.homeLon)) // revert to last good
       return
     }
+    // Both halves must actually carry a number. `Number("")` is 0, and a
+    // stray comma still splits into two parts, so "53.5461," / ", -113.4938"
+    // / "," would each commit 0 for the missing side — and 0 passes every
+    // finite/latitude check below.
     const parts = trimmed.split(",")
-    const lat = parts.length === 2 ? Number(parts[0].trim()) : NaN
-    const lon = parts.length === 2 ? Number(parts[1].trim()) : NaN
-    if (!Number.isFinite(lat) || !Number.isFinite(lon) || Math.abs(lat) > 90) {
+    const rawLat = parts.length === 2 ? parts[0].trim() : ""
+    const rawLon = parts.length === 2 ? parts[1].trim() : ""
+    const lat = rawLat === "" ? NaN : Number(rawLat)
+    const lon = rawLon === "" ? NaN : Number(rawLon)
+    if (!Number.isFinite(lat) || !Number.isFinite(lon)) {
       setCoordError(
         'Couldn\'t parse that — enter as "latitude, longitude" (e.g. 30.22214, -97.61833).',
       )
       return
     }
+    // Range-check what was TYPED. normalizeLon exists for Leaflet's repeated
+    // world copies (a click on Japan can report -221.4), not for hand entry:
+    // running it on a typo folds -976.1833 into a perfectly plausible +103.82
+    // and stores the wrong side of the planet without a word. formatCoords
+    // still normalizes for DISPLAY, so a geofence written out of range by an
+    // older build stays readable and is rewritten canonically as soon as this
+    // field is committed — only fresh input has to stay inside the real range.
+    if (Math.abs(lat) > 90 || Math.abs(lon) > 180) {
+      setCoordError("Out of range — latitude must be within ±90, longitude within ±180.")
+      return
+    }
+    const normalizedLon = normalizeLon(lon)
     setCoordError(null)
-    onChange({ homeLat: lat, homeLon: normalizeLon(lon) })
+    // Snap the field to the committed value ourselves. An entry that differs
+    // only in formatting (" 30.5 , -97.6 " for a stored 30.50000, -97.60000)
+    // parses to the value the parent already holds, so no prop changes and the
+    // sync block above never runs — the field would keep the raw typed text.
+    setCoordText(formatCoords(lat, normalizedLon))
+    // Only persist a real change: a focus/blur with no edit must not fire a
+    // PUT (which remounts the Pi's read-only root) or re-center the map, and
+    // must not quietly round a stored value down to formatCoords' 5 decimals.
+    // Mirrors the `clamped !== values.radiusM` guard on the radius field.
+    if (lat !== values.homeLat || normalizedLon !== values.homeLon) {
+      onChange({ homeLat: lat, homeLon: normalizedLon })
+    }
   }
 
   async function useCurrent() {
@@ -175,7 +224,7 @@ export function HomeGeofencePicker({
         </p>
         {coordError && <p className="mt-1 text-xs text-red-400">{coordError}</p>}
       </div>
-      {!coordError && values.homeLat == null && (
+      {!haveHome && (
         <p className="text-xs text-amber-400/80">
           No home set — tap the map or enter coordinates above to drop your home pin.
         </p>

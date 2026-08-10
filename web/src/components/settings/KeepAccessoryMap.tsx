@@ -24,7 +24,7 @@ const HOME_ICON = L.divIcon({
  * setup). The radius circle resizes live as the parent changes `radiusM`.
  */
 export function KeepAccessoryMap({
-  lat,
+  lat: rawLat,
   lon: rawLon,
   radiusM,
   onPlace,
@@ -34,9 +34,14 @@ export function KeepAccessoryMap({
   radiusM: number
   onPlace: (lat: number, lon: number) => void
 }) {
+  // Sanitize NaN to null on the way in. The parent builds these with
+  // `Number(cfg)` over config strings, so junk yields NaN — and `NaN != null`
+  // is true, which would let it reach setView/L.latLng, where Leaflet throws
+  // "Invalid LatLng object" and takes the whole settings page down.
+  const lat = Number.isFinite(rawLat) ? (rawLat as number) : null
   // Legacy configs may hold a world-copy longitude (e.g. -221 for 139°E);
   // wrap so the pin and the readout agree with what gets stored.
-  const lon = rawLon != null ? normalizeLon(rawLon) : null
+  const lon = Number.isFinite(rawLon) ? normalizeLon(rawLon as number) : null
   const containerRef = useRef<HTMLDivElement>(null)
   const mapRef = useRef<L.Map | null>(null)
   const markerRef = useRef<L.Marker | null>(null)
