@@ -1,13 +1,13 @@
 import { useEffect, useState, lazy, Suspense } from "react"
 import { useSearchParams } from "react-router-dom"
 import {
-  RefreshCw,
-  Stethoscope,
-  Gauge,
-  Unplug,
-  RotateCcw,
-  Loader2,
-} from "lucide-react"
+  CachedIcon,
+  PowerOffIcon,
+  ProgressActivityIcon,
+  RotateLeftIcon,
+  SpeedIcon,
+  StethoscopeIcon,
+} from "@/components/icons"
 import { api } from "@/lib/api"
 import { HeaderStrip } from "@/components/settings/HeaderStrip"
 import { ActionsRail, type ActionChipProps } from "@/components/settings/ActionsRail"
@@ -206,22 +206,22 @@ export default function Settings() {
 
   const actions: ActionChipProps[] = [
     {
-      icon: RefreshCw,
+      icon: CachedIcon,
       label: "Archive Sync",
       onClick: handleArchiveSync,
     },
     {
-      icon: Stethoscope,
+      icon: StethoscopeIcon,
       label: "Health Check",
       onClick: () => setHealthOpen(true),
     },
     {
-      icon: Gauge,
+      icon: SpeedIcon,
       label: "Speed Test",
       onClick: () => setSpeedOpen(true),
     },
     {
-      icon: Unplug,
+      icon: PowerOffIcon,
       label:
         drivesConnected === null
           ? "Toggle USB"
@@ -233,7 +233,7 @@ export default function Settings() {
   ]
   const dangerActions: ActionChipProps[] = [
     {
-      icon: RotateCcw,
+      icon: RotateLeftIcon,
       label: confirmReboot ? "Confirm Restart" : "Restart Pi",
       variant: "danger",
       onClick: handleReboot,
@@ -321,7 +321,7 @@ export default function Settings() {
 function TabFallback() {
   return (
     <div className="flex h-32 items-center justify-center">
-      <Loader2 className="h-5 w-5 animate-spin text-slate-500" />
+      <ProgressActivityIcon className="h-5 w-5 animate-spin text-slate-500" />
     </div>
   )
 }

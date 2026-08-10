@@ -1,5 +1,5 @@
 import { useState } from "react"
-import { Plug, Power } from "lucide-react"
+import { PowerIcon, PowerSettingsNewIcon } from "@/components/icons"
 import { PrefCard } from "@/components/settings/PrefCard"
 import { KeepAccessoryConfig } from "@/components/settings/KeepAccessoryConfig"
 import { useKeepAccessory } from "@/hooks/useKeepAccessory"
@@ -42,7 +42,7 @@ export function KeepAccessorySection({ onOpenWizard }: Props = {}) {
 
   return (
     <PrefCard
-      icon={<Plug className="h-3.5 w-3.5" />}
+      icon={<PowerIcon className="h-3.5 w-3.5" />}
       halo="amber"
       title="Keep Accessory"
       disabled={
@@ -83,7 +83,7 @@ export function KeepAccessorySection({ onOpenWizard }: Props = {}) {
                   disabled={pending}
                   className="inline-flex items-center gap-1.5 rounded-md border border-white/10 bg-white/5 px-2.5 py-1 text-xs text-slate-200 transition-colors hover:border-emerald-500/40 disabled:opacity-50"
                 >
-                  <Power className="h-3 w-3" /> Force ON now
+                  <PowerSettingsNewIcon className="h-3 w-3" /> Force ON now
                 </button>
                 <button
                   type="button"
@@ -91,7 +91,7 @@ export function KeepAccessorySection({ onOpenWizard }: Props = {}) {
                   disabled={pending}
                   className="inline-flex items-center gap-1.5 rounded-md border border-white/10 bg-white/5 px-2.5 py-1 text-xs text-slate-200 transition-colors hover:border-red-500/40 disabled:opacity-50"
                 >
-                  <Power className="h-3 w-3" /> Force OFF now
+                  <PowerSettingsNewIcon className="h-3 w-3" /> Force OFF now
                 </button>
               </div>
               {msg && <p className="text-xs text-slate-500">{msg}</p>}

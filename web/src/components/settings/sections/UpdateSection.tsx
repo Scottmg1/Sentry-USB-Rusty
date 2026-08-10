@@ -1,10 +1,5 @@
 import { useState, useEffect } from "react"
-import {
-  Download,
-  Loader2,
-  CheckCircle,
-  AlertCircle,
-} from "lucide-react"
+import { CheckCircleIcon, DownloadIcon, ErrorIcon, ProgressActivityIcon } from "@/components/icons"
 import { cn } from "@/lib/utils"
 import { wsClient } from "@/lib/ws"
 import { useVersion } from "@/hooks/useVersion"
@@ -359,13 +354,13 @@ export function UpdateSection({ onInstallStart }: Props) {
 
   const headerIcon =
     updateStatus === "error" ? (
-      <AlertCircle className="h-3.5 w-3.5" />
+      <ErrorIcon className="h-3.5 w-3.5" />
     ) : updateStatus === "done" ? (
-      <CheckCircle className="h-3.5 w-3.5" />
+      <CheckCircleIcon className="h-3.5 w-3.5" />
     ) : installInProgress ? (
-      <Loader2 className="h-3.5 w-3.5 animate-spin" />
+      <ProgressActivityIcon className="h-3.5 w-3.5 animate-spin" />
     ) : (
-      <Download className="h-3.5 w-3.5" />
+      <DownloadIcon className="h-3.5 w-3.5" />
     )
 
   const headerHalo =
@@ -505,7 +500,7 @@ export function UpdateSection({ onInstallStart }: Props) {
         >
           {isCheckingUpdate ? (
             <span className="inline-flex items-center gap-1.5">
-              <Loader2 className="h-3.5 w-3.5 animate-spin" /> Checking
+              <ProgressActivityIcon className="h-3.5 w-3.5 animate-spin" /> Checking
             </span>
           ) : (
             "Check for Updates"
@@ -514,7 +509,7 @@ export function UpdateSection({ onInstallStart }: Props) {
       </PrefCard>
 
       <PrefCard
-        icon={<Download className="h-3.5 w-3.5" />}
+        icon={<DownloadIcon className="h-3.5 w-3.5" />}
         halo="slate"
         title="Update Preferences"
       >
@@ -561,9 +556,9 @@ export function UpdateSection({ onInstallStart }: Props) {
         >
           <div className="flex flex-col items-center gap-3 py-6 text-center">
             {updateStatus === "done" ? (
-              <CheckCircle className="h-12 w-12 text-emerald-400" />
+              <CheckCircleIcon className="h-12 w-12 text-emerald-400" />
             ) : (
-              <Loader2 className="h-12 w-12 animate-spin text-blue-400" />
+              <ProgressActivityIcon className="h-12 w-12 animate-spin text-blue-400" />
             )}
             <h2 className="text-lg font-semibold text-slate-100">
               {updateStatus === "checking_internet" && "Checking connection"}

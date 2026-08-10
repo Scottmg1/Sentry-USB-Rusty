@@ -1,5 +1,11 @@
 import { useState, useEffect, useRef, useCallback, useMemo, type ReactNode } from "react"
-import { ScrollText, Download, RefreshCw, ArrowDown, Loader2 } from "lucide-react"
+import {
+  ArrowDownwardIcon,
+  CachedIcon,
+  DownloadIcon,
+  ProgressActivityIcon,
+  ReceiptLongIcon,
+} from "@/components/icons"
 import { cn } from "@/lib/utils"
 
 const logTabs = [
@@ -421,7 +427,7 @@ export default function Logs() {
               disabled={loading}
               className="glass-card glass-card-hover flex items-center gap-1.5 px-3 py-1.5 text-sm text-slate-400 transition-colors hover:text-slate-200 disabled:opacity-50"
             >
-              <RefreshCw
+              <CachedIcon
                 className={cn("h-4 w-4", loading && "animate-spin")}
               />
               Refresh
@@ -436,7 +442,7 @@ export default function Logs() {
             }
             className="glass-card glass-card-hover flex items-center gap-1.5 px-3 py-1.5 text-sm text-slate-400 transition-colors hover:text-slate-200"
           >
-            <Download className="h-4 w-4" />
+            <DownloadIcon className="h-4 w-4" />
             {activeTab === "bluetooth" ? "Download bundle" : "Download"}
           </button>
         </div>
@@ -470,7 +476,7 @@ export default function Logs() {
           <div>
             {loading && !content ? (
               <span className="flex items-center gap-2 text-slate-600">
-                <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                <ProgressActivityIcon className="h-3.5 w-3.5 animate-spin" />
                 Loading...
               </span>
             ) : content ? (
@@ -481,7 +487,7 @@ export default function Logs() {
               )
             ) : (
               <span className="flex items-center gap-2 text-slate-600">
-                <ScrollText className="h-4 w-4" />
+                <ReceiptLongIcon className="h-4 w-4" />
                 No log content
               </span>
             )}
@@ -492,7 +498,7 @@ export default function Logs() {
             onClick={scrollToBottom}
             className="absolute bottom-4 right-6 flex items-center gap-1.5 rounded-full bg-blue-500/90 px-3 py-1.5 text-xs font-medium text-white shadow-lg backdrop-blur transition-opacity hover:bg-blue-500"
           >
-            <ArrowDown className="h-3.5 w-3.5" />
+            <ArrowDownwardIcon className="h-3.5 w-3.5" />
             Follow
           </button>
         )}

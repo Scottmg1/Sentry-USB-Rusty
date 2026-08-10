@@ -1,6 +1,6 @@
 import { useState, useEffect } from "react"
 import { Outlet } from "react-router-dom"
-import { Menu } from "lucide-react"
+import { MenuIcon } from "@/components/icons"
 import { Sidebar } from "./Sidebar"
 import { MobileNav } from "./MobileNav"
 import { ConnectionBanner } from "./ConnectionBanner"
@@ -98,7 +98,7 @@ export function AppShell() {
                 onClick={() => setMobileNavOpen(true)}
                 className="rounded-lg p-2 text-slate-400 hover:bg-white/5 hover:text-slate-200"
               >
-                <Menu className="h-5 w-5" />
+                <MenuIcon className="h-5 w-5" />
               </button>
               <span className="text-sm font-semibold text-slate-100" style={{ fontFamily: '"Inter", -apple-system, system-ui, sans-serif' }}>Sentry USB</span>
             </div>

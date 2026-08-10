@@ -1,5 +1,12 @@
 import { useEffect, useState } from "react"
-import { Archive, Loader2, CheckCircle, XCircle, HardDrive, Save } from "lucide-react"
+import {
+  ArchiveIcon,
+  CancelIcon,
+  CheckCircleIcon,
+  HardDriveIcon,
+  ProgressActivityIcon,
+  SaveIcon,
+} from "@/components/icons"
 import type { StepProps } from "../SetupWizard"
 import { SecretInput } from "../SecretInput"
 import { NasSSHKey } from "../NasSSHKey"
@@ -152,7 +159,7 @@ export function ArchiveStep({ data, onChange }: StepProps) {
   return (
     <div className="space-y-6">
       <div className="flex items-center gap-2">
-        <Archive className="h-4 w-4 text-blue-400" />
+        <ArchiveIcon className="h-4 w-4 text-blue-400" />
         <h3 className="text-sm font-semibold uppercase tracking-wider text-slate-400">
           Archive System
         </h3>
@@ -257,7 +264,7 @@ export function ArchiveStep({ data, onChange }: StepProps) {
           >
             {testing ? (
               <>
-                <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                <ProgressActivityIcon className="h-3.5 w-3.5 animate-spin" />
                 {testStage ?? "Testing..."}
               </>
             ) : (
@@ -268,12 +275,12 @@ export function ArchiveStep({ data, onChange }: StepProps) {
             <div className={cn("flex items-center gap-1.5 text-sm", testResult.success ? "text-emerald-400" : "text-red-400")}>
               {testResult.success ? (
                 <>
-                  <CheckCircle className="h-4 w-4" />
+                  <CheckCircleIcon className="h-4 w-4" />
                   Connection successful
                 </>
               ) : (
                 <>
-                  <XCircle className="h-4 w-4 shrink-0" />
+                  <CancelIcon className="h-4 w-4 shrink-0" />
                   <span className="line-clamp-2">{testResult.error || "Connection failed"}</span>
                 </>
               )}
@@ -310,7 +317,7 @@ export function ArchiveStep({ data, onChange }: StepProps) {
       {/* Config backup location */}
       <div className="space-y-2 rounded-lg border border-white/5 bg-white/[0.02] p-4">
         <div className="flex items-center gap-2">
-          <Save className="h-4 w-4 text-blue-400" />
+          <SaveIcon className="h-4 w-4 text-blue-400" />
           <p className="text-xs font-medium uppercase tracking-wider text-slate-500">
             Config Backup Location
           </p>
@@ -330,7 +337,7 @@ export function ArchiveStep({ data, onChange }: StepProps) {
                 : "border-white/5 bg-white/[0.02] text-slate-400 hover:bg-white/[0.05] hover:border-white/10"
             )}
           >
-            <Archive className="mb-1 h-4 w-4" />
+            <ArchiveIcon className="mb-1 h-4 w-4" />
             <span className="font-semibold">Archive Server</span>
             <br />
             <span className="text-[10px] opacity-60">Same location as footage</span>
@@ -345,7 +352,7 @@ export function ArchiveStep({ data, onChange }: StepProps) {
                 : "border-white/5 bg-white/[0.02] text-slate-400 hover:bg-white/[0.05] hover:border-white/10"
             )}
           >
-            <HardDrive className="mb-1 h-4 w-4" />
+            <HardDriveIcon className="mb-1 h-4 w-4" />
             <span className="font-semibold">Local SSD</span>
             <br />
             <span className="text-[10px] opacity-60">On the data drive</span>

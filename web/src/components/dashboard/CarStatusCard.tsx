@@ -1,17 +1,17 @@
 import { Suspense, lazy, useEffect, useMemo, useState } from "react"
 import { Link } from "react-router-dom"
 import {
-  BatteryCharging,
-  BatteryMedium,
-  Car,
-  AlertTriangle,
-  ChevronDown,
-  ChevronRight,
-  ChevronUp,
-  Disc,
-  Music2,
-  Thermometer,
-} from "lucide-react"
+  AlbumIcon,
+  BatteryAndroidFrameBoltIcon,
+  BatteryAndroidFrameFullIcon,
+  ChevronRightIcon,
+  DeviceThermostatIcon,
+  DirectionsCarIcon,
+  ExpandLessIcon,
+  ExpandMoreIcon,
+  MusicNoteIcon,
+  WarningIcon,
+} from "@/components/icons"
 import type { TireHistoryResponse } from "./TirePressureCard"
 import type { CurrentCharge } from "@/types/charging"
 import { fmtRangeUnit, fmtToFull } from "@/lib/charge-format"
@@ -246,9 +246,9 @@ export function CarStatusCard({
           title={`Active lock chime: ${lockChimeName}`}
           className="absolute right-3 top-3 inline-flex max-w-[120px] items-center gap-1.5 rounded-full border border-emerald-400/25 bg-emerald-500/10 px-2.5 py-1 text-[11px] font-medium text-emerald-300 transition-colors hover:bg-emerald-500/15 sm:max-w-[180px]"
         >
-          <Music2 className="h-3 w-3 shrink-0" />
+          <MusicNoteIcon className="h-3 w-3 shrink-0" />
           <span className="truncate">{lockChimeName}</span>
-          <ChevronRight className="h-3 w-3 shrink-0 text-emerald-400/60" />
+          <ChevronRightIcon className="h-3 w-3 shrink-0 text-emerald-400/60" />
         </Link>
       )}
 
@@ -258,9 +258,9 @@ export function CarStatusCard({
       <div className={"flex items-center gap-3 " + (lockChimeName ? "pr-32 sm:pr-48" : "")}>
         <span className={`tile-icon ${statusHalo}`}>
           {showHealthWarning ? (
-            <AlertTriangle className="h-4 w-4" />
+            <WarningIcon className="h-4 w-4" />
           ) : (
-            <Car className="h-4 w-4" />
+            <DirectionsCarIcon className="h-4 w-4" />
           )}
         </span>
         <div className="min-w-0 flex-1">
@@ -273,7 +273,7 @@ export function CarStatusCard({
                   to="/settings?tab=Car%20%26%20Network"
                   className="ml-1 whitespace-nowrap font-medium text-rose-300 hover:text-rose-200"
                 >
-                  Open settings <ChevronRight className="inline h-3 w-3" />
+                  Open settings <ChevronRightIcon className="inline h-3 w-3" />
                 </Link>
               )}
             </div>
@@ -288,9 +288,9 @@ export function CarStatusCard({
         <StatusChip
           icon={
             charging ? (
-              <BatteryCharging className="h-3.5 w-3.5 animate-pulse" />
+              <BatteryAndroidFrameBoltIcon className="h-3.5 w-3.5 animate-pulse" />
             ) : (
-              <BatteryMedium className="h-3.5 w-3.5" />
+              <BatteryAndroidFrameFullIcon className="h-3.5 w-3.5" />
             )
           }
           label={charging ? "Charging" : "Battery"}
@@ -308,27 +308,27 @@ export function CarStatusCard({
           trailing={
             haveChargeDetail ? (
               batteryOpen ? (
-                <ChevronUp className="h-3.5 w-3.5 text-slate-500" />
+                <ExpandLessIcon className="h-3.5 w-3.5 text-slate-500" />
               ) : (
-                <ChevronDown className="h-3.5 w-3.5 text-slate-500" />
+                <ExpandMoreIcon className="h-3.5 w-3.5 text-slate-500" />
               )
             ) : null
           }
         />
         <StatusChip
-          icon={<Thermometer className="h-3.5 w-3.5" />}
+          icon={<DeviceThermostatIcon className="h-3.5 w-3.5" />}
           label="Interior"
           value={formatTemp(sample?.interior_temp_c, useFahrenheit)}
           stale={staleHint(sample?.field_secs_ago?.interior_temp_c)}
         />
         <StatusChip
-          icon={<Thermometer className="h-3.5 w-3.5" />}
+          icon={<DeviceThermostatIcon className="h-3.5 w-3.5" />}
           label="Exterior"
           value={formatTemp(sample?.exterior_temp_c, useFahrenheit)}
           stale={staleHint(sample?.field_secs_ago?.exterior_temp_c)}
         />
         <StatusChip
-          icon={<Disc className="h-3.5 w-3.5" />}
+          icon={<AlbumIcon className="h-3.5 w-3.5" />}
           label="Tires"
           value={tireStatus.label}
           valueClass={tireStatus.color}
@@ -341,9 +341,9 @@ export function CarStatusCard({
           trailing={
             haveTireData ? (
               tiresOpen ? (
-                <ChevronUp className="h-3.5 w-3.5 text-slate-500" />
+                <ExpandLessIcon className="h-3.5 w-3.5 text-slate-500" />
               ) : (
-                <ChevronDown className="h-3.5 w-3.5 text-slate-500" />
+                <ExpandMoreIcon className="h-3.5 w-3.5 text-slate-500" />
               )
             ) : null
           }
@@ -374,7 +374,7 @@ export function CarStatusCard({
             className="mt-3 inline-flex items-center gap-1 text-xs font-medium text-emerald-300 hover:text-emerald-200"
           >
             View charging history
-            <ChevronRight className="h-3.5 w-3.5" />
+            <ChevronRightIcon className="h-3.5 w-3.5" />
           </Link>
         </div>
       )}

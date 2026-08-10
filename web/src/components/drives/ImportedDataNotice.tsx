@@ -1,5 +1,5 @@
 import { useState } from "react"
-import { Info, X } from "lucide-react"
+import { CloseIcon, InfoIcon } from "@/components/icons"
 import { BannerStack } from "@/components/ui/Banner"
 
 const DISMISS_KEY = "drives.importedDiscrepancyDismissed"
@@ -54,7 +54,7 @@ export function ImportedDataNotice({
         {
           id: "imported-discrepancy",
           kind: "info",
-          icon: <Info className="h-4 w-4" />,
+          icon: <InfoIcon className="h-4 w-4" />,
           title: "Totals may differ slightly from Sentry Cloud & Sentry Drive",
           sub: (
             <>
@@ -71,7 +71,7 @@ export function ImportedDataNotice({
               aria-label="Dismiss notice"
               className="banner-icon shrink-0 rounded-md text-slate-400 transition-colors hover:bg-white/10 hover:text-slate-200"
             >
-              <X className="h-4 w-4" />
+              <CloseIcon className="h-4 w-4" />
             </button>
           ),
         },

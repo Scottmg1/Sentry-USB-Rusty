@@ -1,5 +1,13 @@
 import { useState, useEffect, useRef } from "react"
-import { Cog, Thermometer, MapPin, Search, Battery, AlertTriangle, Ruler } from "lucide-react"
+import {
+  BatteryFullAltIcon,
+  DeviceThermostatIcon,
+  LocationOnIcon,
+  SearchIcon,
+  SettingsIcon,
+  StraightenIcon,
+  WarningIcon,
+} from "@/components/icons"
 import type { StepProps } from "../SetupWizard"
 import { SizeInput } from "../SizeInput"
 
@@ -247,7 +255,7 @@ export function AdvancedStep({ data, onChange, setupAlreadyFinished }: StepProps
       <div>
         <label className="mb-1 block text-sm font-medium text-slate-300">Time Zone</label>
         <div className="relative mb-2">
-          <Search className="absolute left-3 top-2.5 h-3.5 w-3.5 text-slate-600" />
+          <SearchIcon className="absolute left-3 top-2.5 h-3.5 w-3.5 text-slate-600" />
           <input
             type="text"
             value={tzSearch}
@@ -286,7 +294,7 @@ export function AdvancedStep({ data, onChange, setupAlreadyFinished }: StepProps
       {/* Archive tuning */}
       <div>
         <div className="mb-3 flex items-center gap-2">
-          <Cog className="h-4 w-4 text-blue-400" />
+          <SettingsIcon className="h-4 w-4 text-blue-400" />
           <h3 className="text-sm font-semibold uppercase tracking-wider text-slate-400">
             Archive Tuning
           </h3>
@@ -304,7 +312,7 @@ export function AdvancedStep({ data, onChange, setupAlreadyFinished }: StepProps
           dashboard's Display & Units) stay in sync via the same config keys. */}
       <div>
         <div className="mb-3 flex items-center gap-2">
-          <Ruler className="h-4 w-4 text-blue-400" />
+          <StraightenIcon className="h-4 w-4 text-blue-400" />
           <h3 className="text-sm font-semibold uppercase tracking-wider text-slate-400">
             Measurement System
           </h3>
@@ -330,7 +338,7 @@ export function AdvancedStep({ data, onChange, setupAlreadyFinished }: StepProps
           above (TEMPERATURE_UNIT); thresholds render in that unit. */}
       <div>
         <div className="mb-3 flex items-center gap-2">
-          <Thermometer className="h-4 w-4 text-blue-400" />
+          <DeviceThermostatIcon className="h-4 w-4 text-blue-400" />
           <h3 className="text-sm font-semibold uppercase tracking-wider text-slate-400">
             Temperature Monitoring
           </h3>
@@ -355,7 +363,7 @@ export function AdvancedStep({ data, onChange, setupAlreadyFinished }: StepProps
       {isPi5 && (
         <div>
           <div className="mb-3 flex items-center gap-2">
-            <Battery className="h-4 w-4 text-blue-400" />
+            <BatteryFullAltIcon className="h-4 w-4 text-blue-400" />
             <h3 className="text-sm font-semibold uppercase tracking-wider text-slate-400">
               RTC Battery
             </h3>
@@ -377,7 +385,7 @@ export function AdvancedStep({ data, onChange, setupAlreadyFinished }: StepProps
             <>
               <div className="mt-3 rounded-lg border border-amber-500/20 bg-amber-500/5 p-4">
                 <div className="flex items-start gap-3">
-                  <AlertTriangle className="mt-0.5 h-5 w-5 shrink-0 text-amber-400" />
+                  <WarningIcon className="mt-0.5 h-5 w-5 shrink-0 text-amber-400" />
                   <div>
                     <p className="text-sm font-semibold text-amber-200">Hardware Required</p>
                     <p className="mt-1 text-xs text-slate-400">
@@ -415,7 +423,7 @@ export function AdvancedStep({ data, onChange, setupAlreadyFinished }: StepProps
               {data._RTC_TRICKLE_TOGGLE === "true" && (
                 <div className="mt-3 rounded-lg border border-red-500/30 bg-red-500/10 p-4">
                   <div className="flex items-start gap-3">
-                    <AlertTriangle className="mt-0.5 h-5 w-5 shrink-0 text-red-400" />
+                    <WarningIcon className="mt-0.5 h-5 w-5 shrink-0 text-red-400" />
                     <div>
                       <p className="text-sm font-semibold text-red-300">Rechargeable Battery Required</p>
                       <p className="mt-1 text-xs text-slate-400">
@@ -447,7 +455,7 @@ export function AdvancedStep({ data, onChange, setupAlreadyFinished }: StepProps
       {/* System tuning */}
       <div>
         <div className="mb-3 flex items-center gap-2">
-          <Cog className="h-4 w-4 text-blue-400" />
+          <SettingsIcon className="h-4 w-4 text-blue-400" />
           <h3 className="text-sm font-semibold uppercase tracking-wider text-slate-400">
             System Tuning
           </h3>
@@ -477,7 +485,7 @@ export function AdvancedStep({ data, onChange, setupAlreadyFinished }: StepProps
       {/* Drive Map */}
       <div>
         <div className="mb-3 flex items-center gap-2">
-          <MapPin className="h-4 w-4 text-blue-400" />
+          <LocationOnIcon className="h-4 w-4 text-blue-400" />
           <h3 className="text-sm font-semibold uppercase tracking-wider text-slate-400">
             Drive Map
           </h3>
@@ -510,7 +518,7 @@ export function AdvancedStep({ data, onChange, setupAlreadyFinished }: StepProps
       {/* Source */}
       <div>
         <div className="mb-3 flex items-center gap-2">
-          <Cog className="h-4 w-4 text-blue-400" />
+          <SettingsIcon className="h-4 w-4 text-blue-400" />
           <h3 className="text-sm font-semibold uppercase tracking-wider text-slate-400">
             Update Source
           </h3>

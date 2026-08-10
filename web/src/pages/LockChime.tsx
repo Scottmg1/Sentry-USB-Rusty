@@ -1,28 +1,28 @@
 import { useState, useEffect, useRef, useCallback } from "react"
 import {
-  Music,
-  Upload,
-  Play,
-  Pause,
-  CheckCircle2,
-  Trash2,
-  Volume2,
-  X,
-  AlertCircle,
-  AlertTriangle,
-  Shuffle,
-  Clock,
-  Zap,
-  Download,
-  Search,
-  ChevronDown,
-  ChevronLeft,
-  ChevronRight,
-  Loader2,
-  Shield,
-  Pencil,
-  Unplug,
-} from "lucide-react"
+  BoltIcon,
+  CheckCircleIcon,
+  ChevronLeftIcon,
+  ChevronRightIcon,
+  CloseIcon,
+  DeleteIcon,
+  DownloadIcon,
+  EditIcon,
+  ErrorIcon,
+  ExpandMoreIcon,
+  MusicNoteIcon,
+  PauseIcon,
+  PlayArrowIcon,
+  PowerOffIcon,
+  ProgressActivityIcon,
+  ScheduleIcon,
+  SearchIcon,
+  ShieldIcon,
+  ShuffleIcon,
+  UploadIcon,
+  VolumeUpIcon,
+  WarningIcon,
+} from "@/components/icons"
 import MultiFileUploader, { type FileEntry } from "../components/upload/MultiFileUploader"
 import { useObjectUrl } from "@/hooks/useObjectUrl"
 
@@ -238,7 +238,7 @@ export default function LockChime({ adminPasscode }: { adminPasscode: string | n
       {/* USB Disconnect Notice */}
       {tab === "library" && (
         <div className="rounded-xl border border-amber-500/20 bg-amber-500/[0.06] p-3 flex items-start gap-3">
-          <Unplug className="h-4 w-4 shrink-0 mt-0.5 text-amber-400" />
+          <PowerOffIcon className="h-4 w-4 shrink-0 mt-0.5 text-amber-400" />
           <p className="text-xs text-amber-200/80 leading-relaxed">
             Changing or clearing an active chime requires a brief USB disconnect (~5 seconds).
             Tesla will temporarily lose access to the drives during this time.
@@ -248,7 +248,7 @@ export default function LockChime({ adminPasscode }: { adminPasscode: string | n
 
       {/* Preview Volume */}
       <div className="flex items-center gap-3 rounded-xl border border-white/10 bg-white/[0.02] px-4 py-3">
-        <Volume2 className="h-4 w-4 shrink-0 text-slate-400" />
+        <VolumeUpIcon className="h-4 w-4 shrink-0 text-slate-400" />
         <span className="text-xs font-medium text-slate-400 whitespace-nowrap">Preview Volume</span>
         <input
           type="range"
@@ -299,9 +299,9 @@ function useToast() {
       }`}
     >
       {toast.type === "success" ? (
-        <CheckCircle2 className="h-4 w-4 shrink-0" />
+        <CheckCircleIcon className="h-4 w-4 shrink-0" />
       ) : (
-        <AlertCircle className="h-4 w-4 shrink-0" />
+        <ErrorIcon className="h-4 w-4 shrink-0" />
       )}
       {toast.msg}
     </div>
@@ -653,7 +653,7 @@ function MyLibraryTab({ volume }: { volume: number }) {
             <div className={`flex h-9 w-9 shrink-0 items-center justify-center rounded-lg ${
               activeSet ? "bg-violet-500/20" : "bg-white/5"
             }`}>
-              <Volume2 className={`h-4.5 w-4.5 ${activeSet ? "text-violet-400" : "text-slate-600"}`} />
+              <VolumeUpIcon className={`h-4.5 w-4.5 ${activeSet ? "text-violet-400" : "text-slate-600"}`} />
             </div>
             <div className="min-w-0">
               <p className="text-sm font-medium text-slate-200">Active Lock Chime</p>
@@ -668,7 +668,7 @@ function MyLibraryTab({ volume }: { volume: number }) {
               disabled={clearing}
               className="shrink-0 flex items-center gap-1.5 rounded-lg border border-white/10 px-3 py-1.5 text-xs text-slate-400 transition-colors hover:border-red-500/40 hover:text-red-400 disabled:opacity-50"
             >
-              <X className="h-3.5 w-3.5" />
+              <CloseIcon className="h-3.5 w-3.5" />
               {clearing ? "Clearing..." : "Clear"}
             </button>
           )}
@@ -683,7 +683,7 @@ function MyLibraryTab({ volume }: { volume: number }) {
             <div className={`flex h-9 w-9 shrink-0 items-center justify-center rounded-lg ${
               assActiveSet ? "bg-emerald-500/20" : "bg-white/5"
             }`}>
-              <Zap className={`h-4.5 w-4.5 ${assActiveSet ? "text-emerald-400" : "text-slate-600"}`} />
+              <BoltIcon className={`h-4.5 w-4.5 ${assActiveSet ? "text-emerald-400" : "text-slate-600"}`} />
             </div>
             <div className="min-w-0">
               <p className="text-sm font-medium text-slate-200">Active ASS Chime</p>
@@ -698,7 +698,7 @@ function MyLibraryTab({ volume }: { volume: number }) {
               disabled={clearingAss}
               className="shrink-0 flex items-center gap-1.5 rounded-lg border border-white/10 px-3 py-1.5 text-xs text-slate-400 transition-colors hover:border-red-500/40 hover:text-red-400 disabled:opacity-50"
             >
-              <X className="h-3.5 w-3.5" />
+              <CloseIcon className="h-3.5 w-3.5" />
               {clearingAss ? "Clearing..." : "Clear"}
             </button>
           )}
@@ -713,13 +713,13 @@ function MyLibraryTab({ volume }: { volume: number }) {
 
         {loading && (
           <div className="flex items-center justify-center py-12">
-            <Loader2 className="h-5 w-5 animate-spin text-violet-400" />
+            <ProgressActivityIcon className="h-5 w-5 animate-spin text-violet-400" />
           </div>
         )}
 
         {!loading && sounds.length === 0 && (
           <div className="flex flex-col items-center gap-3 rounded-xl border border-white/10 bg-white/[0.02] py-12 text-center">
-            <Music className="h-10 w-10 text-slate-500" />
+            <MusicNoteIcon className="h-10 w-10 text-slate-500" />
             <div>
               <p className="text-sm font-medium text-slate-400">No sounds yet</p>
               <p className="mt-1 text-xs text-slate-600">Upload a .wav file or download from the Community tab</p>
@@ -774,7 +774,7 @@ function MyLibraryTab({ volume }: { volume: number }) {
                         }`}
                         title={isPlaying ? "Pause" : "Play"}
                       >
-                        {isPlaying ? <Pause className="h-4 w-4" /> : <Play className="h-4 w-4 translate-x-0.5" />}
+                        {isPlaying ? <PauseIcon className="h-4 w-4" /> : <PlayArrowIcon className="h-4 w-4 translate-x-0.5" />}
                       </button>
 
                       <div className="min-w-0 flex-1">
@@ -784,14 +784,14 @@ function MyLibraryTab({ volume }: { volume: number }) {
 
                       {isActive && !lockNeedsReapply && (
                         <span className="shrink-0 flex items-center gap-1 rounded-full bg-violet-500/20 px-2 py-0.5 text-xs font-medium text-violet-300">
-                          <CheckCircle2 className="h-3 w-3" />
+                          <CheckCircleIcon className="h-3 w-3" />
                           Lock
                         </span>
                       )}
 
                       {isAssActive && !assNeedsReapply && (
                         <span className="shrink-0 flex items-center gap-1 rounded-full bg-emerald-500/20 px-2 py-0.5 text-xs font-medium text-emerald-300">
-                          <CheckCircle2 className="h-3 w-3" />
+                          <CheckCircleIcon className="h-3 w-3" />
                           ASS
                         </span>
                       )}
@@ -802,7 +802,7 @@ function MyLibraryTab({ volume }: { volume: number }) {
                           disabled={savingVolume || isActivatingLock || isDeleting}
                           className="shrink-0 flex items-center gap-1 rounded-lg border border-amber-500/40 px-3 py-1.5 text-xs font-medium text-amber-300 transition-colors hover:bg-amber-500/10 disabled:opacity-50"
                         >
-                          <AlertTriangle className="h-3 w-3" />
+                          <WarningIcon className="h-3 w-3" />
                           {isActivatingLock ? "Applying..." : "Apply Lock"}
                         </button>
                       )}
@@ -813,7 +813,7 @@ function MyLibraryTab({ volume }: { volume: number }) {
                           disabled={savingVolume || isActivatingAss || isDeleting}
                           className="shrink-0 flex items-center gap-1 rounded-lg border border-amber-500/40 px-3 py-1.5 text-xs font-medium text-amber-300 transition-colors hover:bg-amber-500/10 disabled:opacity-50"
                         >
-                          <AlertTriangle className="h-3 w-3" />
+                          <WarningIcon className="h-3 w-3" />
                           {isActivatingAss ? "Applying..." : "Apply ASS"}
                         </button>
                       )}
@@ -845,7 +845,7 @@ function MyLibraryTab({ volume }: { volume: number }) {
                         }`}
                         title="Adjust volume"
                       >
-                        <Volume2 className="h-4 w-4" />
+                        <VolumeUpIcon className="h-4 w-4" />
                       </button>
 
                       {deleteConfirm === sound.name ? (
@@ -871,7 +871,7 @@ function MyLibraryTab({ volume }: { volume: number }) {
                           className="shrink-0 rounded-lg p-1.5 text-slate-600 transition-colors hover:text-red-400 disabled:opacity-50"
                           title="Delete"
                         >
-                          <Trash2 className="h-4 w-4" />
+                          <DeleteIcon className="h-4 w-4" />
                         </button>
                       )}
                       </div>
@@ -913,7 +913,7 @@ function MyLibraryTab({ volume }: { volume: number }) {
                     disabled={safePage <= 1}
                     className="rounded-lg p-1.5 text-slate-400 transition-colors hover:bg-white/5 hover:text-white disabled:opacity-30 disabled:hover:bg-transparent disabled:hover:text-slate-400"
                   >
-                    <ChevronLeft className="h-4 w-4" />
+                    <ChevronLeftIcon className="h-4 w-4" />
                   </button>
                   <span className="text-xs tabular-nums text-slate-500">
                     Page {safePage} of {libTotalPages}
@@ -923,7 +923,7 @@ function MyLibraryTab({ volume }: { volume: number }) {
                     disabled={safePage >= libTotalPages}
                     className="rounded-lg p-1.5 text-slate-400 transition-colors hover:bg-white/5 hover:text-white disabled:opacity-30 disabled:hover:bg-transparent disabled:hover:text-slate-400"
                   >
-                    <ChevronRight className="h-4 w-4" />
+                    <ChevronRightIcon className="h-4 w-4" />
                   </button>
                 </div>
               )}
@@ -942,7 +942,7 @@ function MyLibraryTab({ volume }: { volume: number }) {
                 onClick={() => randomCfg.enabled && setRandomExpanded((v) => !v)}
                 className={`flex items-center gap-2.5 min-w-0 ${randomCfg.enabled ? "cursor-pointer" : "cursor-default"}`}
               >
-                <Shuffle className={`h-4 w-4 shrink-0 ${randomCfg.enabled ? "text-amber-400" : "text-slate-500"}`} />
+                <ShuffleIcon className={`h-4 w-4 shrink-0 ${randomCfg.enabled ? "text-amber-400" : "text-slate-500"}`} />
                 <h2 className="text-sm font-medium text-slate-200">Random Mode</h2>
                 {randomCfg.enabled && (
                   <>
@@ -962,11 +962,11 @@ function MyLibraryTab({ volume }: { volume: number }) {
                         disabled={randomizing}
                         className="flex items-center gap-1.5 rounded-md border border-amber-500/30 bg-amber-500/10 px-2 py-1 text-[11px] font-medium text-amber-300 transition-colors hover:bg-amber-500/20 disabled:opacity-50"
                       >
-                        <Shuffle className="h-3 w-3" />
+                        <ShuffleIcon className="h-3 w-3" />
                         {randomizing ? "..." : "Randomize"}
                       </button>
                     )}
-                    <ChevronDown className={`h-3.5 w-3.5 text-slate-500 transition-transform ${randomExpanded ? "rotate-180" : ""}`} />
+                    <ExpandMoreIcon className={`h-3.5 w-3.5 text-slate-500 transition-transform ${randomExpanded ? "rotate-180" : ""}`} />
                   </>
                 )}
               </div>
@@ -1012,7 +1012,7 @@ function MyLibraryTab({ volume }: { volume: number }) {
                       : "border-white/10 text-slate-400 hover:border-white/20"
                   }`}
                 >
-                  <Zap className="h-3.5 w-3.5 shrink-0" />
+                  <BoltIcon className="h-3.5 w-3.5 shrink-0" />
                   <div className="text-left">
                     <p className="font-medium">On Connect</p>
                     <p className="mt-0.5 text-[10px] opacity-60">Random sound each time Tesla connects</p>
@@ -1040,7 +1040,7 @@ function MyLibraryTab({ volume }: { volume: number }) {
                         : "border-white/10 text-slate-400 hover:border-white/20"
                   }`}
                 >
-                  <Clock className="h-3.5 w-3.5 shrink-0" />
+                  <ScheduleIcon className="h-3.5 w-3.5 shrink-0" />
                   <div className="text-left">
                     <p className="font-medium">Scheduled</p>
                     <p className="mt-0.5 text-[10px] opacity-60">
@@ -1075,7 +1075,7 @@ function MyLibraryTab({ volume }: { volume: number }) {
                         : "border-white/10 text-slate-400 hover:border-white/20"
                   }`}
                 >
-                  <Shield className="h-3.5 w-3.5 shrink-0" />
+                  <ShieldIcon className="h-3.5 w-3.5 shrink-0" />
                   <div className="text-left">
                     <p className="font-medium">Smart</p>
                     <p className="mt-0.5 text-[10px] opacity-60">
@@ -1115,9 +1115,9 @@ function MyLibraryTab({ volume }: { volume: number }) {
                       className="flex items-center gap-1.5 rounded-lg border border-emerald-500/30 bg-emerald-500/10 px-3 py-1.5 text-xs font-medium text-emerald-300 transition-colors hover:bg-emerald-500/20 disabled:opacity-50"
                     >
                       {bleTestLoading ? (
-                        <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                        <ProgressActivityIcon className="h-3.5 w-3.5 animate-spin" />
                       ) : (
-                        <Shield className="h-3.5 w-3.5" />
+                        <ShieldIcon className="h-3.5 w-3.5" />
                       )}
                       {bleTestLoading ? "Querying..." : "Test BLE"}
                     </button>
@@ -1263,7 +1263,7 @@ function MyLibraryTab({ volume }: { volume: number }) {
                 disabled={randomizing}
                 className="flex items-center gap-2 rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs font-medium text-amber-300 transition-colors hover:bg-amber-500/20 disabled:opacity-50"
               >
-                <Shuffle className="h-3.5 w-3.5" />
+                <ShuffleIcon className="h-3.5 w-3.5" />
                 {randomizing ? "Randomizing..." : "Randomize Now"}
               </button>
             </div>
@@ -1275,7 +1275,7 @@ function MyLibraryTab({ volume }: { volume: number }) {
       {pendingFile ? (
         <div className="rounded-xl border-2 border-violet-500/40 bg-violet-500/[0.06] p-4 space-y-3">
           <div className="flex items-start gap-3 rounded-lg bg-white/[0.04] border border-white/10 px-3 py-2.5">
-            <AlertCircle className="mt-0.5 h-4 w-4 shrink-0 text-amber-400" />
+            <ErrorIcon className="mt-0.5 h-4 w-4 shrink-0 text-amber-400" />
             <p className="text-xs text-slate-400">
               This name will be the file name on your Pi and what shows in the community if you share it.
             </p>
@@ -1299,7 +1299,7 @@ function MyLibraryTab({ volume }: { volume: number }) {
               disabled={!pendingName.trim() || uploading}
               className="flex items-center gap-1.5 rounded-lg bg-violet-600 px-4 py-2 text-xs font-medium text-white transition-colors hover:bg-violet-500 disabled:opacity-50"
             >
-              {uploading ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Upload className="h-3.5 w-3.5" />}
+              {uploading ? <ProgressActivityIcon className="h-3.5 w-3.5 animate-spin" /> : <UploadIcon className="h-3.5 w-3.5" />}
               {uploading ? "Uploading..." : "Upload"}
             </button>
             <button
@@ -1330,12 +1330,12 @@ function MyLibraryTab({ volume }: { volume: number }) {
           <div className="flex flex-col items-center gap-3 py-8 px-4 text-center">
             {uploading ? (
               <>
-                <Loader2 className="h-5 w-5 animate-spin text-violet-400" />
+                <ProgressActivityIcon className="h-5 w-5 animate-spin text-violet-400" />
                 <p className="text-sm text-slate-400">Uploading...</p>
               </>
             ) : (
               <>
-                <Upload className="h-8 w-8 text-slate-600" />
+                <UploadIcon className="h-8 w-8 text-slate-600" />
                 <div>
                   <p className="text-sm font-medium text-slate-300">Drop an audio file or click to browse</p>
                   <p className="mt-1 text-xs text-slate-500">Any audio format · max {MAX_DURATION_SECONDS}s · max 1 MB WAV · auto-converted</p>
@@ -1358,7 +1358,7 @@ function MyLibraryTab({ volume }: { volume: number }) {
 
       {/* Info */}
       <div className="flex items-start gap-3 rounded-xl border border-white/10 bg-white/[0.02] p-4">
-        <AlertCircle className="mt-0.5 h-4 w-4 shrink-0 text-slate-500" />
+        <ErrorIcon className="mt-0.5 h-4 w-4 shrink-0 text-slate-500" />
         <p className="text-xs text-slate-500 leading-relaxed">
           Tesla reads <code className="text-slate-400">LockChime.wav</code> and <code className="text-slate-400">ASSChime.wav</code> from the root of the USB drive.
           The Summon completion sound requires Actually Smart Summon and a Pedestrian Warning System; select USB under the vehicle's Completion Sound setting.
@@ -1378,7 +1378,7 @@ function MyLibraryTab({ volume }: { volume: number }) {
           >
             <div className="flex items-center gap-3">
               <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-amber-500/15">
-                <AlertTriangle className="h-5 w-5 text-amber-400" />
+                <WarningIcon className="h-5 w-5 text-amber-400" />
               </div>
               <h3 className="text-lg font-semibold text-slate-100">Potential Recording Loss</h3>
             </div>
@@ -1397,15 +1397,15 @@ function MyLibraryTab({ volume }: { volume: number }) {
               </div>
               <ul className="space-y-1.5 text-xs text-slate-400">
                 <li className="flex items-start gap-2">
-                  <Zap className="h-3.5 w-3.5 shrink-0 mt-0.5 text-slate-500" />
+                  <BoltIcon className="h-3.5 w-3.5 shrink-0 mt-0.5 text-slate-500" />
                   <span><strong className="text-slate-300">On Connect</strong> — changes the sound when the Pi reconnects to Tesla (during normal archive cycles)</span>
                 </li>
                 <li className="flex items-start gap-2">
-                  <Clock className="h-3.5 w-3.5 shrink-0 mt-0.5 text-slate-500" />
+                  <ScheduleIcon className="h-3.5 w-3.5 shrink-0 mt-0.5 text-slate-500" />
                   <span><strong className="text-slate-300">Scheduled</strong> — changes on a timer which may disconnect USB at any time, including while driving</span>
                 </li>
                 <li className="flex items-start gap-2">
-                  <Shield className="h-3.5 w-3.5 shrink-0 mt-0.5 text-slate-500" />
+                  <ShieldIcon className="h-3.5 w-3.5 shrink-0 mt-0.5 text-slate-500" />
                   <span><strong className="text-slate-300">Smart</strong> — uses BLE to check if parked before changing. Only sentry/recent clips may be affected, never while driving</span>
                 </li>
               </ul>
@@ -1636,7 +1636,7 @@ function CommunityBrowse({ adminPasscode, volume }: { adminPasscode: string | nu
       {/* Search & sort */}
       <div className="flex flex-col gap-3 sm:flex-row sm:items-center">
         <div className="relative flex-1">
-          <Search className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-slate-500" />
+          <SearchIcon className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-slate-500" />
           <input
             type="text"
             value={search}
@@ -1660,20 +1660,20 @@ function CommunityBrowse({ adminPasscode, volume }: { adminPasscode: string | nu
       {/* Grid */}
       {loading && (
         <div className="flex items-center justify-center py-16">
-          <Loader2 className="h-6 w-6 animate-spin text-violet-400" />
+          <ProgressActivityIcon className="h-6 w-6 animate-spin text-violet-400" />
         </div>
       )}
 
       {!loading && error && (
         <div className="flex flex-col items-center gap-3 rounded-xl border border-white/10 bg-white/[0.02] py-16 text-center">
-          <Music className="h-10 w-10 text-slate-500" />
+          <MusicNoteIcon className="h-10 w-10 text-slate-500" />
           <p className="text-sm text-slate-400">{error}</p>
         </div>
       )}
 
       {!loading && !error && sounds.length === 0 && (
         <div className="flex flex-col items-center gap-3 rounded-xl border border-white/10 bg-white/[0.02] py-16 text-center">
-          <Music className="h-10 w-10 text-slate-500" />
+          <MusicNoteIcon className="h-10 w-10 text-slate-500" />
           <div>
             <p className="text-sm font-medium text-slate-400">No community sounds yet</p>
             <p className="mt-1 text-xs text-slate-600">Be the first to share a lock chime!</p>
@@ -1705,7 +1705,7 @@ function CommunityBrowse({ adminPasscode, volume }: { adminPasscode: string | nu
                   }`}
                   title={playingCode === sound.code ? "Stop" : "Preview"}
                 >
-                  {playingCode === sound.code ? <Pause className="h-4 w-4" /> : <Play className="h-4 w-4 translate-x-0.5" />}
+                  {playingCode === sound.code ? <PauseIcon className="h-4 w-4" /> : <PlayArrowIcon className="h-4 w-4 translate-x-0.5" />}
                 </button>
               </div>
 
@@ -1716,9 +1716,9 @@ function CommunityBrowse({ adminPasscode, volume }: { adminPasscode: string | nu
                   className="flex flex-1 items-center justify-center gap-1.5 rounded-lg bg-violet-600/80 px-3 py-2 text-xs font-medium text-white transition-colors hover:bg-violet-500 disabled:opacity-50"
                 >
                   {downloadingCode === sound.code ? (
-                    <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                    <ProgressActivityIcon className="h-3.5 w-3.5 animate-spin" />
                   ) : (
-                    <Download className="h-3.5 w-3.5" />
+                    <DownloadIcon className="h-3.5 w-3.5" />
                   )}
                   {downloadingCode === sound.code ? "Downloading..." : "Download to Pi"}
                 </button>
@@ -1729,13 +1729,13 @@ function CommunityBrowse({ adminPasscode, volume }: { adminPasscode: string | nu
                       onClick={() => setEditingSound(sound)}
                       className="rounded-lg border border-white/10 p-2 text-slate-500 transition-colors hover:text-slate-300"
                     >
-                      <Pencil className="h-3 w-3" />
+                      <EditIcon className="h-3 w-3" />
                     </button>
                     <button
                       onClick={() => setDeletingSound(sound)}
                       className="rounded-lg border border-white/10 p-2 text-slate-500 transition-colors hover:text-red-400"
                     >
-                      <Trash2 className="h-3 w-3" />
+                      <DeleteIcon className="h-3 w-3" />
                     </button>
                   </>
                 )}
@@ -1753,7 +1753,7 @@ function CommunityBrowse({ adminPasscode, volume }: { adminPasscode: string | nu
             disabled={page <= 1}
             className="rounded-lg border border-white/10 p-2 text-slate-400 transition-colors hover:bg-white/5 disabled:opacity-30"
           >
-            <ChevronLeft className="h-4 w-4" />
+            <ChevronLeftIcon className="h-4 w-4" />
           </button>
           <span className="text-xs text-slate-500">
             Page {page} of {totalPages}
@@ -1763,7 +1763,7 @@ function CommunityBrowse({ adminPasscode, volume }: { adminPasscode: string | nu
             disabled={page >= totalPages}
             className="rounded-lg border border-white/10 p-2 text-slate-400 transition-colors hover:bg-white/5 disabled:opacity-30"
           >
-            <ChevronRight className="h-4 w-4" />
+            <ChevronRightIcon className="h-4 w-4" />
           </button>
         </div>
       )}
@@ -1967,7 +1967,7 @@ function AudioPreview({ file }: { file: File }) {
         onClick={togglePlay}
         className="flex h-10 w-10 items-center justify-center rounded-full bg-violet-500/20 text-violet-400 transition-colors hover:bg-violet-500/30"
       >
-        {playing ? <Pause className="h-4 w-4" /> : <Play className="h-4 w-4" />}
+        {playing ? <PauseIcon className="h-4 w-4" /> : <PlayArrowIcon className="h-4 w-4" />}
       </button>
       <audio
         ref={audioRef}

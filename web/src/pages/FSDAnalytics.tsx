@@ -1,6 +1,14 @@
 import { useEffect, useState } from "react"
 import { useNavigate } from "react-router-dom"
-import { ArrowLeft, Zap, Calendar, TrendingUp, AlertTriangle, Flame, ChevronLeft } from "lucide-react"
+import {
+  ArrowBackIcon,
+  BoltIcon,
+  CalendarMonthIcon,
+  ChevronLeftIcon,
+  LocalFireDepartmentIcon,
+  TrendingUpIcon,
+  WarningIcon,
+} from "@/components/icons"
 import { api } from "@/lib/api"
 import type { FSDAnalytics as FSDAnalyticsData } from "@/lib/api"
 import { cn } from "@/lib/utils"
@@ -238,7 +246,7 @@ export default function FSDAnalytics() {
       <div className="flex items-center justify-between">
         <div className="flex items-center gap-3">
           <button onClick={() => navigate("/drives")} className="rounded-lg border border-white/10 bg-white/5 p-2 text-slate-400 transition-colors hover:bg-white/10 hover:text-slate-200">
-            <ArrowLeft className="h-4 w-4" />
+            <ArrowBackIcon className="h-4 w-4" />
           </button>
           <div>
             <h1 className="text-lg font-semibold text-slate-100">FSD Analytics</h1>
@@ -299,7 +307,7 @@ export default function FSDAnalytics() {
               <div>
                 <p className="text-xs text-slate-500">Streak</p>
                 <p className="text-lg font-semibold text-slate-100">
-                  {(data.streak_days ?? 0) > 0 && <Flame className="mr-1 inline h-4 w-4 text-orange-400" />}
+                  {(data.streak_days ?? 0) > 0 && <LocalFireDepartmentIcon className="mr-1 inline h-4 w-4 text-orange-400" />}
                   {data.streak_days ?? 0}d
                 </p>
               </div>
@@ -311,26 +319,26 @@ export default function FSDAnalytics() {
       {/* Stat Cards */}
       <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
         <StatCard
-          icon={Zap}
+          icon={BoltIcon}
           label="Today"
           value={`${Math.round(todayPct)}%`}
           color={todayPct >= 90 ? "emerald" : todayPct >= 60 ? "blue" : "amber"}
         />
         <StatCard
-          icon={TrendingUp}
+          icon={TrendingUpIcon}
           label={period === "day" ? "Day" : period === "week" ? "Week" : "All Time"}
           value={`${Math.round(fsdPct)}%`}
           color={fsdPct >= 90 ? "emerald" : fsdPct >= 60 ? "blue" : "amber"}
         />
         <StatCard
-          icon={Calendar}
+          icon={CalendarMonthIcon}
           label="Best Day"
           value={`${Math.round(bestDayPct)}%`}
           sub={data.best_day ? new Date(data.best_day + "T00:00:00").toLocaleDateString([], { month: "short", day: "numeric" }) : "—"}
           color="emerald"
         />
         <StatCard
-          icon={AlertTriangle}
+          icon={WarningIcon}
           label="Avg. Disengagements"
           value={avgDis.toFixed(1)}
           sub="per drive"
@@ -347,7 +355,7 @@ export default function FSDAnalytics() {
                 onClick={() => setSelectedMonth(null)}
                 className="rounded-md p-1 text-slate-400 transition-colors hover:bg-white/10 hover:text-slate-200"
               >
-                <ChevronLeft className="h-4 w-4" />
+                <ChevronLeftIcon className="h-4 w-4" />
               </button>
             )}
             <h2 className="text-sm font-semibold text-slate-200">{chartTitle}</h2>

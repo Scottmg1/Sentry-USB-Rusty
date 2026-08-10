@@ -1,18 +1,23 @@
 import { Suspense, lazy, useCallback, useEffect, useMemo, useState } from "react"
 import { Link, useParams } from "react-router-dom"
 import {
-  ArrowLeft,
-  BatteryFull,
-  Clock,
-  Disc,
-  Gauge,
-  Loader2,
-  MapPin,
-  Radio,
-  Sparkles,
-  Thermometer,
-  Wind,
-} from "lucide-react"
+  AirIcon,
+  AlbumIcon,
+  ArrowBackIcon,
+  AutoAwesomeIcon,
+  BatteryAndroidFrame1Icon,
+  BatteryAndroidFrame2Icon,
+  BatteryAndroidFrame4Icon,
+  BatteryAndroidFrameFullIcon,
+  DataUsageIcon,
+  DeviceThermostatIcon,
+  LineEndIcon,
+  LineStartIcon,
+  ProgressActivityIcon,
+  ScheduleIcon,
+  SensorsIcon,
+  SpeedIcon,
+} from "@/components/icons"
 import { cn } from "@/lib/utils"
 import { monotonicTrack } from "@/lib/drive-track"
 import { useDriveDetail } from "@/hooks/useDriveDetail"
@@ -52,13 +57,13 @@ export default function DriveDetail() {
         to="/drives"
         className="mb-4 inline-flex items-center gap-2 text-sm text-slate-400 hover:text-slate-200"
       >
-        <ArrowLeft className="h-4 w-4" />
+        <ArrowBackIcon className="h-4 w-4" />
         Back to drives
       </Link>
 
       {loading && (
         <div className="flex items-center justify-center gap-2 rounded-2xl border border-white/[0.06] bg-white/[0.025] p-10 text-sm text-slate-400">
-          <Loader2 className="h-4 w-4 animate-spin" /> Loading drive…
+          <ProgressActivityIcon className="h-4 w-4 animate-spin" /> Loading drive…
         </div>
       )}
       {error && !loading && (
@@ -227,7 +232,7 @@ function DriveDetailContent({ drive, onSaveTags }: DriveDetailContentProps) {
             )}
             aria-pressed={showFsdEvents}
           >
-            <Sparkles className="h-3.5 w-3.5" />
+            <AutoAwesomeIcon className="h-3.5 w-3.5" />
             Toggle FSD Markers
           </button>
         </div>
@@ -281,7 +286,7 @@ function DriveDetailContent({ drive, onSaveTags }: DriveDetailContentProps) {
         <StatTile
           label="Distance"
           value={formatDistance(drive.distanceMi, drive.distanceKm, metric)}
-          icon={<Gauge className="h-4 w-4" />}
+          icon={<SpeedIcon className="h-4 w-4" />}
           size="headline"
         />
         {drive.summon ? (
@@ -291,7 +296,7 @@ function DriveDetailContent({ drive, onSaveTags }: DriveDetailContentProps) {
           <StatTile
             label="Self-driving"
             value="Summon"
-            icon={<Radio className="h-4 w-4" />}
+            icon={<SensorsIcon className="h-4 w-4" />}
             info="The car drove itself via Summon. FSD % doesn't apply — summon telemetry reports no autopilot state."
             size="headline"
           />
@@ -299,7 +304,7 @@ function DriveDetailContent({ drive, onSaveTags }: DriveDetailContentProps) {
           <StatTile
             label="Self-driving"
             value={`${formatPercent(drive.fsdPercent)}%`}
-            icon={<Sparkles className="h-4 w-4" />}
+            icon={<AutoAwesomeIcon className="h-4 w-4" />}
             star={fsdFull}
             info="Percentage of the drive's distance with FSD engaged."
             size="headline"
@@ -308,7 +313,7 @@ function DriveDetailContent({ drive, onSaveTags }: DriveDetailContentProps) {
         <StatTile
           label="Duration"
           value={formatDuration(drive.durationMs)}
-          icon={<Clock className="h-4 w-4" />}
+          icon={<ScheduleIcon className="h-4 w-4" />}
           size="headline"
         />
       </div>
@@ -350,12 +355,12 @@ function SpeedSection({ drive, speedSeries, metric, speedUnit }: SpeedSectionPro
         <StatTile
           label="Avg speed"
           value={formatSpeed(drive.avgSpeedMph, drive.avgSpeedKmh, metric)}
-          icon={<Gauge className="h-4 w-4" />}
+          icon={<SpeedIcon className="h-4 w-4" />}
         />
         <StatTile
           label="Max speed"
           value={formatSpeed(drive.maxSpeedMph, drive.maxSpeedKmh, metric)}
-          icon={<Gauge className="h-4 w-4" />}
+          icon={<SpeedIcon className="h-4 w-4" />}
         />
       </div>
       {speedSeries.length > 1 && (
@@ -377,7 +382,7 @@ function SpeedSection({ drive, speedSeries, metric, speedUnit }: SpeedSectionPro
 function ChartFallback() {
   return (
     <div className="flex h-44 items-center justify-center text-xs text-slate-500">
-      <Loader2 className="mr-2 h-3 w-3 animate-spin" /> Loading chart…
+      <ProgressActivityIcon className="mr-2 h-3 w-3 animate-spin" /> Loading chart…
     </div>
   )
 }
@@ -408,24 +413,24 @@ function AssistedSection({ drive, metric }: AssistedSectionProps) {
             <StatTile
               label="FSD"
               value={`${formatPercent(drive.fsdPercent)}%`}
-              icon={<Sparkles className="h-4 w-4" />}
+              icon={<AutoAwesomeIcon className="h-4 w-4" />}
               info="Time + distance share with Full Self-Driving (Supervised) engaged."
             />
             <StatTile
               label="FSD distance"
               value={formatDistance(drive.fsdDistanceMi, drive.fsdDistanceKm, metric)}
-              icon={<Gauge className="h-4 w-4" />}
+              icon={<SpeedIcon className="h-4 w-4" />}
             />
             <StatTile
               label="Disengagements"
               value={String(drive.fsdDisengagements)}
-              icon={<Disc className="h-4 w-4" />}
+              icon={<AlbumIcon className="h-4 w-4" />}
               info="Number of times FSD handed back control (excluding parks within 2s)."
             />
             <StatTile
               label="Accel pushes"
               value={String(drive.fsdAccelPushes)}
-              icon={<Gauge className="h-4 w-4" />}
+              icon={<SpeedIcon className="h-4 w-4" />}
               info="Number of accelerator presses while FSD was engaged."
             />
           </>
@@ -435,13 +440,13 @@ function AssistedSection({ drive, metric }: AssistedSectionProps) {
             <StatTile
               label="Autopilot"
               value={`${formatPercent(drive.autosteerPercent)}%`}
-              icon={<Sparkles className="h-4 w-4" />}
+              icon={<AutoAwesomeIcon className="h-4 w-4" />}
               info="Autosteer share (lane-keeping without FSD)."
             />
             <StatTile
               label="Autopilot distance"
               value={formatDistance(drive.autosteerDistanceMi, drive.autosteerDistanceKm, metric)}
-              icon={<Gauge className="h-4 w-4" />}
+              icon={<SpeedIcon className="h-4 w-4" />}
             />
           </>
         )}
@@ -450,13 +455,13 @@ function AssistedSection({ drive, metric }: AssistedSectionProps) {
             <StatTile
               label="TACC"
               value={`${formatPercent(drive.taccPercent)}%`}
-              icon={<Sparkles className="h-4 w-4" />}
+              icon={<AutoAwesomeIcon className="h-4 w-4" />}
               info="Traffic-Aware Cruise Control share (speed regulation only)."
             />
             <StatTile
               label="TACC distance"
               value={formatDistance(drive.taccDistanceMi, drive.taccDistanceKm, metric)}
-              icon={<Gauge className="h-4 w-4" />}
+              icon={<SpeedIcon className="h-4 w-4" />}
             />
           </>
         )}
@@ -484,7 +489,7 @@ function OdometerSection({
               ? formatOdometer(drive.odometerMiStart, metric)
               : "—"
           }
-          icon={<MapPin className="h-4 w-4" />}
+          icon={<LineStartIcon className="h-4 w-4" />}
         />
         <StatTile
           label="End"
@@ -493,7 +498,7 @@ function OdometerSection({
               ? formatOdometer(drive.odometerMiEnd, metric)
               : "—"
           }
-          icon={<MapPin className="h-4 w-4" />}
+          icon={<LineEndIcon className="h-4 w-4" />}
         />
         <StatTile
           label="Driven"
@@ -502,11 +507,24 @@ function OdometerSection({
               ? formatOdometer(drive.odometerMiDriven, metric)
               : "—"
           }
-          icon={<Gauge className="h-4 w-4" />}
+          icon={<SpeedIcon className="h-4 w-4" />}
         />
       </div>
     </>
   )
+}
+
+/** Battery glyph matching the state of charge; full when unknown. */
+function BatteryLevelIcon({ pct }: { pct?: number }) {
+  const Icon =
+    pct === undefined || pct >= 75
+      ? BatteryAndroidFrameFullIcon
+      : pct >= 40
+        ? BatteryAndroidFrame4Icon
+        : pct >= 15
+          ? BatteryAndroidFrame2Icon
+          : BatteryAndroidFrame1Icon
+  return <Icon className="h-4 w-4" />
 }
 
 function BatterySection({ drive }: { drive: DriveDetailType }) {
@@ -518,17 +536,17 @@ function BatterySection({ drive }: { drive: DriveDetailType }) {
         <StatTile
           label="Start"
           value={drive.batteryPctStart !== undefined ? `${Math.round(drive.batteryPctStart)}%` : "—"}
-          icon={<BatteryFull className="h-4 w-4" />}
+          icon={<BatteryLevelIcon pct={drive.batteryPctStart} />}
         />
         <StatTile
           label="End"
           value={drive.batteryPctEnd !== undefined ? `${Math.round(drive.batteryPctEnd)}%` : "—"}
-          icon={<BatteryFull className="h-4 w-4" />}
+          icon={<BatteryLevelIcon pct={drive.batteryPctEnd} />}
         />
         <StatTile
           label="Used"
           value={drive.batteryPctUsed !== undefined ? `${drive.batteryPctUsed.toFixed(1)}%` : "—"}
-          icon={<BatteryFull className="h-4 w-4" />}
+          icon={<DataUsageIcon className="h-4 w-4" />}
         />
       </div>
     </>
@@ -585,17 +603,17 @@ function ClimateSection({ drive, metric }: ClimateSectionProps) {
         <StatTile
           label="Interior min"
           value={formatTempC(drive.interiorTempMinC, metric)}
-          icon={<Thermometer className="h-4 w-4" />}
+          icon={<DeviceThermostatIcon className="h-4 w-4" />}
         />
         <StatTile
           label="Interior max"
           value={formatTempC(drive.interiorTempMaxC, metric)}
-          icon={<Thermometer className="h-4 w-4" />}
+          icon={<DeviceThermostatIcon className="h-4 w-4" />}
         />
         <StatTile
           label="Exterior avg"
           value={formatTempC(drive.exteriorTempAvgC, metric)}
-          icon={<Thermometer className="h-4 w-4" />}
+          icon={<DeviceThermostatIcon className="h-4 w-4" />}
         />
         <StatTile
           label="HVAC runtime"
@@ -604,7 +622,7 @@ function ClimateSection({ drive, metric }: ClimateSectionProps) {
               ? formatHvacRuntime(drive.hvacRuntimeS, drive.durationMs)
               : "—"
           }
-          icon={<Wind className="h-4 w-4" />}
+          icon={<AirIcon className="h-4 w-4" />}
         />
       </div>
       {chartReady && (
@@ -638,10 +656,10 @@ function TirePressureSection({ drive }: { drive: DriveDetailType }) {
     <>
       <SectionHeading>Tire pressure</SectionHeading>
       <div className="grid grid-cols-2 gap-4">
-        <StatTile label="FL" value={formatPsi(drive.tireFlPsi, pressureBar)} icon={<Disc className="h-4 w-4" />} />
-        <StatTile label="FR" value={formatPsi(drive.tireFrPsi, pressureBar)} icon={<Disc className="h-4 w-4" />} />
-        <StatTile label="RL" value={formatPsi(drive.tireRlPsi, pressureBar)} icon={<Disc className="h-4 w-4" />} />
-        <StatTile label="RR" value={formatPsi(drive.tireRrPsi, pressureBar)} icon={<Disc className="h-4 w-4" />} />
+        <StatTile label="FL" value={formatPsi(drive.tireFlPsi, pressureBar)} icon={<AlbumIcon className="h-4 w-4" />} />
+        <StatTile label="FR" value={formatPsi(drive.tireFrPsi, pressureBar)} icon={<AlbumIcon className="h-4 w-4" />} />
+        <StatTile label="RL" value={formatPsi(drive.tireRlPsi, pressureBar)} icon={<AlbumIcon className="h-4 w-4" />} />
+        <StatTile label="RR" value={formatPsi(drive.tireRrPsi, pressureBar)} icon={<AlbumIcon className="h-4 w-4" />} />
       </div>
     </>
   )

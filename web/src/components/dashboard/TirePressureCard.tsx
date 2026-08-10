@@ -1,5 +1,5 @@
 import { memo, useMemo } from "react"
-import { Disc } from "lucide-react"
+import { AlbumIcon } from "@/components/icons"
 import {
   CartesianGrid,
   Legend,
@@ -306,7 +306,7 @@ export const TirePressureCard = memo(function TirePressureCard({
     <div className="glass-card p-4">
       <div className="mb-3 flex flex-wrap items-center gap-3">
         <span className="tile-icon halo-blue">
-          <Disc className="h-4 w-4" />
+          <AlbumIcon className="h-4 w-4" />
         </span>
         <div className="min-w-0">
           <div className="text-sm font-semibold text-slate-100">

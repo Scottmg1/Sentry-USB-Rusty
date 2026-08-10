@@ -1,5 +1,5 @@
 import { useState, useEffect } from "react"
-import { ShieldCheck, ShieldAlert } from "lucide-react"
+import { GppMaybeIcon, VerifiedUserIcon } from "@/components/icons"
 import { PrefCard } from "@/components/settings/PrefCard"
 import { Toggle } from "@/components/ui/Toggle"
 import { Pill } from "@/components/ui/Pill"
@@ -77,9 +77,9 @@ export function BleEnableToggle() {
   // somehow already on, leave the toggle enabled so it can be turned off.
   const keepAwakeBlocked = blockedBy !== null && keepAwake !== true
   const icon = anyOn ? (
-    <ShieldCheck className="h-3.5 w-3.5" />
+    <VerifiedUserIcon className="h-3.5 w-3.5" />
   ) : (
-    <ShieldAlert className="h-3.5 w-3.5" />
+    <GppMaybeIcon className="h-3.5 w-3.5" />
   )
 
   return (

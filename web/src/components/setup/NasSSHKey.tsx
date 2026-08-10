@@ -1,5 +1,11 @@
 import { useState } from "react"
-import { Key, Copy, Check, Loader2, RefreshCw } from "lucide-react"
+import {
+  CachedIcon,
+  CheckIcon,
+  ContentCopyIcon,
+  KeyIcon,
+  ProgressActivityIcon,
+} from "@/components/icons"
 
 export function NasSSHKey({
   pubKey,
@@ -96,7 +102,7 @@ export function NasSSHKey({
   return (
     <div className="space-y-3 rounded-lg border border-white/5 bg-white/[0.02] p-4">
       <div className="flex items-center gap-2">
-        <Key className="h-4 w-4 text-blue-400" />
+        <KeyIcon className="h-4 w-4 text-blue-400" />
         <h4 className="text-sm font-medium text-slate-300">NAS SSH Key</h4>
       </div>
       <div className="space-y-2 text-xs text-slate-500">
@@ -147,7 +153,7 @@ mount -o remount,ro /`}
               className="absolute right-2 top-2 rounded p-1 text-slate-500 transition hover:bg-white/10 hover:text-slate-300"
               title="Copy to clipboard"
             >
-              {copied ? <Check className="h-4 w-4 text-emerald-400" /> : <Copy className="h-4 w-4" />}
+              {copied ? <CheckIcon className="h-4 w-4 text-emerald-400" /> : <ContentCopyIcon className="h-4 w-4" />}
             </button>
           </div>
           <button
@@ -155,7 +161,7 @@ mount -o remount,ro /`}
             disabled={loading}
             className="flex items-center gap-1.5 rounded-lg border border-white/10 bg-white/5 px-3 py-1.5 text-xs text-slate-400 transition hover:bg-white/10 hover:text-slate-300 disabled:opacity-50"
           >
-            {loading ? <Loader2 className="h-3 w-3 animate-spin" /> : <RefreshCw className="h-3 w-3" />}
+            {loading ? <ProgressActivityIcon className="h-3 w-3 animate-spin" /> : <CachedIcon className="h-3 w-3" />}
             Regenerate Key
           </button>
         </div>
@@ -166,7 +172,7 @@ mount -o remount,ro /`}
             disabled={loading}
             className="flex items-center gap-1.5 rounded-lg bg-blue-500/20 px-4 py-2 text-sm font-medium text-blue-400 transition hover:bg-blue-500/30 disabled:opacity-50"
           >
-            {loading ? <Loader2 className="h-4 w-4 animate-spin" /> : <Key className="h-4 w-4" />}
+            {loading ? <ProgressActivityIcon className="h-4 w-4 animate-spin" /> : <KeyIcon className="h-4 w-4" />}
             Generate SSH Key
           </button>
           <button
@@ -174,7 +180,7 @@ mount -o remount,ro /`}
             disabled={loading}
             className="flex items-center gap-1.5 rounded-lg border border-white/10 bg-white/5 px-3 py-2 text-sm text-slate-400 transition hover:bg-white/10 hover:text-slate-300 disabled:opacity-50"
           >
-            {loading ? <Loader2 className="h-4 w-4 animate-spin" /> : <RefreshCw className="h-4 w-4" />}
+            {loading ? <ProgressActivityIcon className="h-4 w-4 animate-spin" /> : <CachedIcon className="h-4 w-4" />}
             Check Existing
           </button>
         </div>

@@ -1,6 +1,13 @@
 import { useEffect, useState } from "react"
 import { Link } from "react-router-dom"
-import { Cloud, CloudOff, Upload, ChevronRight, AlertTriangle, X } from "lucide-react"
+import {
+  ChevronRightIcon,
+  CloseIcon,
+  CloudIcon,
+  CloudOffIcon,
+  UploadIcon,
+  WarningIcon,
+} from "@/components/icons"
 import { wsClient } from "@/lib/ws"
 import { Pill, LiveDot } from "@/components/ui/Pill"
 
@@ -80,7 +87,7 @@ export function CloudStatusBar() {
       <div className="glass-card glass-card-hover cloud-bar group relative transition-colors">
         <Link to={linkTo} className="flex min-w-0 flex-1 items-center gap-3">
           <span className="halo-blue inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-lg">
-            <CloudOff className="h-4 w-4" />
+            <CloudOffIcon className="h-4 w-4" />
           </span>
           <div className="min-w-0 flex-1">
             <div className="t-md">Connect SentryCloud</div>
@@ -103,7 +110,7 @@ export function CloudStatusBar() {
           aria-label="Hide SentryCloud"
           className="-mr-1 shrink-0 rounded-md p-1.5 text-slate-500 transition-colors hover:bg-white/5 hover:text-slate-300"
         >
-          <X className="h-4 w-4" />
+          <CloseIcon className="h-4 w-4" />
         </button>
       </div>
     )
@@ -120,7 +127,7 @@ export function CloudStatusBar() {
       >
         <div className="flex items-center gap-3">
           <span className="halo-accent inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-lg">
-            <Upload className="h-4 w-4" />
+            <UploadIcon className="h-4 w-4" />
           </span>
           <div className="min-w-0 flex-1">
             <div className="t-md flex items-center gap-2">
@@ -139,7 +146,7 @@ export function CloudStatusBar() {
                 : "—"}
             </div>
           </div>
-          <ChevronRight className="h-4 w-4 shrink-0 text-slate-600" />
+          <ChevronRightIcon className="h-4 w-4 shrink-0 text-slate-600" />
         </div>
         <div className="bar">
           <div
@@ -159,13 +166,13 @@ export function CloudStatusBar() {
         className="glass-card glass-card-hover cloud-bar group transition-colors"
       >
         <span className="halo-amber inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-lg">
-          <AlertTriangle className="h-4 w-4" />
+          <WarningIcon className="h-4 w-4" />
         </span>
         <div className="min-w-0 flex-1">
           <div className="t-md">SentryCloud — last upload failed</div>
           <div className="t-xs truncate">{status.lastUploadError}</div>
         </div>
-        <ChevronRight className="h-4 w-4 text-slate-600" />
+        <ChevronRightIcon className="h-4 w-4 text-slate-600" />
       </Link>
     )
   }
@@ -177,7 +184,7 @@ export function CloudStatusBar() {
       className="glass-card glass-card-hover cloud-bar group transition-colors"
     >
       <span className="halo-accent inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-lg">
-        <Cloud className="h-4 w-4" />
+        <CloudIcon className="h-4 w-4" />
       </span>
       <div className="min-w-0 flex-1">
         <div className="t-md flex items-center gap-2">
@@ -191,7 +198,7 @@ export function CloudStatusBar() {
           )}
         </div>
       </div>
-      <ChevronRight className="h-4 w-4 text-slate-600 transition-transform group-hover:translate-x-0.5" />
+      <ChevronRightIcon className="h-4 w-4 text-slate-600 transition-transform group-hover:translate-x-0.5" />
     </Link>
   )
 }

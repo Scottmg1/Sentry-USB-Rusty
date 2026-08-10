@@ -1,5 +1,5 @@
 import { useMemo, useRef } from "react"
-import { Pause, Play } from "lucide-react"
+import { PauseIcon, PlayArrowIcon } from "@/components/icons"
 import { cn } from "@/lib/utils"
 import { useScrubberActions, useScrubberState } from "@/hooks/useScrubberSync"
 
@@ -95,7 +95,7 @@ export function DriveScrubber({ points, startTime, fsdStates }: DriveScrubberPro
           className="inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-emerald-500/95 text-slate-950 transition-colors hover:bg-emerald-400"
           aria-label={playing ? "Pause" : "Play"}
         >
-          {playing ? <Pause className="h-4 w-4" /> : <Play className="h-4 w-4 translate-x-px" />}
+          {playing ? <PauseIcon className="h-4 w-4" /> : <PlayArrowIcon className="h-4 w-4 translate-x-px" />}
         </button>
 
         <span className="w-16 shrink-0 text-right text-xs tabular-nums text-slate-400">

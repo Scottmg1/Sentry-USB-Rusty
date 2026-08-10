@@ -1,6 +1,6 @@
 import { useEffect, type ReactNode } from "react"
 import { createPortal } from "react-dom"
-import { X } from "lucide-react"
+import { CloseIcon } from "@/components/icons"
 import { cn } from "@/lib/utils"
 
 interface ModalProps {
@@ -59,7 +59,7 @@ export function Modal({
           <span className="modal-title">{title}</span>
           {dismissable && (
             <button className="modal-close" onClick={onClose} aria-label="Close">
-              <X className="h-4 w-4" />
+              <CloseIcon className="h-4 w-4" />
             </button>
           )}
         </div>

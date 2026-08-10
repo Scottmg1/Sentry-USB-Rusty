@@ -1,4 +1,4 @@
-import { Clock, Gauge, Radio, Sparkles } from "lucide-react"
+import { AutoAwesomeIcon, ScheduleIcon, SensorsIcon, SpeedIcon } from "@/components/icons"
 import { useNavigate } from "react-router-dom"
 import { cn } from "@/lib/utils"
 import { formatDistance, formatDuration, formatPercent } from "@/lib/drive-format"
@@ -101,21 +101,21 @@ export function DriveRow({
       <div className="flex flex-col items-end justify-between gap-2">
         <div className="flex flex-wrap items-center justify-end gap-1.5">
           <Chip>
-            <Gauge className="h-3.5 w-3.5" />
+            <SpeedIcon className="h-3.5 w-3.5" />
             {formatDistance(drive.distanceMi, drive.distanceKm, metric)}
           </Chip>
           <Chip>
-            <Clock className="h-3.5 w-3.5" />
+            <ScheduleIcon className="h-3.5 w-3.5" />
             {formatDuration(drive.durationMs)}
           </Chip>
           {drive.summon ? (
             <Chip summon>
-              <Radio className="h-3.5 w-3.5" />
+              <SensorsIcon className="h-3.5 w-3.5" />
               Summon
             </Chip>
           ) : (
             <Chip emphasis>
-              <Sparkles className="h-3.5 w-3.5" />
+              <AutoAwesomeIcon className="h-3.5 w-3.5" />
               FSD {fsdDisplay}%
               {fsdFull && (
                 <span className="ml-0.5 text-amber-300" aria-hidden>

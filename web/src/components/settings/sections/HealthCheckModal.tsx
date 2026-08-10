@@ -1,14 +1,14 @@
 import { useState, useEffect } from "react"
 import {
-  Stethoscope,
-  Loader2,
-  ChevronDown,
-  ChevronRight,
-  CheckCircle,
-  AlertTriangle,
-  AlertCircle,
-  XCircle,
-} from "lucide-react"
+  CancelIcon,
+  CheckCircleIcon,
+  ChevronRightIcon,
+  ErrorIcon,
+  ExpandMoreIcon,
+  ProgressActivityIcon,
+  StethoscopeIcon,
+  WarningIcon,
+} from "@/components/icons"
 import { cn } from "@/lib/utils"
 import { Modal } from "@/components/ui/Modal"
 
@@ -52,9 +52,9 @@ export function HealthCheckModal({ onClose }: { onClose: () => void }) {
   }, [])
 
   const statusIcon = (s: string) => {
-    if (s === "pass") return <CheckCircle className="h-3.5 w-3.5 text-emerald-400" />
-    if (s === "warn") return <AlertTriangle className="h-3.5 w-3.5 text-amber-400" />
-    return <XCircle className="h-3.5 w-3.5 text-red-400" />
+    if (s === "pass") return <CheckCircleIcon className="h-3.5 w-3.5 text-emerald-400" />
+    if (s === "warn") return <WarningIcon className="h-3.5 w-3.5 text-amber-400" />
+    return <CancelIcon className="h-3.5 w-3.5 text-red-400" />
   }
 
   const failCount = report
@@ -82,7 +82,7 @@ export function HealthCheckModal({ onClose }: { onClose: () => void }) {
     <Modal
       title={
         <span className="flex items-center gap-2">
-          <Stethoscope className={cn("h-4 w-4", headerIconClass)} />
+          <StethoscopeIcon className={cn("h-4 w-4", headerIconClass)} />
           <span>Health Check</span>
           {report && !loading && (
             <span
@@ -116,14 +116,14 @@ export function HealthCheckModal({ onClose }: { onClose: () => void }) {
     >
       {loading && (
         <div className="flex items-center justify-center py-8 text-slate-500">
-          <Loader2 className="mr-2 h-5 w-5 animate-spin" />
+          <ProgressActivityIcon className="mr-2 h-5 w-5 animate-spin" />
           Running health check...
         </div>
       )}
 
       {error && !loading && (
         <div className="flex items-start gap-3 rounded-xl border border-red-500/20 bg-red-500/5 p-4 text-sm">
-          <AlertCircle className="mt-0.5 h-5 w-5 shrink-0 text-red-400" />
+          <ErrorIcon className="mt-0.5 h-5 w-5 shrink-0 text-red-400" />
           <div>
             <p className="font-medium text-red-300">Health check failed</p>
             <p className="mt-1 text-xs text-slate-400">{error}</p>
@@ -145,9 +145,9 @@ export function HealthCheckModal({ onClose }: { onClose: () => void }) {
                 className="flex w-full items-center gap-2 py-2 text-left"
               >
                 {isOpen ? (
-                  <ChevronDown className="h-3.5 w-3.5 text-slate-500" />
+                  <ExpandMoreIcon className="h-3.5 w-3.5 text-slate-500" />
                 ) : (
-                  <ChevronRight className="h-3.5 w-3.5 text-slate-500" />
+                  <ChevronRightIcon className="h-3.5 w-3.5 text-slate-500" />
                 )}
                 <span className="flex-1 text-xs font-medium text-slate-300">{cat.name}</span>
                 {catFails > 0 && (

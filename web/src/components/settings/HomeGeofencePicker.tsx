@@ -1,5 +1,5 @@
 import { useEffect, useState, type ReactNode } from "react"
-import { MapPin, Loader2 } from "lucide-react"
+import { LocationOnIcon, ProgressActivityIcon } from "@/components/icons"
 import { cn } from "@/lib/utils"
 import { KeepAccessoryMap } from "@/components/settings/KeepAccessoryMap"
 
@@ -93,9 +93,9 @@ export function HomeGeofencePicker({
             className="inline-flex items-center gap-1.5 rounded-md border border-white/10 bg-white/5 px-2.5 py-1 text-xs text-slate-200 transition-colors hover:border-blue-500/40 disabled:opacity-50"
           >
             {locating ? (
-              <Loader2 className="h-3 w-3 animate-spin" />
+              <ProgressActivityIcon className="h-3 w-3 animate-spin" />
             ) : (
-              <MapPin className="h-3 w-3" />
+              <LocationOnIcon className="h-3 w-3" />
             )}
             Use current location
           </button>

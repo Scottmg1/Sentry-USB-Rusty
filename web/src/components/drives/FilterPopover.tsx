@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react"
-import { Filter } from "lucide-react"
+import { FilterAltIcon } from "@/components/icons"
 import { cn } from "@/lib/utils"
 import type { DrivesFilters } from "@/hooks/useDrivesList"
 import type { DriveSummary } from "@/types/drives"
@@ -84,7 +84,7 @@ export function FilterPopover({ drives, filters, onChange, metric }: FilterPopov
             : "border-white/10 bg-white/[0.03] text-slate-200 hover:bg-white/[0.06]",
         )}
       >
-        <Filter className="h-4 w-4" />
+        <FilterAltIcon className="h-4 w-4" />
         Filter
         {activeCount > 0 && (
           <span className="rounded-full bg-emerald-400/20 px-1.5 text-xs">{activeCount}</span>

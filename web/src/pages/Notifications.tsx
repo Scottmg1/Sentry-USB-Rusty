@@ -1,27 +1,27 @@
 import { useState, useEffect, useCallback } from "react"
 import {
-  Bell,
-  BellOff,
-  CheckCircle2,
-  AlertTriangle,
-  XCircle,
-  Trash2,
-  X,
-  Settings,
-  Clock,
-  Archive,
-  Thermometer,
-  Zap,
-  HardDrive,
-  Download,
-  Battery,
-  Music,
-  Filter,
-  Loader2,
-  Info,
-  Plug,
-  Wrench,
-} from "lucide-react"
+  ArchiveIcon,
+  BatteryFullAltIcon,
+  BoltIcon,
+  BuildIcon,
+  CancelIcon,
+  CheckCircleIcon,
+  CloseIcon,
+  DeleteIcon,
+  DeviceThermostatIcon,
+  DownloadIcon,
+  FilterAltIcon,
+  HardDriveIcon,
+  InfoIcon,
+  MusicNoteIcon,
+  NotificationsIcon,
+  NotificationsOffIcon,
+  PowerIcon,
+  ProgressActivityIcon,
+  ScheduleIcon,
+  SettingsIcon,
+  WarningIcon,
+} from "@/components/icons"
 import { cn } from "@/lib/utils"
 
 // ─── Types ────────────────────────────────────────────────────────────────────
@@ -62,22 +62,22 @@ type Tab = "history" | "settings"
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
 const NOTIFICATION_TYPES = [
-  { key: "archive_start", label: "Archive Started", description: "When file archiving begins", icon: Archive },
-  { key: "archive_complete", label: "Archive Complete", description: "When file archiving finishes successfully", icon: CheckCircle2 },
-  { key: "archive_error", label: "Archive Errors", description: "When archiving encounters errors", icon: XCircle },
-  { key: "temperature", label: "Temperature Alerts", description: "When CPU temperature exceeds safe thresholds", icon: Thermometer },
-  { key: "keep_awake_failure", label: "Keep-Awake Failures", description: "When Sentry Mode keep-awake fails after retries", icon: Zap },
-  { key: "update", label: "Update Available", description: "When a new software update is detected", icon: Download },
-  { key: "drives", label: "New Drives Detected", description: "When new TeslaCam drives are mapped", icon: HardDrive },
-  { key: "rtc_battery", label: "RTC Battery Warning", description: "When the real-time clock battery is low or missing", icon: Battery },
-  { key: "music_sync", label: "Music Sync", description: "When music files finish syncing to USB", icon: Music },
-  { key: "keep_accessory", label: "Keep Accessory", description: "When the Pi releases 12V accessory power at home and is about to go offline", icon: Plug },
-  { key: "storage_repair", label: "Storage Auto Repair", description: "When boot-time repair of dashcam storage succeeds, fails, or needs manual action", icon: Wrench },
+  { key: "archive_start", label: "Archive Started", description: "When file archiving begins", icon: ArchiveIcon },
+  { key: "archive_complete", label: "Archive Complete", description: "When file archiving finishes successfully", icon: CheckCircleIcon },
+  { key: "archive_error", label: "Archive Errors", description: "When archiving encounters errors", icon: CancelIcon },
+  { key: "temperature", label: "Temperature Alerts", description: "When CPU temperature exceeds safe thresholds", icon: DeviceThermostatIcon },
+  { key: "keep_awake_failure", label: "Keep-Awake Failures", description: "When Sentry Mode keep-awake fails after retries", icon: BoltIcon },
+  { key: "update", label: "Update Available", description: "When a new software update is detected", icon: DownloadIcon },
+  { key: "drives", label: "New Drives Detected", description: "When new TeslaCam drives are mapped", icon: HardDriveIcon },
+  { key: "rtc_battery", label: "RTC Battery Warning", description: "When the real-time clock battery is low or missing", icon: BatteryFullAltIcon },
+  { key: "music_sync", label: "Music Sync", description: "When music files finish syncing to USB", icon: MusicNoteIcon },
+  { key: "keep_accessory", label: "Keep Accessory", description: "When the Pi releases 12V accessory power at home and is about to go offline", icon: PowerIcon },
+  { key: "storage_repair", label: "Storage Auto Repair", description: "When boot-time repair of dashcam storage succeeds, fails, or needs manual action", icon: BuildIcon },
 ] as const
 
 function typeIcon(type: string) {
   const found = NOTIFICATION_TYPES.find(t => t.key === type)
-  return found?.icon || Bell
+  return found?.icon || NotificationsIcon
 }
 
 function typeLabel(type: string): string {
@@ -122,9 +122,9 @@ function providerStatusIcon(results: Record<string, string>) {
   if (values.length === 0) return null
   const allOk = values.every(v => v === "ok")
   const allError = values.every(v => v !== "ok")
-  if (allOk) return <CheckCircle2 className="h-3.5 w-3.5 text-emerald-400" />
-  if (allError) return <XCircle className="h-3.5 w-3.5 text-red-400" />
-  return <AlertTriangle className="h-3.5 w-3.5 text-amber-400" />
+  if (allOk) return <CheckCircleIcon className="h-3.5 w-3.5 text-emerald-400" />
+  if (allError) return <CancelIcon className="h-3.5 w-3.5 text-red-400" />
+  return <WarningIcon className="h-3.5 w-3.5 text-amber-400" />
 }
 
 function relativeTime(ts: number): string {
@@ -269,8 +269,8 @@ export default function Notifications() {
   }
 
   const TABS = [
-    { id: "history" as const, label: "History", icon: Clock },
-    { id: "settings" as const, label: "Settings", icon: Settings },
+    { id: "history" as const, label: "History", icon: ScheduleIcon },
+    { id: "settings" as const, label: "Settings", icon: SettingsIcon },
   ]
 
   return (
@@ -304,7 +304,7 @@ export default function Notifications() {
           <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
             {/* Filter */}
             <div className="flex items-center gap-2">
-              <Filter className="h-4 w-4 text-slate-500" />
+              <FilterAltIcon className="h-4 w-4 text-slate-500" />
               <select
                 value={typeFilter}
                 onChange={e => handleFilterChange(e.target.value)}
@@ -320,7 +320,7 @@ export default function Notifications() {
                   onClick={() => handleFilterChange("")}
                   className="rounded-md p-1 text-slate-500 transition-colors hover:bg-white/5 hover:text-slate-300"
                 >
-                  <X className="h-3.5 w-3.5" />
+                  <CloseIcon className="h-3.5 w-3.5" />
                 </button>
               )}
             </div>
@@ -337,7 +337,7 @@ export default function Notifications() {
                 events.length === 0 && "cursor-not-allowed opacity-50"
               )}
             >
-              <Trash2 className="h-3.5 w-3.5" />
+              <DeleteIcon className="h-3.5 w-3.5" />
               {confirmClear ? "Click again to confirm" : "Clear All"}
             </button>
           </div>
@@ -345,12 +345,12 @@ export default function Notifications() {
           {/* Events list */}
           {loading ? (
             <div className="flex items-center justify-center py-16">
-              <Loader2 className="h-6 w-6 animate-spin text-blue-400" />
+              <ProgressActivityIcon className="h-6 w-6 animate-spin text-blue-400" />
             </div>
           ) : events.length === 0 ? (
             <div className="glass-card flex flex-col items-center justify-center py-16 text-center">
               <div className="flex h-14 w-14 items-center justify-center rounded-2xl bg-white/5">
-                <BellOff className="h-7 w-7 text-slate-600" />
+                <NotificationsOffIcon className="h-7 w-7 text-slate-600" />
               </div>
               <p className="mt-4 text-sm font-medium text-slate-400">No notifications yet</p>
               <p className="mt-1 text-xs text-slate-600">
@@ -374,7 +374,7 @@ export default function Notifications() {
                       className="absolute right-3 top-3 rounded-md p-1 text-slate-600 opacity-0 transition-all hover:bg-white/10 hover:text-slate-400 group-hover:opacity-100"
                       title="Dismiss"
                     >
-                      <X className="h-3.5 w-3.5" />
+                      <CloseIcon className="h-3.5 w-3.5" />
                     </button>
 
                     <div className="flex gap-3">
@@ -458,7 +458,7 @@ export default function Notifications() {
           <div className="glass-card overflow-hidden p-5">
             <div className="flex items-start gap-3">
               <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-blue-500/15">
-                <Info className="h-5 w-5 text-blue-400" />
+                <InfoIcon className="h-5 w-5 text-blue-400" />
               </div>
               <div>
                 <p className="text-sm text-slate-300">

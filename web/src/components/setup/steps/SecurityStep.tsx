@@ -1,4 +1,4 @@
-import { Lock } from "lucide-react"
+import { LockIcon } from "@/components/icons"
 import type { StepProps } from "../SetupWizard"
 import { SecretInput } from "../SecretInput"
 import { cn } from "@/lib/utils"
@@ -32,7 +32,7 @@ export function SecurityStep({ data, onChange }: StepProps) {
   return (
     <div className="space-y-6">
       <div className="flex items-center gap-2">
-        <Lock className="h-4 w-4 text-blue-400" />
+        <LockIcon className="h-4 w-4 text-blue-400" />
         <h3 className="text-sm font-semibold uppercase tracking-wider text-slate-400">
           Security
         </h3>

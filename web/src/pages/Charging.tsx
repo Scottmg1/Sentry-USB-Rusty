@@ -1,15 +1,17 @@
 import { useCallback, useEffect, useMemo, useState } from "react"
 import { useNavigate } from "react-router-dom"
 import {
-  BatteryCharging,
-  CheckSquare,
-  ChevronRight,
-  Home,
-  Loader2,
-  MapPin,
-  Trash2,
-  Zap,
-} from "lucide-react"
+  BatteryAndroidFrameBoltIcon,
+  BoltIcon,
+  CheckBoxIcon,
+  ChevronRightIcon,
+  DeleteIcon,
+  ElectricalServicesIcon,
+  EvStationIcon,
+  HomeIcon,
+  LocationOnIcon,
+  ProgressActivityIcon,
+} from "@/components/icons"
 import {
   bulkDeleteCharges,
   fetchChargeSessions,
@@ -266,7 +268,7 @@ export default function Charging() {
               onClick={toggleSelectMode}
               className="inline-flex items-center gap-2 rounded-full border border-white/10 bg-white/[0.03] px-3.5 py-1.5 text-sm font-medium text-slate-200 transition-colors hover:bg-white/[0.06]"
             >
-              <CheckSquare className="h-4 w-4" />
+              <CheckBoxIcon className="h-4 w-4" />
               Select
             </button>
           )}
@@ -276,7 +278,7 @@ export default function Charging() {
       <div className="mt-4 flex flex-col gap-3">
         {loading && (
           <div className="flex items-center justify-center gap-2 rounded-2xl border border-white/[0.06] bg-white/[0.025] p-10 text-sm text-slate-400">
-            <Loader2 className="h-4 w-4 animate-spin" />
+            <ProgressActivityIcon className="h-4 w-4 animate-spin" />
             Loading charging history…
           </div>
         )}
@@ -287,7 +289,7 @@ export default function Charging() {
         )}
         {!loading && !error && visible.length === 0 && (
           <div className="rounded-2xl border border-white/[0.06] bg-white/[0.025] p-10 text-center text-sm text-slate-400">
-            <BatteryCharging className="mx-auto mb-3 h-8 w-8 text-slate-600" />
+            <BatteryAndroidFrameBoltIcon className="mx-auto mb-3 h-8 w-8 text-slate-600" />
             {sessions.length === 0
               ? "No charging sessions recorded yet. Sessions appear here once the car charges while the Pi is sampling."
               : "No charging sessions match these filters."}
@@ -341,9 +343,9 @@ export default function Charging() {
                 className="inline-flex items-center gap-1.5 rounded-lg bg-rose-600 px-4 py-1.5 text-xs font-medium text-white transition-colors hover:bg-rose-500 disabled:opacity-50"
               >
                 {deletingBulk ? (
-                  <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                  <ProgressActivityIcon className="h-3.5 w-3.5 animate-spin" />
                 ) : (
-                  <Trash2 className="h-3.5 w-3.5" />
+                  <DeleteIcon className="h-3.5 w-3.5" />
                 )}
                 {deletingBulk
                   ? "Deleting…"
@@ -384,7 +386,7 @@ function ChargingSelectBar({
         onClick={onDelete}
         className="inline-flex items-center gap-1.5 rounded-full bg-rose-500/95 px-3 py-1 text-xs font-medium text-white transition-colors hover:bg-rose-400 disabled:opacity-50"
       >
-        <Trash2 className="h-3.5 w-3.5" />
+        <DeleteIcon className="h-3.5 w-3.5" />
         Delete
       </button>
       <button
@@ -498,7 +500,11 @@ function ChargeRow({
       )}
 
       <span className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-emerald-500/10 text-emerald-300 ring-1 ring-inset ring-emerald-500/20">
-        <BatteryCharging className={"h-5 w-5" + (active ? " animate-pulse" : "")} />
+        {session.fastCharging ? (
+          <EvStationIcon className={"h-5 w-5" + (active ? " animate-pulse" : "")} />
+        ) : (
+          <ElectricalServicesIcon className={"h-5 w-5" + (active ? " animate-pulse" : "")} />
+        )}
       </span>
 
       <div className="min-w-0 flex-1">
@@ -514,13 +520,13 @@ function ChargeRow({
               title="DC fast charging (Supercharger / CCS) — peak power over 22 kW"
               className="inline-flex shrink-0 items-center gap-1 rounded-full bg-amber-500/15 px-1.5 py-0.5 text-[10px] font-medium text-amber-300 ring-1 ring-inset ring-amber-400/20"
             >
-              <Zap className="h-2.5 w-2.5 fill-amber-300" />
+              <BoltIcon className="h-2.5 w-2.5 fill-amber-300" />
               Fast
             </span>
           )}
           {session.location ? (
             <>
-              <MapPin className="h-3.5 w-3.5 shrink-0 text-emerald-300/80" />
+              <LocationOnIcon className="h-3.5 w-3.5 shrink-0 text-emerald-300/80" />
               <span className="truncate">{session.location}</span>
             </>
           ) : (
@@ -544,7 +550,7 @@ function ChargeRow({
             title gets the full row width instead of being squeezed. */}
         <div className="mt-1.5 flex items-center gap-2.5 tabular-nums sm:hidden">
           <span className="inline-flex items-center gap-1 text-sm font-semibold text-emerald-300">
-            <Zap className="h-3.5 w-3.5" />
+            <BoltIcon className="h-3.5 w-3.5" />
             {fmtEnergy(session.energyAddedKwh)}
           </span>
           <span className="text-xs text-slate-500">{socShort}</span>
@@ -559,7 +565,7 @@ function ChargeRow({
       {/* Desktop: energy + SoC + cost as a right-aligned column. */}
       <div className="hidden shrink-0 text-right sm:block">
         <div className="flex items-center justify-end gap-1 text-sm font-semibold text-emerald-300 tabular-nums">
-          <Zap className="h-3.5 w-3.5" />
+          <BoltIcon className="h-3.5 w-3.5" />
           {fmtEnergy(session.energyAddedKwh)}
         </div>
         <div className="mt-0.5 text-xs text-slate-500 tabular-nums">{socFull}</div>
@@ -579,7 +585,7 @@ function ChargeRow({
             title="Charged at home (automatic)"
             className="inline-flex items-center gap-1 rounded-md border border-emerald-400/30 bg-emerald-400/10 px-2 py-1 text-xs font-medium text-emerald-200"
           >
-            <Home className="h-3 w-3" />
+            <HomeIcon className="h-3 w-3" />
             Home
           </span>
         )}
@@ -597,7 +603,7 @@ function ChargeRow({
         />
       )}
 
-      <ChevronRight className="h-4 w-4 shrink-0 text-slate-600 transition-colors group-hover:text-slate-400" />
+      <ChevronRightIcon className="h-4 w-4 shrink-0 text-slate-600 transition-colors group-hover:text-slate-400" />
     </div>
   )
 }

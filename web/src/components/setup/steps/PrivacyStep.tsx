@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react"
-import { ShieldCheck, Check, X, Loader2 } from "lucide-react"
+import { CheckIcon, CloseIcon, ProgressActivityIcon, VerifiedUserIcon } from "@/components/icons"
 import type { StepProps } from "../SetupWizard"
 import { cn } from "@/lib/utils"
 
@@ -46,7 +46,7 @@ export function PrivacyStep(_props: StepProps) {
   return (
     <div className="flex flex-col items-center py-6">
       <div className="mb-6 flex h-20 w-20 items-center justify-center rounded-2xl bg-emerald-500/15">
-        <ShieldCheck className="h-10 w-10 text-emerald-400" />
+        <VerifiedUserIcon className="h-10 w-10 text-emerald-400" />
       </div>
 
       <h2 className="text-center text-2xl font-bold text-slate-100">
@@ -150,9 +150,9 @@ export function PrivacyStep(_props: StepProps) {
             )}
           >
             {saving && choice !== true ? (
-              <Loader2 className="h-4 w-4 animate-spin" />
+              <ProgressActivityIcon className="h-4 w-4 animate-spin" />
             ) : (
-              <Check className="h-4 w-4" />
+              <CheckIcon className="h-4 w-4" />
             )}
             Yes, count me
           </button>
@@ -168,9 +168,9 @@ export function PrivacyStep(_props: StepProps) {
             )}
           >
             {saving && choice !== false ? (
-              <Loader2 className="h-4 w-4 animate-spin" />
+              <ProgressActivityIcon className="h-4 w-4 animate-spin" />
             ) : (
-              <X className="h-4 w-4" />
+              <CloseIcon className="h-4 w-4" />
             )}
             No thanks
           </button>

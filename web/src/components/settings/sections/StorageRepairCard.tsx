@@ -1,13 +1,13 @@
 import { useCallback, useEffect, useRef, useState } from "react"
 import {
-  HardDrive,
-  Loader2,
-  AlertTriangle,
-  CheckCircle,
-  AlertCircle,
-  RotateCw,
-  Wrench,
-} from "lucide-react"
+  BuildIcon,
+  CheckCircleIcon,
+  ErrorIcon,
+  HardDriveIcon,
+  ProgressActivityIcon,
+  RotateRightIcon,
+  WarningIcon,
+} from "@/components/icons"
 import { cn } from "@/lib/utils"
 import { PrefCard } from "@/components/settings/PrefCard"
 import { wsClient } from "@/lib/ws"
@@ -222,7 +222,7 @@ export function StorageRepairCard() {
   if (health && !health.external) {
     return (
       <PrefCard
-        icon={<HardDrive className="h-3.5 w-3.5" />}
+        icon={<HardDriveIcon className="h-3.5 w-3.5" />}
         halo="slate"
         title="Repair Storage"
         disabled={{
@@ -246,7 +246,7 @@ export function StorageRepairCard() {
 
   return (
     <PrefCard
-      icon={<HardDrive className="h-3.5 w-3.5" />}
+      icon={<HardDriveIcon className="h-3.5 w-3.5" />}
       halo={health?.state === "corrupt" ? "red" : "amber"}
       title="Repair Storage"
       badge={
@@ -301,7 +301,7 @@ export function StorageRepairCard() {
       {/* Healthy idle */}
       {health?.state === "healthy" && phase === "idle" && (
         <p className="flex items-center gap-1.5 text-[11px] text-emerald-300/90">
-          <CheckCircle className="h-3.5 w-3.5" />
+          <CheckCircleIcon className="h-3.5 w-3.5" />
           Storage is mounted and healthy — no repair needed.
         </p>
       )}
@@ -326,7 +326,7 @@ export function StorageRepairCard() {
           ))}
           {running && (
             <div className="mt-1 flex items-center gap-1.5 text-slate-500">
-              <Loader2 className="h-3 w-3 animate-spin" /> working…
+              <ProgressActivityIcon className="h-3 w-3 animate-spin" /> working…
             </div>
           )}
         </div>
@@ -336,7 +336,7 @@ export function StorageRepairCard() {
       {phase === "needs_force" && (
         <div className="rounded-xl border border-red-500/25 bg-red-500/5 p-3">
           <div className="flex items-start gap-2.5">
-            <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-red-400" />
+            <WarningIcon className="mt-0.5 h-4 w-4 shrink-0 text-red-400" />
             <div>
               <p className="text-xs font-medium text-red-300">Destructive repair required</p>
               <p className="mt-1 text-[11px] text-slate-400">{forceMsg}</p>
@@ -366,7 +366,7 @@ export function StorageRepairCard() {
       {phase === "reboot_required" && (
         <div className="rounded-xl border border-emerald-500/20 bg-emerald-500/5 p-3">
           <div className="flex items-start gap-2.5">
-            <CheckCircle className="mt-0.5 h-4 w-4 shrink-0 text-emerald-400" />
+            <CheckCircleIcon className="mt-0.5 h-4 w-4 shrink-0 text-emerald-400" />
             <div>
               <p className="text-xs font-medium text-emerald-300">Repair complete</p>
               <p className="mt-1 text-[11px] text-slate-400">{doneMsg}</p>
@@ -377,11 +377,11 @@ export function StorageRepairCard() {
               >
                 {rebooting ? (
                   <>
-                    <Loader2 className="h-3.5 w-3.5 animate-spin" /> Rebooting…
+                    <ProgressActivityIcon className="h-3.5 w-3.5 animate-spin" /> Rebooting…
                   </>
                 ) : (
                   <>
-                    <RotateCw className="h-3.5 w-3.5" /> Reboot now
+                    <RotateRightIcon className="h-3.5 w-3.5" /> Reboot now
                   </>
                 )}
               </button>
@@ -393,7 +393,7 @@ export function StorageRepairCard() {
       {/* Error */}
       {phase === "error" && (
         <div className="flex items-start gap-2 rounded-lg bg-red-500/10 px-3 py-2 text-[11px] text-red-300">
-          <AlertCircle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+          <ErrorIcon className="mt-0.5 h-3.5 w-3.5 shrink-0" />
           <span>{errorMsg}</span>
         </div>
       )}
@@ -422,7 +422,7 @@ export function StorageRepairCard() {
       <div className="space-y-3 border-t border-white/5 pt-3">
         <label className="flex cursor-pointer items-start justify-between gap-3">
           <div className="flex items-start gap-2">
-            <Wrench className="mt-0.5 h-3.5 w-3.5 shrink-0 text-blue-400" />
+            <BuildIcon className="mt-0.5 h-3.5 w-3.5 shrink-0 text-blue-400" />
             <div>
               <span className="text-xs font-medium text-slate-200">Auto repair at boot</span>
               <span className="mt-0.5 block text-[10px] text-slate-500">
@@ -448,7 +448,7 @@ export function StorageRepairCard() {
           )}
         >
           <div className="flex items-start gap-2">
-            <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0 text-red-400" />
+            <WarningIcon className="mt-0.5 h-3.5 w-3.5 shrink-0 text-red-400" />
             <div>
               <span className="text-xs font-medium text-slate-200">
                 Auto force fix (destructive)

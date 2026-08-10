@@ -1,5 +1,5 @@
 import { useState } from "react"
-import { Shield, LogIn, Loader2, AlertCircle } from "lucide-react"
+import { ErrorIcon, LoginIcon, ProgressActivityIcon, ShieldIcon } from "@/components/icons"
 import { useAuth } from "@/hooks/useAuth"
 
 interface LoginProps {
@@ -33,7 +33,7 @@ export default function Login({ onLogin }: LoginProps) {
       <div className="glass-card w-full max-w-sm p-6">
         <div className="mb-6 flex flex-col items-center">
           <div className="mb-3 flex h-14 w-14 items-center justify-center rounded-full bg-blue-500/15">
-            <Shield className="h-7 w-7 text-blue-400" />
+            <ShieldIcon className="h-7 w-7 text-blue-400" />
           </div>
           <h1 className="text-lg font-semibold text-slate-100">Sentry USB</h1>
           <p className="mt-1 text-center text-sm text-slate-500">
@@ -43,7 +43,7 @@ export default function Login({ onLogin }: LoginProps) {
 
         {error && (
           <div className="mb-4 flex items-center gap-2 rounded-lg bg-red-500/10 px-3 py-2 text-sm text-red-400">
-            <AlertCircle className="h-4 w-4 shrink-0" />
+            <ErrorIcon className="h-4 w-4 shrink-0" />
             {error}
           </div>
         )}
@@ -83,12 +83,12 @@ export default function Login({ onLogin }: LoginProps) {
           >
             {loading ? (
               <>
-                <Loader2 className="h-4 w-4 animate-spin" />
+                <ProgressActivityIcon className="h-4 w-4 animate-spin" />
                 Signing in...
               </>
             ) : (
               <>
-                <LogIn className="h-4 w-4" />
+                <LoginIcon className="h-4 w-4" />
                 Sign In
               </>
             )}

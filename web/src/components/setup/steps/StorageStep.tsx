@@ -1,5 +1,5 @@
 import { useState, useEffect } from "react"
-import { HardDrive, RefreshCw } from "lucide-react"
+import { CachedIcon, HardDriveIcon } from "@/components/icons"
 import type { StepProps } from "../SetupWizard"
 import { SizeInput } from "../SizeInput"
 
@@ -39,7 +39,7 @@ export function StorageStep({ data, onChange }: StepProps) {
   return (
     <div className="space-y-6">
       <div className="flex items-center gap-2">
-        <HardDrive className="h-4 w-4 text-blue-400" />
+        <HardDriveIcon className="h-4 w-4 text-blue-400" />
         <h3 className="text-sm font-semibold uppercase tracking-wider text-slate-400">
           Drive Sizes
         </h3>
@@ -128,7 +128,7 @@ export function StorageStep({ data, onChange }: StepProps) {
             disabled={loadingDevices}
             className="flex items-center gap-1.5 rounded-lg border border-white/10 bg-white/5 px-3 py-2 text-xs font-medium text-slate-300 transition-colors hover:bg-white/10 disabled:opacity-50"
           >
-            <RefreshCw className={`h-3.5 w-3.5 ${loadingDevices ? "animate-spin" : ""}`} />
+            <CachedIcon className={`h-3.5 w-3.5 ${loadingDevices ? "animate-spin" : ""}`} />
             Refresh
           </button>
         </div>

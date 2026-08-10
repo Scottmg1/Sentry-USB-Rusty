@@ -1,19 +1,19 @@
 import { useCallback, useEffect, useRef, useState } from "react"
 import {
-  AlertCircle,
-  Bot,
-  Check,
-  ExternalLink,
-  FileCheck2,
-  FileLock2,
-  Loader2,
-  MessageCircleQuestion,
-  RefreshCw,
-  Send,
-  ShieldAlert,
-  Users,
-  X,
-} from "lucide-react"
+  CachedIcon,
+  CheckIcon,
+  CloseIcon,
+  ContactSupportIcon,
+  EncryptedIcon,
+  ErrorIcon,
+  GppMaybeIcon,
+  GroupIcon,
+  OpenInNewIcon,
+  ProgressActivityIcon,
+  SendIcon,
+  SmartToyIcon,
+  TaskIcon,
+} from "@/components/icons"
 import { cn, errorMessage } from "@/lib/utils"
 import { AssistantMarkdown } from "./assistantMarkdown"
 import {
@@ -551,7 +551,7 @@ export function AISupportChat({
       <header className="flex flex-wrap items-center justify-between gap-3">
         <div className="flex min-w-0 items-center gap-3">
           <div className="halo-accent flex h-9 w-9 shrink-0 items-center justify-center rounded-xl">
-            <MessageCircleQuestion className="h-5 w-5" />
+            <ContactSupportIcon className="h-5 w-5" />
           </div>
           <div className="min-w-0">
             <h1 className="text-lg font-semibold text-slate-100">AI Support &amp; Help</h1>
@@ -562,7 +562,7 @@ export function AISupportChat({
           <DiscordLink compact />
           {conversation && !requiresDisclosureReset && (
             <button type="button" onClick={() => { void startNewConversation() }} className="action-chip">
-              <RefreshCw className="h-3.5 w-3.5" /> New chat
+              <CachedIcon className="h-3.5 w-3.5" /> New chat
             </button>
           )}
         </div>
@@ -588,7 +588,7 @@ export function AISupportChat({
             <div className="min-h-0 flex-1 overflow-y-auto px-3 py-4 sm:px-5" aria-live="polite">
               {loadingConversation && messages.length === 0 ? (
                 <div className="flex h-full items-center justify-center gap-2 text-sm text-slate-500">
-                  <Loader2 className="h-4 w-4 animate-spin" /> Resuming conversation…
+                  <ProgressActivityIcon className="h-4 w-4 animate-spin" /> Resuming conversation…
                 </div>
               ) : messages.length === 0 ? (
                 <EmptyConversation onSuggestion={setDraft} />
@@ -610,10 +610,10 @@ export function AISupportChat({
             <div className="shrink-0 border-t border-white/5 bg-black/10 px-3 py-3 sm:px-4">
               {error && (
                 <div className="mb-2 flex items-start gap-2 rounded-lg border border-rose-400/20 bg-rose-500/[0.07] px-3 py-2 text-xs text-rose-200" role="alert">
-                  <AlertCircle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+                  <ErrorIcon className="mt-0.5 h-3.5 w-3.5 shrink-0" />
                   <span className="flex-1">{error}</span>
                   <button type="button" onClick={() => setError(null)} aria-label="Dismiss error" className="text-rose-300 hover:text-white">
-                    <X className="h-3.5 w-3.5" />
+                    <CloseIcon className="h-3.5 w-3.5" />
                   </button>
                 </div>
               )}
@@ -649,7 +649,7 @@ export function AISupportChat({
                   aria-label="Send message"
                   className="flex h-11 w-11 shrink-0 items-center justify-center rounded-xl bg-blue-500 text-white transition-colors hover:bg-blue-600 disabled:cursor-not-allowed disabled:opacity-40"
                 >
-                  {sending ? <Loader2 className="h-4 w-4 animate-spin" /> : <Send className="h-4 w-4" />}
+                  {sending ? <ProgressActivityIcon className="h-4 w-4 animate-spin" /> : <SendIcon className="h-4 w-4" />}
                 </button>
               </div>
               <div className="mt-1.5 flex items-center justify-between gap-3 text-[10px] text-slate-500">
@@ -669,7 +669,7 @@ function DisclosureGate({ onAcknowledge }: { onAcknowledge: () => void }) {
     <div className="flex min-h-full flex-1 items-center justify-center px-4 py-8" aria-label="AI support disclosure">
       <div className="w-full max-w-md rounded-2xl border border-white/[0.08] bg-white/[0.025] p-5 text-center shadow-2xl shadow-black/20 sm:p-6">
         <span className="halo-amber mx-auto flex h-10 w-10 items-center justify-center rounded-xl">
-          <ShieldAlert className="h-5 w-5" />
+          <GppMaybeIcon className="h-5 w-5" />
         </span>
         <h2 className="mt-3 text-base font-semibold text-slate-100">Before you chat</h2>
         <p className="mt-2 text-xs leading-relaxed text-slate-400">
@@ -694,7 +694,7 @@ function DisclosureGate({ onAcknowledge }: { onAcknowledge: () => void }) {
           rel="noopener noreferrer"
           className="mt-3 inline-flex text-[11px] text-blue-400 hover:text-blue-300"
         >
-          Privacy policy <ExternalLink className="ml-1 h-3 w-3" />
+          Privacy policy <OpenInNewIcon className="ml-1 h-3 w-3" />
         </a>
       </div>
     </div>
@@ -716,7 +716,7 @@ function DisclosureRefreshGate({
     <div className="flex min-h-full flex-1 items-center justify-center px-4 py-8" aria-label="AI support privacy update">
       <div className="w-full max-w-md rounded-2xl border border-white/[0.08] bg-white/[0.025] p-5 text-center shadow-2xl shadow-black/20 sm:p-6">
         <span className="halo-amber mx-auto flex h-10 w-10 items-center justify-center rounded-xl">
-          <ShieldAlert className="h-5 w-5" />
+          <GppMaybeIcon className="h-5 w-5" />
         </span>
         <h2 className="mt-3 text-base font-semibold text-slate-100">AI Support privacy update</h2>
         <p className="mt-2 text-xs leading-relaxed text-slate-400">
@@ -732,7 +732,7 @@ function DisclosureRefreshGate({
           disabled={deleting}
           className="mt-4 flex w-full items-center justify-center gap-2 rounded-xl bg-rose-500/85 px-4 py-2.5 text-sm font-semibold text-white transition-colors hover:bg-rose-500 disabled:cursor-not-allowed disabled:opacity-50"
         >
-          {deleting && <Loader2 className="h-4 w-4 animate-spin" />}
+          {deleting && <ProgressActivityIcon className="h-4 w-4 animate-spin" />}
           Delete old chat &amp; continue
         </button>
         {error && (
@@ -751,7 +751,7 @@ function DisclosureRefreshGate({
           rel="noopener noreferrer"
           className="mt-3 inline-flex text-[11px] text-blue-400 hover:text-blue-300"
         >
-          Privacy policy <ExternalLink className="ml-1 h-3 w-3" />
+          Privacy policy <OpenInNewIcon className="ml-1 h-3 w-3" />
         </a>
       </div>
     </div>
@@ -767,7 +767,7 @@ function EmptyConversation({ onSuggestion }: { onSuggestion: (message: string) =
   return (
     <div className="flex min-h-full flex-col items-center justify-center py-6 text-center">
       <div className="halo-accent mb-3 flex h-14 w-14 items-center justify-center rounded-2xl">
-        <Bot className="h-7 w-7" />
+        <SmartToyIcon className="h-7 w-7" />
       </div>
       <h2 className="text-base font-semibold text-slate-200">What can I help with?</h2>
       <p className="mt-1 max-w-lg text-xs leading-relaxed text-slate-500">
@@ -813,7 +813,7 @@ function MessageBubble({
     <article className={cn("mb-4 flex items-end gap-2", isUser ? "justify-end" : "justify-start")}>
       {!isUser && (
         <div className="halo-accent flex h-8 w-8 shrink-0 items-center justify-center rounded-xl" aria-hidden="true">
-          <Bot className="h-4 w-4" />
+          <SmartToyIcon className="h-4 w-4" />
         </div>
       )}
       <div className={cn("max-w-[88%] sm:max-w-[76%]", !isUser && "min-w-0")}>
@@ -853,7 +853,7 @@ function TypingBubble() {
   return (
     <div className="mb-4 flex items-end gap-2" role="status" aria-live="polite" aria-label="Sentry AI is preparing a response">
       <div className="halo-accent flex h-8 w-8 shrink-0 items-center justify-center rounded-xl" aria-hidden="true">
-        <Bot className="h-4 w-4" />
+        <SmartToyIcon className="h-4 w-4" />
       </div>
       <div className="rounded-2xl rounded-bl-md border border-white/[0.07] bg-white/[0.04] px-4 py-3" aria-hidden="true">
         <div className="flex items-center gap-1.5">
@@ -888,7 +888,7 @@ function FileConsentCard({
     <section className="mt-2.5 overflow-hidden rounded-xl border border-amber-400/20 bg-amber-500/[0.055]" aria-label={`File access request for ${request.label}`}>
       <div className="flex items-start gap-2.5 px-3 py-2.5">
         <span className="halo-amber flex h-8 w-8 shrink-0 items-center justify-center rounded-lg">
-          <FileLock2 className="h-4 w-4" />
+          <EncryptedIcon className="h-4 w-4" />
         </span>
         <div className="min-w-0 flex-1">
           <p className="text-xs font-semibold text-amber-100">AI requests one-time access</p>
@@ -907,7 +907,7 @@ function FileConsentCard({
         Includes date, hostname, uptime, software/OS/board and service details, storage, USB-gadget and network status, temperatures, Bluetooth adapter and BLE telemetry state, and recent logs including archiveloop, the drive-import history and the Sentry USB service journal. Logs can incidentally contain local IPs, device or vehicle identifiers, error payloads, or location-related details. Do not upload secrets or data you are not authorized to share. Nothing is collected or uploaded until you approve.
         </p>
         {policyIssue && state.phase === "idle" && (
-          <p className="mb-2 flex items-start gap-1.5 text-[10px] text-rose-300"><AlertCircle className="mt-0.5 h-3 w-3 shrink-0" />{policyIssue}</p>
+          <p className="mb-2 flex items-start gap-1.5 text-[10px] text-rose-300"><ErrorIcon className="mt-0.5 h-3 w-3 shrink-0" />{policyIssue}</p>
         )}
 
         {state.phase === "idle" ? (
@@ -918,28 +918,28 @@ function FileConsentCard({
               onClick={() => { void onDecision(reference, "approved") }}
               className="flex items-center gap-1.5 rounded-lg bg-amber-400/15 px-3 py-1.5 text-xs font-medium text-amber-200 hover:bg-amber-400/25 disabled:cursor-not-allowed disabled:opacity-40"
             >
-              <Check className="h-3.5 w-3.5" /> Generate &amp; upload diagnostics once
+              <CheckIcon className="h-3.5 w-3.5" /> Generate &amp; upload diagnostics once
             </button>
             <button
               type="button"
               onClick={() => { void onDecision(reference, "denied") }}
               className="flex items-center gap-1.5 rounded-lg border border-white/10 px-3 py-1.5 text-xs font-medium text-slate-300 hover:bg-white/[0.06]"
             >
-              <X className="h-3.5 w-3.5" /> Deny
+              <CloseIcon className="h-3.5 w-3.5" /> Deny
             </button>
           </div>
         ) : working ? (
           <p className="flex items-center gap-2 text-xs text-amber-200" role="status">
-            <Loader2 className="h-3.5 w-3.5 animate-spin" />
+            <ProgressActivityIcon className="h-3.5 w-3.5 animate-spin" />
             {state.phase === "approving" ? "Preparing and sharing approved diagnostics…" : "Saving your decision…"}
           </p>
         ) : state.phase === "approved" ? (
-          <p className="flex items-start gap-2 text-xs text-emerald-300"><FileCheck2 className="mt-0.5 h-3.5 w-3.5 shrink-0" />{state.detail || "Diagnostics shared once."}</p>
+          <p className="flex items-start gap-2 text-xs text-emerald-300"><TaskIcon className="mt-0.5 h-3.5 w-3.5 shrink-0" />{state.detail || "Diagnostics shared once."}</p>
         ) : state.phase === "denied" ? (
-          <p className="flex items-start gap-2 text-xs text-slate-400"><X className="mt-0.5 h-3.5 w-3.5 shrink-0" />Denied. No file was collected or uploaded.</p>
+          <p className="flex items-start gap-2 text-xs text-slate-400"><CloseIcon className="mt-0.5 h-3.5 w-3.5 shrink-0" />Denied. No file was collected or uploaded.</p>
         ) : (
           <div className="space-y-2">
-            <p className="flex items-start gap-2 text-xs text-rose-300" role="alert"><AlertCircle className="mt-0.5 h-3.5 w-3.5 shrink-0" />{state.detail || "The file was not shared."}</p>
+            <p className="flex items-start gap-2 text-xs text-rose-300" role="alert"><ErrorIcon className="mt-0.5 h-3.5 w-3.5 shrink-0" />{state.detail || "The file was not shared."}</p>
             {state.retryDecision && (
               <button
                 type="button"
@@ -960,7 +960,7 @@ function DiscordSuggestion() {
   return (
     <div className="mt-2.5 rounded-xl border border-violet-400/20 bg-violet-500/[0.07] px-3 py-2.5">
       <div className="flex items-start gap-2.5">
-        <Users className="mt-0.5 h-4 w-4 shrink-0 text-violet-300" />
+        <GroupIcon className="mt-0.5 h-4 w-4 shrink-0 text-violet-300" />
         <div className="min-w-0 flex-1">
           <p className="text-xs font-semibold text-violet-200">Want help from a person?</p>
           <p className="mt-0.5 text-[11px] leading-relaxed text-slate-400">Join the Sentry Six Discord community. This AI conversation is not transferred—share only what you choose.</p>
@@ -982,7 +982,7 @@ function DiscordLink({ compact = false }: { compact?: boolean }) {
         compact ? "border border-violet-400/15 px-2.5 py-1.5 text-xs" : "mt-2 bg-violet-500/10 px-3 py-1.5 text-xs",
       )}
     >
-      <Users className="h-3.5 w-3.5" /> Join Discord <ExternalLink className="h-3 w-3" />
+      <GroupIcon className="h-3.5 w-3.5" /> Join Discord <OpenInNewIcon className="h-3 w-3" />
     </a>
   )
 }

@@ -1,4 +1,4 @@
-import { Settings as SettingsIcon } from "lucide-react"
+import { SettingsIcon } from "@/components/icons"
 import { formatUptime } from "@/lib/utils"
 import { useVersion } from "@/hooks/useVersion"
 

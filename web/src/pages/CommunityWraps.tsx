@@ -1,5 +1,16 @@
 import { useEffect, useState, useCallback, useRef } from "react"
-import { Search, Download, Paintbrush, ChevronLeft, ChevronRight, Loader2, CheckCircle, AlertCircle, Trash2, Pencil } from "lucide-react"
+import {
+  BrushIcon,
+  CheckCircleIcon,
+  ChevronLeftIcon,
+  ChevronRightIcon,
+  DeleteIcon,
+  DownloadIcon,
+  EditIcon,
+  ErrorIcon,
+  ProgressActivityIcon,
+  SearchIcon,
+} from "@/components/icons"
 import GodotRenderer, { type GodotRendererHandle } from "../components/wraps/GodotRenderer"
 import MultiFileUploader, { type FileEntry } from "../components/upload/MultiFileUploader"
 import { useObjectUrl } from "@/hooks/useObjectUrl"
@@ -303,7 +314,7 @@ function BrowseTab({ adminPasscode, onAdminExit }: { adminPasscode: string | nul
         <div className={`fixed right-4 top-4 z-50 flex items-center gap-2 rounded-lg px-4 py-3 text-sm font-medium shadow-lg ${
           toast.type === "success" ? "bg-emerald-500/20 text-emerald-400 border border-emerald-500/30" : "bg-red-500/20 text-red-400 border border-red-500/30"
         }`}>
-          {toast.type === "success" ? <CheckCircle className="h-4 w-4" /> : <AlertCircle className="h-4 w-4" />}
+          {toast.type === "success" ? <CheckCircleIcon className="h-4 w-4" /> : <ErrorIcon className="h-4 w-4" />}
           {toast.message}
         </div>
       )}
@@ -311,7 +322,7 @@ function BrowseTab({ adminPasscode, onAdminExit }: { adminPasscode: string | nul
       {/* Filters */}
       <div className="flex flex-col gap-3 sm:flex-row sm:items-center">
         <div className="relative flex-1">
-          <Search className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-slate-500" />
+          <SearchIcon className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-slate-500" />
           <input
             type="text"
             value={search}
@@ -344,17 +355,17 @@ function BrowseTab({ adminPasscode, onAdminExit }: { adminPasscode: string | nul
       {/* Results */}
       {loading ? (
         <div className="flex items-center justify-center py-20">
-          <Loader2 className="h-6 w-6 animate-spin text-blue-400" />
+          <ProgressActivityIcon className="h-6 w-6 animate-spin text-blue-400" />
         </div>
       ) : error ? (
         <div className="flex flex-col items-center justify-center py-20 text-slate-500">
-          <AlertCircle className="mb-2 h-8 w-8" />
+          <ErrorIcon className="mb-2 h-8 w-8" />
           <p className="text-sm">{error}</p>
           <button onClick={fetchWraps} className="mt-3 text-xs text-blue-400 hover:text-blue-300">Retry</button>
         </div>
       ) : wraps.length === 0 ? (
         <div className="flex flex-col items-center justify-center py-20 text-slate-500">
-          <Paintbrush className="mb-2 h-8 w-8" />
+          <BrushIcon className="mb-2 h-8 w-8" />
           <p className="text-sm">No wraps found</p>
         </div>
       ) : (
@@ -386,7 +397,7 @@ function BrowseTab({ adminPasscode, onAdminExit }: { adminPasscode: string | nul
                         {wrap.tesla_model}
                       </span>
                       <span className="flex items-center gap-1 text-[10px] text-slate-600">
-                        <Download className="h-3 w-3" />
+                        <DownloadIcon className="h-3 w-3" />
                         {wrap.download_count}
                       </span>
                     </div>
@@ -406,14 +417,14 @@ function BrowseTab({ adminPasscode, onAdminExit }: { adminPasscode: string | nul
                       className="rounded bg-black/60 p-1 text-blue-400 opacity-0 transition-opacity hover:bg-black/80 hover:text-blue-300 group-hover:opacity-100"
                       title="Edit"
                     >
-                      <Pencil className="h-3.5 w-3.5" />
+                      <EditIcon className="h-3.5 w-3.5" />
                     </button>
                     <button
                       onClick={(e) => { e.stopPropagation(); setDeletingWrap(wrap) }}
                       className="rounded bg-black/60 p-1 text-red-400 opacity-0 transition-opacity hover:bg-black/80 hover:text-red-300 group-hover:opacity-100"
                       title="Delete"
                     >
-                      <Trash2 className="h-3.5 w-3.5" />
+                      <DeleteIcon className="h-3.5 w-3.5" />
                     </button>
                   </div>
                 )}
@@ -429,7 +440,7 @@ function BrowseTab({ adminPasscode, onAdminExit }: { adminPasscode: string | nul
                 disabled={page === 1}
                 className="rounded-lg border border-white/10 p-2 text-slate-400 transition-colors hover:bg-white/5 disabled:opacity-30"
               >
-                <ChevronLeft className="h-4 w-4" />
+                <ChevronLeftIcon className="h-4 w-4" />
               </button>
               <span className="text-sm text-slate-400">{page} / {totalPages}</span>
               <button
@@ -437,7 +448,7 @@ function BrowseTab({ adminPasscode, onAdminExit }: { adminPasscode: string | nul
                 disabled={page >= totalPages}
                 className="rounded-lg border border-white/10 p-2 text-slate-400 transition-colors hover:bg-white/5 disabled:opacity-30"
               >
-                <ChevronRight className="h-4 w-4" />
+                <ChevronRightIcon className="h-4 w-4" />
               </button>
             </div>
           )}
@@ -465,7 +476,7 @@ function BrowseTab({ adminPasscode, onAdminExit }: { adminPasscode: string | nul
                   {selectedWrap.tesla_model}
                 </span>
                 <span className="flex items-center gap-1 text-xs text-slate-500">
-                  <Download className="h-3 w-3" />
+                  <DownloadIcon className="h-3 w-3" />
                   {selectedWrap.download_count} downloads
                 </span>
               </div>
@@ -481,9 +492,9 @@ function BrowseTab({ adminPasscode, onAdminExit }: { adminPasscode: string | nul
                   className="flex flex-1 items-center justify-center gap-2 rounded-lg bg-blue-600 px-4 py-2.5 text-sm font-medium text-white transition-colors hover:bg-blue-500 disabled:opacity-50"
                 >
                   {downloading === selectedWrap.code ? (
-                    <Loader2 className="h-4 w-4 animate-spin" />
+                    <ProgressActivityIcon className="h-4 w-4 animate-spin" />
                   ) : (
-                    <Download className="h-4 w-4" />
+                    <DownloadIcon className="h-4 w-4" />
                   )}
                   Download to Pi
                 </button>
@@ -494,14 +505,14 @@ function BrowseTab({ adminPasscode, onAdminExit }: { adminPasscode: string | nul
                       className="rounded-lg border border-blue-500/30 px-3 py-2.5 text-blue-400 transition-colors hover:bg-blue-500/10"
                       title="Edit"
                     >
-                      <Pencil className="h-4 w-4" />
+                      <EditIcon className="h-4 w-4" />
                     </button>
                     <button
                       onClick={() => setDeletingWrap(selectedWrap)}
                       className="rounded-lg border border-red-500/30 px-3 py-2.5 text-red-400 transition-colors hover:bg-red-500/10"
                       title="Delete"
                     >
-                      <Trash2 className="h-4 w-4" />
+                      <DeleteIcon className="h-4 w-4" />
                     </button>
                   </>
                 )}
@@ -593,7 +604,7 @@ function EditWrapModal({ wrap, onSave, onClose }: {
             disabled={!name.trim() || !model || saving}
             className="flex flex-1 items-center justify-center gap-2 rounded-lg bg-blue-600 px-4 py-2.5 text-sm font-medium text-white transition-colors hover:bg-blue-500 disabled:opacity-50"
           >
-            {saving && <Loader2 className="h-4 w-4 animate-spin" />}
+            {saving && <ProgressActivityIcon className="h-4 w-4 animate-spin" />}
             Save
           </button>
           <button
@@ -637,7 +648,7 @@ function DeleteWrapModal({ wrap, onDelete, onClose }: {
             disabled={deleting}
             className="flex flex-1 items-center justify-center gap-2 rounded-lg bg-red-600 px-4 py-2.5 text-sm font-medium text-white transition-colors hover:bg-red-500 disabled:opacity-50"
           >
-            {deleting && <Loader2 className="h-4 w-4 animate-spin" />}
+            {deleting && <ProgressActivityIcon className="h-4 w-4 animate-spin" />}
             Delete
           </button>
           <button

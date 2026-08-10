@@ -3,8 +3,9 @@ Copyright 2025-2026 Jhoan Romero, Scott Vandereems, and Jason Perez
 
 This product is licensed under the PolyForm Noncommercial License 1.0.0 (see
 LICENSE), EXCEPT for the third-party and derived files listed below, which
-remain under their original MIT License. The PolyForm Noncommercial terms do
-NOT apply to those files; the MIT terms in section "MIT License" below do.
+remain under their original licenses (MIT, BSD 2-Clause, or Apache 2.0 as
+noted per section). The PolyForm Noncommercial terms do NOT apply to those
+files; the terms named in each section below do.
 
 If a file is not listed below, it is original work of the Sentry-USB-Rusty
 authors and is covered by the PolyForm Noncommercial License 1.0.0.
@@ -135,3 +136,16 @@ Local modifications: unused (deleted) directory entries are skipped per the
 exFAT specification instead of ending the directory scan, and benign
 primary entries (e.g. Volume GUID) are ignored instead of failing — both
 required to read Tesla-written filesystems.
+
+================================================================================
+4. Vendored Material Symbols icons  --  Apache License 2.0
+================================================================================
+
+The SVG path data in web/src/components/icons.tsx is generated from Google's
+Material Symbols icon set (outlined style, weight 400), obtained via the
+@material-symbols/svg-400 package (https://github.com/marella/material-symbols),
+Copyright Google LLC, licensed under the Apache License, Version 2.0
+(http://www.apache.org/licenses/LICENSE-2.0). The glyphs are embedded as inline
+SVG so the UI ships no icon font and makes no external request. Local
+modifications: `battery_full_alt` is mirrored horizontally so the battery
+terminal faces right.

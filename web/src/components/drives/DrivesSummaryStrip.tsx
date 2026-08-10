@@ -1,4 +1,4 @@
-import { Activity, Clock, Gauge, Sparkles } from "lucide-react"
+import { AutoAwesomeIcon, ScheduleIcon, SpeedIcon, VitalSignsIcon } from "@/components/icons"
 import { formatDuration, formatPercent } from "@/lib/drive-format"
 import type { DrivesFilteredStats } from "@/hooks/useDrivesList"
 
@@ -60,7 +60,7 @@ export function DrivesSummaryStrip({
   return (
     <div className="flex flex-wrap items-center gap-x-5 gap-y-2">
       <StatCell
-        icon={<Gauge className="h-3.5 w-3.5" />}
+        icon={<SpeedIcon className="h-3.5 w-3.5" />}
         label="Distance"
         value={formatAggregateDistance(
           stats.totalDistanceMi,
@@ -70,7 +70,7 @@ export function DrivesSummaryStrip({
       />
       <Divider />
       <StatCell
-        icon={<Clock className="h-3.5 w-3.5" />}
+        icon={<ScheduleIcon className="h-3.5 w-3.5" />}
         label="Time"
         value={formatDuration(stats.totalDurationMs)}
       />
@@ -78,7 +78,7 @@ export function DrivesSummaryStrip({
         <>
           <Divider />
           <StatCell
-            icon={<Sparkles className="h-3.5 w-3.5 text-emerald-300" />}
+            icon={<AutoAwesomeIcon className="h-3.5 w-3.5 text-emerald-300" />}
             label="FSD"
             value={`${formatPercent(stats.fsdPercent)}%`}
             highlight={stats.fsdPercent >= 99}
@@ -89,7 +89,7 @@ export function DrivesSummaryStrip({
         <>
           <Divider />
           <StatCell
-            icon={<Activity className="h-3.5 w-3.5" />}
+            icon={<VitalSignsIcon className="h-3.5 w-3.5" />}
             label="Autopilot"
             value={`${formatPercent(stats.autopilotPercent)}%`}
           />
@@ -99,7 +99,7 @@ export function DrivesSummaryStrip({
         <>
           <Divider />
           <StatCell
-            icon={<Sparkles className="h-3.5 w-3.5 text-rose-300" />}
+            icon={<AutoAwesomeIcon className="h-3.5 w-3.5 text-rose-300" />}
             label="Disengagements"
             value={stats.fsdDisengagements.toLocaleString()}
           />
@@ -109,7 +109,7 @@ export function DrivesSummaryStrip({
         <>
           <Divider />
           <StatCell
-            icon={<Sparkles className="h-3.5 w-3.5 text-violet-300" />}
+            icon={<AutoAwesomeIcon className="h-3.5 w-3.5 text-violet-300" />}
             label="Tessie"
             value={stats.tessieCount.toLocaleString()}
           />

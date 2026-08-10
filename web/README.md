@@ -7,7 +7,7 @@ The Sentry USB web interface — a React single-page application with a dark gla
 - **React 19** + TypeScript
 - **Vite** — build tooling and dev server
 - **TailwindCSS** — utility-first styling
-- **Lucide React** — icons
+- **Material Symbols** — icons, vendored as inline SVG in `src/components/icons.tsx`
 - **Leaflet** — drive map visualization
 
 ## Development

@@ -1,26 +1,26 @@
 import { useState, useEffect, useRef, useCallback, useMemo } from "react"
 import {
-  FolderOpen,
-  Upload,
-  Download,
-  FolderPlus,
-  Trash2,
-  File,
-  Folder,
-  ArrowLeft,
-  Loader2,
-  Music,
-  Video,
-  Paintbrush,
-  RectangleHorizontal,
-  CheckCircle,
-  X,
-  Search,
-  ArrowUpDown,
-  Check,
-  Volume2,
-  HardDrive,
-} from "lucide-react"
+  ArrowBackIcon,
+  BrushIcon,
+  CheckCircleIcon,
+  CheckIcon,
+  CloseIcon,
+  CreateNewFolderIcon,
+  DeleteIcon,
+  DownloadIcon,
+  DraftIcon,
+  FolderIcon,
+  FolderOpenIcon,
+  HardDriveIcon,
+  MusicNoteIcon,
+  ProgressActivityIcon,
+  RectangleIcon,
+  SearchIcon,
+  SwapVertIcon,
+  UploadIcon,
+  VideocamIcon,
+  VolumeUpIcon,
+} from "@/components/icons"
 import { cn } from "@/lib/utils"
 
 type SortOption = "name-asc" | "name-desc" | "date-newest" | "date-oldest" | "size-largest" | "size-smallest" | "type"
@@ -66,12 +66,12 @@ const ALL_DRIVES: DriveTab[] = [
 ]
 
 const TAB_ICONS: Record<DriveTab["icon"], React.ComponentType<{ className?: string }>> = {
-  cam: Video,
-  media: Music,
-  wrap: Paintbrush,
-  plate: RectangleHorizontal,
-  lock: Volume2,
-  drive: HardDrive,
+  cam: VideocamIcon,
+  media: MusicNoteIcon,
+  wrap: BrushIcon,
+  plate: RectangleIcon,
+  lock: VolumeUpIcon,
+  drive: HardDriveIcon,
 }
 
 function formatSize(bytes: number): string {
@@ -398,7 +398,7 @@ export default function Files() {
   if (!activeDrive) {
     return (
       <div className="flex items-center justify-center p-8">
-        <Loader2 className="h-5 w-5 animate-spin text-slate-500" />
+        <ProgressActivityIcon className="h-5 w-5 animate-spin text-slate-500" />
       </div>
     )
   }
@@ -420,7 +420,7 @@ export default function Files() {
             onClick={handleNewFolder}
             className="glass-card glass-card-hover flex items-center gap-1.5 px-3 py-1.5 text-sm text-slate-400 transition-colors hover:text-slate-200"
           >
-            <FolderPlus className="h-4 w-4" />
+            <CreateNewFolderIcon className="h-4 w-4" />
             New Folder
           </button>
           <button
@@ -431,7 +431,7 @@ export default function Files() {
               uploading ? "text-slate-600 cursor-not-allowed" : "text-slate-400 hover:text-slate-200"
             )}
           >
-            {uploading ? <Loader2 className="h-4 w-4 animate-spin" /> : <Upload className="h-4 w-4" />}
+            {uploading ? <ProgressActivityIcon className="h-4 w-4 animate-spin" /> : <UploadIcon className="h-4 w-4" />}
             {uploading ? "Uploading..." : "Upload"}
           </button>
           <input ref={uploadRef} type="file" multiple className="hidden" onChange={handleUpload} />
@@ -443,7 +443,7 @@ export default function Files() {
               uploading ? "text-slate-600 cursor-not-allowed" : "text-slate-400 hover:text-slate-200"
             )}
           >
-            <FolderOpen className="h-4 w-4" />
+            <FolderOpenIcon className="h-4 w-4" />
             Upload Folder
           </button>
           {/* @ts-expect-error webkitdirectory is non-standard but supported in all major browsers */}
@@ -473,7 +473,7 @@ export default function Files() {
       {/* Search and Sort */}
       <div className="flex items-center gap-2">
         <div className="relative flex-1">
-          <Search className="pointer-events-none absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-slate-600" />
+          <SearchIcon className="pointer-events-none absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-slate-600" />
           <input
             type="text"
             value={search}
@@ -486,7 +486,7 @@ export default function Files() {
               onClick={() => handleSearchChange("")}
               className="absolute right-2 top-1/2 -translate-y-1/2 rounded p-0.5 text-slate-600 hover:text-slate-400"
             >
-              <X className="h-3.5 w-3.5" />
+              <CloseIcon className="h-3.5 w-3.5" />
             </button>
           )}
         </div>
@@ -498,7 +498,7 @@ export default function Files() {
               showSortMenu ? "text-blue-400" : "text-slate-400 hover:text-slate-200"
             )}
           >
-            <ArrowUpDown className="h-3.5 w-3.5" />
+            <SwapVertIcon className="h-3.5 w-3.5" />
             <span className="hidden sm:inline">{SORT_LABELS[sortOption]}</span>
           </button>
           {showSortMenu && (
@@ -513,7 +513,7 @@ export default function Files() {
                   )}
                 >
                   {SORT_LABELS[opt]}
-                  {sortOption === opt && <Check className="h-3.5 w-3.5" />}
+                  {sortOption === opt && <CheckIcon className="h-3.5 w-3.5" />}
                 </button>
               ))}
             </div>
@@ -528,14 +528,14 @@ export default function Files() {
             <p className="text-xs font-medium text-slate-300">
               {uploading ? "Uploading files..." : (
                 <span className="flex items-center gap-1.5">
-                  <CheckCircle className="h-3.5 w-3.5 text-emerald-400" />
+                  <CheckCircleIcon className="h-3.5 w-3.5 text-emerald-400" />
                   Upload complete
                 </span>
               )}
             </p>
             {!uploading && (
               <button onClick={() => setUploads([])} className="rounded p-0.5 text-slate-600 hover:text-slate-400">
-                <X className="h-3.5 w-3.5" />
+                <CloseIcon className="h-3.5 w-3.5" />
               </button>
             )}
           </div>
@@ -592,7 +592,7 @@ export default function Files() {
         {dragging && (
           <div className="absolute inset-0 z-30 flex items-center justify-center bg-slate-900/80 backdrop-blur-sm">
             <div className="flex flex-col items-center gap-2 text-blue-400">
-              <Upload className="h-10 w-10" />
+              <UploadIcon className="h-10 w-10" />
               <p className="text-sm font-medium">Drop files here to upload</p>
             </div>
           </div>
@@ -604,7 +604,7 @@ export default function Files() {
                 onClick={goUp}
                 className="rounded p-1 text-slate-500 hover:bg-white/5 hover:text-slate-300"
               >
-                <ArrowLeft className="h-4 w-4" />
+                <ArrowBackIcon className="h-4 w-4" />
               </button>
             )}
             <p className="font-mono text-sm text-slate-400">{relativePath}</p>
@@ -619,11 +619,11 @@ export default function Files() {
         <div className="flex-1 overflow-y-auto">
           {loading ? (
             <div className="flex items-center justify-center p-8">
-              <Loader2 className="h-5 w-5 animate-spin text-slate-500" />
+              <ProgressActivityIcon className="h-5 w-5 animate-spin text-slate-500" />
             </div>
           ) : error ? (
             <div className="flex flex-col items-center justify-center p-8">
-              <FolderOpen className="mb-2 h-10 w-10 text-slate-500" />
+              <FolderOpenIcon className="mb-2 h-10 w-10 text-slate-500" />
               <p className="text-sm text-slate-500">{error}</p>
             </div>
           ) : sortedFiles.length === 0 ? (
@@ -675,9 +675,9 @@ export default function Files() {
                     </td>
                     <td className="px-1 py-3">
                       {f.is_dir ? (
-                        <Folder className="h-4 w-4 text-blue-400" />
+                        <FolderIcon className="h-4 w-4 text-blue-400" />
                       ) : (
-                        <File className="h-4 w-4 text-slate-500" />
+                        <DraftIcon className="h-4 w-4 text-slate-500" />
                       )}
                     </td>
                     <td className="min-w-0 truncate py-3 text-slate-300">{f.name}</td>
@@ -707,14 +707,14 @@ export default function Files() {
               onClick={handleDownloadSelected}
               className="flex items-center gap-2 rounded-lg bg-blue-500/15 px-3 py-2 text-sm font-medium text-blue-400 transition-colors hover:bg-blue-500/25"
             >
-              <Download className="h-4 w-4" />
+              <DownloadIcon className="h-4 w-4" />
               Download
             </button>
             <button
               onClick={handleDelete}
               className="flex items-center gap-2 rounded-lg bg-red-500/10 px-3 py-2 text-sm font-medium text-red-400 transition-colors hover:bg-red-500/20"
             >
-              <Trash2 className="h-4 w-4" />
+              <DeleteIcon className="h-4 w-4" />
               Delete
             </button>
             <button
@@ -722,7 +722,7 @@ export default function Files() {
               className="rounded-lg p-2 text-slate-500 transition-colors hover:bg-white/5 hover:text-slate-300"
               title="Clear selection"
             >
-              <X className="h-4 w-4" />
+              <CloseIcon className="h-4 w-4" />
             </button>
           </div>
         </div>

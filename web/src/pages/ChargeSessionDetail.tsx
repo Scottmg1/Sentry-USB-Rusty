@@ -1,20 +1,20 @@
 import { useCallback, useEffect, useMemo, useState } from "react"
 import { Link, useParams } from "react-router-dom"
 import {
-  ArrowLeft,
-  BatteryCharging,
-  Check,
-  DollarSign,
-  Gauge,
-  Home,
-  Leaf,
-  Loader2,
-  MapPin,
-  Pencil,
-  Plug,
-  X,
-  Zap,
-} from "lucide-react"
+  ArrowBackIcon,
+  AttachMoneyIcon,
+  BatteryAndroidFrameBoltIcon,
+  BoltIcon,
+  CheckIcon,
+  CloseIcon,
+  EditIcon,
+  HomeIcon,
+  LocationOnIcon,
+  NestEcoLeafIcon,
+  PowerIcon,
+  ProgressActivityIcon,
+  SpeedIcon,
+} from "@/components/icons"
 import {
   fetchChargeSession,
   fetchCurrentCharge,
@@ -210,13 +210,13 @@ export default function ChargeSessionDetailPage() {
         to="/charging"
         className="mb-4 inline-flex items-center gap-1.5 text-sm text-slate-400 hover:text-slate-200"
       >
-        <ArrowLeft className="h-4 w-4" />
+        <ArrowBackIcon className="h-4 w-4" />
         Charging
       </Link>
 
       {loading && (
         <div className="flex items-center justify-center gap-2 rounded-2xl border border-white/[0.06] bg-white/[0.025] p-10 text-sm text-slate-400">
-          <Loader2 className="h-4 w-4 animate-spin" />
+          <ProgressActivityIcon className="h-4 w-4 animate-spin" />
           Loading session…
         </div>
       )}
@@ -239,7 +239,7 @@ export default function ChargeSessionDetailPage() {
                     title="DC fast charging (Supercharger / CCS) — peak power over 22 kW"
                     className="inline-flex items-center gap-1 rounded-full bg-amber-500/15 px-2 py-0.5 text-xs font-medium text-amber-300 ring-1 ring-inset ring-amber-400/20"
                   >
-                    <Zap className="h-3 w-3 fill-amber-300" />
+                    <BoltIcon className="h-3 w-3 fill-amber-300" />
                     Fast charging
                   </span>
                 )}
@@ -247,7 +247,7 @@ export default function ChargeSessionDetailPage() {
                 <span>{fmtDuration(session.durationSecs)}</span>
                 {session.location && (
                   <span className="inline-flex items-center gap-1">
-                    <MapPin className="h-3.5 w-3.5" />
+                    <LocationOnIcon className="h-3.5 w-3.5" />
                     {session.location}
                   </span>
                 )}
@@ -259,7 +259,7 @@ export default function ChargeSessionDetailPage() {
                   title="Charged at home (automatic)"
                   className="inline-flex items-center gap-1 rounded-md border border-emerald-400/30 bg-emerald-400/10 px-2 py-1 text-xs font-medium text-emerald-200"
                 >
-                  <Home className="h-3 w-3" />
+                  <HomeIcon className="h-3 w-3" />
                   Home
                 </span>
               )}
@@ -269,7 +269,7 @@ export default function ChargeSessionDetailPage() {
 
           {inProgress && (
             <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5 rounded-xl border border-emerald-500/20 bg-emerald-500/10 px-4 py-2.5 text-sm text-emerald-200 tabular-nums">
-              <BatteryCharging className="h-4 w-4 shrink-0 animate-pulse" />
+              <BatteryAndroidFrameBoltIcon className="h-4 w-4 shrink-0 animate-pulse" />
               <span className="font-medium text-emerald-100">Charging</span>
               {remaining && (
                 <>
@@ -308,19 +308,19 @@ export default function ChargeSessionDetailPage() {
                 <StatTile
                   label="Energy added"
                   value={fmtEnergy(session.energyAddedKwh)}
-                  icon={<BatteryCharging className="h-4 w-4" />}
+                  icon={<BatteryAndroidFrameBoltIcon className="h-4 w-4" />}
                   info="Energy added to the battery this session (reported by the car)."
                 />
                 <StatTile
                   label="Energy used"
                   value={fmtEnergy(session.energyUsedKwh)}
-                  icon={<Zap className="h-4 w-4" />}
+                  icon={<BoltIcon className="h-4 w-4" />}
                   info="Energy drawn from the charger (wall-side), estimated by integrating charging power. Higher than energy added — the difference is charging loss."
                 />
                 <StatTile
                   label="Efficiency"
                   value={fmtPercent(session.efficiencyPct)}
-                  icon={<Leaf className="h-4 w-4" />}
+                  icon={<NestEcoLeafIcon className="h-4 w-4" />}
                   info="Energy added to the battery divided by energy drawn from the charger."
                 />
                 <StatTile
@@ -339,7 +339,7 @@ export default function ChargeSessionDetailPage() {
                       "—"
                     )
                   }
-                  icon={<DollarSign className="h-4 w-4" />}
+                  icon={<AttachMoneyIcon className="h-4 w-4" />}
                   info={
                     session.fastCharging
                       ? session.costOverridden
@@ -360,19 +360,19 @@ export default function ChargeSessionDetailPage() {
                       ? `${fmtSoc(session.startSoc)} → ${fmtSoc(session.endSoc)}`
                       : fmtSoc(session.endSoc)
                   }
-                  icon={<BatteryCharging className="h-4 w-4" />}
+                  icon={<BatteryAndroidFrameBoltIcon className="h-4 w-4" />}
                   info="State of charge at start and end."
                 />
                 <StatTile
                   label="Range added"
                   value={rangeAdded != null ? fmtRangeUnit(rangeAdded, metric) : "—"}
-                  icon={<Gauge className="h-4 w-4" />}
+                  icon={<SpeedIcon className="h-4 w-4" />}
                   info="Rated range gained this session."
                 />
                 <StatTile
                   label="Charge limit"
                   value={fmtSoc(session.chargeLimitSoc)}
-                  icon={<BatteryCharging className="h-4 w-4" />}
+                  icon={<BatteryAndroidFrameBoltIcon className="h-4 w-4" />}
                   info="Target state of charge for this session."
                 />
               </StatGroup>
@@ -381,7 +381,7 @@ export default function ChargeSessionDetailPage() {
                 <StatTile
                   label="Peak power"
                   value={fmtPower(session.peakPowerKw)}
-                  icon={<Zap className="h-4 w-4" />}
+                  icon={<BoltIcon className="h-4 w-4" />}
                   info={
                     session.avgPowerKw != null
                       ? `Highest charging power seen this session. Average ${Math.round(session.avgPowerKw)} kW.`
@@ -391,12 +391,12 @@ export default function ChargeSessionDetailPage() {
                 <StatTile
                   label="Peak current"
                   value={session.peakCurrentA != null ? `${session.peakCurrentA} A` : "—"}
-                  icon={<Plug className="h-4 w-4" />}
+                  icon={<PowerIcon className="h-4 w-4" />}
                 />
                 <StatTile
                   label="Voltage"
                   value={session.peakVoltageV != null ? `${session.peakVoltageV} V` : "—"}
-                  icon={<Zap className="h-4 w-4" />}
+                  icon={<BoltIcon className="h-4 w-4" />}
                 />
               </StatGroup>
             </div>
@@ -534,7 +534,7 @@ function EditableCost({
         ) : (
           <span className="text-base font-medium text-slate-500">Set cost</span>
         )}
-        <Pencil className="h-3.5 w-3.5 text-slate-500 opacity-0 transition-opacity group-hover/cost:opacity-100" />
+        <EditIcon className="h-3.5 w-3.5 text-slate-500 opacity-0 transition-opacity group-hover/cost:opacity-100" />
       </button>
     )
   }
@@ -567,9 +567,9 @@ function EditableCost({
         className="inline-flex h-7 w-7 items-center justify-center rounded-md bg-emerald-500/90 text-white hover:bg-emerald-400 disabled:opacity-50"
       >
         {saving ? (
-          <Loader2 className="h-4 w-4 animate-spin" />
+          <ProgressActivityIcon className="h-4 w-4 animate-spin" />
         ) : (
-          <Check className="h-4 w-4" />
+          <CheckIcon className="h-4 w-4" />
         )}
       </button>
       <button
@@ -579,7 +579,7 @@ function EditableCost({
         onClick={() => setEditing(false)}
         className="inline-flex h-7 w-7 items-center justify-center rounded-md border border-white/10 bg-white/[0.03] text-slate-300 hover:bg-white/[0.06] disabled:opacity-50"
       >
-        <X className="h-4 w-4" />
+        <CloseIcon className="h-4 w-4" />
       </button>
       {overridden && (
         <button

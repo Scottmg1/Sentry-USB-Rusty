@@ -1,4 +1,4 @@
-import { Radio, Wifi, Info } from "lucide-react"
+import { InfoIcon, SensorsIcon, WifiIcon } from "@/components/icons"
 import type { StepProps } from "../SetupWizard"
 import { SecretInput } from "../SecretInput"
 import { cn } from "@/lib/utils"
@@ -62,7 +62,7 @@ export function NetworkStep({ data, onChange, onBatchChange }: StepProps) {
       {/* WiFi info banner */}
       <div className="rounded-lg border border-blue-500/20 bg-blue-500/5 p-4">
         <div className="flex items-start gap-3">
-          <Info className="mt-0.5 h-5 w-5 shrink-0 text-blue-400" />
+          <InfoIcon className="mt-0.5 h-5 w-5 shrink-0 text-blue-400" />
           <div>
             <p className="text-sm font-medium text-slate-200">
               WiFi is configured during SD card imaging
@@ -83,7 +83,7 @@ export function NetworkStep({ data, onChange, onBatchChange }: StepProps) {
       {/* Hostname */}
       <div>
         <div className="mb-3 flex items-center gap-2">
-          <Wifi className="h-4 w-4 text-blue-400" />
+          <WifiIcon className="h-4 w-4 text-blue-400" />
           <h3 className="text-sm font-semibold uppercase tracking-wider text-slate-400">
             Hostname
           </h3>
@@ -101,7 +101,7 @@ export function NetworkStep({ data, onChange, onBatchChange }: StepProps) {
       {/* Access Point */}
       <div>
         <div className="mb-3 flex items-center gap-2">
-          <Radio className="h-4 w-4 text-blue-400" />
+          <SensorsIcon className="h-4 w-4 text-blue-400" />
           <h3 className="text-sm font-semibold uppercase tracking-wider text-slate-400">
             WiFi Access Point
           </h3>
@@ -163,7 +163,7 @@ export function NetworkStep({ data, onChange, onBatchChange }: StepProps) {
                 geofence setup lives in Settings → Car & Network. */}
             <div className="mt-3 rounded-lg border border-blue-500/20 bg-blue-500/5 p-3">
               <div className="flex items-start gap-2.5">
-                <Info className="mt-0.5 h-4 w-4 shrink-0 text-blue-400" />
+                <InfoIcon className="mt-0.5 h-4 w-4 shrink-0 text-blue-400" />
                 <div className="text-xs leading-relaxed text-slate-400">
                   <p className="font-medium text-slate-200">Away Mode has two modes</p>
                   <p className="mt-1">

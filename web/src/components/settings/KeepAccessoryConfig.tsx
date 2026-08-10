@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react"
-import { Loader2, AlertTriangle } from "lucide-react"
+import { ProgressActivityIcon, WarningIcon } from "@/components/icons"
 import { cn } from "@/lib/utils"
 import { HomeGeofencePicker } from "@/components/settings/HomeGeofencePicker"
 
@@ -106,7 +106,7 @@ export function KeepAccessoryConfig({
           reachable over BLE through the archive. */}
       {checkKeepAwake && values.enabled && keepAwakeOn === false && (
         <div className="flex items-start gap-2 rounded-lg border border-amber-500/30 bg-amber-500/10 p-3">
-          <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-amber-400" />
+          <WarningIcon className="mt-0.5 h-4 w-4 shrink-0 text-amber-400" />
           <div className="space-y-2">
             <p className="text-xs text-amber-200/90">
               <span className="font-medium">Turn on “Use BLE for keep-awake” too.</span> It keeps
@@ -119,7 +119,7 @@ export function KeepAccessoryConfig({
               disabled={enablingKa}
               className="inline-flex items-center gap-1.5 rounded-md border border-amber-500/40 bg-amber-500/15 px-2.5 py-1 text-xs font-medium text-amber-100 transition-colors hover:bg-amber-500/25 disabled:opacity-50"
             >
-              {enablingKa && <Loader2 className="h-3 w-3 animate-spin" />}
+              {enablingKa && <ProgressActivityIcon className="h-3 w-3 animate-spin" />}
               Turn on keep-awake
             </button>
           </div>

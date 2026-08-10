@@ -1,5 +1,5 @@
 import { useEffect, useState, type ReactNode } from "react"
-import { ChevronDown, Plus, Settings2, Trash2, X } from "lucide-react"
+import { AddIcon, CloseIcon, DeleteIcon, ExpandMoreIcon, TuneIcon } from "@/components/icons"
 import {
   useChargingRates,
   type RateSchedule,
@@ -215,7 +215,7 @@ export function ChargingRatesButton({
         onClick={() => (open ? setOpen(false) : openEditor())}
         className="inline-flex items-center gap-1.5 rounded-lg border border-white/10 bg-white/[0.03] px-2.5 py-1.5 text-xs font-medium text-slate-300 transition-colors hover:bg-white/[0.06] disabled:opacity-50"
       >
-        <Settings2 className="h-3.5 w-3.5" />
+        <TuneIcon className="h-3.5 w-3.5" />
         Rates
       </button>
 
@@ -239,7 +239,7 @@ export function ChargingRatesButton({
                 onClick={() => setOpen(false)}
                 className="rounded-md p-1 text-slate-400 hover:bg-white/5 hover:text-slate-200"
               >
-                <X className="h-4 w-4" />
+                <CloseIcon className="h-4 w-4" />
               </button>
             </div>
 
@@ -371,7 +371,7 @@ function TagPlanEditor({
         onClick={onToggle}
         className="flex w-full items-center gap-2 px-3 py-2 text-left"
       >
-        <ChevronDown
+        <ExpandMoreIcon
           className={cn(
             "h-4 w-4 shrink-0 text-slate-500 transition-transform",
             expanded && "rotate-180",
@@ -426,7 +426,7 @@ function TagPlanEditor({
               onClick={addSchedule}
               className="mt-2 inline-flex items-center justify-center gap-1 rounded-md border border-white/10 bg-white/[0.03] px-2.5 py-1.5 text-xs font-medium text-slate-300 transition-colors hover:bg-white/[0.06]"
             >
-              <Plus className="h-3.5 w-3.5" />
+              <AddIcon className="h-3.5 w-3.5" />
               Add rate schedule
             </button>
           </div>
@@ -461,7 +461,7 @@ function ScheduleCard({
           onClick={onRemove}
           className="shrink-0 rounded-md p-1 text-slate-500 hover:bg-white/5 hover:text-rose-300"
         >
-          <Trash2 className="h-4 w-4" />
+          <DeleteIcon className="h-4 w-4" />
         </button>
       </div>
 

@@ -1,14 +1,14 @@
 import { useEffect, useState } from "react"
 import {
-  Download,
-  Settings as SettingsIcon,
-  Wand2,
-  ShieldCheck,
-  Check,
-  X,
-  Loader2,
-  FileText,
-} from "lucide-react"
+  CheckIcon,
+  CloseIcon,
+  DescriptionIcon,
+  DownloadIcon,
+  ProgressActivityIcon,
+  SettingsIcon,
+  VerifiedUserIcon,
+  WandStarsIcon,
+} from "@/components/icons"
 import { PrefCard, PrefGrid } from "@/components/settings/PrefCard"
 import { ConfigBackupSection } from "@/components/settings/sections/ConfigBackupSection"
 import { StorageRepairCard } from "@/components/settings/sections/StorageRepairCard"
@@ -135,7 +135,7 @@ export function SystemTab({ onOpenRawConfig, onOpenWizard, version, hostname }: 
               onClick={exportConfig}
               className="rounded-lg border border-white/10 bg-white/5 px-3 py-1.5 text-xs font-medium text-slate-300 transition-colors hover:bg-white/10"
             >
-              <Download className="mr-1.5 inline h-3.5 w-3.5" />
+              <DownloadIcon className="mr-1.5 inline h-3.5 w-3.5" />
               Download sentryusb.conf
             </button>
           </div>
@@ -147,7 +147,7 @@ export function SystemTab({ onOpenRawConfig, onOpenWizard, version, hostname }: 
 
       {/* --- Setup Wizard + Resources (was: About) --- */}
       <PrefCard
-        icon={<Wand2 className="h-3.5 w-3.5" />}
+        icon={<WandStarsIcon className="h-3.5 w-3.5" />}
         halo="accent"
         title="Setup Wizard"
       >
@@ -227,7 +227,7 @@ function PrivacyCards() {
   return (
     <>
       <PrefCard
-        icon={<ShieldCheck className="h-3.5 w-3.5" />}
+        icon={<VerifiedUserIcon className="h-3.5 w-3.5" />}
         halo="accent"
         title="Analytics opt-in"
       >
@@ -254,9 +254,9 @@ function PrivacyCards() {
             )}
           >
             {saving && choice !== true ? (
-              <Loader2 className="h-3.5 w-3.5 animate-spin" />
+              <ProgressActivityIcon className="h-3.5 w-3.5 animate-spin" />
             ) : (
-              <Check className="h-3.5 w-3.5" />
+              <CheckIcon className="h-3.5 w-3.5" />
             )}
             Opted in
           </button>
@@ -272,9 +272,9 @@ function PrivacyCards() {
             )}
           >
             {saving && choice !== false ? (
-              <Loader2 className="h-3.5 w-3.5 animate-spin" />
+              <ProgressActivityIcon className="h-3.5 w-3.5 animate-spin" />
             ) : (
-              <X className="h-3.5 w-3.5" />
+              <CloseIcon className="h-3.5 w-3.5" />
             )}
             Opted out
           </button>
@@ -289,7 +289,7 @@ function PrivacyCards() {
       </PrefCard>
 
       <PrefCard
-        icon={<FileText className="h-3.5 w-3.5" />}
+        icon={<DescriptionIcon className="h-3.5 w-3.5" />}
         halo="slate"
         title="What we send, and when"
       >
