@@ -23,6 +23,7 @@ import type { ChargeSessionSummary, CurrentCharge } from "@/types/charging"
 import { cn } from "@/lib/utils"
 import { DatePopover } from "@/components/drives/DatePopover"
 import { TagPopover } from "@/components/drives/TagPopover"
+import { HomeLocationSection } from "@/components/charging/HomeLocationSection"
 import {
   ChargingSummaryStrip,
   type ChargingStats,
@@ -39,6 +40,34 @@ import { fmtDuration, fmtEnergy, fmtMoney, fmtSoc } from "@/lib/charge-format"
 const POLL_MS = 30_000
 
 export default function Charging() {
+  const [homeSeed, setHomeSeed] = useState<{ lat: number | null; lon: number | null } | null>(null)
+  // Whether a home geofence exists at all. Without one NOTHING can be tagged
+  // Home, so the answer is a single prompt — not a "set as home" button on
+  // every row, which is what per-session affordances degrade into when the
+  // feature is entirely unconfigured.
+  const [homeConfigured, setHomeConfigured] = useState<boolean | null>(null)
+  // Escape closes the editor. Nothing is written until the user confirms, so
+  // backing out is always safe and should not need a mouse.
+  useEffect(() => {
+    if (!homeSeed) return
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") setHomeSeed(null)
+    }
+    document.addEventListener("keydown", onKey)
+    return () => document.removeEventListener("keydown", onKey)
+  }, [homeSeed])
+  useEffect(() => {
+    let alive = true
+    fetch("/api/system/keep-accessory-config")
+      .then((r) => (r.ok ? r.json() : null))
+      .then((d) => {
+        if (alive) setHomeConfigured(d ? d.home_lat != null && d.home_lon != null : null)
+      })
+      .catch(() => {})
+    return () => {
+      alive = false
+    }
+  }, [])
   const [sessions, setSessions] = useState<ChargeSessionSummary[]>([])
   const [tags, setTags] = useState<string[]>([])
   const [selectedTags, setSelectedTags] = useState<string[]>([])
@@ -119,6 +148,23 @@ export default function Charging() {
 
   const onTagsChange = useCallback(
     async (id: number, next: string[]) => {
+      // Tagging a charge "Home" is the user saying "this is home" — so treat it
+      // as a request to MOVE the geofence, not a tag write. The tag is derived
+      // and the store strips it anyway, so storing it would silently do
+      // nothing; this turns a dead action into the one they meant. The change
+      // still has to be confirmed in the dialog, because it re-tags history.
+      const isHome = (t: string) => t.trim().toLowerCase() === "home"
+      const sess = sessions.find((x) => x.id === id)
+      // "Home" is never in a session's stored tags (it is derived into `atHome`,
+      // and the store strips it), so its presence here means the user just typed
+      // or picked it. Unrelated edits carry it in neither list and never open the
+      // dialog. Still filtered out below rather than trusted to that.
+      const asksHome = next.some(isHome) && !(sess?.tags ?? []).some(isHome)
+      if (asksHome && sess?.locationLat != null && sess?.locationLon != null) {
+        setHomeSeed({ lat: sess.locationLat, lon: sess.locationLon })
+      }
+      // Strip it either way: it is derived, and the store discards it on write.
+      next = next.filter((t) => !isHome(t))
       // Optimistic: show the new tags immediately, then resync (cost is
       // recomputed server-side from the tags).
       setSessions((prev) =>
@@ -130,7 +176,7 @@ export default function Charging() {
         await reload()
       }
     },
-    [reload],
+    [reload, sessions],
   )
 
   const toggleSelectMode = () => {
@@ -275,6 +321,32 @@ export default function Charging() {
         </div>
       </div>
 
+      {homeConfigured === false && sessions.some((x) => x.locationLat != null) && (
+        <div className="mb-3 flex flex-wrap items-center gap-3 rounded-lg border border-white/10 bg-white/[0.02] px-3 py-2.5">
+          <HomeIcon className="h-4 w-4 shrink-0 text-slate-400" />
+          <p className="min-w-0 flex-1 text-xs text-slate-400">
+            No home location set, so none of these charges can be tagged{" "}
+            <span className="text-slate-300">Home</span> or priced with a home rate.
+          </p>
+          <button
+            type="button"
+            onClick={() => {
+              // Seed from the most recent charge that has coordinates — for most
+              // people that is home, and it beats opening a world map. They can
+              // drag the pin if it guessed wrong.
+              const withFix = sessions.find((x) => x.locationLat != null && x.locationLon != null)
+              setHomeSeed({
+                lat: withFix?.locationLat ?? null,
+                lon: withFix?.locationLon ?? null,
+              })
+            }}
+            className="shrink-0 rounded-md border border-white/10 bg-white/[0.04] px-3 py-1.5 text-xs font-medium text-slate-200 hover:bg-white/[0.08]"
+          >
+            Set home location
+          </button>
+        </div>
+      )}
+
       <div className="mt-4 flex flex-col gap-3">
         {loading && (
           <div className="flex items-center justify-center gap-2 rounded-2xl border border-white/[0.06] bg-white/[0.025] p-10 text-sm text-slate-400">
@@ -307,9 +379,49 @@ export default function Charging() {
               selected={selected.has(s.id)}
               onToggleSelected={onToggleSelected}
               onTagsChange={onTagsChange}
+              onOpenHomeLocation={(lat, lon) => setHomeSeed({ lat, lon })}
             />
           ))}
       </div>
+
+      {homeSeed && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4"
+          onClick={() => setHomeSeed(null)}
+        >
+          <div
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="home-location-title"
+            className="max-h-[85vh] w-full max-w-md overflow-y-auto rounded-xl border border-white/10 bg-slate-950 p-4"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="mb-3 flex items-center justify-between">
+              <div>
+                <h2 id="home-location-title" className="text-sm font-medium text-slate-200">
+                  Home location
+                </h2>
+              </div>
+              <button
+                type="button"
+                onClick={() => setHomeSeed(null)}
+                className="rounded-md border border-white/10 bg-white/[0.04] px-3 py-1 text-xs font-medium text-slate-200 hover:bg-white/[0.08]"
+              >
+                Done
+              </button>
+            </div>
+            <HomeLocationSection
+              onSaved={() => {
+                setHomeConfigured(true) // kill the banner without a page reload
+                reload()
+              }}
+              onDone={() => setHomeSeed(null)}
+              seedLat={homeSeed.lat}
+              seedLon={homeSeed.lon}
+            />
+          </div>
+        </div>
+      )}
 
       {confirmingBulkDelete && (
         <div className="fixed inset-0 z-[2000] flex items-center justify-center bg-black/60 backdrop-blur-sm">
@@ -416,6 +528,7 @@ function ChargeRow({
   selected,
   onToggleSelected,
   onTagsChange,
+  onOpenHomeLocation,
 }: {
   session: ChargeSessionSummary
   metric: boolean
@@ -425,6 +538,7 @@ function ChargeRow({
   selected: boolean
   onToggleSelected: (id: number) => void
   onTagsChange: (id: number, tags: string[]) => Promise<void> | void
+  onOpenHomeLocation: (lat: number | null, lon: number | null) => void
 }) {
   const navigate = useNavigate()
   const start = new Date(session.startMs)
@@ -581,13 +695,21 @@ function ChargeRow({
         className="flex items-center gap-1.5"
       >
         {session.atHome && (
-          <span
-            title="Charged at home (automatic)"
-            className="inline-flex items-center gap-1 rounded-md border border-emerald-400/30 bg-emerald-400/10 px-2 py-1 text-xs font-medium text-emerald-200"
+          // Tappable on purpose. The Home chip is derived from the geofence, so
+          // "how does it know?" is the obvious next question — answer it where
+          // the question is asked instead of burying the setting in a menu.
+          <button
+            type="button"
+            title="Charged at home — tap to see or change your home location"
+            onClick={(e) => {
+              e.stopPropagation() // the whole row navigates to the detail page
+              onOpenHomeLocation(null, null) // edit the saved home, don't propose a move
+            }}
+            className="inline-flex items-center gap-1 rounded-md border border-emerald-400/30 bg-emerald-400/10 px-2 py-1 text-xs font-medium text-emerald-200 transition-colors hover:bg-emerald-400/20"
           >
             <HomeIcon className="h-3 w-3" />
             Home
-          </span>
+          </button>
         )}
         <TagPopover
           tags={session.tags}

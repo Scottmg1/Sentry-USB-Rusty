@@ -48,7 +48,10 @@ use sentryusb_drives::charging::{
 static CHARGING_LIST_CACHE: crate::ttl_cache::StaleWhileRevalidate<(), std::sync::Arc<String>> =
     crate::ttl_cache::StaleWhileRevalidate::new(std::time::Duration::from_secs(15));
 
-fn invalidate_charging_list() {
+/// Drop the cached charging list. Also called when the home geofence moves:
+/// the "Home" tag is derived from it, so the cached list would show stale tags
+/// for up to the 15s TTL.
+pub(crate) fn invalidate_charging_list() {
     CHARGING_LIST_CACHE.clear();
 }
 
@@ -77,6 +80,7 @@ struct ChargeSessionDetail {
 /// One time-of-use price window for a tag, scoped by time-of-day, days of
 /// the week, and a month range — the device equivalent of a Tessie "rate
 /// schedule". All bounds are in local time.
+#[derive(PartialEq)]
 struct RateSchedule {
     rate: f64,
     /// Local minutes-of-day. `start_min > end_min` wraps past midnight
@@ -134,6 +138,7 @@ impl RateSchedule {
 /// Pricing for one tag: an optional flat fallback rate plus any number of
 /// time-of-use schedules. A charging interval is priced at the first
 /// schedule that covers it, else `flat`, else the global default rate.
+#[derive(PartialEq)]
 struct TagRate {
     flat: Option<f64>,
     schedules: Vec<RateSchedule>,
@@ -199,6 +204,43 @@ impl RateConfig {
             default_rate,
             tags,
         }
+    }
+
+    /// Copy the "Home" rate onto `tag` so frozen sessions keep their price.
+    /// Errors (rather than logging) so the caller can abort the move.
+    /// Returns whether the rate map changed, for the cloud-sync nudge.
+    ///
+    /// `label_in_use` is evaluated INSIDE the prefs lock and only when a rate
+    /// would actually be written: giving an in-use label the Home rate would
+    /// reprice charges that were never home, but with no rate change reuse is
+    /// harmless. Deciding that outside the lock would let a concurrent rate
+    /// edit turn a skipped check into a needed one.
+    fn copy_home_rate_to(
+        tag: &str,
+        label_in_use: impl FnOnce() -> anyhow::Result<bool>,
+    ) -> anyhow::Result<bool> {
+        crate::preferences::update_prefs(|prefs| match home_rate_copy_plan(prefs, tag) {
+            RateCopy::Nothing => Ok(false),
+            RateCopy::Conflict(why) => anyhow::bail!("{why}"),
+            RateCopy::Copy(rate) => {
+                if label_in_use()? {
+                    anyhow::bail!(
+                        "\"{tag}\" is already used by other charges — pick a name that isn't in use"
+                    );
+                }
+                let mut rates = prefs
+                    .get("charging_tag_rates")
+                    .and_then(|v| v.as_object())
+                    .cloned()
+                    .unwrap_or_default();
+                rates.insert(tag.to_string(), rate);
+                prefs.insert(
+                    "charging_tag_rates".to_string(),
+                    serde_json::Value::Object(rates),
+                );
+                Ok(true)
+            }
+        })
     }
 }
 
@@ -447,6 +489,215 @@ fn distance_m(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
     2.0 * EARTH_R_M * a.sqrt().min(1.0).asin()
 }
 
+
+/// What freezing under `tag` should do to the rate map.
+#[derive(Debug, PartialEq)]
+enum RateCopy {
+    /// No rate change needed, and none of the sessions change price.
+    Nothing,
+    /// Refuse the whole freeze; the payload is shown to the user.
+    Conflict(String),
+    /// Give `tag` this rate.
+    Copy(serde_json::Value),
+}
+
+/// Decide the above from `prefs`. Pure, so the cost-preservation logic is
+/// unit-testable — a wrong answer here fails silently.
+///
+/// Destination keys are matched EXACTLY, because `apply_rates` resolves a
+/// stored tag with an exact `rates.tags.get(tag)`; matching case-insensitively
+/// would call a differently-cased key "already priced" and skip the write,
+/// leaving the frozen sessions with a tag no rate lookup can reach. The Home
+/// SOURCE key stays case-insensitive, matching how a home charge is priced.
+/// Values are compared after `parse_tag_rate`, so `0.2`, `"0.2"` and
+/// `{"flat":0.2}` are one rate rather than a false conflict.
+fn home_rate_copy_plan(
+    prefs: &serde_json::Map<String, serde_json::Value>,
+    tag: &str,
+) -> RateCopy {
+    let Some(rates) = prefs.get("charging_tag_rates").and_then(|v| v.as_object()) else {
+        return RateCopy::Nothing; // no rates at all: nothing to preserve
+    };
+    // Only CONFIGURED Home entries count: a malformed one ("NaN", "-1", `{}`)
+    // prices nothing, so there is no cost to preserve and copying it would just
+    // spread the junk.
+    let home_keys: Vec<&serde_json::Value> = rates
+        .iter()
+        .filter(|(k, v)| k.eq_ignore_ascii_case(HOME_TAG) && parse_tag_rate(v).is_configured())
+        .map(|(_, v)| v)
+        .collect();
+    // `apply_rates` prices a home charge at the most expensive Home-cased key,
+    // which needs the session's rows to evaluate. Rather than guess which one
+    // to preserve, refuse: two Home rates differing only in capitalization is a
+    // config mistake the user should resolve.
+    if home_keys.len() > 1 && home_keys.windows(2).any(|w| parse_tag_rate(w[0]) != parse_tag_rate(w[1]))
+    {
+        return RateCopy::Conflict(format!(
+            "there are two \"{HOME_TAG}\" rates differing only in capitalization — remove one first"
+        ));
+    }
+    let home_rate = rates
+        .get(HOME_TAG)
+        .filter(|v| parse_tag_rate(v).is_configured())
+        .or_else(|| home_keys.first().copied());
+    // An unconfigured destination entry prices nothing, so it is not a rate the
+    // user set deliberately and may be overwritten.
+    let dest = rates.get(tag).filter(|v| parse_tag_rate(v).is_configured());
+    match (home_rate, dest) {
+        // No Home rate to preserve, but the label already prices something:
+        // freezing would move these charges onto a rate they never had.
+        (None, Some(_)) => RateCopy::Conflict(format!(
+            "\"{tag}\" already has a rate, and these charges had none — pick another name"
+        )),
+        (None, None) => RateCopy::Nothing,
+        (Some(home), None) => RateCopy::Copy(home.clone()),
+        (Some(home), Some(d)) if parse_tag_rate(home) == parse_tag_rate(d) => RateCopy::Nothing,
+        (Some(_), Some(_)) => RateCopy::Conflict(format!(
+            "\"{tag}\" already has a different rate — pick another name, or those charges would be repriced instead of preserved"
+        )),
+    }
+}
+
+/// The geofence a pending write leaves behind: the current one with whichever
+/// of the fields the request supplies, already clamped by the caller so this
+/// cannot disagree with what gets written. Rounded to the same 6dp the config
+/// file holds, so "still home afterwards" is decided against the values that
+/// will actually be read back. `None` when no home is configured — also the
+/// case where nothing can lose the tag.
+pub(crate) fn pending_home_geofence(
+    lat: Option<f64>,
+    lon: Option<f64>,
+    radius_m: Option<f64>,
+) -> Option<(f64, f64, f64)> {
+    let (cur_lat, cur_lon, cur_radius) = home_geofence()?;
+    // Round only what is being rewritten. A field the request omits keeps
+    // whatever precision the file already holds, so rounding it here would
+    // describe a circle a few centimetres off the one that stays on disk.
+    let round6 = |v: f64| format!("{v:.6}").parse::<f64>().unwrap_or(v);
+    Some((
+        lat.map(round6).unwrap_or(cur_lat),
+        lon.map(round6).unwrap_or(cur_lon),
+        radius_m.unwrap_or(cur_radius),
+    ))
+}
+
+/// True when moving the geofence to `new_home` takes this session out of Home.
+///
+/// `new_home: None` means the move is not describable, so every at-home session
+/// counts as losing it. That is the safe direction: over-freezing leaves a spare
+/// label the user can delete, under-freezing drops a cost nothing can rebuild.
+fn loses_home(
+    lat: Option<f64>,
+    lon: Option<f64>,
+    old_home: (f64, f64, f64),
+    new_home: Option<(f64, f64, f64)>,
+) -> bool {
+    is_home_charge(lat, lon, Some(old_home)) && !is_home_charge(lat, lon, new_home)
+}
+
+/// Session ids a move to `new_home` would un-tag. Errors rather than returning
+/// an empty list on a read failure: callers use this to decide whether history
+/// is at risk, and a silent zero reads as "nothing to lose".
+pub(crate) fn sessions_losing_home(
+    store: &sentryusb_drives::db::DriveStore,
+    new_home: Option<(f64, f64, f64)>,
+) -> anyhow::Result<Vec<i64>> {
+    let old_home = match home_geofence() {
+        Some(h) => h,
+        None => return Ok(Vec::new()), // no home configured: nothing was ever Home
+    };
+    let rows = store.with_read_conn(|conn| load_charge_rows(conn, 0, None))?;
+    Ok(group_sessions(rows)
+        .iter()
+        .map(|g| summarize(g))
+        .filter(|s| loses_home(s.location_lat, s.location_lon, old_home, new_home))
+        .map(|s| s.id)
+        .collect())
+}
+
+/// Session ids currently inside the home geofence — every one of them is at
+/// risk when the destination is unknown, which is what the count endpoint
+/// reports before the user has picked a new location.
+pub(crate) fn sessions_at_home(store: &sentryusb_drives::db::DriveStore) -> anyhow::Result<Vec<i64>> {
+    sessions_losing_home(store, None)
+}
+
+/// Freeze the sessions a move to `new_home` would un-tag, and copy the Home
+/// rate onto `tag` so their cost survives the move as well as their label.
+///
+/// Only the sessions that actually LOSE Home are frozen. A charge that stays
+/// inside the new circle — an overlapping move, or a radius increase — keeps
+/// deriving Home and would otherwise carry a permanent second label naming a
+/// house it never left, priced at a rate that stops matching the moment the
+/// Home rate is edited.
+///
+/// Additive and transactional (see `add_charge_tag_bulk`): existing tags are
+/// untouched, and either every session is frozen or none is.
+pub(crate) fn freeze_home_sessions(
+    store: &sentryusb_drives::db::DriveStore,
+    tag: &str,
+    new_home: Option<(f64, f64, f64)>,
+) -> anyhow::Result<Frozen> {
+    let tag = tag.trim();
+    if tag.is_empty() || sentryusb_drives::charging::is_reserved_tag(tag) {
+        anyhow::bail!("pick a name that isn't a reserved tag");
+    }
+    let ids = sessions_losing_home(store, new_home)?;
+    if ids.is_empty() {
+        return Ok(Frozen { tagged: 0, rates_dirty: false });
+    }
+    // Rate first: it is the half that can conflict, and a conflict must abort
+    // before anything is written. The in-use check runs inside that step (see
+    // copy_home_rate_to); with the label unused, a rate left behind by a later
+    // failure prices nothing. Exact tag match, mirroring `apply_rates`.
+    let id_set: std::collections::HashSet<i64> = ids.iter().copied().collect();
+    RateConfig::copy_home_rate_to(tag, || {
+        // Propagates: treating a failed read as "no labels in use" would let the
+        // repricing through on exactly the request that could not check.
+        //
+        // Known narrow race: this reads SQLite while holding only the prefs
+        // lock, so a tag edit landing between the read and the write could give
+        // an unrelated charge the copied rate. Closing it needs a lock spanning
+        // both stores, which does not exist; the window is microseconds and the
+        // outcome is a recoverable mispriced charge, not lost data.
+        Ok(store
+            .get_all_charge_tags()?
+            .iter()
+            .any(|(id, tags)| !id_set.contains(id) && tags.iter().any(|t| t == tag)))
+    })?;
+    // Mark BEFORE the tag write, and on "the label is priced" rather than "this
+    // call changed the map". A sync pull with no dirty row replaces the rate map
+    // wholesale, so an unmarked copy is not merely unsynced — it is deleted, and
+    // the frozen sessions lose exactly the cost this is preserving. Marking only
+    // on change leaves that hole open: if the tag write below fails after the
+    // rate landed, the retry plans `Nothing` and would never mark it.
+    //
+    // Hard error, not a warning: aborting here leaves an orphan rate on a label
+    // no session carries, which prices nothing.
+    let rates_dirty = tag_is_priced(&crate::preferences::load_prefs(), tag);
+    if rates_dirty {
+        store.mark_rate_config_dirty()?;
+    }
+    let n = store.add_charge_tag_bulk(&ids, tag)?;
+    Ok(Frozen { tagged: n, rates_dirty })
+}
+
+/// Whether `tag` resolves to a configured rate, matched EXACTLY as
+/// `apply_rates` looks it up. Pure so the sync-marking decision is testable:
+/// getting it wrong loses the frozen sessions' cost on the next pull, silently.
+fn tag_is_priced(prefs: &serde_json::Map<String, serde_json::Value>, tag: &str) -> bool {
+    prefs
+        .get("charging_tag_rates")
+        .and_then(|v| v.as_object())
+        .and_then(|m| m.get(tag))
+        .is_some_and(|v| parse_tag_rate(v).is_configured())
+}
+
+/// Freeze outcome. `rates_dirty` drives the cloud-sync nudge.
+pub(crate) struct Frozen {
+    pub tagged: usize,
+    pub rates_dirty: bool,
+}
 
 /// True when a session's charge location falls inside the home geofence.
 fn is_home_charge(lat: Option<f64>, lon: Option<f64>, home: Option<(f64, f64, f64)>) -> bool {
@@ -792,6 +1043,33 @@ pub async fn list_charge_tags(
 /// PUT /api/charging/{id}/tags — set tags for a charge session. `id` is
 /// the session's start timestamp (its stable id), so unlike drives it
 /// needs no resolution to a canonical key.
+/// GET /api/charging/home-sessions -> how many past sessions the CURRENT
+/// geofence claims, so the UI can say "189 charges are tagged Home" before a
+/// move rather than after. Errors are reported as errors: a silent 0 would
+/// tell the user there is nothing to lose at the exact moment there is.
+pub async fn home_session_count(
+    State(state): State<AppState>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let store = state.drives.store.clone();
+    match tokio::task::spawn_blocking(move || sessions_at_home(&store)).await {
+        Ok(Ok(ids)) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "count": ids.len(),
+                "home_set": home_geofence().is_some(),
+            })),
+        ),
+        Ok(Err(e)) => crate::json_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("could not read charge history: {e}"),
+        ),
+        Err(e) => crate::json_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("task failed: {e}"),
+        ),
+    }
+}
+
 pub async fn set_charge_tags(
     State(state): State<AppState>,
     Path(id): Path<i64>,
@@ -1564,5 +1842,194 @@ mod tests {
         assert_eq!(parse_minute_of_day(&serde_json::json!(390)), Some(390));
         assert_eq!(parse_minute_of_day(&serde_json::json!("nope")), None);
         assert_eq!(parse_minute_of_day(&serde_json::json!("25:00")), None);
+    }
+    #[test]
+    fn home_rate_is_copied_onto_the_frozen_tag() {
+        let mk = |json: &str| -> serde_json::Map<String, serde_json::Value> {
+            serde_json::from_str(json).unwrap()
+        };
+
+        // The case that matters: a Home rate exists, so the frozen set keeps
+        // the price it had while it was home.
+        let p = mk(r#"{"charging_tag_rates":{"Home":0.12,"Public":0.45}}"#);
+        assert_eq!(
+            home_rate_copy_plan(&p, "Old House"),
+            RateCopy::Copy(serde_json::json!(0.12))
+        );
+
+        // Case-insensitive on the Home key, matching how rates are matched.
+        let p = mk(r#"{"charging_tag_rates":{"home":0.2}}"#);
+        assert_eq!(
+            home_rate_copy_plan(&p, "Old House"),
+            RateCopy::Copy(serde_json::json!(0.2))
+        );
+
+        // Schedules (the object shape) copy whole, not just a flat rate.
+        let p = mk(r#"{"charging_tag_rates":{"Home":{"flat":0.1,"schedules":[{"rate":0.05}]}}}"#);
+        match home_rate_copy_plan(&p, "Old House") {
+            RateCopy::Copy(v) => assert_eq!(v["schedules"][0]["rate"], serde_json::json!(0.05)),
+            other => panic!("expected a copy, got {other:?}"),
+        }
+
+        // Nothing to preserve — reusing a named label is then harmless.
+        let p = mk(r#"{"charging_tag_rates":{"Public":0.45}}"#);
+        assert_eq!(home_rate_copy_plan(&p, "Old House"), RateCopy::Nothing);
+        assert_eq!(home_rate_copy_plan(&mk("{}"), "Old House"), RateCopy::Nothing);
+
+        // Re-freezing under a label that already holds the current Home rate is
+        // a no-op, not a conflict.
+        let p = mk(r#"{"charging_tag_rates":{"Home":0.12,"Old House":0.12}}"#);
+        assert_eq!(home_rate_copy_plan(&p, "Old House"), RateCopy::Nothing);
+
+        // Same rate written differently is the same rate, not a conflict.
+        let p = mk(r#"{"charging_tag_rates":{"Home":0.2,"Old House":"0.20"}}"#);
+        assert_eq!(home_rate_copy_plan(&p, "Old House"), RateCopy::Nothing);
+        let p = mk(r#"{"charging_tag_rates":{"Home":0.2,"Old House":{"flat":0.2}}}"#);
+        assert_eq!(home_rate_copy_plan(&p, "Old House"), RateCopy::Nothing);
+
+        // The label exists at a DIFFERENT rate: copying would clobber a
+        // deliberate rate, proceeding would reprice the frozen sessions at it.
+        let p = mk(r#"{"charging_tag_rates":{"Home":0.20,"Old House":0.29}}"#);
+        assert!(matches!(home_rate_copy_plan(&p, "Old House"), RateCopy::Conflict(_)));
+
+        // Casing: rate lookup at render time is EXACT, so a differently-cased
+        // key is NOT this tag. Copying under the requested spelling is what
+        // keeps the frozen sessions priced; treating it as "already there"
+        // would leave them with a tag no rate can be found for.
+        let p = mk(r#"{"charging_tag_rates":{"Home":0.12,"old house":0.12}}"#);
+        assert_eq!(
+            home_rate_copy_plan(&p, "Old House"),
+            RateCopy::Copy(serde_json::json!(0.12))
+        );
+
+        // Home key itself stays case-insensitive, matching how a home charge is
+        // priced; the canonical spelling wins when both exist and agree.
+        let p = mk(r#"{"charging_tag_rates":{"home":0.4,"Home":0.4}}"#);
+        assert_eq!(
+            home_rate_copy_plan(&p, "Old House"),
+            RateCopy::Copy(serde_json::json!(0.4))
+        );
+
+        // Two DISAGREEING Home rates: a home charge is priced at the most
+        // expensive of them, which needs the session rows. Refuse rather than
+        // guess which one to preserve.
+        let p = mk(r#"{"charging_tag_rates":{"home":0.4,"Home":0.1}}"#);
+        assert!(matches!(home_rate_copy_plan(&p, "Old House"), RateCopy::Conflict(_)));
+
+        // No Home rate but the label prices something: these charges had no
+        // derived cost, so freezing under it would invent one.
+        let p = mk(r#"{"charging_tag_rates":{"Old House":0.29}}"#);
+        assert!(matches!(home_rate_copy_plan(&p, "Old House"), RateCopy::Conflict(_)));
+
+        // An unconfigured destination prices nothing, so it is not a deliberate
+        // rate and may be overwritten rather than refused.
+        let p = mk(r#"{"charging_tag_rates":{"Home":0.15,"Old House":{}}}"#);
+        assert_eq!(
+            home_rate_copy_plan(&p, "Old House"),
+            RateCopy::Copy(serde_json::json!(0.15))
+        );
+
+        // No Home rate and an unconfigured destination: nothing is repriced.
+        let p = mk(r#"{"charging_tag_rates":{"Old House":{}}}"#);
+        assert_eq!(home_rate_copy_plan(&p, "Old House"), RateCopy::Nothing);
+
+        // A malformed Home rate prices nothing, so there is nothing to preserve
+        // and nothing to spread onto the frozen label.
+        for junk in [r#""NaN""#, r#""-1""#, "{}", r#"{"flat":null}"#] {
+            let p = mk(&format!(r#"{{"charging_tag_rates":{{"Home":{junk}}}}}"#));
+            assert_eq!(
+                home_rate_copy_plan(&p, "Old House"),
+                RateCopy::Nothing,
+                "junk Home rate {junk} must not be copied"
+            );
+        }
+    }
+
+    /// The freeze set is decided by this. A false negative drops a charge from
+    /// the freeze that the move then un-tags, losing a cost nothing can rebuild;
+    /// a false positive only leaves a spare label on a charge that stayed home.
+    #[test]
+    fn only_the_charges_a_move_leaves_behind_are_frozen() {
+        // ~0.01 deg of latitude is ~1.1km, far outside any of these circles.
+        let old = (40.000_000, -75.000_000, 120.0);
+        let at_old = (Some(40.000_000), Some(-75.000_000));
+        let far = (Some(40.010_000), Some(-75.000_000));
+
+        // No move described: everything at home is treated as at risk.
+        assert!(loses_home(at_old.0, at_old.1, old, None));
+
+        // Moved away entirely — the old set loses the tag.
+        let moved = Some((40.010_000, -75.000_000, 120.0));
+        assert!(loses_home(at_old.0, at_old.1, old, moved));
+
+        // Same circle, re-saved: nothing leaves.
+        assert!(!loses_home(at_old.0, at_old.1, old, Some(old)));
+
+        // Radius INCREASE keeps every old charge inside, so none is frozen.
+        // This is the case that used to stamp a second label on charges that
+        // never left home.
+        let wider = Some((40.000_000, -75.000_000, 400.0));
+        assert!(!loses_home(at_old.0, at_old.1, old, wider));
+
+        // Radius shrink drops the ones now outside, keeps the ones inside.
+        let tighter = Some((40.000_000, -75.000_000, 20.0));
+        // ~0.0005 deg latitude is ~55m: inside 120m, outside 20m.
+        let edge = (Some(40.000_500), Some(-75.000_000));
+        assert!(loses_home(edge.0, edge.1, old, tighter));
+        assert!(!loses_home(at_old.0, at_old.1, old, tighter));
+
+        // Never home to begin with: not this feature's business either way.
+        assert!(!loses_home(far.0, far.1, old, moved));
+        assert!(!loses_home(None, None, old, moved));
+    }
+
+    /// The freeze marks the rate document dirty on this predicate. A false
+    /// negative is silent and destructive: an unmarked rate loses to the next
+    /// pull, which replaces the rate map wholesale, so the frozen sessions keep
+    /// the label and lose the cost the freeze existed to preserve.
+    #[test]
+    fn a_priced_freeze_label_is_recognised_for_sync() {
+        let mk = |json: &str| -> serde_json::Map<String, serde_json::Value> {
+            serde_json::from_str(json).unwrap()
+        };
+
+        // Just-copied: the case that must sync.
+        let p = mk(r#"{"charging_tag_rates":{"Home":0.12,"Old House":0.12}}"#);
+        assert!(tag_is_priced(&p, "Old House"));
+
+        // The retry hole. A tag write that fails after the rate landed leaves
+        // this state; the retry plans `Nothing`, so marking on "the map changed"
+        // would never fire and the copy would be dropped on the next pull.
+        assert_eq!(home_rate_copy_plan(&p, "Old House"), RateCopy::Nothing);
+        assert!(tag_is_priced(&p, "Old House"), "an equal rate still needs marking");
+
+        // Schedule-only pricing counts: no flat rate, but the windows price it.
+        let p = mk(
+            r#"{"charging_tag_rates":{"Old House":{"schedules":[
+                {"start":"22:00","end":"06:00","rate":"0.08"}
+            ]}}}"#,
+        );
+        assert!(tag_is_priced(&p, "Old House"));
+
+        // A schedule the parser drops (no time bounds) prices nothing, so the
+        // label is not priced by it — matching `is_configured`.
+        let p = mk(r#"{"charging_tag_rates":{"Old House":{"schedules":[{"rate":0.05}]}}}"#);
+        assert!(!tag_is_priced(&p, "Old House"));
+
+        // Nothing was preserved, so there is nothing to sync.
+        assert!(!tag_is_priced(&mk("{}"), "Old House"));
+        let p = mk(r#"{"charging_tag_rates":{"Home":0.12}}"#);
+        assert!(!tag_is_priced(&p, "Old House"));
+
+        // Exact match, mirroring the render-time lookup: a differently-cased key
+        // is a different tag and does not price this one.
+        let p = mk(r#"{"charging_tag_rates":{"old house":0.12}}"#);
+        assert!(!tag_is_priced(&p, "Old House"));
+
+        // Junk prices nothing, so it is not worth a push.
+        for junk in [r#""NaN""#, r#""-1""#, "{}", r#"{"flat":null}"#] {
+            let p = mk(&format!(r#"{{"charging_tag_rates":{{"Old House":{junk}}}}}"#));
+            assert!(!tag_is_priced(&p, "Old House"), "junk rate {junk} is not a price");
+        }
     }
 }

@@ -227,10 +227,14 @@ pub fn build_router(state: AppState) -> Router {
             get(crate::drives_handler::tire_history),
         )
         // Charging — sessions derived on-demand from the per-sample
-        // charge columns. Empty unless the experimental flag is on.
+        // charge columns.
         .route("/api/charging", get(crate::charging::list_charging))
         .route("/api/charging/current", get(crate::charging::current_charging))
         .route("/api/charging/tags", get(crate::charging::list_charge_tags))
+        .route(
+            "/api/charging/home-sessions",
+            get(crate::charging::home_session_count),
+        )
         .route(
             "/api/charging/bulk-delete",
             post(crate::charging::bulk_delete_charges),

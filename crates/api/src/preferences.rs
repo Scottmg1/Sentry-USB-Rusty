@@ -47,6 +47,39 @@ pub(crate) fn load_prefs() -> serde_json::Map<String, serde_json::Value> {
         .unwrap_or_default()
 }
 
+/// Load → modify → save under [`PREFS_LOCK`], propagating write failures.
+/// `f` returns whether it changed anything; nothing is written if it didn't.
+/// Use over `save_prefs` (which only logs) when the caller must know the
+/// write landed.
+pub(crate) fn update_prefs<F>(f: F) -> anyhow::Result<bool>
+where
+    F: FnOnce(&mut serde_json::Map<String, serde_json::Value>) -> anyhow::Result<bool>,
+{
+    let _guard = PREFS_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let mut prefs = load_prefs();
+    if !f(&mut prefs)? {
+        return Ok(false);
+    }
+    save_prefs_checked(&prefs)?;
+    Ok(true)
+}
+
+/// Same write as [`save_prefs`] but the caller sees the failure.
+fn save_prefs_checked(prefs: &serde_json::Map<String, serde_json::Value>) -> anyhow::Result<()> {
+    let data = serde_json::to_string_pretty(prefs)?;
+    let prefs_path = prefs_file();
+    if let Some(parent) = std::path::Path::new(&prefs_path).parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let tmp = format!("{}.tmp", prefs_path);
+    std::fs::write(&tmp, &data)?;
+    if let Err(e) = std::fs::rename(&tmp, &prefs_path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e.into());
+    }
+    Ok(())
+}
+
 pub(crate) fn save_prefs(prefs: &serde_json::Map<String, serde_json::Value>) {
     // Atomic tmp+rename — a direct `fs::write` leaves the file in an
     // intermediate zero-length state if the kernel panics mid-write,
