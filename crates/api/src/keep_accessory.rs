@@ -165,6 +165,14 @@ pub struct KeepAccessoryConfigBody {
     pub home_lat: Option<f64>,
     pub home_lon: Option<f64>,
     pub home_radius_m: Option<f64>,
+    /// Before moving home, freeze the sessions this move takes out of the
+    /// geofence under this stored tag (e.g. "Old House"). The Home tag is
+    /// derived, so without this a move un-tags every past charge it leaves
+    /// behind and drops any cost that came from the Home rate. Charges that stay
+    /// inside the new circle keep deriving Home and are left alone. Must run
+    /// BEFORE the geofence moves — afterwards the old set cannot be identified.
+    /// Ignored when home is not changing.
+    pub freeze_home_as: Option<String>,
 }
 
 /// PUT /api/system/keep-accessory-config → persist the keep-accessory
@@ -174,29 +182,86 @@ pub async fn keep_accessory_config_set(
     State(_s): State<AppState>,
     Json(body): Json<KeepAccessoryConfigBody>,
 ) -> (StatusCode, Json<serde_json::Value>) {
+    // Radius resizes the same circle, so it re-derives the Home set exactly
+    // as a center move does — invalidate on either.
+    let freeze_as = body.freeze_home_as.clone().filter(|t| !t.trim().is_empty());
+    let home_moving =
+        body.home_lat.is_some() || body.home_lon.is_some() || body.home_radius_m.is_some();
+
+    // Clamp ONCE, here, and both write and freeze the same numbers. The freeze
+    // decides which sessions survive the move by testing them against the
+    // destination, so a second clamp elsewhere could answer "still home" about a
+    // circle that is not the one being written.
+    let new_lat = body.home_lat.filter(|v| v.is_finite()).map(|v| v.clamp(-90.0, 90.0));
+    // Leaflet world-copy clicks can arrive as e.g. -221.4 for 138.6°E.
+    let new_lon = body.home_lon.filter(|v| v.is_finite()).map(crate::normalize_lon);
+    // Clamp to a sane range (20m–2km) so a fat-finger can't make the geofence
+    // cover the county or vanish.
+    let new_radius = body.home_radius_m.map(|r| r.clamp(20.0, 2000.0).round());
+    let enabled = body.enabled;
+
+    let mut frozen = 0usize;
+    if home_moving {
+        if let Some(tag) = freeze_as {
+            let store = _s.drives.store.clone();
+            match tokio::task::spawn_blocking(move || {
+                let new_home =
+                    crate::charging::pending_home_geofence(new_lat, new_lon, new_radius);
+                crate::charging::freeze_home_sessions(&store, &tag, new_home)
+            })
+            .await
+            {
+                Ok(Ok(f)) => {
+                    frozen = f.tagged;
+                    // The copied rate is part of the synced rate document, so it
+                    // has to reach the cloud like any other rate edit. The dirty
+                    // mark itself happens at write time inside the freeze — doing
+                    // it only here would leave the rate unmarked whenever the
+                    // freeze failed after writing it, and a pull would then drop
+                    // the copy. All that is left is waking the sweep.
+                    if f.rates_dirty {
+                        _s.cloud.uploader.nudge();
+                    }
+                }
+                // ABORT: the caller asked to preserve history first. Moving
+                // anyway would destroy exactly what they were protecting, and
+                // an ok:true would hide it. Leave the geofence alone.
+                Ok(Err(e)) => {
+                    return crate::json_error(
+                        StatusCode::BAD_REQUEST,
+                        &format!("home not moved — could not preserve past charges: {e}"),
+                    )
+                }
+                Err(e) => {
+                    return crate::json_error(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        &format!("home not moved — freeze task failed: {e}"),
+                    )
+                }
+            }
+        }
+    }
+
     let result = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
         let config_path = sentryusb_config::find_config_path();
         let (mut active, _) = sentryusb_config::parse_file(config_path)?;
-        if let Some(enabled) = body.enabled {
+        if let Some(enabled) = enabled {
             active.insert(
                 "KEEP_ACCESSORY_ENABLED".to_string(),
                 if enabled { "yes" } else { "no" }.to_string(),
             );
         }
-        if let Some(lat) = body.home_lat.filter(|v| v.is_finite()) {
-            let lat = lat.clamp(-90.0, 90.0);
+        if let Some(lat) = new_lat {
             active.insert("KEEP_ACCESSORY_HOME_LAT".to_string(), format!("{lat:.6}"));
         }
-        if let Some(lon) = body.home_lon.filter(|v| v.is_finite()) {
-            // Leaflet world-copy clicks can arrive as e.g. -221.4 for 138.6°E.
-            let lon = crate::normalize_lon(lon);
+        if let Some(lon) = new_lon {
             active.insert("KEEP_ACCESSORY_HOME_LON".to_string(), format!("{lon:.6}"));
         }
-        if let Some(r) = body.home_radius_m {
-            // Clamp to a sane range (20m–2km) so a fat-finger can't make
-            // the geofence cover the county or vanish.
-            let r = r.clamp(20.0, 2000.0).round() as i64;
-            active.insert("KEEP_ACCESSORY_HOME_RADIUS_M".to_string(), r.to_string());
+        if let Some(r) = new_radius {
+            active.insert(
+                "KEEP_ACCESSORY_HOME_RADIUS_M".to_string(),
+                (r as i64).to_string(),
+            );
         }
         // RO root → flip rw for the write (same pattern as ble_enabled_set).
         let _ = std::process::Command::new("bash")
@@ -210,7 +275,17 @@ pub async fn keep_accessory_config_set(
     match result {
         Ok(Ok(())) => {
             info!("[keep-accessory] config updated");
-            (StatusCode::OK, Json(serde_json::json!({ "ok": true })))
+            if home_moving {
+                // The "Home" tag is derived from this geofence, so every cached
+                // charging summary is now stale. Without this the user saves a
+                // new home and the tags stay wrong for up to the cache TTL,
+                // which reads as "it didn't work".
+                crate::charging::invalidate_charging_list();
+            }
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({ "ok": true, "frozen": frozen })),
+            )
         }
         Ok(Err(e)) => crate::json_error(
             StatusCode::INTERNAL_SERVER_ERROR,

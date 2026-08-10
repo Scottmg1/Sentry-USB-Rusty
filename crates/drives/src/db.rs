@@ -1063,6 +1063,43 @@ impl DriveStore {
         Ok(())
     }
 
+    /// ADD one tag to many sessions in a SINGLE transaction.
+    ///
+    /// Used when the home geofence moves: the "Home" tag is derived, so every
+    /// past session at the old address is about to lose it (and any cost that
+    /// came from the Home rate). Freezing them under a real stored tag keeps
+    /// that history — but only if it is all-or-nothing. Tagging them one call
+    /// at a time meant a failure halfway left some sessions frozen and the rest
+    /// silently stripped, which is worse than not offering the feature.
+    ///
+    /// Additive on purpose: it never rewrites a session's existing tags, so a
+    /// failed read of the current tag map cannot wipe them. Re-running with the
+    /// same label is a no-op thanks to INSERT OR IGNORE.
+    pub fn add_charge_tag_bulk(&self, session_ts: &[i64], tag: &str) -> Result<usize> {
+        let tag = tag.trim();
+        if tag.is_empty() || crate::charging::is_reserved_tag(tag) {
+            anyhow::bail!("refusing to store a reserved or empty tag: {tag:?}");
+        }
+        if session_ts.is_empty() {
+            return Ok(0);
+        }
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        {
+            let mut stmt = tx.prepare(
+                "INSERT OR IGNORE INTO charge_tags(session_ts, tag) VALUES(?1, ?2)",
+            )?;
+            for ts in session_ts {
+                stmt.execute(params![ts, tag])?;
+            }
+        }
+        for ts in session_ts {
+            mark_mutable_dirty(&tx, "charge", &ts.to_string())?;
+        }
+        tx.commit()?;
+        Ok(session_ts.len())
+    }
+
     /// Tags for one charge session, or an empty vec.
     pub fn get_charge_tags(&self, session_ts: i64) -> Result<Vec<String>> {
         self.with_read_conn(|conn| {
@@ -4166,4 +4203,38 @@ mod tests {
         assert_ne!(pushed, "stale-go-era-copy");
         assert!(pushed.contains("2025-01-15"));
     }
+    #[test]
+    fn bulk_tag_is_additive_and_rejects_reserved_labels() {
+        let store = DriveStore::open_memory().unwrap();
+        // Existing tags must survive: the freeze runs while the user still has
+        // a year of labels on these sessions, and clobbering them would be a
+        // worse loss than the derived tag it is trying to preserve.
+        store.set_charge_tags(1000, &["Public".into()]).unwrap();
+        store.set_charge_tags(2000, &["Road trip".into()]).unwrap();
+
+        let n = store.add_charge_tag_bulk(&[1000, 2000], "Old House").unwrap();
+        assert_eq!(n, 2);
+        assert_eq!(
+            store.get_charge_tags(1000).unwrap(),
+            vec!["Old House".to_string(), "Public".to_string()]
+        );
+        assert_eq!(
+            store.get_charge_tags(2000).unwrap(),
+            vec!["Old House".to_string(), "Road trip".to_string()]
+        );
+
+        // Idempotent — moving house twice with the same label must not duplicate.
+        store.add_charge_tag_bulk(&[1000], "Old House").unwrap();
+        assert_eq!(
+            store.get_charge_tags(1000).unwrap(),
+            vec!["Old House".to_string(), "Public".to_string()]
+        );
+
+        // Reserved labels are refused: they are re-derived, so storing one is a
+        // silent no-op that would leave the user believing history was kept.
+        assert!(store.add_charge_tag_bulk(&[1000], "Home").is_err());
+        assert!(store.add_charge_tag_bulk(&[1000], "fast charging").is_err());
+        assert!(store.add_charge_tag_bulk(&[1000], "   ").is_err());
+    }
+
 }
