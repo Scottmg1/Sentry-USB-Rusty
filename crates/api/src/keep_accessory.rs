@@ -165,11 +165,13 @@ pub struct KeepAccessoryConfigBody {
     pub home_lat: Option<f64>,
     pub home_lon: Option<f64>,
     pub home_radius_m: Option<f64>,
-    /// Before moving home, freeze the sessions inside the OLD geofence under
-    /// this stored tag (e.g. "Old House"). The Home tag is derived, so without
-    /// this a move un-tags every past charge there and drops any cost that came
-    /// from the Home rate. Must run BEFORE the geofence moves — afterwards the
-    /// old set cannot be identified. Ignored when home is not changing.
+    /// Before moving home, freeze the sessions this move takes out of the
+    /// geofence under this stored tag (e.g. "Old House"). The Home tag is
+    /// derived, so without this a move un-tags every past charge it leaves
+    /// behind and drops any cost that came from the Home rate. Charges that stay
+    /// inside the new circle keep deriving Home and are left alone. Must run
+    /// BEFORE the geofence moves — afterwards the old set cannot be identified.
+    /// Ignored when home is not changing.
     pub freeze_home_as: Option<String>,
 }
 
@@ -186,12 +188,26 @@ pub async fn keep_accessory_config_set(
     let home_moving =
         body.home_lat.is_some() || body.home_lon.is_some() || body.home_radius_m.is_some();
 
+    // Clamp ONCE, here, and both write and freeze the same numbers. The freeze
+    // decides which sessions survive the move by testing them against the
+    // destination, so a second clamp elsewhere could answer "still home" about a
+    // circle that is not the one being written.
+    let new_lat = body.home_lat.filter(|v| v.is_finite()).map(|v| v.clamp(-90.0, 90.0));
+    // Leaflet world-copy clicks can arrive as e.g. -221.4 for 138.6°E.
+    let new_lon = body.home_lon.filter(|v| v.is_finite()).map(crate::normalize_lon);
+    // Clamp to a sane range (20m–2km) so a fat-finger can't make the geofence
+    // cover the county or vanish.
+    let new_radius = body.home_radius_m.map(|r| r.clamp(20.0, 2000.0).round());
+    let enabled = body.enabled;
+
     let mut frozen = 0usize;
     if home_moving {
         if let Some(tag) = freeze_as {
             let store = _s.drives.store.clone();
             match tokio::task::spawn_blocking(move || {
-                crate::charging::freeze_home_sessions(&store, &tag)
+                let new_home =
+                    crate::charging::pending_home_geofence(new_lat, new_lon, new_radius);
+                crate::charging::freeze_home_sessions(&store, &tag, new_home)
             })
             .await
             {
@@ -229,26 +245,23 @@ pub async fn keep_accessory_config_set(
     let result = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
         let config_path = sentryusb_config::find_config_path();
         let (mut active, _) = sentryusb_config::parse_file(config_path)?;
-        if let Some(enabled) = body.enabled {
+        if let Some(enabled) = enabled {
             active.insert(
                 "KEEP_ACCESSORY_ENABLED".to_string(),
                 if enabled { "yes" } else { "no" }.to_string(),
             );
         }
-        if let Some(lat) = body.home_lat.filter(|v| v.is_finite()) {
-            let lat = lat.clamp(-90.0, 90.0);
+        if let Some(lat) = new_lat {
             active.insert("KEEP_ACCESSORY_HOME_LAT".to_string(), format!("{lat:.6}"));
         }
-        if let Some(lon) = body.home_lon.filter(|v| v.is_finite()) {
-            // Leaflet world-copy clicks can arrive as e.g. -221.4 for 138.6°E.
-            let lon = crate::normalize_lon(lon);
+        if let Some(lon) = new_lon {
             active.insert("KEEP_ACCESSORY_HOME_LON".to_string(), format!("{lon:.6}"));
         }
-        if let Some(r) = body.home_radius_m {
-            // Clamp to a sane range (20m–2km) so a fat-finger can't make
-            // the geofence cover the county or vanish.
-            let r = r.clamp(20.0, 2000.0).round() as i64;
-            active.insert("KEEP_ACCESSORY_HOME_RADIUS_M".to_string(), r.to_string());
+        if let Some(r) = new_radius {
+            active.insert(
+                "KEEP_ACCESSORY_HOME_RADIUS_M".to_string(),
+                (r as i64).to_string(),
+            );
         }
         // RO root → flip rw for the write (same pattern as ble_enabled_set).
         let _ = std::process::Command::new("bash")

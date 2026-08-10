@@ -196,8 +196,8 @@ export function HomeLocationSection({
                 {atRisk === null
                   ? "Some past charges may be tagged Home at your current location."
                   : `${atRisk} past ${atRisk === 1 ? "charge is" : "charges are"} tagged Home at your current location.`}{" "}
-                Moving home un-tags {atRisk === 1 ? "it" : "them"} and drops any cost that came from
-                your Home rate. Keep them under a name instead:
+                Any that end up outside the new area lose that tag, and with it any cost that came
+                from your Home rate. Keep those under a name instead:
               </p>
               <div className="flex items-center gap-2">
                 <input
@@ -217,8 +217,8 @@ export function HomeLocationSection({
                 </button>
               </div>
               <p className="text-[10px] text-amber-200/60">
-                Tags those charges and copies your Home rate onto that name, so they keep their cost
-                and stay filterable.
+                Tags the charges that leave the area and copies your Home rate onto that name, so
+                they keep their cost and stay filterable. Charges still inside it are left alone.
               </p>
               <button
                 type="button"

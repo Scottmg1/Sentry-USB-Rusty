@@ -558,11 +558,51 @@ fn home_rate_copy_plan(
     }
 }
 
-/// Session ids currently inside the home geofence. Errors rather than
-/// returning an empty list on a read failure: callers use this to decide
-/// whether history is at risk, and a silent zero reads as "nothing to lose".
-pub(crate) fn sessions_at_home(store: &sentryusb_drives::db::DriveStore) -> anyhow::Result<Vec<i64>> {
-    let home = match home_geofence() {
+/// The geofence a pending write leaves behind: the current one with whichever
+/// of the fields the request supplies, already clamped by the caller so this
+/// cannot disagree with what gets written. Rounded to the same 6dp the config
+/// file holds, so "still home afterwards" is decided against the values that
+/// will actually be read back. `None` when no home is configured — also the
+/// case where nothing can lose the tag.
+pub(crate) fn pending_home_geofence(
+    lat: Option<f64>,
+    lon: Option<f64>,
+    radius_m: Option<f64>,
+) -> Option<(f64, f64, f64)> {
+    let (cur_lat, cur_lon, cur_radius) = home_geofence()?;
+    // Round only what is being rewritten. A field the request omits keeps
+    // whatever precision the file already holds, so rounding it here would
+    // describe a circle a few centimetres off the one that stays on disk.
+    let round6 = |v: f64| format!("{v:.6}").parse::<f64>().unwrap_or(v);
+    Some((
+        lat.map(round6).unwrap_or(cur_lat),
+        lon.map(round6).unwrap_or(cur_lon),
+        radius_m.unwrap_or(cur_radius),
+    ))
+}
+
+/// True when moving the geofence to `new_home` takes this session out of Home.
+///
+/// `new_home: None` means the move is not describable, so every at-home session
+/// counts as losing it. That is the safe direction: over-freezing leaves a spare
+/// label the user can delete, under-freezing drops a cost nothing can rebuild.
+fn loses_home(
+    lat: Option<f64>,
+    lon: Option<f64>,
+    old_home: (f64, f64, f64),
+    new_home: Option<(f64, f64, f64)>,
+) -> bool {
+    is_home_charge(lat, lon, Some(old_home)) && !is_home_charge(lat, lon, new_home)
+}
+
+/// Session ids a move to `new_home` would un-tag. Errors rather than returning
+/// an empty list on a read failure: callers use this to decide whether history
+/// is at risk, and a silent zero reads as "nothing to lose".
+pub(crate) fn sessions_losing_home(
+    store: &sentryusb_drives::db::DriveStore,
+    new_home: Option<(f64, f64, f64)>,
+) -> anyhow::Result<Vec<i64>> {
+    let old_home = match home_geofence() {
         Some(h) => h,
         None => return Ok(Vec::new()), // no home configured: nothing was ever Home
     };
@@ -570,25 +610,39 @@ pub(crate) fn sessions_at_home(store: &sentryusb_drives::db::DriveStore) -> anyh
     Ok(group_sessions(rows)
         .iter()
         .map(|g| summarize(g))
-        .filter(|s| is_home_charge(s.location_lat, s.location_lon, Some(home)))
+        .filter(|s| loses_home(s.location_lat, s.location_lon, old_home, new_home))
         .map(|s| s.id)
         .collect())
 }
 
-/// Freeze today's at-home sessions under `tag`, and copy the Home rate onto it
-/// so their cost survives the move as well as their label.
+/// Session ids currently inside the home geofence — every one of them is at
+/// risk when the destination is unknown, which is what the count endpoint
+/// reports before the user has picked a new location.
+pub(crate) fn sessions_at_home(store: &sentryusb_drives::db::DriveStore) -> anyhow::Result<Vec<i64>> {
+    sessions_losing_home(store, None)
+}
+
+/// Freeze the sessions a move to `new_home` would un-tag, and copy the Home
+/// rate onto `tag` so their cost survives the move as well as their label.
+///
+/// Only the sessions that actually LOSE Home are frozen. A charge that stays
+/// inside the new circle — an overlapping move, or a radius increase — keeps
+/// deriving Home and would otherwise carry a permanent second label naming a
+/// house it never left, priced at a rate that stops matching the moment the
+/// Home rate is edited.
 ///
 /// Additive and transactional (see `add_charge_tag_bulk`): existing tags are
 /// untouched, and either every session is frozen or none is.
 pub(crate) fn freeze_home_sessions(
     store: &sentryusb_drives::db::DriveStore,
     tag: &str,
+    new_home: Option<(f64, f64, f64)>,
 ) -> anyhow::Result<Frozen> {
     let tag = tag.trim();
     if tag.is_empty() || sentryusb_drives::charging::is_reserved_tag(tag) {
         anyhow::bail!("pick a name that isn't a reserved tag");
     }
-    let ids = sessions_at_home(store)?;
+    let ids = sessions_losing_home(store, new_home)?;
     if ids.is_empty() {
         return Ok(Frozen { tagged: 0, rates_dirty: false });
     }
@@ -1889,6 +1943,44 @@ mod tests {
                 "junk Home rate {junk} must not be copied"
             );
         }
+    }
+
+    /// The freeze set is decided by this. A false negative drops a charge from
+    /// the freeze that the move then un-tags, losing a cost nothing can rebuild;
+    /// a false positive only leaves a spare label on a charge that stayed home.
+    #[test]
+    fn only_the_charges_a_move_leaves_behind_are_frozen() {
+        // ~0.01 deg of latitude is ~1.1km, far outside any of these circles.
+        let old = (40.000_000, -75.000_000, 120.0);
+        let at_old = (Some(40.000_000), Some(-75.000_000));
+        let far = (Some(40.010_000), Some(-75.000_000));
+
+        // No move described: everything at home is treated as at risk.
+        assert!(loses_home(at_old.0, at_old.1, old, None));
+
+        // Moved away entirely — the old set loses the tag.
+        let moved = Some((40.010_000, -75.000_000, 120.0));
+        assert!(loses_home(at_old.0, at_old.1, old, moved));
+
+        // Same circle, re-saved: nothing leaves.
+        assert!(!loses_home(at_old.0, at_old.1, old, Some(old)));
+
+        // Radius INCREASE keeps every old charge inside, so none is frozen.
+        // This is the case that used to stamp a second label on charges that
+        // never left home.
+        let wider = Some((40.000_000, -75.000_000, 400.0));
+        assert!(!loses_home(at_old.0, at_old.1, old, wider));
+
+        // Radius shrink drops the ones now outside, keeps the ones inside.
+        let tighter = Some((40.000_000, -75.000_000, 20.0));
+        // ~0.0005 deg latitude is ~55m: inside 120m, outside 20m.
+        let edge = (Some(40.000_500), Some(-75.000_000));
+        assert!(loses_home(edge.0, edge.1, old, tighter));
+        assert!(!loses_home(at_old.0, at_old.1, old, tighter));
+
+        // Never home to begin with: not this feature's business either way.
+        assert!(!loses_home(far.0, far.1, old, moved));
+        assert!(!loses_home(None, None, old, moved));
     }
 
     /// The freeze marks the rate document dirty on this predicate. A false

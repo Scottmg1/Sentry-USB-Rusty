@@ -46,6 +46,16 @@ export default function Charging() {
   // every row, which is what per-session affordances degrade into when the
   // feature is entirely unconfigured.
   const [homeConfigured, setHomeConfigured] = useState<boolean | null>(null)
+  // Escape closes the editor. Nothing is written until the user confirms, so
+  // backing out is always safe and should not need a mouse.
+  useEffect(() => {
+    if (!homeSeed) return
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") setHomeSeed(null)
+    }
+    document.addEventListener("keydown", onKey)
+    return () => document.removeEventListener("keydown", onKey)
+  }, [homeSeed])
   useEffect(() => {
     let alive = true
     fetch("/api/system/keep-accessory-config")
@@ -380,12 +390,17 @@ export default function Charging() {
           onClick={() => setHomeSeed(null)}
         >
           <div
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="home-location-title"
             className="max-h-[85vh] w-full max-w-md overflow-y-auto rounded-xl border border-white/10 bg-slate-950 p-4"
             onClick={(e) => e.stopPropagation()}
           >
             <div className="mb-3 flex items-center justify-between">
               <div>
-                <h2 className="text-sm font-medium text-slate-200">Home location</h2>
+                <h2 id="home-location-title" className="text-sm font-medium text-slate-200">
+                  Home location
+                </h2>
               </div>
               <button
                 type="button"
