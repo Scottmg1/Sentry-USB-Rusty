@@ -2876,6 +2876,7 @@ fn select_overview_metas(conn: &Connection) -> Result<Vec<crate::grouper::Overvi
                 gear_states_blob, gear_runs_blob,
                 raw_park_count, raw_frame_count,
                 CASE WHEN file LIKE 'SavedClips/%' OR file LIKE 'SentryClips/%'
+                          OR file LIKE 'SavedClips\\%' OR file LIKE 'SentryClips\\%'
                      THEN speeds_blob ELSE NULL END,
                 source, external_signature
          FROM routes
