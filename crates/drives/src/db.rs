@@ -2022,13 +2022,82 @@ impl DriveStore {
             }
         }
 
-        let routes = self.with_read_conn(select_routes_for_overview)?;
-        let overviews = crate::grouper::route_overviews(routes, max_points);
+        let overviews = self.build_overviews_streaming(max_points)?;
         let json = serde_json::to_string(&overviews).unwrap_or_else(|_| "[]".to_string());
         let mut cache = self.route_overview_cache.lock().unwrap();
         *cache = Some(RouteOverviewCache { generation, max_points, json: json.clone() });
         self.last_overview_rebuild.store(now_unix(), Ordering::Release);
         Ok(json)
+    }
+
+    /// Streaming overview build: plan every drive from metadata, then
+    /// decode point BLOBs in bounded batches of consecutive drives.
+    /// Peak heap is one batch (~budgeted) plus the response, instead of
+    /// every route's full arrays (~350MB decoded on an 18.5k-route
+    /// store). Output is byte-identical to the old in-memory path —
+    /// enforced by the grouper's differential test and the db-level
+    /// parity test below.
+    fn build_overviews_streaming(
+        &self,
+        max_points: usize,
+    ) -> Result<Vec<crate::types::RouteOverview>> {
+        // Decoded-point budget per batch: 1M points = 16MB decoded.
+        const BATCH_POINT_BUDGET: usize = 1_000_000;
+
+        let metas = self.with_read_conn(select_overview_metas)?;
+        let plans = crate::grouper::plan_overviews(&metas);
+
+        let mut out = Vec::with_capacity(plans.len());
+        let mut batch_start = 0usize;
+        while batch_start < plans.len() {
+            // Greedy: consecutive drives until the point budget is hit
+            // (always at least one drive, however large).
+            let mut batch_end = batch_start;
+            let mut budget = 0usize;
+            let mut files: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+            while batch_end < plans.len() {
+                let cost: usize = plans[batch_end]
+                    .fragments
+                    .iter()
+                    .map(|f| metas[f.meta_idx].n_points)
+                    .sum();
+                if batch_end > batch_start && budget + cost > BATCH_POINT_BUDGET {
+                    break;
+                }
+                budget += cost;
+                for f in &plans[batch_end].fragments {
+                    files.insert(metas[f.meta_idx].file.as_str());
+                }
+                batch_end += 1;
+            }
+
+            let file_list: Vec<&str> = files.into_iter().collect();
+            let points = self.with_read_conn(|conn| select_points_by_files(conn, &file_list))?;
+
+            for (idx, drive) in plans[batch_start..batch_end].iter().enumerate() {
+                let id = (batch_start + idx) as i32;
+                let overview = crate::grouper::overview_from_fragments(
+                    id,
+                    drive,
+                    &metas,
+                    &mut |meta_idx| {
+                        // A row deleted between the meta and points
+                        // queries yields no entry; empty points keep the
+                        // drive present (matching the oracle's
+                        // empty-geometry behavior) until the generation
+                        // bump rebuilds.
+                        Ok(points
+                            .get(&metas[meta_idx].file)
+                            .cloned()
+                            .unwrap_or_default())
+                    },
+                    max_points,
+                )?;
+                out.push(overview);
+            }
+            batch_start = batch_end;
+        }
+        Ok(out)
     }
 
     /// Return the pre-computed drive stats as a JSON string. `processed_count`
@@ -2777,36 +2846,87 @@ fn select_all_routes(conn: &Connection) -> Result<Vec<Route>> {
     Ok(out)
 }
 
-/// [`select_all_routes`] minus every column the map overview never reads
-/// — AP/accel/flag blobs and the telemetry rollups — with speeds kept
-/// only for event rows, whose gap-fill driving gate reads them. Same
-/// column positions (NULL placeholders) so the shared row mapper
-/// applies; decoded Routes differ only in fields the overview path is
-/// proven not to touch. Roughly 70MB less read and two thirds less
-/// decoded heap on a measured 18.5k-route store.
-fn select_routes_for_overview(conn: &Connection) -> Result<Vec<Route>> {
+/// Reduced per-route metadata for the overview planner: every fact the
+/// grouping topology consults, no point data. gear_states and event
+/// speeds are decoded per row, reduced to scalars, and dropped.
+fn select_overview_metas(conn: &Connection) -> Result<Vec<crate::grouper::OverviewClipMeta>> {
     let mut stmt = conn.prepare_cached(
-        "SELECT file, date_dir, raw_park_count, raw_frame_count,
-                points_blob, gear_states_blob, NULL,
+        "SELECT file,
+                coalesce(length(points_blob), 0) / 16,
+                gear_states_blob, gear_runs_blob,
+                raw_park_count, raw_frame_count,
                 CASE WHEN file LIKE 'SavedClips/%' OR file LIKE 'SentryClips/%'
                      THEN speeds_blob ELSE NULL END,
-                NULL, gear_runs_blob,
-                source, external_signature, NULL,
-                NULL, NULL,
-                NULL, NULL, NULL,
-                NULL,
-                NULL, NULL, NULL, NULL,
-                NULL, NULL,
-                NULL, NULL,
-                NULL
+                source, external_signature
          FROM routes
          ORDER BY file",
     )?;
-    let rows = stmt.query_map([], route_row_mapper)?;
+    let rows = stmt.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, i64>(1)?,
+            row.get::<_, Option<Vec<u8>>>(2)?,
+            row.get::<_, Option<Vec<u8>>>(3)?,
+            row.get::<_, i64>(4)?,
+            row.get::<_, i64>(5)?,
+            row.get::<_, Option<Vec<u8>>>(6)?,
+            row.get::<_, Option<String>>(7)?,
+            row.get::<_, Option<String>>(8)?,
+        ))
+    })?;
 
     let mut out = Vec::new();
     for r in rows {
-        out.push(build_route_from_row(r?)?);
+        let (file, n_points, gs_blob, gr_blob, park, frame, sp_blob, source, sig) = r?;
+        let gear_states = decode_u8s(gs_blob.as_deref()).unwrap_or_default();
+        let gear_runs = decode_gear_runs(gr_blob.as_deref())
+            .with_context(|| format!("decode gear_runs {}", file))?
+            .unwrap_or_default();
+        let speeds = decode_f32s(sp_blob.as_deref())
+            .with_context(|| format!("decode speeds {}", file))?
+            .unwrap_or_default();
+        out.push(crate::grouper::OverviewClipMeta {
+            file,
+            n_points: n_points.max(0) as usize,
+            gear_runs,
+            gear_states_len: gear_states.len(),
+            gear_states_non_park: gear_states.iter().any(|&g| g != crate::types::GEAR_PARK),
+            gear_states_park_count: gear_states
+                .iter()
+                .filter(|&&g| g == crate::types::GEAR_PARK)
+                .count(),
+            raw_park_count: park.max(0) as u32,
+            raw_frame_count: frame.max(0) as u32,
+            speeds_driving: crate::grouper::speeds_driving(&speeds),
+            source,
+            external_signature: sig,
+        });
+    }
+    Ok(out)
+}
+
+/// Decoded points for the named files, chunked IN-lookups on the PK.
+fn select_points_by_files(
+    conn: &Connection,
+    files: &[&str],
+) -> Result<std::collections::HashMap<String, std::rc::Rc<Vec<GpsPoint>>>> {
+    const CHUNK: usize = 400;
+    let mut out = std::collections::HashMap::with_capacity(files.len());
+    for chunk in files.chunks(CHUNK) {
+        let placeholders = vec!["?"; chunk.len()].join(",");
+        let mut stmt = conn.prepare(&format!(
+            "SELECT file, points_blob FROM routes WHERE file IN ({placeholders})"
+        ))?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(chunk.iter()), |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, Option<Vec<u8>>>(1)?))
+        })?;
+        for r in rows {
+            let (file, blob) = r?;
+            let pts = crate::blob::decode_points(blob.as_deref())
+                .with_context(|| format!("decode points {}", file))?
+                .unwrap_or_default();
+            out.insert(file, std::rc::Rc::new(pts));
+        }
     }
     Ok(out)
 }
@@ -3499,30 +3619,40 @@ mod tests {
         assert!(stats.contains("drives_count"));
     }
 
-    /// The pruned overview query must group and render byte-identically
-    /// to the full one. The event row is crafted so its gap-fill
-    /// admission hinges ONLY on the speeds column — empty gear evidence,
-    /// park count equal to frame count — proving the pruned query keeps
-    /// speeds for event rows.
+    /// The streaming builder must produce byte-identical overview JSON to
+    /// the retained in-memory oracle over a store exercising park splits,
+    /// speeds-gated gap-fill, and plain drives, at several point limits.
     #[test]
-    fn pruned_overview_query_matches_full_route_load() {
+    fn streaming_overviews_match_in_memory_oracle() {
         let store = DriveStore::open_memory().unwrap();
-        let pts: Vec<GpsPoint> = vec![[37.7749, -122.4194], [37.7760, -122.4180]];
-        // Two RecentClips anchors with a 10-minute hole between them.
+        let pts: Vec<GpsPoint> = (0..6).map(|i| [37.7 + i as f64 * 0.001, -122.4]).collect();
         store
             .add_route("a/2025-01-01_10-00-00-front.mp4", "a", &pts, &[4, 4], &[0, 0], &[20.0, 21.0], &[0.0, 0.0], 0, 2, &[], &[])
             .unwrap();
-        store
-            .add_route("a/2025-01-01_10-10-00-front.mp4", "a", &pts, &[4, 4], &[0, 0], &[20.0, 21.0], &[0.0, 0.0], 0, 2, &[], &[])
-            .unwrap();
-        // Interior event clip shaped so ONLY the speeds column proves
-        // driving: no gear evidence and zero raw frame counts (the
-        // imported-history shape), so every other clause of
-        // telemetry_has_driving is false. Dropping speeds from the
-        // pruned query would demote this to two separate drives.
+        // Park-split clip.
         store
             .add_route(
-                "SavedClips/2025-01-01_10-20-00/2025-01-01_10-05-00-front.mp4",
+                "a/2025-01-01_10-00-40-front.mp4",
+                "a",
+                &pts,
+                &[4, 4, 0, 0, 4, 4],
+                &[0; 6],
+                &[15.0; 6],
+                &[0.0; 6],
+                300,
+                900,
+                &[
+                    crate::types::GearRun { gear: 4, frames: 300 },
+                    crate::types::GearRun { gear: 0, frames: 300 },
+                    crate::types::GearRun { gear: 4, frames: 300 },
+                ],
+                &[],
+            )
+            .unwrap();
+        // Speeds-gated interior event fill for the 10:00:40 -> 10:08 hole.
+        store
+            .add_route(
+                "SavedClips/2025-01-01_10-30-00/2025-01-01_10-04-00-front.mp4",
                 "SavedClips",
                 &pts,
                 &[],
@@ -3535,19 +3665,21 @@ mod tests {
                 &[],
             )
             .unwrap();
+        store
+            .add_route("a/2025-01-01_10-08-00-front.mp4", "a", &pts, &[4, 4], &[0, 0], &[18.0, 18.0], &[0.0, 0.0], 0, 2, &[], &[])
+            .unwrap();
 
-        let (full, pruned) = store.with_locked_conn(|conn| {
-            (
-                select_all_routes(conn).unwrap(),
-                select_routes_for_overview(conn).unwrap(),
-            )
-        });
-        let a = serde_json::to_string(&crate::grouper::route_overviews(full, 20)).unwrap();
-        let b = serde_json::to_string(&crate::grouper::route_overviews(pruned, 20)).unwrap();
-        assert_eq!(a, b, "pruned and full overview outputs must match");
-        // The speeds-gated event clip merged the two anchors: one drive.
-        let parsed: Vec<crate::types::RouteOverview> = serde_json::from_str(&a).unwrap();
-        assert_eq!(parsed.len(), 1, "event fill should bridge the hole: {a}");
+        for max_points in [2usize, 20, 500] {
+            let oracle = store.with_locked_conn(|conn| {
+                crate::grouper::route_overviews(select_all_routes(conn).unwrap(), max_points)
+            });
+            let streamed = store.build_overviews_streaming(max_points).unwrap();
+            assert_eq!(
+                serde_json::to_string(&oracle).unwrap(),
+                serde_json::to_string(&streamed).unwrap(),
+                "streaming builder diverged at max_points={max_points}"
+            );
+        }
     }
 
     /// Tag edits patch the cached list in place. The patched bytes must

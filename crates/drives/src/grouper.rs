@@ -1149,6 +1149,12 @@ pub(crate) fn overview_filter_points(pts: &mut Vec<GpsPoint>) {
     }
 }
 
+/// Any |speed| above the gap-fill driving threshold — the speeds clause
+/// of [`telemetry_has_driving`], shared with the DB-side meta loader.
+pub(crate) fn speeds_driving(speeds: &[f32]) -> bool {
+    speeds.iter().any(|&sp| sp.abs() > GAP_FILL_MIN_SPEED_MPS)
+}
+
 /// Reduced per-route facts — everything the grouping topology consults,
 /// none of the point data.
 pub(crate) struct OverviewClipMeta {
@@ -1168,6 +1174,7 @@ pub(crate) struct OverviewClipMeta {
 }
 
 impl OverviewClipMeta {
+    #[cfg(test)]
     pub(crate) fn from_route(r: &Route) -> Self {
         OverviewClipMeta {
             file: r.file.clone(),
@@ -1178,7 +1185,7 @@ impl OverviewClipMeta {
             gear_states_park_count: r.gear_states.iter().filter(|&&g| g == GEAR_PARK).count(),
             raw_park_count: r.raw_park_count,
             raw_frame_count: r.raw_frame_count,
-            speeds_driving: r.speeds.iter().any(|&sp| sp.abs() > GAP_FILL_MIN_SPEED_MPS),
+            speeds_driving: speeds_driving(&r.speeds),
             source: r.source.clone(),
             external_signature: r.external_signature.clone(),
         }
@@ -1443,7 +1450,12 @@ pub(crate) fn overview_from_fragments(
     let mut pts: Vec<GpsPoint> = Vec::new();
     for f in &drive.fragments {
         let all = points_for(f.meta_idx)?;
-        for p in &all[f.range.clone()] {
+        // Clamped: a row rewritten between the plan and this read can
+        // shrink the array; a stale range must degrade, not panic. The
+        // next generation bump rebuilds from consistent data.
+        let end = f.range.end.min(all.len());
+        let start = f.range.start.min(end);
+        for p in &all[start..end] {
             if !(p[0].abs() < 1.0 && p[1].abs() < 1.0) {
                 pts.push([p[0], p[1]]);
             }
