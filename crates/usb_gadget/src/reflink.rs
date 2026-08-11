@@ -50,14 +50,132 @@ const FIEMAP_EXTENT_SHARED: u32 = 0x2000;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MappedExtent {
     pub logical: u64,
+    /// Physical byte offset on the device. This is what identifies a block
+    /// ACROSS files: two snapshots sharing data map the same physical
+    /// range, which is how [`cumulative_reclaim`] can tell who else is
+    /// holding a block.
+    pub physical: u64,
     pub length: u64,
     pub flags: u32,
 }
 
 impl MappedExtent {
+    /// For callers that only care about sharing, not placement (tests).
     pub fn new(logical: u64, length: u64, flags: u32) -> Self {
-        Self { logical, length, flags }
+        Self { logical, physical: 0, length, flags }
     }
+
+    pub fn at(logical: u64, physical: u64, length: u64, flags: u32) -> Self {
+        Self { logical, physical, length, flags }
+    }
+}
+
+/// A half-open physical byte range `[start, start + len)`.
+pub type PhysicalRange = (u64, u64);
+
+/// Bytes freed by deleting each oldest-first PREFIX of the snapshot list.
+///
+/// The per-snapshot "exclusively held" figure is the wrong question for
+/// this workload and measures ~0 for every row: hourly snapshots of a
+/// slowly-changing disk share nearly every block with several neighbours,
+/// so almost nothing belongs to exactly one. Yet the set collectively
+/// holds hundreds of GB. Both facts are true, and only the second is
+/// actionable.
+///
+/// A block is released when its LAST holder goes. Deleting oldest-first,
+/// that is the NEWEST snapshot referencing it — so attribute every
+/// physical range to its newest holder, then prefix-sum. Result `i` is
+/// "delete snapshots 0..=i and this much comes back".
+///
+/// `external` is every range referenced by something that is not a
+/// snapshot (chiefly the live `cam_disk.bin`). Those blocks survive no
+/// matter how many snapshots go, so they are excluded entirely.
+///
+/// `ordered` must be oldest-first; the returned vector matches its order.
+pub fn cumulative_reclaim(
+    ordered: &[Vec<PhysicalRange>],
+    external: &[PhysicalRange],
+) -> Vec<u64> {
+    // Sweep line over physical space. At each elementary interval we need
+    // two things: whether anything external covers it (then it can never
+    // be freed), and the highest snapshot index covering it (its last
+    // holder).
+    #[derive(Clone, Copy)]
+    struct Event {
+        pos: u64,
+        delta: i32,
+        owner: Option<usize>,
+    }
+
+    let mut events: Vec<Event> = Vec::new();
+    let push = |start: u64, len: u64, owner: Option<usize>, ev: &mut Vec<Event>| {
+        if len == 0 {
+            return;
+        }
+        let end = start.saturating_add(len);
+        ev.push(Event { pos: start, delta: 1, owner });
+        ev.push(Event { pos: end, delta: -1, owner });
+    };
+
+    for (idx, ranges) in ordered.iter().enumerate() {
+        for &(start, len) in ranges {
+            push(start, len, Some(idx), &mut events);
+        }
+    }
+    for &(start, len) in external {
+        push(start, len, None, &mut events);
+    }
+
+    if events.is_empty() {
+        return vec![0; ordered.len()];
+    }
+    events.sort_by_key(|e| e.pos);
+
+    // Bytes whose last holder is snapshot i.
+    let mut owned_by = vec![0u64; ordered.len()];
+    let mut external_depth: i64 = 0;
+    // Active snapshot indices → coverage count. BTreeMap so the highest
+    // active index (the last holder) is the final key.
+    let mut active: std::collections::BTreeMap<usize, i64> = std::collections::BTreeMap::new();
+    let mut prev_pos = events[0].pos;
+
+    let mut i = 0;
+    while i < events.len() {
+        let pos = events[i].pos;
+
+        // Account for the span [prev_pos, pos) using the state before this
+        // position's events are applied.
+        if pos > prev_pos && external_depth == 0 {
+            if let Some((&last_holder, _)) = active.iter().next_back() {
+                owned_by[last_holder] = owned_by[last_holder].saturating_add(pos - prev_pos);
+            }
+        }
+
+        while i < events.len() && events[i].pos == pos {
+            let e = events[i];
+            match e.owner {
+                None => external_depth += e.delta as i64,
+                Some(idx) => {
+                    let c = active.entry(idx).or_insert(0);
+                    *c += e.delta as i64;
+                    if *c <= 0 {
+                        active.remove(&idx);
+                    }
+                }
+            }
+            i += 1;
+        }
+        prev_pos = pos;
+    }
+
+    // Prefix sum: deleting 0..=k frees everything whose last holder is <= k.
+    let mut out = Vec::with_capacity(ordered.len());
+    let mut running = 0u64;
+    for bytes in owned_by {
+        running = running.saturating_add(bytes);
+        out.push(running);
+    }
+    out
 }
 
 /// Accumulates a FIEMAP walk one page of records at a time.
@@ -71,6 +189,7 @@ pub struct Walk {
     cursor: u64,
     done: bool,
     poisoned: bool,
+    ranges: Vec<PhysicalRange>,
 }
 
 /// The extent map was too fragmented to walk within the round-trip budget.
@@ -188,6 +307,9 @@ impl Walk {
                     .context("FIEMAP exclusive-byte total overflows u64")?;
             }
 
+            // Physical placement, for cross-file sharing analysis.
+            self.ranges.push((e.physical, e.length));
+
             self.cursor = end;
             if e.flags & FIEMAP_EXTENT_LAST != 0 {
                 // LAST must terminate the page. Returning early here used
@@ -216,15 +338,26 @@ impl Walk {
     /// prefix accumulated so far would look entirely plausible and be
     /// silently too small.
     pub fn finish(self) -> Result<u64> {
+        self.check_complete()?;
+        Ok(self.total)
+    }
+
+    /// Every physical range this file maps, once the walk is complete.
+    pub fn finish_map(self) -> Result<Vec<PhysicalRange>> {
+        self.check_complete()?;
+        Ok(self.ranges)
+    }
+
+    fn check_complete(&self) -> Result<()> {
         if !self.done {
             bail!(
                 "FIEMAP walk did not reach the end of the map (stopped at offset {}, \
-                 {} exclusive bytes so far) — refusing to report a partial total",
+                 {} exclusive bytes so far) — refusing to report a partial result",
                 self.cursor,
                 self.total
             );
         }
-        Ok(self.total)
+        Ok(())
     }
 }
 
@@ -384,7 +517,7 @@ impl SizeCache {
 }
 
 #[cfg(target_os = "linux")]
-pub use self::linux::exclusive_bytes;
+pub use self::linux::{exclusive_bytes, extent_map};
 
 #[cfg(target_os = "linux")]
 mod linux {
@@ -460,7 +593,19 @@ mod linux {
     /// immutable once published, does nothing about refcount changes
     /// involving other files, and would repeat whole-inode writeback on
     /// every page. Callers that hit an incomplete map retry later.
+    /// Every physical range `path` maps, for cross-file sharing analysis.
+    ///
+    /// Same validation and safety checks as [`exclusive_bytes`]; only the
+    /// result differs.
+    pub fn extent_map(path: &Path) -> Result<Vec<PhysicalRange>> {
+        walk_file(path)?.finish_map()
+    }
+
     pub fn exclusive_bytes(path: &Path) -> Result<u64> {
+        walk_file(path)?.finish()
+    }
+
+    fn walk_file(path: &Path) -> Result<Walk> {
         // O_NOFOLLOW guards only the FINAL component, so check the parent
         // too: a symlinked `snap-NNNNNN` directory would otherwise be
         // followed and we would measure some other regular XFS file while
@@ -588,7 +733,7 @@ mod linux {
                     let base = buf.as_ptr().cast::<u8>().add(hdr_size);
                     *base.add(i * ext_size).cast::<FiemapExtent>()
                 };
-                page.push(MappedExtent::new(e.fe_logical, e.fe_length, e.fe_flags));
+                page.push(MappedExtent::at(e.fe_logical, e.fe_physical, e.fe_length, e.fe_flags));
             }
             walk.ingest(&page)?;
         }
@@ -603,12 +748,17 @@ mod linux {
             }
             .into());
         }
-        walk.finish()
+        Ok(walk)
     }
 }
 
 #[cfg(not(target_os = "linux"))]
 pub fn exclusive_bytes(_path: &std::path::Path) -> Result<u64> {
+    bail!("FIEMAP extent accounting is Linux-only")
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn extent_map(_path: &std::path::Path) -> Result<Vec<PhysicalRange>> {
     bail!("FIEMAP extent accounting is Linux-only")
 }
 
@@ -813,6 +963,81 @@ mod tests {
     /// Deleting ONE snapshot can change every other row's number, because
     /// an extent shared only with the deleted snapshot becomes exclusive
     /// to its remaining neighbour. Invalidation must therefore be total.
+    /// A block held by several snapshots is freed only when the LAST one
+    /// goes. Deleting oldest-first, that means it lands entirely on the
+    /// newest holder — nothing before it, everything from it onward.
+    #[test]
+    fn shared_block_frees_only_when_its_last_holder_is_deleted() {
+        // Three snapshots all holding the same 10 MiB block.
+        let snaps = vec![
+            vec![(0u64, 10 * MIB)],
+            vec![(0u64, 10 * MIB)],
+            vec![(0u64, 10 * MIB)],
+        ];
+        let got = cumulative_reclaim(&snaps, &[]);
+        assert_eq!(
+            got,
+            vec![0, 0, 10 * MIB],
+            "deleting the first two frees nothing; the third releases it",
+        );
+    }
+
+    /// Blocks the live dashcam drive still references never come back,
+    /// however many snapshots are deleted.
+    #[test]
+    fn blocks_still_held_by_the_live_disk_are_never_counted() {
+        let snaps = vec![vec![(0u64, 8 * MIB)], vec![(0u64, 8 * MIB)]];
+        let live = [(0u64, 8 * MIB)];
+        assert_eq!(cumulative_reclaim(&snaps, &live), vec![0, 0]);
+    }
+
+    /// The real shape on Scott's device: 99.5% of extents shared, so
+    /// per-snapshot exclusivity is ~0 while the set collectively holds a
+    /// large amount. The cumulative curve must still reach that total —
+    /// this is exactly the case the old per-row metric reported as
+    /// kilobytes.
+    #[test]
+    fn heavy_sharing_reads_as_zero_per_row_but_reaches_the_full_total() {
+        // One 100 MiB block held by all four; each also has a 1 MiB
+        // sliver of its own.
+        let shared = (0u64, 100 * MIB);
+        let snaps = vec![
+            vec![shared, (1000 * MIB, MIB)],
+            vec![shared, (1001 * MIB, MIB)],
+            vec![shared, (1002 * MIB, MIB)],
+            vec![shared, (1003 * MIB, MIB)],
+        ];
+        let got = cumulative_reclaim(&snaps, &[]);
+        assert_eq!(got[0], MIB, "deleting just the oldest frees only its sliver");
+        assert_eq!(got[1], 2 * MIB);
+        assert_eq!(got[2], 3 * MIB);
+        assert_eq!(
+            got[3],
+            104 * MIB,
+            "deleting all of them finally releases the shared block too",
+        );
+    }
+
+    /// Partial overlaps: snapshots can share part of a range, not all of
+    /// it. The sweep must split at the boundary rather than assigning the
+    /// whole extent to one holder.
+    #[test]
+    fn partially_overlapping_ranges_split_at_the_boundary() {
+        let snaps = vec![vec![(0u64, 10 * MIB)], vec![(4 * MIB, 10 * MIB)]];
+        let got = cumulative_reclaim(&snaps, &[]);
+        // 0-4 MiB belongs to snap 0 alone; 4-14 MiB's last holder is snap 1.
+        assert_eq!(got, vec![4 * MIB, 14 * MIB]);
+    }
+
+    #[test]
+    fn cumulative_is_monotonic_and_zero_for_no_snapshots() {
+        assert!(cumulative_reclaim(&[], &[]).is_empty());
+        let snaps = vec![vec![(0u64, MIB)], vec![(MIB, MIB)], vec![(2 * MIB, MIB)]];
+        let got = cumulative_reclaim(&snaps, &[]);
+        assert_eq!(got, vec![MIB, 2 * MIB, 3 * MIB]);
+        assert!(got.windows(2).all(|w| w[1] >= w[0]), "must never decrease");
+    }
+
     fn ids(v: &[&str]) -> Vec<String> {
         v.iter().map(|s| s.to_string()).collect()
     }

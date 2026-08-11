@@ -28,27 +28,39 @@ use crate::router::AppState;
 
 const SNAPSHOTS_DIR: &str = "/backingfiles/snapshots";
 const RELEASE_SNAPSHOT_SCRIPT: &str = "/root/bin/release_snapshot.sh";
+/// The live image. Its extents are the main "external" holder that keeps
+/// snapshot blocks alive regardless of deletions.
+const CAM_DISK: &str = "/backingfiles/cam_disk.bin";
 
 /// One snapshot entry in the listing response.
 #[derive(serde::Serialize)]
 struct SnapshotEntry {
     /// `snap-<id>` directory name. Used as the path parameter for delete.
     id: String,
-    /// Estimated bytes held only by THIS snapshot — approximately what
-    /// deleting it returns. Not an exact `statvfs` delta; see
-    /// `sentryusb_gadget::reflink` for what the figure excludes.
+    /// Estimated bytes freed by deleting THIS snapshot **and every older
+    /// one**, not this snapshot alone.
     ///
-    /// `None` means "not measured yet, or could not be measured" — the UI
-    /// must render that as pending/unavailable and NEVER as `0 B`, which
-    /// would read as "safe to delete, frees nothing". A measured zero is
-    /// legitimate and does render as `0 B`.
+    /// Per-snapshot figures are useless on this workload. Hourly snapshots
+    /// of a slowly-changing disk share ~99% of their extents with
+    /// neighbours, so almost nothing belongs to exactly one snapshot and
+    /// every row measures near zero — while the set collectively holds
+    /// hundreds of GB. A block is only released when its LAST holder is
+    /// deleted, so reclaim is a property of a RUN of snapshots, and
+    /// oldest-first prefixes are the runs users actually delete.
     ///
-    /// This replaces a `du -sB1` of the snapshot directory. `du` charges
-    /// every block a file maps to that file with no notion of XFS reflink
-    /// sharing, so each snapshot reported the whole cam-disk block count:
-    /// rows of 45-64 GB whose deletion returned ~5 GB, summing to several
-    /// times the partition size.
-    reclaimable_bytes: Option<u64>,
+    /// The final row therefore equals the whole snapshot footprint, which
+    /// `total_allocated_bytes` derives independently via `df`. Those two
+    /// agreeing is the cross-check that the earlier per-snapshot metric
+    /// lacked: it summed to ~400 KB against a 217 GB total and nothing
+    /// caught it.
+    ///
+    /// `None` means "not measured yet, or could not be measured" — render
+    /// as pending/unavailable, NEVER as `0 B`. A measured zero is
+    /// legitimate (a run that frees nothing) and does render as `0 B`.
+    cumulative_reclaim_bytes: Option<u64>,
+    /// How many snapshots are older than this one, so the UI can say
+    /// "this and N older" without depending on its display sort order.
+    older_count: usize,
     /// Unix epoch seconds — directory mtime. Used by the UI to render a
     /// human-friendly date and to sort.
     created_unix: i64,
@@ -86,6 +98,8 @@ impl Drop for RefreshGuard {
 /// Walking extent maps costs thousands to millions of records per image,
 /// far too much for a request handler — which previously spawned one `du`
 /// per snapshot on every page load. At most one refresh runs at a time.
+/// `ids` must be OLDEST-FIRST: the cumulative figure for a snapshot is
+/// "delete this and everything older", so the prefix order is the meaning.
 fn spawn_size_refresh(ids: Vec<String>, generation: u64) {
     use std::sync::atomic::Ordering;
     if REFRESH_IN_FLIGHT.swap(true, Ordering::SeqCst) {
@@ -93,25 +107,69 @@ fn spawn_size_refresh(ids: Vec<String>, generation: u64) {
     }
     tokio::task::spawn_blocking(move || {
         let _guard = RefreshGuard;
-        // Capture the file's identity alongside the size so a directory
-        // replaced under the same snapshot id can't inherit the old
-        // number. Identity is read AFTER measuring, so a replacement
-        // mid-measure yields a value tagged with the new inode and is
-        // simply re-measured next time rather than served wrongly.
-        let (ok, failed) = sentryusb_gadget::reflink::measure_all_with(&ids, |id| {
+
+        // Collect every snapshot's physical extent map. A snapshot that
+        // cannot be mapped poisons the whole computation — a cumulative
+        // figure that silently omitted one member of the run would claim
+        // the wrong reclaim for every row after it — so the entire attempt
+        // is published as "no data" rather than a partial curve.
+        let mut maps: Vec<Vec<sentryusb_gadget::reflink::PhysicalRange>> =
+            Vec::with_capacity(ids.len());
+        let mut idents = Vec::with_capacity(ids.len());
+        let mut failed: Option<(String, String)> = None;
+        for id in &ids {
             let bin = format!("{}/{}/snap.bin", SNAPSHOTS_DIR, id);
             let p = std::path::Path::new(&bin);
-            let bytes = sentryusb_gadget::reflink::exclusive_bytes(p)?;
-            Ok((bytes, sentryusb_gadget::reflink::file_identity(p)?))
-        });
-        for (id, e) in &failed {
-            tracing::warn!("could not measure reclaimable size for {}: {}", id, e);
+            match sentryusb_gadget::reflink::extent_map(p)
+                .and_then(|m| Ok((m, sentryusb_gadget::reflink::file_identity(p)?)))
+            {
+                Ok((m, ident)) => {
+                    maps.push(m);
+                    idents.push(ident);
+                }
+                Err(e) => {
+                    failed = Some((id.clone(), e.to_string()));
+                    break;
+                }
+            }
         }
+
+        // Blocks the live image (or any other non-snapshot file) still
+        // references never come back, no matter how many snapshots go.
+        let external = if failed.is_none() {
+            match sentryusb_gadget::reflink::extent_map(std::path::Path::new(CAM_DISK)) {
+                Ok(m) => Some(m),
+                Err(e) => {
+                    failed = Some((CAM_DISK.to_string(), e.to_string()));
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        let entries = match (failed, external) {
+            (None, Some(external)) => {
+                let curve = sentryusb_gadget::reflink::cumulative_reclaim(&maps, &external);
+                ids.iter()
+                    .zip(curve)
+                    .zip(idents)
+                    .map(|((id, bytes), ident)| (id.clone(), (bytes, ident)))
+                    .collect()
+            }
+            (failed, _) => {
+                if let Some((id, e)) = failed {
+                    tracing::warn!("cumulative snapshot sizing failed at {}: {}", id, e);
+                }
+                Vec::new()
+            }
+        };
+
         if let Ok(mut cache) = size_cache().lock() {
             // Publish only if nothing invalidated the cache while we ran —
             // otherwise a delete that landed mid-measurement would be
             // undone by republishing the pre-delete numbers as fresh.
-            if !cache.publish(generation, ids, ok, now_secs()) {
+            if !cache.publish(generation, ids, entries, now_secs()) {
                 tracing::debug!("discarded a snapshot-size measurement invalidated mid-flight");
             }
         }
@@ -168,14 +226,20 @@ pub async fn list_snapshots(
             id: name,
             // Filled from the cache below — measuring here would put an
             // extent-map walk per snapshot on the request path.
-            reclaimable_bytes: None,
+            cumulative_reclaim_bytes: None,
+            older_count: 0,
             created_unix,
         });
     }
 
     // Oldest first by mtime. UI may re-sort, but this default matches
-    // what users actually want (delete the oldest to free space).
+    // what users actually want (delete the oldest to free space) — and the
+    // cumulative figures are DEFINED against this order, so it is set
+    // before the cache fill below.
     entries.sort_by_key(|e| e.created_unix);
+    for (i, e) in entries.iter_mut().enumerate() {
+        e.older_count = i;
+    }
 
     // Fill from the cache, and kick off a refresh when it is missing or
     // stale. A stale figure is worse than none here: it was computed
@@ -190,7 +254,7 @@ pub async fn list_snapshots(
                 for e in entries.iter_mut() {
                     // Verify the file is still the one that was measured.
                     let bin = format!("{}/{}/snap.bin", SNAPSHOTS_DIR, e.id);
-                    e.reclaimable_bytes =
+                    e.cumulative_reclaim_bytes =
                         sentryusb_gadget::reflink::file_identity(std::path::Path::new(&bin))
                             .ok()
                             .and_then(|ident| cache.get_if_same(&e.id, ident));
@@ -254,6 +318,27 @@ pub async fn list_snapshots(
 
         used_bytes.saturating_sub(non_snap_bytes)
     };
+
+    // Cross-check: the curve's final value and `total_allocated_bytes`
+    // measure the same thing ("delete every snapshot") by two unrelated
+    // routes — FIEMAP extent attribution vs df-minus-du. Disagreement
+    // beyond metadata noise means one of them is wrong. The previous
+    // per-snapshot metric had no such invariant, which is how it shipped
+    // summing to ~400 KB against a 217 GB caption with nothing tripping.
+    if let Some(last) = entries.last().and_then(|e| e.cumulative_reclaim_bytes) {
+        let hi = total_allocated_bytes.max(last);
+        let lo = total_allocated_bytes.min(last);
+        // Metadata, the journal and in-flight writes justify some gap;
+        // an order-of-magnitude one they do not.
+        if hi > 0 && (hi - lo) * 10 > hi * 3 {
+            tracing::warn!(
+                "snapshot accounting disagreement: cumulative curve ends at {} bytes but \
+                 df-based total is {} — one of these is wrong",
+                last,
+                total_allocated_bytes
+            );
+        }
+    }
 
     (StatusCode::OK, Json(serde_json::json!({
         "snapshots": entries,
