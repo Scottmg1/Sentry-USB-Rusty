@@ -2031,6 +2031,18 @@ impl DriveStore {
         // test data may live entirely in the past). Too wide a span is
         // cheaper as a full rebuild.
         let newest_day = self.with_read_conn(|conn| -> Result<Option<String>> {
+            // Any path family the window query below does not select
+            // (teslascope-style imports, backslash paths, odd digit
+            // keys) could hold rows past the cutoff that the full
+            // rebuild would group — bail rather than silently drop them.
+            let unknown: bool = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM routes WHERE                    (file < 'A' AND file NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]*')                    OR (file >= 'A'                        AND file NOT LIKE 'SavedClips/%'                        AND file NOT LIKE 'SentryClips/%'                        AND file NOT LIKE 'tessie/%'))",
+                [],
+                |r| r.get(0),
+            )?;
+            if unknown {
+                return Ok(None);
+            }
             let f: Option<String> = conn
                 .query_row(
                     "SELECT file FROM routes WHERE file < 'A' ORDER BY file DESC LIMIT 1",
@@ -2060,10 +2072,16 @@ impl DriveStore {
             self.with_read_conn(|conn| -> Result<_> {
                 let mut clauses: Vec<String> = Vec::new();
                 let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+                // '~' (0x7E) upper bounds cover both `DAY/...` and the
+                // event-style `DAY_HH-MM-SS/...` native keys ('_' sorts
+                // above '0'). Tessie imports live under their own prefix.
                 for day in &days {
                     clauses.push("(file >= ? AND file < ?)".to_string());
                     params.push(Box::new(format!("{day}/")));
-                    params.push(Box::new(format!("{day}0")));
+                    params.push(Box::new(format!("{day}~")));
+                    clauses.push("(file >= ? AND file < ?)".to_string());
+                    params.push(Box::new(format!("tessie/{day}/")));
+                    params.push(Box::new(format!("tessie/{day}~")));
                 }
                 clauses.push(
                     "file LIKE 'SavedClips/%' OR file LIKE 'SentryClips/%' \
@@ -2094,10 +2112,18 @@ impl DriveStore {
                     "SELECT COALESCE(MAX(updated_at), 0) FROM routes WHERE file >= ? AND file < ?",
                 )?;
                 for day in &days {
-                    let m: i64 = stmt2
-                        .query_row(params![format!("{day}/"), format!("{day}0")], |r| r.get(0))
-                        .unwrap_or(0);
-                    max_upd = max_upd.max(m);
+                    for prefix in ["", "tessie/"] {
+                        let m: i64 = stmt2
+                            .query_row(
+                                params![
+                                    format!("{prefix}{day}/"),
+                                    format!("{prefix}{day}~")
+                                ],
+                                |r| r.get(0),
+                            )
+                            .unwrap_or(0);
+                        max_upd = max_upd.max(m);
+                    }
                 }
                 Ok((rows, tags, tags_count, max_upd))
             })?;
@@ -4049,6 +4075,45 @@ mod tests {
             store.append_splices.load(Ordering::Relaxed),
             splices_before,
             "no quiet zone -> must not splice"
+        );
+    }
+
+    /// A non-overlapping Tessie import in the suffix region must survive
+    /// an append splice: the window query loads `tessie/` day ranges, so
+    /// the regrouped suffix contains the imported drive.
+    #[test]
+    fn append_with_tessie_rows_matches_full_rebuild() {
+        let store = DriveStore::open_memory().unwrap();
+        add_clip(&store, "2025-01-01/2025-01-01_18-00-00-front.mp4");
+        add_clip(&store, "2025-01-02/2025-01-02_08-00-00-front.mp4");
+        add_clip(&store, "tessie/2025-01-02/2025-01-02_09-00-00-front-tessie-1.mp4");
+        let _ = store.get_cached_drives_json().unwrap();
+        let splices_before = store.append_splices.load(Ordering::Relaxed);
+        add_clip(&store, "2025-01-02/2025-01-02_08-02-00-front.mp4");
+        assert_caches_equal_full_rebuild(&store);
+        assert_eq!(
+            store.append_splices.load(Ordering::Relaxed),
+            splices_before + 1,
+            "tessie rows load into the window, so the splice still runs"
+        );
+    }
+
+    /// A path family the window query cannot enumerate forces the full
+    /// path — it might hold rows past the cutoff.
+    #[test]
+    fn append_with_unknown_family_falls_back() {
+        let store = DriveStore::open_memory().unwrap();
+        add_clip(&store, "2025-01-01/2025-01-01_18-00-00-front.mp4");
+        add_clip(&store, "2025-01-02/2025-01-02_08-00-00-front.mp4");
+        add_clip(&store, "teslascope/2025-01-02/2025-01-02_09-00-00-front-x-1.mp4");
+        let _ = store.get_cached_drives_json().unwrap();
+        let splices_before = store.append_splices.load(Ordering::Relaxed);
+        add_clip(&store, "2025-01-02/2025-01-02_08-02-00-front.mp4");
+        assert_caches_equal_full_rebuild(&store);
+        assert_eq!(
+            store.append_splices.load(Ordering::Relaxed),
+            splices_before,
+            "unknown family -> full rebuild"
         );
     }
 
