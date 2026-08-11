@@ -12,7 +12,7 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 chrono = { workspace = true }
 rusqlite = { version = "0.40", features = ["bundled"] }
-base64 = "0.22"
+base64 = "0.23"
 
 sentryusb-ws = { path = "../ws", package = "sentryusb-ws" }
 
