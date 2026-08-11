@@ -1224,6 +1224,32 @@ run_patch() {
     fi
 }
 
+# ── MALLOC_ARENA_MAX on the server unit (all boards) ────────────────────
+#
+# main.rs' periodic malloc_trim assumes the unit caps glibc at two malloc
+# arenas; fresh installs get the Environment line from setup-sentryusb,
+# but units written by older setups never had it — glibc then defaults to
+# 8 * cores arenas, whose free lists hold RSS after clip-ingest bursts on
+# exactly the low-RAM boards that can least afford it.
+apply_malloc_arena_cap() {
+    local unit=/etc/systemd/system/sentryusb.service
+    [ -f "$unit" ] || { log "malloc-arena: no server unit — skipping"; return 0; }
+    if grep -q '^Environment=MALLOC_ARENA_MAX=' "$unit"; then
+        log "malloc-arena: already set"
+        return 0
+    fi
+    [ -x /root/bin/remountfs_rw ] && /root/bin/remountfs_rw >/dev/null 2>&1 || true
+    if sed -i '/^\[Service\]/a Environment=MALLOC_ARENA_MAX=2' "$unit"; then
+        systemctl daemon-reload 2>/dev/null || true
+        # Takes effect on the service's next restart — the OTA flow
+        # restarts it right after this script anyway.
+        log "malloc-arena: MALLOC_ARENA_MAX=2 added to $unit"
+    else
+        err "malloc-arena: failed to edit $unit"
+        return 1
+    fi
+}
+
 # ── Run all patches ─────────────────────────────────────────────────────
 
 run_patch apply_ble_nonfatal_adv
@@ -1238,6 +1264,7 @@ run_patch apply_rclone_config_mutable_migration
 run_patch apply_rclone_watchdog_fix
 run_patch apply_snapshot_eviction_by_age
 run_patch apply_snapshot_slot_pick_hardening
+run_patch apply_malloc_arena_cap
 
 # Future patches that must survive an OTA update get appended here. Each
 # one self-checks board / precondition / marker so the whole script stays
