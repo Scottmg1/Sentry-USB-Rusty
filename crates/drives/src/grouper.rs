@@ -1158,19 +1158,30 @@ struct ClipSegment {
     parked: bool,
 }
 
-/// Analyse a clip's GearRuns and split its points at any Park gap >=
-/// PARK_GAP_SECONDS. Returns one or more segments.
-fn split_clip_at_park_gaps(clip: &TimedRoute) -> Vec<ClipSegment> {
-    let total_raw_frames: u32 = clip.route.gear_runs.iter().map(|r| r.frames).sum();
+/// One planned fragment of a clip: point range + segment timestamp
+/// offset, or a park boundary marker. Pure index math over gear runs
+/// and the point COUNT — the single source of truth for the
+/// frame-to-point mapping, shared by the in-memory splitter below and
+/// the streaming overview builder, which plans fragments without
+/// decoding point BLOBs.
+pub(crate) struct PlannedSeg {
+    pub(crate) range: std::ops::Range<usize>,
+    pub(crate) offset_secs: i64,
+    pub(crate) parked: bool,
+}
+
+/// `None` — the clip stays whole (no gear runs, or no park gap long
+/// enough to split at).
+pub(crate) fn plan_clip_at_park_gaps(
+    gear_runs: &[GearRun],
+    n_points: usize,
+) -> Option<Vec<PlannedSeg>> {
+    let total_raw_frames: u32 = gear_runs.iter().map(|r| r.frames).sum();
     if total_raw_frames == 0 {
-        return vec![ClipSegment {
-            route: clip.clone(),
-            parked: false,
-        }];
+        return None;
     }
 
     let seconds_per_frame = 60.0 / total_raw_frames as f64;
-    let n_points = clip.route.points.len();
 
     // Identify raw segments that are park gaps
     struct RawSeg {
@@ -1181,7 +1192,7 @@ fn split_clip_at_park_gaps(clip: &TimedRoute) -> Vec<ClipSegment> {
 
     let mut raw_segs = Vec::new();
     let mut frame: u32 = 0;
-    for run in &clip.route.gear_runs {
+    for run in gear_runs {
         let duration = run.frames as f64 * seconds_per_frame;
         let is_park_gap = run.gear == GEAR_PARK && duration >= PARK_GAP_SECONDS;
         raw_segs.push(RawSeg {
@@ -1204,25 +1215,15 @@ fn split_clip_at_park_gaps(clip: &TimedRoute) -> Vec<ClipSegment> {
         merged.push(seg);
     }
 
-    // Check if any split is needed
     if !merged.iter().any(|s| s.parked) {
-        return vec![ClipSegment {
-            route: clip.clone(),
-            parked: false,
-        }];
+        return None;
     }
 
-    // Map raw frame ranges to deduped point indices and build segments
-    let mut result = Vec::new();
+    // Map raw frame ranges to deduped point indices
+    let mut out = Vec::new();
     for seg in &merged {
         if seg.parked {
-            result.push(ClipSegment {
-                route: TimedRoute {
-                    route: Route::empty(),
-                    timestamp: clip.timestamp,
-                },
-                parked: true,
-            });
+            out.push(PlannedSeg { range: 0..0, offset_secs: 0, parked: true });
             continue;
         }
 
@@ -1242,6 +1243,40 @@ fn split_clip_at_park_gaps(clip: &TimedRoute) -> Vec<ClipSegment> {
             continue;
         }
 
+        out.push(PlannedSeg {
+            range: start_idx..end_idx,
+            offset_secs: (start_frac * 60.0) as i64,
+            parked: false,
+        });
+    }
+    Some(out)
+}
+
+/// Analyse a clip's GearRuns and split its points at any Park gap >=
+/// PARK_GAP_SECONDS. Returns one or more segments.
+fn split_clip_at_park_gaps(clip: &TimedRoute) -> Vec<ClipSegment> {
+    let Some(plan) = plan_clip_at_park_gaps(&clip.route.gear_runs, clip.route.points.len())
+    else {
+        return vec![ClipSegment {
+            route: clip.clone(),
+            parked: false,
+        }];
+    };
+
+    let mut result = Vec::new();
+    for seg in plan {
+        if seg.parked {
+            result.push(ClipSegment {
+                route: TimedRoute {
+                    route: Route::empty(),
+                    timestamp: clip.timestamp,
+                },
+                parked: true,
+            });
+            continue;
+        }
+
+        let (start_idx, end_idx) = (seg.range.start, seg.range.end);
         let seg_points = clip.route.points[start_idx..end_idx].to_vec();
 
         let seg_gears = if clip.route.gear_states.len() >= end_idx {
@@ -1268,9 +1303,7 @@ fn split_clip_at_park_gaps(clip: &TimedRoute) -> Vec<ClipSegment> {
             Vec::new()
         };
 
-        // Compute timestamp offset for this segment within the clip
-        let offset_secs = (start_frac * 60.0) as i64;
-        let offset = chrono::Duration::seconds(offset_secs);
+        let offset = chrono::Duration::seconds(seg.offset_secs);
 
         result.push(ClipSegment {
             route: TimedRoute {
