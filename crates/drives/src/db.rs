@@ -3928,7 +3928,9 @@ mod tests {
         store
             .add_route("a/2025-01-01_12-30-00-front.mp4", "a", &pts, &[4, 4], &[0, 0], &[20.0, 21.0], &[0.0, 0.0], 0, 2, &[], &[])
             .unwrap();
-        assert!(store.drive_cache_dirty.load(Ordering::Acquire));
+        // A pure insert records an append watermark rather than the full
+        // dirty flag; either way the next read must rebuild.
+        assert!(store.cache_needs_rebuild());
         let json2 = store.get_cached_drives_json().unwrap();
         assert!(
             json2.matches("\"id\"").count() > json.matches("\"id\"").count(),
