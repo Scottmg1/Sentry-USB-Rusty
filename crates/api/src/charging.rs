@@ -1164,6 +1164,7 @@ pub async fn bulk_delete_charges(
         store.with_locked_conn(|conn| -> anyhow::Result<(usize, usize)> {
             let mut deleted = 0usize;
             let mut sessions = 0usize;
+            let now = chrono::Utc::now().timestamp();
             for id in &ids {
                 // Re-derive the session window from its start id (bounded
                 // scan, same as single_charging), then drop its samples.
@@ -1175,23 +1176,51 @@ pub async fn bulk_delete_charges(
                 };
                 let start = session.first().unwrap().ts;
                 let end = session.last().unwrap().ts;
-                deleted += conn.execute(
+                // One transaction per session: the cloud-delete outbox row
+                // must land atomically with the local deletes, or a crash
+                // in between leaves a cloud copy no one will ever retire.
+                let tx = conn.unchecked_transaction()?;
+                deleted += tx.execute(
                     "DELETE FROM telemetry_samples WHERE ts BETWEEN ?1 AND ?2 \
                      AND (charging_state IS NOT NULL \
                           OR charger_power_kw IS NOT NULL \
                           OR charge_rate_mph IS NOT NULL)",
                     rusqlite::params![start, end],
                 )?;
-                conn.execute(
+                tx.execute(
                     "DELETE FROM charge_tags WHERE session_ts = ?1",
                     rusqlite::params![start],
                 )?;
                 // The manual cost override is keyed the same way — drop it
                 // too, or it lingers orphaned after the session is gone.
-                conn.execute(
+                tx.execute(
                     "DELETE FROM charge_costs WHERE session_ts = ?1",
                     rusqlite::params![start],
                 )?;
+                // Cloud propagation (ENCRYPTION.md §11.7 in the cloud
+                // repo): queue the delete unconditionally — even a
+                // never-marked session may have an upload in flight — and
+                // retire the upload record plus any pending mutable push.
+                tx.execute(
+                    "INSERT INTO charge_delete_outbox(session_ts, cloud_charge_id, queued_at) \
+                     VALUES(?1, ?2, ?3) \
+                     ON CONFLICT(session_ts) DO UPDATE SET \
+                       cloud_charge_id = ?2, queued_at = ?3, acked_at = NULL",
+                    rusqlite::params![
+                        start,
+                        sentryusb_cloud_uploader::charge_id_for_session(start),
+                        now
+                    ],
+                )?;
+                tx.execute(
+                    "DELETE FROM charge_uploads WHERE session_ts = ?1",
+                    rusqlite::params![start],
+                )?;
+                tx.execute(
+                    "DELETE FROM mutable_dirty WHERE kind = 'charge' AND key = ?1",
+                    rusqlite::params![start.to_string()],
+                )?;
+                tx.commit()?;
                 sessions += 1;
             }
             Ok((deleted, sessions))
@@ -1202,6 +1231,11 @@ pub async fn bulk_delete_charges(
     match result {
         Ok(Ok((deleted, sessions))) => {
             invalidate_charging_list();
+            if sessions > 0 {
+                // Drain the outbox promptly instead of waiting out the
+                // 10-minute safety timer.
+                state.cloud.uploader.nudge();
+            }
             (
                 StatusCode::OK,
                 Json(serde_json::json!({ "deleted": deleted, "sessions": sessions })),

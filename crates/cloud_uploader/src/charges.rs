@@ -233,9 +233,23 @@ pub async fn sweep_once(state: Arc<CloudStateInner>) -> Result<u32> {
                 Ok(())
             })?;
 
+            // Delete-outbox exclusion is a POST gate only — it must
+            // NOT feed sweep_frontier's handled predicate above, or the
+            // cursor could advance past a re-imported session until the
+            // daily full scan.
+            let outboxed: std::collections::HashSet<i64> = store
+                .charge_delete_outbox_all()
+                .unwrap_or_default()
+                .into_iter()
+                .map(|(ts, _, _)| ts)
+                .collect();
             let pending: Vec<Vec<charging::ChargeRow>> = sessions
                 .into_iter()
-                .filter(|s| closed(s) && !handled(s))
+                .filter(|s| {
+                    closed(s)
+                        && !handled(s)
+                        && !s.first().is_some_and(|f| outboxed.contains(&f.ts))
+                })
                 .collect();
             Ok(pending)
         })
@@ -373,6 +387,13 @@ pub async fn sweep_once(state: Arc<CloudStateInner>) -> Result<u32> {
                 "stored" | "duplicate" => {
                     if result.status == "stored" {
                         total_stored += 1;
+                    }
+                    // A local delete may have queued this session after
+                    // prep; marking it uploaded now would leave the Pi
+                    // claiming "uploaded" over an empty cloud once the
+                    // delete stage (later this sweep) retires it.
+                    if store.charge_delete_outbox_contains(*session_ts).unwrap_or(false) {
+                        continue;
                     }
                     if let Err(e) = store.charge_upload_mark(
                         *session_ts,

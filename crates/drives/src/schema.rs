@@ -469,6 +469,22 @@ pub const CHARGE_UPLOADS_TABLE: &[&str] = &[
      ON charge_uploads(cloud_charge_id)",
 ];
 
+/// Durable outbox for propagating local charge deletions to the cloud
+/// (ENCRYPTION.md §11.7 in the cloud repo). A row per deleted session
+/// still awaiting the cloud's terminal ack. `acked_at` NULL = pending;
+/// set = settled, kept for one extra sweep round (a final delete is
+/// issued) to close the late-committing-upload race, then removed —
+/// after that a re-imported session may legitimately re-upload.
+/// Standalone idempotent table — no CURRENT_SCHEMA_VERSION bump needed.
+pub const CHARGE_DELETE_OUTBOX_TABLE: &[&str] = &[
+    "CREATE TABLE IF NOT EXISTS charge_delete_outbox (
+        session_ts      INTEGER PRIMARY KEY,
+        cloud_charge_id TEXT NOT NULL,
+        queued_at       INTEGER NOT NULL,
+        acked_at        INTEGER
+    ) WITHOUT ROWID",
+];
+
 /// Dirty queue for two-way cloud sync. A row per locally-changed
 /// mutable item awaiting push to the cloud:
 ///   kind 'drive'  — key = drive_tags.drive_key (start_time string)
@@ -614,7 +630,11 @@ pub fn migrate(conn: &Connection) -> Result<()> {
 
     // Cloud charge-upload bookkeeping + mutable-sync dirty queue. Same
     // idempotent standalone-table treatment; see the const docs.
-    for stmt in CHARGE_UPLOADS_TABLE.iter().chain(MUTABLE_DIRTY_TABLE.iter()) {
+    for stmt in CHARGE_UPLOADS_TABLE
+        .iter()
+        .chain(MUTABLE_DIRTY_TABLE.iter())
+        .chain(CHARGE_DELETE_OUTBOX_TABLE.iter())
+    {
         conn.execute(stmt, []).with_context(|| {
             format!("migrate: applying cloud-sync DDL {:?}", truncate(stmt, 60))
         })?;

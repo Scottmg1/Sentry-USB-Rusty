@@ -1433,6 +1433,56 @@ impl DriveStore {
         Ok(())
     }
 
+    /// Every delete-outbox row: (session_ts, cloud_charge_id, settled).
+    /// Pending rows (acked_at NULL) await the cloud's terminal ack;
+    /// settled rows ride one extra sweep (a final delete is issued) to
+    /// close the late-committing-upload race, then get removed.
+    pub fn charge_delete_outbox_all(&self) -> Result<Vec<(i64, String, bool)>> {
+        self.with_read_conn(|conn| {
+            let mut stmt = conn.prepare_cached(
+                "SELECT session_ts, cloud_charge_id, acked_at IS NOT NULL                  FROM charge_delete_outbox ORDER BY session_ts",
+            )?;
+            let rows = stmt.query_map([], |r| {
+                Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, bool>(2)?))
+            })?;
+            rows.collect::<std::result::Result<Vec<_>, _>>().map_err(Into::into)
+        })
+    }
+
+    /// Whether a session is in the delete outbox (any state). The
+    /// uploader consults this at ack time so an in-flight upload that
+    /// raced a local delete never re-marks the session as uploaded.
+    pub fn charge_delete_outbox_contains(&self, session_ts: i64) -> Result<bool> {
+        self.with_read_conn(|conn| {
+            let n: i64 = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM charge_delete_outbox WHERE session_ts = ?1)",
+                params![session_ts],
+                |r| r.get(0),
+            )?;
+            Ok(n != 0)
+        })
+    }
+
+    /// Terminal ack from the cloud: mark settled (kept one more round).
+    pub fn charge_delete_ack(&self, session_ts: i64, now_unix: i64) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE charge_delete_outbox SET acked_at = ?2 WHERE session_ts = ?1",
+            params![session_ts, now_unix],
+        )?;
+        Ok(())
+    }
+
+    /// Grace round complete — drop the settled row.
+    pub fn charge_delete_remove(&self, session_ts: i64) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "DELETE FROM charge_delete_outbox WHERE session_ts = ?1",
+            params![session_ts],
+        )?;
+        Ok(())
+    }
+
     /// [`charge_uploads_map`] bounded to sessions starting at or after
     /// `from` — the charge sweep's scan window.
     pub fn charge_uploads_map_since(
@@ -4097,6 +4147,42 @@ mod tests {
             splices_before,
             "no quiet zone -> must not splice"
         );
+    }
+
+    /// Outbox lifecycle: pending until acked, settled for one grace
+    /// round, then removed; membership is visible throughout.
+    #[test]
+    fn charge_delete_outbox_lifecycle() {
+        let store = DriveStore::open_memory().unwrap();
+        {
+            let conn = store.conn.lock().unwrap();
+            conn.execute(
+                "INSERT INTO charge_delete_outbox(session_ts, cloud_charge_id, queued_at)                  VALUES(1000, 'aa', 1), (2000, 'bb', 1)",
+                [],
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            store.charge_delete_outbox_all().unwrap(),
+            vec![(1000, "aa".into(), false), (2000, "bb".into(), false)]
+        );
+        assert!(store.charge_delete_outbox_contains(1000).unwrap());
+        assert!(!store.charge_delete_outbox_contains(3000).unwrap());
+
+        store.charge_delete_ack(1000, 99).unwrap();
+        assert_eq!(
+            store.charge_delete_outbox_all().unwrap(),
+            vec![(1000, "aa".into(), true), (2000, "bb".into(), false)],
+            "acked row settles but survives for the grace round"
+        );
+        assert!(store.charge_delete_outbox_contains(1000).unwrap());
+
+        store.charge_delete_remove(1000).unwrap();
+        assert_eq!(
+            store.charge_delete_outbox_all().unwrap(),
+            vec![(2000, "bb".into(), false)]
+        );
+        assert!(!store.charge_delete_outbox_contains(1000).unwrap());
     }
 
     /// A non-overlapping Tessie import in the suffix region must survive

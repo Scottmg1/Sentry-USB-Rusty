@@ -61,6 +61,21 @@ pub async fn run_sweep_loop(state: Arc<CloudStateInner>) {
             }
         }
 
+        // Deletion outbox AFTER uploads: an upload prepared before a
+        // mid-sweep local delete is retired in the same pass instead of
+        // living in the cloud until the next wake.
+        match crate::charge_deletes::sweep_once(state.clone()).await {
+            Ok(n) if n > 0 => {
+                info!("cloud charge delete sweep: {} sessions retired", n);
+            }
+            Ok(_) => {}
+            Err(e) => {
+                warn!("cloud charge delete error: {}", e);
+                let mut last_err = state.last_upload_error.lock().await;
+                *last_err = Some(format!("{:#}", e));
+            }
+        }
+
         // Two-way mutable sync (tags / cost overrides / rate config).
         if let Err(e) = crate::sync::run_once(state.clone()).await {
             warn!("cloud sync error: {}", e);
