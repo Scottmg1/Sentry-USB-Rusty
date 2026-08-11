@@ -794,6 +794,12 @@ impl DriveStore {
 
         tx.commit()?;
         drop(conn);
+        // Counters BEFORE the invalidation publish: a rebuilder that
+        // consumes the watermark/flag must never read a pre-increment
+        // route count into the cache's validity marker.
+        self.processed_count
+            .fetch_add(pf_inserted as i64, Ordering::Relaxed);
+        self.route_count.fetch_add(route_inserted, Ordering::Release);
         // A pointless mark-processed (no GPS -> no route row) can't change
         // the drive list, stats, or overview — leave the caches alone.
         // During ingest of a mostly-parked card these were the majority of
@@ -819,9 +825,6 @@ impl DriveStore {
             }
             self.route_overview_gen.fetch_add(1, Ordering::Release);
         }
-        self.processed_count
-            .fetch_add(pf_inserted as i64, Ordering::Relaxed);
-        self.route_count.fetch_add(route_inserted, Ordering::Relaxed);
         Ok(())
     }
 
@@ -1104,10 +1107,18 @@ impl DriveStore {
             Ok(v) => v,
             Err(_) => return Ok(false),
         };
-        let Some(entry) = list.iter_mut().find(|d| d.start_time == drive_key) else {
+        // Every drive with this key, not just the first: two visible
+        // signature-split drives can share a start_time, and a full
+        // rebuild applies the tag map to all of them.
+        let clean: Vec<String> = tags.iter().filter(|t| !t.is_empty()).cloned().collect();
+        let mut hit = false;
+        for entry in list.iter_mut().filter(|d| d.start_time == drive_key) {
+            entry.tags = clean.clone();
+            hit = true;
+        }
+        if !hit {
             return Ok(false);
-        };
-        entry.tags = tags.iter().filter(|t| !t.is_empty()).cloned().collect();
+        }
         let patched = serde_json::to_string(&list)?;
         let conn = self.conn.lock().unwrap();
         schema::meta_set(&conn, "drive_list_cache", &patched)?;
@@ -1930,8 +1941,7 @@ impl DriveStore {
         // snapshot (it begins after) AND re-flags — worst case one
         // redundant rebuild, never a missed one. Clearing later would
         // let a mid-rebuild mutation be swallowed.
-        let full = force || self.drive_cache_dirty.load(Ordering::Acquire);
-        self.drive_cache_dirty.store(false, Ordering::Release);
+        let full = force || self.drive_cache_dirty.swap(false, Ordering::AcqRel);
         let watermark = self.append_watermark.lock().unwrap().take();
 
         // Append fast path: pure inserts only, all at or after the
@@ -1957,6 +1967,17 @@ impl DriveStore {
             }
         }
 
+        // The invalidation state is already consumed; if the rebuild
+        // fails now, nothing else re-flags it and every later getter
+        // would serve the stale cache as clean. Re-dirty on any error.
+        let res = self.full_rebuild_inner();
+        if res.is_err() {
+            self.drive_cache_dirty.store(true, Ordering::Release);
+        }
+        res
+    }
+
+    fn full_rebuild_inner(&self) -> Result<()> {
         // Phase 1: snapshot inputs. On a file-backed store this uses a
         // dedicated READ-ONLY connection — WAL lets it scan the summary
         // rows concurrently with the shared connection's writers, so the
