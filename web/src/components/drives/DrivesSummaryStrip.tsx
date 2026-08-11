@@ -1,4 +1,4 @@
-import { Robot2Icon, ScheduleIcon, SpeedIcon, VitalSignsIcon } from "@/components/icons"
+import { DangerousIcon, Robot2Icon, ScheduleIcon, SpeedIcon, VitalSignsIcon } from "@/components/icons"
 import { formatDuration, formatPercent } from "@/lib/drive-format"
 import type { DrivesFilteredStats } from "@/hooks/useDrivesList"
 
@@ -99,7 +99,7 @@ export function DrivesSummaryStrip({
         <>
           <Divider />
           <StatCell
-            icon={<Robot2Icon className="h-3.5 w-3.5 text-rose-300" />}
+            icon={<DangerousIcon className="h-3.5 w-3.5 text-rose-300" />}
             label="Disengagements"
             value={stats.fsdDisengagements.toLocaleString()}
           />

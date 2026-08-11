@@ -3,6 +3,7 @@ import { Link, useParams } from "react-router-dom"
 import {
   AirIcon,
   AlbumIcon,
+  DangerousIcon,
   ArrowBackIcon,
   Robot2Icon,
   DataUsageIcon,
@@ -421,7 +422,7 @@ function AssistedSection({ drive, metric }: AssistedSectionProps) {
             <StatTile
               label="Disengagements"
               value={String(drive.fsdDisengagements)}
-              icon={<AlbumIcon className="h-4 w-4" />}
+              icon={<DangerousIcon className="h-4 w-4" />}
               info="Number of times FSD handed back control (excluding parks within 2s)."
             />
             <StatTile

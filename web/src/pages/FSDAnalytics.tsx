@@ -7,7 +7,7 @@ import {
   ChevronLeftIcon,
   LocalFireDepartmentIcon,
   TrendingUpIcon,
-  WarningIcon,
+  DangerousIcon,
 } from "@/components/icons"
 import { api } from "@/lib/api"
 import type { FSDAnalytics as FSDAnalyticsData } from "@/lib/api"
@@ -338,7 +338,7 @@ export default function FSDAnalytics() {
           color="emerald"
         />
         <StatCard
-          icon={WarningIcon}
+          icon={DangerousIcon}
           label="Avg. Disengagements"
           value={avgDis.toFixed(1)}
           sub="per drive"

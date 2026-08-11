@@ -44,6 +44,7 @@ export const SYMBOLS = [
   "content_copy", // was Lucide Copy
   "conversion_path", // was Lucide Route
   "create_new_folder", // was Lucide FolderPlus
+  "dangerous", // FSD disengagement stats
   "dashboard", // was Lucide LayoutDashboard
   "data_usage",
   "delete", // was Lucide Trash2
