@@ -313,7 +313,7 @@ pub struct DriveSummary {
     pub point_count: usize,
     pub start_point: Option<GpsPoint>,
     pub end_point: Option<GpsPoint>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tags: Vec<String>,
     // FSD analytics (state=1)
     pub fsd_engaged_ms: i64,

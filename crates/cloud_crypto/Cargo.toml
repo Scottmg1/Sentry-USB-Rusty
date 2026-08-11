@@ -15,7 +15,7 @@ ring = "0.17"
 # ring::agreement does not expose long-term private keys; a small dalek dep is the trade.
 x25519-dalek = { version = "3", features = ["static_secrets"] }
 
-base64 = "0.22"
+base64 = "0.23"
 hex = "0.4"
 
 [dev-dependencies]

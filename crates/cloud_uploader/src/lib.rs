@@ -1,3 +1,4 @@
+pub mod charge_deletes;
 pub mod charges;
 pub mod client;
 pub mod credentials_store;
@@ -18,6 +19,12 @@ use sentryusb_drives::DriveStore;
 use sentryusb_ws::Hub;
 
 pub use crate::state::{CloudStatus, CloudStateInner, PairingState, RateConfigAccess};
+
+/// Cloud chargeId for a local session start — exposed so the API layer
+/// can queue delete-outbox rows without a direct crypto dependency.
+pub fn charge_id_for_session(start_ts: i64) -> String {
+    crypto::ids::charge_id_from_start_ts(start_ts)
+}
 
 pub const DEFAULT_CLOUD_BASE_URL: &str = "https://sentryusb.com";
 

@@ -21,6 +21,20 @@ pub struct AppState {
     pub net_sampler: NetSampler,
 }
 
+// Substate extraction, so handlers needing only auth or the WS hub can
+// be mounted by both the full router and the degraded one.
+impl axum::extract::FromRef<AppState> for AuthState {
+    fn from_ref(s: &AppState) -> Self {
+        s.auth.clone()
+    }
+}
+
+impl axum::extract::FromRef<AppState> for sentryusb_ws::Hub {
+    fn from_ref(s: &AppState) -> Self {
+        s.hub.clone()
+    }
+}
+
 /// Build the complete Axum router with all API routes.
 pub fn build_router(state: AppState) -> Router {
     let api = Router::new()
@@ -329,12 +343,13 @@ pub async fn slow_request_log(
     resp
 }
 
-/// WebSocket handler.
-async fn ws_handler(
+/// WebSocket handler. Takes only the hub so the degraded router can
+/// mount it too (storage-repair progress streams over it).
+pub(crate) async fn ws_handler(
     ws: axum::extract::WebSocketUpgrade,
-    axum::extract::State(state): axum::extract::State<AppState>,
+    axum::extract::State(hub): axum::extract::State<sentryusb_ws::Hub>,
 ) -> impl axum::response::IntoResponse {
-    ws.on_upgrade(move |socket| handle_ws(socket, state.hub))
+    ws.on_upgrade(move |socket| handle_ws(socket, hub))
 }
 
 async fn handle_ws(socket: axum::extract::ws::WebSocket, hub: sentryusb_ws::Hub) {

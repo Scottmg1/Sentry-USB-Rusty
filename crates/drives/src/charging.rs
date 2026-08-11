@@ -32,6 +32,7 @@ pub const FAST_CHARGE_THRESHOLD_KW: i64 = 22;
 
 /// One row pulled from `telemetry_samples`, already filtered to samples
 /// where the car was actively charging (see `is_actively_charging`).
+#[derive(Default)]
 pub struct ChargeRow {
     pub ts: i64,
     pub power_kw: Option<i64>,

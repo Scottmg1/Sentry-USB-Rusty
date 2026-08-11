@@ -186,71 +186,66 @@ async fn main() {
 
     // Drive store (SQLite)
     let db_path = sentryusb_drives::DEFAULT_DB_PATH;
-    // `true` when the persistent store could not be opened on a real
-    // device and we are running on an ephemeral in-memory one. Startup
-    // steps whose safety depends on a SUCCESSFUL open must be skipped in
-    // that state (see the legacy-cleanup call below).
-    let mut store_degraded = false;
     let store = match sentryusb_drives::DriveStore::open(db_path) {
         Ok(s) => Arc::new(s),
-        Err(e) => {
-            // Dev machines have no /backingfiles, so in-memory is the
-            // correct fallback there. On a REAL device the same fallback
-            // silently serves an empty history and makes that boot's
-            // ingest ephemeral — indistinguishable, in the UI, from
-            // "all my drives were deleted". Log accordingly so the
-            // journal names the actual condition instead of a passing
-            // warning. (Deliberately still non-fatal: exiting would
-            // crash-loop the daemon under systemd's Restart=always and
-            // take the web UI with it, leaving no way to free space or
-            // run recovery on a device that is merely full. Making this
-            // fatal is a real product tradeoff — data-truth versus
-            // remote access — and is tracked separately.)
-            let looks_like_device = std::path::Path::new(db_path)
-                .parent()
-                .is_some_and(|p| p.exists());
-            if looks_like_device {
-                store_degraded = true;
-                tracing::error!(
-                    "Failed to open drive DB at {}: {}. SERVING AN EMPTY IN-MEMORY STORE: \
-                     this boot shows no drives and anything ingested now is lost on reboot. \
-                     Common causes are a full disk, a locked DB, or a damaged file — free \
-                     space and restart, and do NOT re-run setup before checking the DB.",
-                    db_path,
-                    e
-                );
-            } else {
-                tracing::warn!(
-                    "Failed to open drive DB at {}: {}. Using in-memory (no {} — dev machine?).",
-                    db_path,
-                    e,
-                    std::path::Path::new(db_path)
-                        .parent()
-                        .map(|p| p.display().to_string())
-                        .unwrap_or_default()
-                );
-            }
+        Err(e) if args.dev => {
+            // Explicit dev mode: no /backingfiles exists, in-memory is
+            // the intended store.
+            tracing::warn!("Failed to open drive DB at {}: {}. Using in-memory (--dev).", db_path, e);
             Arc::new(sentryusb_drives::DriveStore::open_memory().expect("failed to create in-memory DB"))
+        }
+        Err(e) => {
+            // A real device whose DB will not open must not serve an
+            // empty in-memory store: empty history is indistinguishable,
+            // in the UI, from "all my drives were deleted", and every
+            // background job would run against fiction whose writes
+            // vanish on reboot. Serve an explicit degraded mode instead:
+            // the SPA plus a banner, 503 on every data endpoint, and a
+            // recovery allowlist (logs, storage health/repair, reboot).
+            // No store, processor, or cloud uploader is constructed. A
+            // periodic reopen probe exits cleanly once the DB comes back
+            // — a transient cause (mount ordering, a lock, fsck) heals
+            // on its own via systemd's Restart=always.
+            tracing::error!(
+                "Failed to open drive DB at {}: {}. Entering degraded mode —                  common causes are a full disk, a locked DB, or a damaged file.                  Do NOT re-run setup before checking the DB file.",
+                db_path,
+                e
+            );
+            tokio::spawn(async {
+                let mut tick = tokio::time::interval(std::time::Duration::from_secs(30));
+                tick.tick().await; // skip the immediate tick
+                loop {
+                    tick.tick().await;
+                    let ok = tokio::task::spawn_blocking(|| {
+                        sentryusb_drives::DriveStore::open(sentryusb_drives::DEFAULT_DB_PATH).is_ok()
+                    })
+                    .await
+                    .unwrap_or(false);
+                    if ok {
+                        tracing::info!(
+                            "drive DB opens again — exiting degraded mode; systemd restarts into normal service"
+                        );
+                        std::process::exit(0);
+                    }
+                }
+            });
+            let degraded = sentryusb_api::degraded::DegradedState {
+                auth: auth.clone(),
+                hub: hub.clone(),
+                reason: std::sync::Arc::new(e.to_string()),
+            };
+            let app = sentryusb_api::degraded::build_degraded_router(degraded);
+            serve_with_common_layers(app, auth, args.port, args.dev, t0).await;
+            return;
         }
     };
     // Remove orphaned files older binaries wrote to /mutable (drive-data.json
     // moved to /backingfiles, plus a couple of pre-Rust state files). Runs
     // after DriveStore::open so any one-shot importer that needs the legacy
-    // path has already had a chance to consume it.
-    // ONLY safe after a successful persistent open. The cleanup deletes
-    // /mutable/drive-data.json on the documented premise that
-    // DriveStore::open already imported it — but when open FAILED that
-    // import never ran, so deleting it would destroy the user's last
-    // remaining copy of their drive history at exactly the moment the
-    // database is unavailable. Keep it as a recovery source instead.
-    if store_degraded {
-        tracing::error!(
-            "skipping legacy-file cleanup: the persistent store never opened, so nothing \
-             was imported — preserving /mutable/drive-data.json as a recovery source"
-        );
-    } else {
-        sentryusb_drives::cleanup_legacy_mutable_files();
-    }
+    // path has already had a chance to consume it. Only reached after a
+    // successful persistent open (an open failure exits above), so the
+    // legacy JSON can never be deleted without having been imported.
+    sentryusb_drives::cleanup_legacy_mutable_files();
     phase!("drive_store_opened");
 
     // Legacy-JSON migration is now handled automatically inside
@@ -372,8 +367,22 @@ async fn main() {
     phase!("startup_tasks_spawned");
 
     // Build the API router
-    let mut app = sentryusb_api::build_router(app_state.clone());
+    let app = sentryusb_api::build_router(app_state.clone());
+    phase!("router_built");
 
+    serve_with_common_layers(app, auth, args.port, args.dev, t0).await;
+}
+
+/// Shared serving tail for normal and degraded startup: media mounts,
+/// SPA fallback, compression, auth gate, slow-request journal, bind,
+/// serve. Runs until shutdown.
+async fn serve_with_common_layers(
+    mut app: axum::Router,
+    auth: sentryusb_api::auth::AuthState,
+    port: u16,
+    dev: bool,
+    t0: std::time::Instant,
+) {
     // Serve TeslaCam video files via the bind mount of /mutable/TeslaCam
     // at /var/www/html/TeslaCam. Modern browsers (Chrome 80+, Firefox 70+,
     // Safari iOS 13+, ExoPlayer) parse Tesla's `ctts` atom natively, so
@@ -390,7 +399,7 @@ async fn main() {
     );
 
     // Static file serving with SPA fallback (unless dev mode)
-    if !args.dev {
+    if !dev {
         app = app.fallback(embed::spa_handler);
         info!("Serving embedded static files");
     } else {
@@ -464,15 +473,14 @@ async fn main() {
     app = app.layer(axum::middleware::from_fn(
         sentryusb_api::router::slow_request_log,
     ));
-    phase!("router_built");
 
-    let addr = std::net::SocketAddr::from((std::net::Ipv6Addr::UNSPECIFIED, args.port));
+    let addr = std::net::SocketAddr::from((std::net::Ipv6Addr::UNSPECIFIED, port));
     info!("SentryUSB server listening on {}", addr);
 
     let listener = tokio::net::TcpListener::bind(addr)
         .await
         .expect("failed to bind address");
-    phase!("listener_bound");
+    info!(boot_phase = "listener_bound", elapsed_ms = t0.elapsed().as_millis() as u64);
 
     info!(
         boot_phase = "ready",

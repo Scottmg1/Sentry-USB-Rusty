@@ -5,7 +5,7 @@ import { useConnectionStatus, type ConnectionState } from "@/hooks/useConnection
 import { getStoredAwayMode } from "@/hooks/useAwayMode"
 
 export function ConnectionBanner() {
-  const { state, retry } = useConnectionStatus()
+  const { state, degraded, retry } = useConnectionStatus()
   const [visible, setVisible] = useState(false)
   const [displayState, setDisplayState] = useState<ConnectionState | "connected-flash">(state)
   const [dismissed, setDismissed] = useState(false)
@@ -33,6 +33,28 @@ export function ConnectionBanner() {
       setVisible(false)
     }
   }, [state])
+
+  // Degraded mode outranks connection state and cannot be dismissed:
+  // the server is up but its database is not, so every data page is
+  // empty for a real reason the user must see.
+  if (degraded) {
+    return (
+      <div className="mb-4 flex items-start gap-3 rounded-lg border border-red-500/30 bg-red-500/10 px-4 py-3 text-sm text-red-300">
+        <WifiOffIcon className="h-4 w-4 shrink-0 mt-0.5" />
+        <div className="flex-1 space-y-1">
+          <p className="font-medium">Database unavailable</p>
+          <p className="text-xs text-red-400/70">
+            Sentry USB is running but cannot open its drive database, so
+            history cannot be read and recording data is not being saved.
+            Drives, charging, and clips are temporarily unavailable. Check
+            Settings &gt; Storage for repair options, or the logs for
+            details. This page will recover automatically once the
+            database is back.
+          </p>
+        </div>
+      </div>
+    )
+  }
 
   if (!visible || dismissed) return null
 

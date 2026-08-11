@@ -35,6 +35,17 @@ jobs:
           cd web
           npm ci
           npx eslint . --max-warnings 30
+      - name: Production build
+        # Unconditional here: this workflow only fires on direct pushes to
+        # main touching web/**, which is exactly the path where nothing
+        # else compiles the bundle until someone cuts a release.
+        run: |
+          cd web
+          npm run build
+          if [ ! -s "dist/index.html" ]; then
+            echo "::error::web/dist/index.html missing or empty after npm run build"
+            exit 1
+          fi
       - name: Icons up to date
         # src/components/icons.tsx is generated from scripts/icons/symbols.mjs.
         # Hand-editing it silently drifts from the Material Symbols source (a

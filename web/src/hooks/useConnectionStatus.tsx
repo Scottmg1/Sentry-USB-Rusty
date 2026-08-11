@@ -5,11 +5,14 @@ export type ConnectionState = "connected" | "reconnecting" | "disconnected"
 
 interface ConnectionContextValue {
   state: ConnectionState
+  /** Set when the server is up but its database is not ("database_unavailable"). */
+  degraded: string | null
   retry: () => void
 }
 
 const ConnectionContext = createContext<ConnectionContextValue>({
   state: "connected",
+  degraded: null,
   retry: () => {},
 })
 
@@ -19,6 +22,7 @@ export function useConnectionStatus() {
 
 export function ConnectionProvider({ children }: { children: React.ReactNode }) {
   const [state, setState] = useState<ConnectionState>("connected")
+  const [degraded, setDegraded] = useState<string | null>(null)
   const disconnectTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
   const httpOk = useRef(true)
   const httpFailCount = useRef(0)
@@ -75,8 +79,17 @@ export function ConnectionProvider({ children }: { children: React.ReactNode }) 
         clearTimeout(timeout)
         if (mounted) {
           httpOk.current = res.ok
-          if (res.ok) httpFailCount.current = 0
-          else httpFailCount.current++
+          if (res.ok) {
+            httpFailCount.current = 0
+            // Degraded mode: server reachable, DB not. The status body
+            // carries the marker; a parse failure just means normal mode.
+            try {
+              const body = await res.clone().json()
+              setDegraded(typeof body?.degraded === "string" ? body.degraded : null)
+            } catch {
+              setDegraded(null)
+            }
+          } else httpFailCount.current++
           evaluate()
         }
       } catch {
@@ -113,7 +126,7 @@ export function ConnectionProvider({ children }: { children: React.ReactNode }) 
   }
 
   return (
-    <ConnectionContext.Provider value={{ state, retry }}>
+    <ConnectionContext.Provider value={{ state, degraded, retry }}>
       {children}
     </ConnectionContext.Provider>
   )

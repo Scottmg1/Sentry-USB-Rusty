@@ -10,7 +10,22 @@ import {
 
 interface SnapshotEntry {
   id: string
-  size_bytes: number
+  /**
+   * Estimated bytes freed by deleting this snapshot AND every older one.
+   *
+   * Not this snapshot's own size: snapshots share nearly all their storage
+   * with their neighbours, so "what does this one alone hold" measures ~0
+   * for every row while the set collectively holds hundreds of GB. Space
+   * only returns when the last snapshot holding a block goes, which makes
+   * reclaim a property of an oldest-first run, not of one snapshot.
+   *
+   * null means not measured yet, or not measurable. It must never render
+   * as "0 B" — that reads as "deleting frees nothing", which is a
+   * different (and here wrong) claim. A measured 0 is legitimate.
+   */
+  cumulative_reclaim_bytes: number | null
+  /** Snapshots older than this one — for "this + N older" labels. */
+  older_count: number
   created_unix: number
 }
 
@@ -21,7 +36,7 @@ interface FreeSpace {
   mounted: boolean
 }
 
-type SortMode = "oldest" | "newest" | "largest"
+type SortMode = "oldest" | "newest"
 
 function formatBytes(bytes: number): string {
   if (!Number.isFinite(bytes) || bytes <= 0) return "0 B"
@@ -59,6 +74,9 @@ export default function Snapshots() {
   // they need to delete to free space, so the first row is the most
   // useful action by default. Allow re-sorting for browsing.
   const [sortMode, setSortMode] = useState<SortMode>("oldest")
+  // Measuring reclaimable size walks each image's extent map, so it runs
+  // off the request path. While it's running rows have no number yet.
+  const [sizesPending, setSizesPending] = useState(false)
 
   const refresh = useCallback(async () => {
     setError(null)
@@ -75,6 +93,7 @@ export default function Snapshots() {
           ? listData.total_allocated_bytes
           : 0,
       )
+      setSizesPending(listData?.sizes_pending === true)
       if (spaceRes.ok) {
         const spaceData = await spaceRes.json()
         setFree(spaceData)
@@ -90,11 +109,24 @@ export default function Snapshots() {
     refresh()
   }, [refresh])
 
+  // Poll while a measurement is running so the numbers appear on their
+  // own. Deliberately stops as soon as they land — this walks extent maps
+  // on a Pi, so it must not become a background load.
+  useEffect(() => {
+    if (!sizesPending) return
+    const t = setInterval(refresh, 4000)
+    return () => clearInterval(t)
+  }, [sizesPending, refresh])
+
+  // Only chronological sorts. "Largest first" is gone deliberately: the
+  // figure on each row is CUMULATIVE (this snapshot + everything older),
+  // which is monotonic by age — sorting by it IS sorting by age, and
+  // offering it as a separate mode would imply the rows carry
+  // independent sizes to compare. They don't; snapshots share storage.
   const sortedSnapshots = useMemo(() => {
     const arr = [...snapshots]
     if (sortMode === "oldest") arr.sort((a, b) => a.created_unix - b.created_unix)
-    else if (sortMode === "newest") arr.sort((a, b) => b.created_unix - a.created_unix)
-    else if (sortMode === "largest") arr.sort((a, b) => b.size_bytes - a.size_bytes)
+    else arr.sort((a, b) => b.created_unix - a.created_unix)
     return arr
   }, [snapshots, sortMode])
 
@@ -138,6 +170,14 @@ export default function Snapshots() {
           Snapshots are point-in-time copies of your dashcam footage stored on
           the backingfiles partition. Delete oldest snapshots here to free
           space — for example, before growing the dashcam drive size.
+        </p>
+        <p className="mt-2 text-xs text-slate-500">
+          Snapshots share storage, so deleting a single snapshot usually frees
+          almost nothing — space only comes back once every snapshot holding it
+          is gone. Each row therefore shows what you would get back by deleting
+          that snapshot <span className="font-medium text-slate-400">together with all older ones</span>:
+          scan down to the amount you need, then delete from the oldest down to
+          that row.
         </p>
       </div>
 
@@ -198,7 +238,6 @@ export default function Snapshots() {
             >
               <option value="oldest">Oldest first</option>
               <option value="newest">Newest first</option>
-              <option value="largest">Largest first</option>
             </select>
           </label>
         </div>
@@ -234,7 +273,28 @@ export default function Snapshots() {
                     <span className="mx-1.5 text-slate-700">•</span>
                     {relativeTime(s.created_unix)}
                     <span className="mx-1.5 text-slate-700">•</span>
-                    {formatBytes(s.size_bytes)}
+                    {s.cumulative_reclaim_bytes !== null ? (
+                      <span
+                        title={
+                          s.older_count === 0
+                            ? "Estimated space freed by deleting this oldest snapshot. Snapshots share storage, so most space only returns once every snapshot still holding it is gone."
+                            : `Estimated space freed by deleting this snapshot AND the ${s.older_count} older ${s.older_count === 1 ? "one" : "ones"} — not this snapshot alone. Snapshots share storage, so space only returns when the last snapshot holding it is deleted.`
+                        }
+                      >
+                        {s.older_count === 0
+                          ? `deleting this frees ~${formatBytes(s.cumulative_reclaim_bytes)}`
+                          : `deleting this + ${s.older_count} older frees ~${formatBytes(s.cumulative_reclaim_bytes)}`}
+                      </span>
+                    ) : sizesPending ? (
+                      <span className="text-slate-600">measuring…</span>
+                    ) : (
+                      <span
+                        className="text-slate-600"
+                        title="Could not measure. A snapshot may be in use, or the filesystem may not support extent accounting."
+                      >
+                        size unavailable
+                      </span>
+                    )}
                   </p>
                 </div>
                 {isConfirming ? (

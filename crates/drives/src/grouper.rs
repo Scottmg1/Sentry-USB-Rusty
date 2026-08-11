@@ -20,7 +20,7 @@ use crate::types::*;
 // ---------------------------------------------------------------------------
 
 /// Time gap (ms) that splits clips into separate drives (5 minutes).
-const DRIVE_GAP_MS: i64 = 5 * 60 * 1000;
+pub(crate) const DRIVE_GAP_MS: i64 = 5 * 60 * 1000;
 
 /// Minimum gap (ms) between consecutive RecentClips timestamps that counts
 /// as a recording hole (≥1 missing minute-clip; normal spacing is ~60s).
@@ -628,13 +628,37 @@ pub(crate) fn telemetry_has_driving(
     raw_park_count: u32,
     raw_frame_count: u32,
 ) -> bool {
-    gear_runs.iter().any(|r| r.gear != GEAR_PARK)
-        || gear_states.iter().any(|&g| g != GEAR_PARK)
-        || (gear_runs.is_empty()
-            && gear_states.is_empty()
+    telemetry_has_driving_core(
+        gear_runs.iter().any(|r| r.gear != GEAR_PARK),
+        gear_runs.is_empty(),
+        gear_states.iter().any(|&g| g != GEAR_PARK),
+        gear_states.is_empty(),
+        raw_park_count,
+        raw_frame_count,
+        speeds.iter().any(|&s| s.abs() > GAP_FILL_MIN_SPEED_MPS),
+    )
+}
+
+/// [`telemetry_has_driving`] over pre-reduced scalars, so the overview
+/// planner can evaluate it from metadata without loading the arrays.
+/// One source of truth: the array version above delegates here.
+#[allow(clippy::fn_params_excessive_bools)]
+pub(crate) fn telemetry_has_driving_core(
+    gear_runs_non_park: bool,
+    gear_runs_empty: bool,
+    gear_states_non_park: bool,
+    gear_states_empty: bool,
+    raw_park_count: u32,
+    raw_frame_count: u32,
+    speeds_driving: bool,
+) -> bool {
+    gear_runs_non_park
+        || gear_states_non_park
+        || (gear_runs_empty
+            && gear_states_empty
             && raw_frame_count > 0
             && raw_park_count < raw_frame_count)
-        || speeds.iter().any(|&s| s.abs() > GAP_FILL_MIN_SPEED_MPS)
+        || speeds_driving
 }
 
 /// POSITIVE gear evidence only: at least one non-Park gear frame.
@@ -1064,6 +1088,393 @@ fn group_clips(routes: Vec<Route>) -> Vec<Vec<TimedRoute>> {
 }
 
 // ---------------------------------------------------------------------------
+// Overview planning (streaming map builder)
+//
+// Mirrors group_clips' topology over reduced metadata so drive fragments
+// are known before any point BLOB is decoded. Every rule delegates to
+// the same functions the in-memory path uses; the differential tests
+// assert byte-equal output.
+// ---------------------------------------------------------------------------
+
+/// Median-cluster then neighbour-jump filtering over a drive's collected
+/// points — shared by the in-memory overview path and the streaming
+/// assembler so trails can never diverge between them.
+pub(crate) fn overview_filter_points(pts: &mut Vec<GpsPoint>) {
+    use crate::calc::MAX_FROM_MEDIAN_M;
+    use crate::calc::MAX_JUMP_M;
+
+    // Median-cluster filter: drop points >1000km from median
+    if pts.len() > 2 {
+        let q1 = pts.len() / 4;
+        let q3 = pts.len() * 3 / 4;
+        let count = q3 - q1 + 1;
+        let mut sum_lat: f64 = 0.0;
+        let mut sum_lng: f64 = 0.0;
+        for i in q1..=q3 {
+            sum_lat += pts[i][0];
+            sum_lng += pts[i][1];
+        }
+        let med_lat = sum_lat / count as f64;
+        let med_lng = sum_lng / count as f64;
+
+        pts.retain(|p| calc::geodesic_m(p[0], p[1], med_lat, med_lng) <= MAX_FROM_MEDIAN_M);
+    }
+
+    // Neighbor-jump filter
+    if pts.len() > 2 {
+        let n = pts.len();
+        let mut remove = vec![false; n];
+        for i in 0..n {
+            let has_prev = i > 0;
+            let has_next = i < n - 1;
+            let far_from_prev =
+                has_prev && calc::geodesic_m(pts[i - 1][0], pts[i - 1][1], pts[i][0], pts[i][1]) > MAX_JUMP_M;
+            let far_from_next =
+                has_next && calc::geodesic_m(pts[i][0], pts[i][1], pts[i + 1][0], pts[i + 1][1]) > MAX_JUMP_M;
+            if (has_prev && has_next && far_from_prev && far_from_next)
+                || (!has_prev && far_from_next)
+                || (!has_next && far_from_prev)
+            {
+                remove[i] = true;
+            }
+        }
+        let mut write = 0;
+        for read in 0..n {
+            if !remove[read] {
+                pts[write] = pts[read];
+                write += 1;
+            }
+        }
+        pts.truncate(write);
+    }
+}
+
+/// Any |speed| above the gap-fill driving threshold — the speeds clause
+/// of [`telemetry_has_driving`], shared with the DB-side meta loader.
+pub(crate) fn speeds_driving(speeds: &[f32]) -> bool {
+    speeds.iter().any(|&sp| sp.abs() > GAP_FILL_MIN_SPEED_MPS)
+}
+
+/// Reduced per-route facts — everything the grouping topology consults,
+/// none of the point data.
+pub(crate) struct OverviewClipMeta {
+    pub(crate) file: String,
+    pub(crate) n_points: usize,
+    pub(crate) gear_runs: Vec<GearRun>,
+    pub(crate) gear_states_len: usize,
+    pub(crate) gear_states_non_park: bool,
+    pub(crate) gear_states_park_count: usize,
+    pub(crate) raw_park_count: u32,
+    pub(crate) raw_frame_count: u32,
+    /// Any |speed| above the gap-fill threshold. Consulted only for
+    /// event rows.
+    pub(crate) speeds_driving: bool,
+    pub(crate) source: Option<String>,
+    pub(crate) external_signature: Option<String>,
+}
+
+impl OverviewClipMeta {
+    #[cfg(test)]
+    pub(crate) fn from_route(r: &Route) -> Self {
+        OverviewClipMeta {
+            file: r.file.clone(),
+            n_points: r.points.len(),
+            gear_runs: r.gear_runs.clone(),
+            gear_states_len: r.gear_states.len(),
+            gear_states_non_park: r.gear_states.iter().any(|&g| g != GEAR_PARK),
+            gear_states_park_count: r.gear_states.iter().filter(|&&g| g == GEAR_PARK).count(),
+            raw_park_count: r.raw_park_count,
+            raw_frame_count: r.raw_frame_count,
+            speeds_driving: speeds_driving(&r.speeds),
+            source: r.source.clone(),
+            external_signature: r.external_signature.clone(),
+        }
+    }
+
+    fn driving(&self) -> bool {
+        telemetry_has_driving_core(
+            self.gear_runs.iter().any(|g| g.gear != GEAR_PARK),
+            self.gear_runs.is_empty(),
+            self.gear_states_non_park,
+            self.gear_states_len == 0,
+            self.raw_park_count,
+            self.raw_frame_count,
+            self.speeds_driving,
+        )
+    }
+}
+
+/// One planned slice of one clip inside a drive.
+pub(crate) struct PlannedFragment {
+    pub(crate) meta_idx: usize,
+    pub(crate) range: std::ops::Range<usize>,
+    pub(crate) timestamp: NaiveDateTime,
+}
+
+pub(crate) struct PlannedDrive {
+    pub(crate) fragments: Vec<PlannedFragment>,
+}
+
+struct TimedMeta {
+    idx: usize,
+    ts: NaiveDateTime,
+}
+
+/// group_clips over metadata. `metas` must be in the same order the
+/// route query returns (ORDER BY file) — dedup keeps first occurrence.
+pub(crate) fn plan_overviews(metas: &[OverviewClipMeta]) -> Vec<PlannedDrive> {
+    let mut seen = std::collections::HashMap::new();
+    let mut timed: Vec<TimedMeta> = Vec::new();
+    let mut events: Vec<usize> = Vec::new();
+    for (i, m) in metas.iter().enumerate() {
+        let norm = m.file.replace('\\', "/");
+        if seen.insert(norm, ()).is_some() {
+            continue;
+        }
+        if is_event_folder_path(&m.file) {
+            events.push(i);
+        } else if let Some(ts) = parse_clip_timestamp(&m.file) {
+            timed.push(TimedMeta { idx: i, ts });
+        }
+    }
+    timed.sort_by(|a, b| a.ts.cmp(&b.ts));
+
+    if !events.is_empty() {
+        let recent_ts: Vec<NaiveDateTime> = timed.iter().map(|t| t.ts).collect();
+        let mut cands: Vec<(NaiveDateTime, Option<usize>)> = Vec::new();
+        for &i in &events {
+            if let Some(ts) = parse_clip_timestamp(&metas[i].file) {
+                cands.push((ts, Some(i)));
+            }
+        }
+        let keys: Vec<GapFillCandidate> = cands
+            .iter()
+            .map(|(ts, i)| {
+                let m = &metas[i.unwrap()];
+                GapFillCandidate {
+                    ts: *ts,
+                    file: m.file.as_str(),
+                    driving: Some(m.driving()),
+                    // gear_runs ONLY — mirrors group_clips (see its
+                    // comment on map/list unanchored-cluster parity).
+                    gear_driving: m.gear_runs.iter().any(|g| g.gear != GEAR_PARK),
+                }
+            })
+            .collect();
+        let mut admitted = 0usize;
+        for k in select_gap_fill(&recent_ts, &keys) {
+            let (ts, i) = &mut cands[k];
+            timed.push(TimedMeta { idx: i.take().unwrap(), ts: *ts });
+            admitted += 1;
+        }
+        if admitted > 0 {
+            timed.sort_by(|a, b| a.ts.cmp(&b.ts));
+        }
+    }
+    if timed.is_empty() {
+        return Vec::new();
+    }
+
+    let mut time_groups: Vec<Vec<TimedMeta>> = Vec::new();
+    let mut current = vec![timed.remove(0)];
+    for tm in timed {
+        if (tm.ts - current.last().unwrap().ts).num_milliseconds() > DRIVE_GAP_MS {
+            time_groups.push(std::mem::take(&mut current));
+        }
+        current.push(tm);
+    }
+    if !current.is_empty() {
+        time_groups.push(current);
+    }
+
+    let mut drives = Vec::new();
+    for tg in time_groups {
+        for gg in plan_split_by_gear(metas, tg) {
+            for sg in plan_split_by_signature(metas, gg) {
+                drives.push(PlannedDrive { fragments: sg });
+            }
+        }
+    }
+    drives
+}
+
+fn whole_fragment(metas: &[OverviewClipMeta], tm: &TimedMeta) -> PlannedFragment {
+    PlannedFragment {
+        meta_idx: tm.idx,
+        range: 0..metas[tm.idx].n_points,
+        timestamp: tm.ts,
+    }
+}
+
+/// split_by_gear_state over metadata.
+fn plan_split_by_gear(
+    metas: &[OverviewClipMeta],
+    group: Vec<TimedMeta>,
+) -> Vec<Vec<PlannedFragment>> {
+    if group.is_empty() {
+        return Vec::new();
+    }
+    let has_gear_runs = group.iter().any(|t| !metas[t.idx].gear_runs.is_empty());
+    if !has_gear_runs {
+        return plan_split_legacy(metas, group);
+    }
+
+    let mut result: Vec<Vec<PlannedFragment>> = Vec::new();
+    let mut current: Vec<PlannedFragment> = Vec::new();
+    for tm in group.iter() {
+        let m = &metas[tm.idx];
+        if m.gear_runs.is_empty() {
+            current.push(whole_fragment(metas, tm));
+            continue;
+        }
+        match plan_clip_at_park_gaps(&m.gear_runs, m.n_points) {
+            None => {
+                // Mirrors the slicer: an unsplit gear-run clip is kept
+                // only when it has points.
+                if m.n_points > 0 {
+                    current.push(whole_fragment(metas, tm));
+                }
+            }
+            Some(plan) => {
+                for seg in plan {
+                    if seg.parked {
+                        if !current.is_empty() {
+                            result.push(std::mem::take(&mut current));
+                        }
+                    } else {
+                        current.push(PlannedFragment {
+                            meta_idx: tm.idx,
+                            range: seg.range,
+                            timestamp: tm.ts + chrono::Duration::seconds(seg.offset_secs),
+                        });
+                    }
+                }
+            }
+        }
+    }
+    if !current.is_empty() {
+        result.push(current);
+    }
+    if result.is_empty() {
+        // Everything parked: the whole group passes through unsplit.
+        return vec![group.iter().map(|tm| whole_fragment(metas, tm)).collect()];
+    }
+    result
+}
+
+/// split_by_gear_state_legacy over metadata — including its quirk of
+/// returning EMPTY (not the original group) when every clip is parked.
+fn plan_split_legacy(
+    metas: &[OverviewClipMeta],
+    group: Vec<TimedMeta>,
+) -> Vec<Vec<PlannedFragment>> {
+    let as_whole =
+        |g: &[TimedMeta]| g.iter().map(|tm| whole_fragment(metas, tm)).collect::<Vec<_>>();
+    if group.len() <= 1 {
+        return vec![as_whole(&group)];
+    }
+    let has_gear = group.iter().any(|t| metas[t.idx].gear_states_len > 0);
+    if !has_gear {
+        return vec![as_whole(&group)];
+    }
+
+    let mut result: Vec<Vec<PlannedFragment>> = Vec::new();
+    let mut current: Vec<PlannedFragment> = Vec::new();
+    for tm in group.iter() {
+        let m = &metas[tm.idx];
+        if mostly_parked_legacy_core(
+            m.raw_park_count,
+            m.raw_frame_count,
+            m.gear_states_park_count,
+            m.gear_states_len,
+        ) {
+            if !current.is_empty() {
+                result.push(std::mem::take(&mut current));
+            }
+        } else {
+            current.push(whole_fragment(metas, tm));
+        }
+    }
+    if !current.is_empty() {
+        result.push(current);
+    }
+    result
+}
+
+/// split_by_external_signature over fragments — same HashMap bucket
+/// construct, so its (nondeterministic) multi-signature ordering
+/// matches the production path's behavior class.
+fn plan_split_by_signature(
+    metas: &[OverviewClipMeta],
+    group: Vec<PlannedFragment>,
+) -> Vec<Vec<PlannedFragment>> {
+    if group.len() <= 1 {
+        return vec![group];
+    }
+    let has_any = group
+        .iter()
+        .any(|f| metas[f.meta_idx].external_signature.is_some());
+    if !has_any {
+        return vec![group];
+    }
+
+    let mut buckets: std::collections::HashMap<String, Vec<PlannedFragment>> =
+        std::collections::HashMap::new();
+    let mut no_sig: Vec<PlannedFragment> = Vec::new();
+    for frag in group {
+        match &metas[frag.meta_idx].external_signature {
+            Some(sig) => buckets.entry(sig.clone()).or_default().push(frag),
+            None => no_sig.push(frag),
+        }
+    }
+
+    let mut result = Vec::new();
+    if !no_sig.is_empty() {
+        result.push(no_sig);
+    }
+    for bucket in buckets.into_values() {
+        result.push(bucket);
+    }
+    result
+}
+
+/// Render one planned drive. `points_for` yields a clip's full decoded
+/// point array by meta index; the caller controls batching and reuse.
+pub(crate) fn overview_from_fragments(
+    id: i32,
+    drive: &PlannedDrive,
+    metas: &[OverviewClipMeta],
+    points_for: &mut dyn FnMut(usize) -> anyhow::Result<std::rc::Rc<Vec<GpsPoint>>>,
+    max_points_per_drive: usize,
+) -> anyhow::Result<RouteOverview> {
+    let mut pts: Vec<GpsPoint> = Vec::new();
+    for f in &drive.fragments {
+        let all = points_for(f.meta_idx)?;
+        // Clamped: a row rewritten between the plan and this read can
+        // shrink the array; a stale range must degrade, not panic. The
+        // next generation bump rebuilds from consistent data.
+        let end = f.range.end.min(all.len());
+        let start = f.range.start.min(end);
+        for p in &all[start..end] {
+            if !(p[0].abs() < 1.0 && p[1].abs() < 1.0) {
+                pts.push([p[0], p[1]]);
+            }
+        }
+    }
+    overview_filter_points(&mut pts);
+
+    let first = drive.fragments.first();
+    Ok(RouteOverview {
+        id,
+        points: downsample(&pts, max_points_per_drive),
+        source: first.and_then(|f| metas[f.meta_idx].source.clone()),
+        start_time: first
+            .map(|f| f.timestamp.format("%Y-%m-%dT%H:%M:%S").to_string())
+            .unwrap_or_default(),
+    })
+}
+
+// ---------------------------------------------------------------------------
 // Internal: external-signature splitting (Tessie drives)
 // ---------------------------------------------------------------------------
 
@@ -1158,19 +1569,30 @@ struct ClipSegment {
     parked: bool,
 }
 
-/// Analyse a clip's GearRuns and split its points at any Park gap >=
-/// PARK_GAP_SECONDS. Returns one or more segments.
-fn split_clip_at_park_gaps(clip: &TimedRoute) -> Vec<ClipSegment> {
-    let total_raw_frames: u32 = clip.route.gear_runs.iter().map(|r| r.frames).sum();
+/// One planned fragment of a clip: point range + segment timestamp
+/// offset, or a park boundary marker. Pure index math over gear runs
+/// and the point COUNT — the single source of truth for the
+/// frame-to-point mapping, shared by the in-memory splitter below and
+/// the streaming overview builder, which plans fragments without
+/// decoding point BLOBs.
+pub(crate) struct PlannedSeg {
+    pub(crate) range: std::ops::Range<usize>,
+    pub(crate) offset_secs: i64,
+    pub(crate) parked: bool,
+}
+
+/// `None` — the clip stays whole (no gear runs, or no park gap long
+/// enough to split at).
+pub(crate) fn plan_clip_at_park_gaps(
+    gear_runs: &[GearRun],
+    n_points: usize,
+) -> Option<Vec<PlannedSeg>> {
+    let total_raw_frames: u32 = gear_runs.iter().map(|r| r.frames).sum();
     if total_raw_frames == 0 {
-        return vec![ClipSegment {
-            route: clip.clone(),
-            parked: false,
-        }];
+        return None;
     }
 
     let seconds_per_frame = 60.0 / total_raw_frames as f64;
-    let n_points = clip.route.points.len();
 
     // Identify raw segments that are park gaps
     struct RawSeg {
@@ -1181,7 +1603,7 @@ fn split_clip_at_park_gaps(clip: &TimedRoute) -> Vec<ClipSegment> {
 
     let mut raw_segs = Vec::new();
     let mut frame: u32 = 0;
-    for run in &clip.route.gear_runs {
+    for run in gear_runs {
         let duration = run.frames as f64 * seconds_per_frame;
         let is_park_gap = run.gear == GEAR_PARK && duration >= PARK_GAP_SECONDS;
         raw_segs.push(RawSeg {
@@ -1204,25 +1626,15 @@ fn split_clip_at_park_gaps(clip: &TimedRoute) -> Vec<ClipSegment> {
         merged.push(seg);
     }
 
-    // Check if any split is needed
     if !merged.iter().any(|s| s.parked) {
-        return vec![ClipSegment {
-            route: clip.clone(),
-            parked: false,
-        }];
+        return None;
     }
 
-    // Map raw frame ranges to deduped point indices and build segments
-    let mut result = Vec::new();
+    // Map raw frame ranges to deduped point indices
+    let mut out = Vec::new();
     for seg in &merged {
         if seg.parked {
-            result.push(ClipSegment {
-                route: TimedRoute {
-                    route: Route::empty(),
-                    timestamp: clip.timestamp,
-                },
-                parked: true,
-            });
+            out.push(PlannedSeg { range: 0..0, offset_secs: 0, parked: true });
             continue;
         }
 
@@ -1242,6 +1654,40 @@ fn split_clip_at_park_gaps(clip: &TimedRoute) -> Vec<ClipSegment> {
             continue;
         }
 
+        out.push(PlannedSeg {
+            range: start_idx..end_idx,
+            offset_secs: (start_frac * 60.0) as i64,
+            parked: false,
+        });
+    }
+    Some(out)
+}
+
+/// Analyse a clip's GearRuns and split its points at any Park gap >=
+/// PARK_GAP_SECONDS. Returns one or more segments.
+fn split_clip_at_park_gaps(clip: &TimedRoute) -> Vec<ClipSegment> {
+    let Some(plan) = plan_clip_at_park_gaps(&clip.route.gear_runs, clip.route.points.len())
+    else {
+        return vec![ClipSegment {
+            route: clip.clone(),
+            parked: false,
+        }];
+    };
+
+    let mut result = Vec::new();
+    for seg in plan {
+        if seg.parked {
+            result.push(ClipSegment {
+                route: TimedRoute {
+                    route: Route::empty(),
+                    timestamp: clip.timestamp,
+                },
+                parked: true,
+            });
+            continue;
+        }
+
+        let (start_idx, end_idx) = (seg.range.start, seg.range.end);
         let seg_points = clip.route.points[start_idx..end_idx].to_vec();
 
         let seg_gears = if clip.route.gear_states.len() >= end_idx {
@@ -1268,9 +1714,7 @@ fn split_clip_at_park_gaps(clip: &TimedRoute) -> Vec<ClipSegment> {
             Vec::new()
         };
 
-        // Compute timestamp offset for this segment within the clip
-        let offset_secs = (start_frac * 60.0) as i64;
-        let offset = chrono::Duration::seconds(offset_secs);
+        let offset = chrono::Duration::seconds(seg.offset_secs);
 
         result.push(ClipSegment {
             route: TimedRoute {
@@ -1367,20 +1811,35 @@ fn split_by_gear_state_legacy(group: Vec<TimedRoute>) -> Vec<Vec<TimedRoute>> {
 
 /// Returns true if the clip is majority Park (legacy heuristic).
 fn clip_is_mostly_parked_legacy(clip: &TimedRoute) -> bool {
-    if clip.route.raw_frame_count > 0 {
-        return (clip.route.raw_park_count as f64 / clip.route.raw_frame_count as f64)
-            > calc::PARK_MAJORITY_FRACTION;
-    }
-    if clip.route.gear_states.is_empty() {
-        return false;
-    }
     let park_count = clip
         .route
         .gear_states
         .iter()
         .filter(|&&g| g == GEAR_PARK)
         .count();
-    park_count > clip.route.gear_states.len() / 2
+    mostly_parked_legacy_core(
+        clip.route.raw_park_count,
+        clip.route.raw_frame_count,
+        park_count,
+        clip.route.gear_states.len(),
+    )
+}
+
+/// [`clip_is_mostly_parked_legacy`] over pre-reduced scalars, shared
+/// with the overview planner. The array version delegates here.
+pub(crate) fn mostly_parked_legacy_core(
+    raw_park_count: u32,
+    raw_frame_count: u32,
+    gear_park_count: usize,
+    gear_states_len: usize,
+) -> bool {
+    if raw_frame_count > 0 {
+        return (raw_park_count as f64 / raw_frame_count as f64) > calc::PARK_MAJORITY_FRACTION;
+    }
+    if gear_states_len == 0 {
+        return false;
+    }
+    gear_park_count > gear_states_len / 2
 }
 
 // ---------------------------------------------------------------------------
@@ -1997,9 +2456,6 @@ fn group_routes_overview(routes: Vec<Route>, max_points_per_drive: usize) -> Vec
     let groups = group_clips(routes);
     let mut result = Vec::with_capacity(groups.len());
 
-    use crate::calc::MAX_FROM_MEDIAN_M;
-    use crate::calc::MAX_JUMP_M;
-
     for (idx, clips) in groups.iter().enumerate() {
         // Collect valid (non-null-island) lat/lng from each clip
         let mut pts: Vec<GpsPoint> = Vec::new();
@@ -2011,50 +2467,7 @@ fn group_routes_overview(routes: Vec<Route>, max_points_per_drive: usize) -> Vec
             }
         }
 
-        // Median-cluster filter: drop points >1000km from median
-        if pts.len() > 2 {
-            let q1 = pts.len() / 4;
-            let q3 = pts.len() * 3 / 4;
-            let count = q3 - q1 + 1;
-            let mut sum_lat: f64 = 0.0;
-            let mut sum_lng: f64 = 0.0;
-            for i in q1..=q3 {
-                sum_lat += pts[i][0];
-                sum_lng += pts[i][1];
-            }
-            let med_lat = sum_lat / count as f64;
-            let med_lng = sum_lng / count as f64;
-
-            pts.retain(|p| calc::geodesic_m(p[0], p[1], med_lat, med_lng) <= MAX_FROM_MEDIAN_M);
-        }
-
-        // Neighbor-jump filter
-        if pts.len() > 2 {
-            let n = pts.len();
-            let mut remove = vec![false; n];
-            for i in 0..n {
-                let has_prev = i > 0;
-                let has_next = i < n - 1;
-                let far_from_prev =
-                    has_prev && calc::geodesic_m(pts[i - 1][0], pts[i - 1][1], pts[i][0], pts[i][1]) > MAX_JUMP_M;
-                let far_from_next =
-                    has_next && calc::geodesic_m(pts[i][0], pts[i][1], pts[i + 1][0], pts[i + 1][1]) > MAX_JUMP_M;
-                if (has_prev && has_next && far_from_prev && far_from_next)
-                    || (!has_prev && far_from_next)
-                    || (!has_next && far_from_prev)
-                {
-                    remove[i] = true;
-                }
-            }
-            let mut write = 0;
-            for read in 0..n {
-                if !remove[read] {
-                    pts[write] = pts[read];
-                    write += 1;
-                }
-            }
-            pts.truncate(write);
-        }
+        overview_filter_points(&mut pts);
 
         let source = clips.first().and_then(|c| c.route.source.clone());
         // Format matches build_summary_from_aggregates (grouper.rs ~2588) so
@@ -3402,6 +3815,195 @@ fn roll_up_telemetry(clips: &[SubClipSummary]) -> DriveTelemetryRollup {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Differential release gate for the streaming planner: over a
+    /// fixture exercising every grouping rule, planning from metadata
+    /// plus fragment assembly must serialize byte-identically to the
+    /// in-memory oracle at several downsample limits. Single external
+    /// signature only — multi-signature group order is nondeterministic
+    /// in BOTH paths (HashMap buckets), so bytes can't be compared.
+    #[test]
+    fn planned_overviews_match_oracle() {
+        let mk = |file: &str,
+                  points: Vec<GpsPoint>,
+                  gear_states: Vec<u8>,
+                  gear_runs: Vec<GearRun>,
+                  speeds: Vec<f32>,
+                  raw_park: u32,
+                  raw_frame: u32,
+                  source: Option<&str>,
+                  sig: Option<&str>| Route {
+            file: file.to_string(),
+            date: "d".to_string(),
+            points,
+            gear_states,
+            autopilot_states: Vec::new(),
+            speeds,
+            accel_positions: Vec::new(),
+            raw_park_count: raw_park,
+            raw_frame_count: raw_frame,
+            gear_runs,
+            flag_runs: Vec::new(),
+            source: source.map(|s| s.to_string()),
+            external_signature: sig.map(|s| s.to_string()),
+            ..Route::empty()
+        };
+        let p = |lat: f64, lng: f64| [lat, lng];
+
+        let routes = vec![
+            // Normal driving clip with a null island and a >1000km outlier.
+            mk(
+                "2025-01-01/2025-01-01_10-00-00-front.mp4",
+                vec![p(37.7749, -122.4194), p(0.0, 0.0), p(37.7760, -122.4180), p(12.0, 30.0)],
+                vec![4, 4, 4, 4],
+                Vec::new(),
+                vec![20.0, 21.0],
+                0,
+                4,
+                Some("sei"),
+                None,
+            ),
+            // Zero-point clip riding in the same drive.
+            mk(
+                "2025-01-01/2025-01-01_10-00-20-front.mp4",
+                Vec::new(),
+                vec![4],
+                Vec::new(),
+                Vec::new(),
+                0,
+                1,
+                Some("sei"),
+                None,
+            ),
+            // Park-split clip: D 300 / P 300 (=20s >= 2s) / D 300.
+            mk(
+                "2025-01-01/2025-01-01_10-00-40-front.mp4",
+                (0..6).map(|i| p(37.7 + i as f64 * 0.001, -122.4)).collect(),
+                vec![4, 4, 0, 0, 4, 4],
+                vec![
+                    GearRun { gear: 4, frames: 300 },
+                    GearRun { gear: 0, frames: 300 },
+                    GearRun { gear: 4, frames: 300 },
+                ],
+                vec![15.0; 6],
+                300,
+                900,
+                Some("sei"),
+                None,
+            ),
+            // Event clip interior to the 10:00:40 -> 10:08 hole, driving
+            // proven ONLY by speeds (no gear, zero raw counts).
+            mk(
+                "SavedClips/2025-01-01_10-30-00/2025-01-01_10-04-00-front.mp4",
+                vec![p(37.71, -122.41), p(37.712, -122.412)],
+                Vec::new(),
+                Vec::new(),
+                vec![3.0, 3.0],
+                0,
+                0,
+                Some("sei"),
+                None,
+            ),
+            // Far anchor closing the hole.
+            mk(
+                "2025-01-01/2025-01-01_10-08-00-front.mp4",
+                vec![p(37.72, -122.42), p(37.721, -122.421)],
+                vec![4, 4],
+                Vec::new(),
+                vec![18.0, 18.0],
+                0,
+                2,
+                Some("sei"),
+                None,
+            ),
+            // Legacy group hours later: middle clip majority-park splits it.
+            mk(
+                "2025-01-01/2025-01-01_14-00-00-front.mp4",
+                vec![p(37.8, -122.5), p(37.801, -122.501)],
+                vec![4, 4],
+                Vec::new(),
+                Vec::new(),
+                0,
+                2,
+                None,
+                None,
+            ),
+            mk(
+                "2025-01-01/2025-01-01_14-01-00-front.mp4",
+                vec![p(37.802, -122.502)],
+                vec![0, 0, 0],
+                Vec::new(),
+                Vec::new(),
+                3,
+                3,
+                None,
+                None,
+            ),
+            mk(
+                "2025-01-01/2025-01-01_14-02-00-front.mp4",
+                vec![p(37.803, -122.503), p(37.804, -122.504)],
+                vec![4, 4],
+                Vec::new(),
+                Vec::new(),
+                0,
+                2,
+                None,
+                None,
+            ),
+            // Signature-bearing import in its own time window.
+            mk(
+                "2025-01-01/2025-01-01_18-00-00-front.mp4",
+                vec![p(37.9, -122.6), p(37.901, -122.601)],
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                0,
+                0,
+                Some("tessie"),
+                Some("sig-a"),
+            ),
+            // Duplicate path (backslash variant) that dedup must drop.
+            mk(
+                "2025-01-01\\2025-01-01_10-00-00-front.mp4",
+                vec![p(1.5, 1.5)],
+                vec![4],
+                Vec::new(),
+                Vec::new(),
+                0,
+                1,
+                Some("sei"),
+                None,
+            ),
+        ];
+
+        for max_points in [2usize, 20, 500] {
+            let oracle = route_overviews(routes.clone(), max_points);
+
+            let metas: Vec<OverviewClipMeta> =
+                routes.iter().map(OverviewClipMeta::from_route).collect();
+            let plans = plan_overviews(&metas);
+            let planned: Vec<RouteOverview> = plans
+                .iter()
+                .enumerate()
+                .map(|(idx, d)| {
+                    overview_from_fragments(
+                        idx as i32,
+                        d,
+                        &metas,
+                        &mut |i| Ok(std::rc::Rc::new(routes[i].points.clone())),
+                        max_points,
+                    )
+                    .unwrap()
+                })
+                .collect();
+
+            assert_eq!(
+                serde_json::to_string(&oracle).unwrap(),
+                serde_json::to_string(&planned).unwrap(),
+                "planner output diverged at max_points={max_points}"
+            );
+        }
+    }
 
     #[test]
     fn test_parse_file_timestamp() {

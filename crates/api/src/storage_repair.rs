@@ -29,7 +29,6 @@ use axum::http::StatusCode;
 use serde::{Deserialize, Serialize};
 use tokio::process::Command;
 
-use crate::router::AppState;
 
 const BACKINGFILES: &str = "/backingfiles";
 /// XFS label the setup code stamps on the backingfiles partition
@@ -535,7 +534,7 @@ struct StorageHealth {
 }
 
 /// GET /api/storage/health
-pub async fn storage_health(State(_s): State<AppState>) -> (StatusCode, Json<serde_json::Value>) {
+pub async fn storage_health() -> (StatusCode, Json<serde_json::Value>) {
     let device = resolve_backing_device().await;
     let mounts = read_proc_mounts().await;
     let mounted = resolve_mount_source(&mounts, BACKINGFILES).is_some();
@@ -626,7 +625,7 @@ impl RepairLog {
 /// Validates synchronously (so the caller gets an immediate 4xx on a bad
 /// precondition) then spawns the repair, streaming progress over WS. Returns
 /// `{ "status": "started" }` on a valid request.
-pub async fn storage_repair(State(s): State<AppState>, body: String) -> (StatusCode, Json<serde_json::Value>) {
+pub async fn storage_repair(State(hub): State<sentryusb_ws::Hub>, body: String) -> (StatusCode, Json<serde_json::Value>) {
     let req: RepairRequest = serde_json::from_str(&body).unwrap_or_default();
 
     let device = match resolve_backing_device().await {
@@ -662,7 +661,6 @@ pub async fn storage_repair(State(s): State<AppState>, body: String) -> (StatusC
         }
     }
 
-    let hub = s.hub.clone();
     tokio::spawn(async move {
         run_repair(
             hub,

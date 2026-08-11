@@ -12,7 +12,7 @@ use sentryusb_ble_health::{
 use crate::router::AppState;
 
 /// POST /api/system/reboot
-pub async fn reboot(State(_s): State<AppState>) -> (StatusCode, Json<serde_json::Value>) {
+pub async fn reboot() -> (StatusCode, Json<serde_json::Value>) {
     tokio::spawn(async { let _ = sentryusb_shell::run("reboot", &[]).await; });
     crate::json_ok()
 }
@@ -23,7 +23,7 @@ pub async fn reboot(State(_s): State<AppState>) -> (StatusCode, Json<serde_json:
 /// the kernel starts tearing things down. Falls back through `poweroff`
 /// → `shutdown -h now` → `systemctl poweroff` since some minimal images
 /// only ship one of the three.
-pub async fn shutdown(State(_s): State<AppState>) -> (StatusCode, Json<serde_json::Value>) {
+pub async fn shutdown() -> (StatusCode, Json<serde_json::Value>) {
     tokio::spawn(async {
         if sentryusb_shell::run("poweroff", &[]).await.is_ok() {
             return;
