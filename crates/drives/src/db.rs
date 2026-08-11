@@ -2041,10 +2041,33 @@ impl DriveStore {
         &self,
         max_points: usize,
     ) -> Result<Vec<crate::types::RouteOverview>> {
+        // One WAL snapshot for the WHOLE build — plan and every points
+        // batch see the same committed state, exactly like the old
+        // single select_all_routes. Without it a concurrent write could
+        // yield hybrids: ghost drives from deleted rows, or stale park
+        // ranges over rewritten points. A fresh RO connection (same
+        // pattern as rebuild_caches_off_lock's snapshot phase) so the
+        // multi-second build never occupies a pool lane. `:memory:`
+        // stores use the shared connection, which is one snapshot by
+        // construction.
+        if self.path == ":memory:" {
+            return self.with_locked_conn(|conn| Self::build_overviews_on(conn, max_points));
+        }
+        let rconn = open_readonly_connection(&self.path)?;
+        let tx = rconn.unchecked_transaction()?;
+        let out = Self::build_overviews_on(&tx, max_points)?;
+        drop(tx);
+        Ok(out)
+    }
+
+    fn build_overviews_on(
+        conn: &Connection,
+        max_points: usize,
+    ) -> Result<Vec<crate::types::RouteOverview>> {
         // Decoded-point budget per batch: 1M points = 16MB decoded.
         const BATCH_POINT_BUDGET: usize = 1_000_000;
 
-        let metas = self.with_read_conn(select_overview_metas)?;
+        let metas = select_overview_metas(conn)?;
         let plans = crate::grouper::plan_overviews(&metas);
 
         let mut out = Vec::with_capacity(plans.len());
@@ -2072,7 +2095,7 @@ impl DriveStore {
             }
 
             let file_list: Vec<&str> = files.into_iter().collect();
-            let points = self.with_read_conn(|conn| select_points_by_files(conn, &file_list))?;
+            let points = select_points_by_files(conn, &file_list)?;
 
             for (idx, drive) in plans[batch_start..batch_end].iter().enumerate() {
                 let id = (batch_start + idx) as i32;
@@ -2081,11 +2104,8 @@ impl DriveStore {
                     drive,
                     &metas,
                     &mut |meta_idx| {
-                        // A row deleted between the meta and points
-                        // queries yields no entry; empty points keep the
-                        // drive present (matching the oracle's
-                        // empty-geometry behavior) until the generation
-                        // bump rebuilds.
+                        // Defense in depth only: under the pinned
+                        // snapshot every planned file exists.
                         Ok(points
                             .get(&metas[meta_idx].file)
                             .cloned()
