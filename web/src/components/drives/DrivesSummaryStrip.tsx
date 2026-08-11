@@ -1,4 +1,4 @@
-import { AutoAwesomeIcon, ScheduleIcon, SpeedIcon, VitalSignsIcon } from "@/components/icons"
+import { Robot2Icon, ScheduleIcon, SpeedIcon, VitalSignsIcon } from "@/components/icons"
 import { formatDuration, formatPercent } from "@/lib/drive-format"
 import type { DrivesFilteredStats } from "@/hooks/useDrivesList"
 
@@ -78,7 +78,7 @@ export function DrivesSummaryStrip({
         <>
           <Divider />
           <StatCell
-            icon={<AutoAwesomeIcon className="h-3.5 w-3.5 text-emerald-300" />}
+            icon={<Robot2Icon className="h-3.5 w-3.5 text-emerald-300" />}
             label="FSD"
             value={`${formatPercent(stats.fsdPercent)}%`}
             highlight={stats.fsdPercent >= 99}
@@ -99,7 +99,7 @@ export function DrivesSummaryStrip({
         <>
           <Divider />
           <StatCell
-            icon={<AutoAwesomeIcon className="h-3.5 w-3.5 text-rose-300" />}
+            icon={<Robot2Icon className="h-3.5 w-3.5 text-rose-300" />}
             label="Disengagements"
             value={stats.fsdDisengagements.toLocaleString()}
           />
@@ -109,7 +109,7 @@ export function DrivesSummaryStrip({
         <>
           <Divider />
           <StatCell
-            icon={<AutoAwesomeIcon className="h-3.5 w-3.5 text-violet-300" />}
+            icon={<Robot2Icon className="h-3.5 w-3.5 text-violet-300" />}
             label="Tessie"
             value={stats.tessieCount.toLocaleString()}
           />

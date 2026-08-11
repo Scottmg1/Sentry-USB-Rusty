@@ -61,13 +61,6 @@ export const AttachMoneyIcon = (props: SVGProps<SVGSVGElement>) => (
     </svg>
 )
 
-/** Material Symbols `auto_awesome` (was Lucide Sparkles). */
-export const AutoAwesomeIcon = (props: SVGProps<SVGSVGElement>) => (
-  <svg viewBox="0 0 48 48" width="24" height="24" fill="currentColor" {...props}>
-      <path d="m38.6 16.25-2.15-5-5.2-2.3 5.2-2.25 2.15-4.75 2.15 4.75 5.2 2.25-5.2 2.3Zm0 29.75-2.15-4.8-5.2-2.25 5.2-2.25 2.15-5.05 2.15 5.05 5.2 2.25-5.2 2.25Zm-21.95-7.7-4.6-9.85L2 23.95l10.05-4.5 4.6-9.8 4.65 9.8 10 4.5-10 4.5Zm0-7.4 2.4-4.8 4.9-2.15-4.9-2.15-2.4-4.8-2.35 4.8-4.95 2.15 4.95 2.15Zm0-6.95Z"/>
-    </svg>
-)
-
 /** Material Symbols `back_hand` (was Lucide Hand). */
 export const BackHandIcon = (props: SVGProps<SVGSVGElement>) => (
   <svg viewBox="0 -960 960 960" width="24" height="24" fill="currentColor" {...props}>
@@ -89,10 +82,31 @@ export const BatteryAndroidFrame2Icon = (props: SVGProps<SVGSVGElement>) => (
     </svg>
 )
 
+/** Material Symbols `battery_android_frame_3`. */
+export const BatteryAndroidFrame3Icon = (props: SVGProps<SVGSVGElement>) => (
+  <svg viewBox="0 -960 960 960" width="24" height="24" fill="currentColor" {...props}>
+      <path d="M130-240q-37.5 0-63.75-26.25T40-330v-300q0-37.5 26.25-63.75T130-720h620q37.5 0 63.75 26.25T840-630v300q0 37.5-26.25 63.75T750-240H130Zm0-60h620q12.75 0 21.38-8.63Q780-317.25 780-330v-300q0-12.75-8.62-21.38Q762.75-660 750-660H130q-12.75 0-21.37 8.62Q100-642.75 100-630v300q0 12.75 8.63 21.37Q117.25-300 130-300Zm740-87v-186h20q12 0 21 9t9 21v126q0 12-9 21t-21 9h-20Zm-740 57v-300h220v300H130Z"/>
+    </svg>
+)
+
 /** Material Symbols `battery_android_frame_4`. */
 export const BatteryAndroidFrame4Icon = (props: SVGProps<SVGSVGElement>) => (
   <svg viewBox="0 -960 960 960" width="24" height="24" fill="currentColor" {...props}>
       <path d="M130-240q-37.5 0-63.75-26.25T40-330v-300q0-37.5 26.25-63.75T130-720h620q37.5 0 63.75 26.25T840-630v300q0 37.5-26.25 63.75T750-240H130Zm0-60h620q12.75 0 21.38-8.63Q780-317.25 780-330v-300q0-12.75-8.62-21.38Q762.75-660 750-660H130q-12.75 0-21.37 8.62Q100-642.75 100-630v300q0 12.75 8.63 21.37Q117.25-300 130-300Zm740-87v-186h20q12 0 21 9t9 21v126q0 12-9 21t-21 9h-20Zm-740 57v-300h300v300H130Z"/>
+    </svg>
+)
+
+/** Material Symbols `battery_android_frame_5`. */
+export const BatteryAndroidFrame5Icon = (props: SVGProps<SVGSVGElement>) => (
+  <svg viewBox="0 -960 960 960" width="24" height="24" fill="currentColor" {...props}>
+      <path d="M130-240q-37.5 0-63.75-26.25T40-330v-300q0-37.5 26.25-63.75T130-720h620q37.5 0 63.75 26.25T840-630v300q0 37.5-26.25 63.75T750-240H130Zm0-60h620q12.75 0 21.38-8.63Q780-317.25 780-330v-300q0-12.75-8.62-21.38Q762.75-660 750-660H130q-12.75 0-21.37 8.62Q100-642.75 100-630v300q0 12.75 8.63 21.37Q117.25-300 130-300Zm740-87v-186h20q12 0 21 9t9 21v126q0 12-9 21t-21 9h-20Zm-740 57v-300h380v300H130Z"/>
+    </svg>
+)
+
+/** Material Symbols `battery_android_frame_6`. */
+export const BatteryAndroidFrame6Icon = (props: SVGProps<SVGSVGElement>) => (
+  <svg viewBox="0 -960 960 960" width="24" height="24" fill="currentColor" {...props}>
+      <path d="M130-240q-37.5 0-63.75-26.25T40-330v-300q0-37.5 26.25-63.75T130-720h620q37.5 0 63.75 26.25T840-630v300q0 37.5-26.25 63.75T750-240H130Zm0-60h620q12.75 0 21.38-8.63Q780-317.25 780-330v-300q0-12.75-8.62-21.38Q762.75-660 750-660H130q-12.75 0-21.37 8.62Q100-642.75 100-630v300q0 12.75 8.63 21.37Q117.25-300 130-300Zm740-87v-186h20q12 0 21 9t9 21v126q0 12-9 21t-21 9h-20Zm-740 57v-300h460v300H130Z"/>
     </svg>
 )
 
@@ -103,19 +117,10 @@ export const BatteryAndroidFrameBoltIcon = (props: SVGProps<SVGSVGElement>) => (
     </svg>
 )
 
-/** Material Symbols `battery_android_frame_full` (was Lucide BatteryMedium). */
+/** Material Symbols `battery_android_frame_full` (was Lucide Battery/BatteryFull/BatteryMedium). */
 export const BatteryAndroidFrameFullIcon = (props: SVGProps<SVGSVGElement>) => (
   <svg viewBox="0 -960 960 960" width="24" height="24" fill="currentColor" {...props}>
       <path d="M130-240q-37.5 0-63.75-26.25T40-330v-300q0-37.5 26.25-63.75T130-720h620q37.5 0 63.75 26.25T840-630v300q0 37.5-26.25 63.75T750-240H130Zm0-60h620q12.75 0 21.38-8.63Q780-317.25 780-330v-300q0-12.75-8.62-21.38Q762.75-660 750-660H130q-12.75 0-21.37 8.62Q100-642.75 100-630v300q0 12.75 8.63 21.37Q117.25-300 130-300Zm740-87v-186h20q12 0 21 9t9 21v126q0 12-9 21t-21 9h-20Zm-740 57v-300h620v300H130Z"/>
-    </svg>
-)
-
-/** Material Symbols `battery_full_alt` (was Lucide Battery/BatteryFull). Mirrored so the battery terminal faces right. */
-export const BatteryFullAltIcon = (props: SVGProps<SVGSVGElement>) => (
-  <svg viewBox="0 -960 960 960" width="24" height="24" fill="currentColor" {...props}>
-      <g transform="scale(-1,1) translate(-960,0)">
-        <path d="M174-280q-12.75 0-21.37-8.63Q144-297.25 144-310v-90H80v-160h64v-90q0-12.75 8.63-21.38Q161.25-680 174-680h676q12.75 0 21.38 8.62Q880-662.75 880-650v340q0 12.75-8.62 21.37Q862.75-280 850-280H174Z"/>
-      </g>
     </svg>
 )
 
@@ -662,6 +667,13 @@ export const ReceiptLongIcon = (props: SVGProps<SVGSVGElement>) => (
 export const RectangleIcon = (props: SVGProps<SVGSVGElement>) => (
   <svg viewBox="0 -960 960 960" width="24" height="24" fill="currentColor" {...props}>
       <path d="M80-160v-640h800v640H80Zm60-60h680v-520H140v520Zm0 0v-520 520Z"/>
+    </svg>
+)
+
+/** Material Symbols `robot_2` (was Lucide Sparkles). */
+export const Robot2Icon = (props: SVGProps<SVGSVGElement>) => (
+  <svg viewBox="0 -960 960 960" width="24" height="24" fill="currentColor" {...props}>
+      <path d="M160-120v-220q0-24.75 17.63-42.38Q195.25-400 220-400h520q24.75 0 42.38 17.62Q800-364.75 800-340v220H160Zm200-320q-83 0-141.5-58.5T160-640q0-83 58.5-141.5T360-840h240q83 0 141.5 58.5T800-640q0 83-58.5 141.5T600-440H360ZM220-180h520v-160H220v160Zm140-320h240q58.33 0 99.17-40.76 40.83-40.77 40.83-99Q740-698 699.17-739q-40.84-41-99.17-41H360q-58.33 0-99.17 40.76-40.83 40.77-40.83 99Q220-582 260.83-541q40.84 41 99.17 41Zm21.5-118.68q8.5-8.67 8.5-21.5 0-12.82-8.68-21.32-8.67-8.5-21.5-8.5-12.82 0-21.32 8.68-8.5 8.67-8.5 21.5 0 12.82 8.68 21.32 8.67 8.5 21.5 8.5 12.82 0 21.32-8.68Zm240 0q8.5-8.67 8.5-21.5 0-12.82-8.68-21.32-8.67-8.5-21.5-8.5-12.82 0-21.32 8.68-8.5 8.67-8.5 21.5 0 12.82 8.68 21.32 8.67 8.5 21.5 8.5 12.82 0 21.32-8.68ZM480-180Zm0-460Z"/>
     </svg>
 )
 

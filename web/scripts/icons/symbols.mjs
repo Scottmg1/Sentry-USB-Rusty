@@ -13,14 +13,15 @@ export const SYMBOLS = [
   "arrow_back", // was Lucide ArrowLeft
   "arrow_downward", // was Lucide ArrowDown
   "attach_money", // was Lucide DollarSign
-  "auto_awesome", // was Lucide Sparkles
   "back_hand", // was Lucide Hand
   "battery_android_frame_1",
   "battery_android_frame_2", // was Lucide BatteryLow
+  "battery_android_frame_3",
   "battery_android_frame_4",
+  "battery_android_frame_5",
+  "battery_android_frame_6",
   "battery_android_frame_bolt", // was Lucide BatteryCharging
-  "battery_android_frame_full", // was Lucide BatteryMedium
-  "battery_full_alt", // was Lucide Battery/BatteryFull
+  "battery_android_frame_full", // was Lucide BatteryMedium; also replaced battery_full_alt
   "bluetooth", // was Lucide Bluetooth
   "bolt", // was Lucide Zap
   "brush", // was Lucide Paintbrush
@@ -99,6 +100,7 @@ export const SYMBOLS = [
   "progress_activity", // was Lucide Loader2
   "receipt_long", // was Lucide ScrollText
   "rectangle", // was Lucide RectangleHorizontal
+  "robot_2", // was Lucide Sparkles (FSD stats; replaced retired auto_awesome)
   "rotate_left", // was Lucide RotateCcw
   "rotate_right", // was Lucide RotateCw
   "save", // was Lucide Save
@@ -141,11 +143,12 @@ export const SYMBOLS = [
 ]
 
 /**
- * Symbols mirrored horizontally when drawn. Material draws its horizontal
- * batteries terminal-left; this app shows them terminal-right, matching the
- * battery_android_frame_* family which already points that way.
+ * Symbols mirrored horizontally when drawn. Currently empty — the
+ * battery_android_frame_* family already points terminal-right. (Material's
+ * other horizontal batteries, e.g. battery_full_alt, draw terminal-left and
+ * needed a flip while this app used one.)
  */
-export const FLIP = new Set(["battery_full_alt"])
+export const FLIP = new Set([])
 
 /**
  * Which Lucide icon each symbol replaced, kept as provenance in the generated
@@ -189,7 +192,7 @@ export const LUCIDE_ORIGIN = {
   "verified_user": [
     "ShieldCheck"
   ],
-  "auto_awesome": [
+  "robot_2": [
     "Sparkles"
   ],
   "cardiology": [
@@ -261,11 +264,9 @@ export const LUCIDE_ORIGIN = {
   "directions_car": [
     "Car"
   ],
-  "battery_full_alt": [
-    "Battery",
-    "BatteryFull"
-  ],
   "battery_android_frame_full": [
+    "Battery",
+    "BatteryFull",
     "BatteryMedium"
   ],
   "battery_android_frame_2": [

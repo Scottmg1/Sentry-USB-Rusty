@@ -1,7 +1,7 @@
 import { useState, useEffect, useCallback } from "react"
 import {
   ArchiveIcon,
-  BatteryFullAltIcon,
+  BatteryAndroidFrameFullIcon,
   BoltIcon,
   BuildIcon,
   CancelIcon,
@@ -69,7 +69,7 @@ const NOTIFICATION_TYPES = [
   { key: "keep_awake_failure", label: "Keep-Awake Failures", description: "When Sentry Mode keep-awake fails after retries", icon: BoltIcon },
   { key: "update", label: "Update Available", description: "When a new software update is detected", icon: DownloadIcon },
   { key: "drives", label: "New Drives Detected", description: "When new TeslaCam drives are mapped", icon: HardDriveIcon },
-  { key: "rtc_battery", label: "RTC Battery Warning", description: "When the real-time clock battery is low or missing", icon: BatteryFullAltIcon },
+  { key: "rtc_battery", label: "RTC Battery Warning", description: "When the real-time clock battery is low or missing", icon: BatteryAndroidFrameFullIcon },
   { key: "music_sync", label: "Music Sync", description: "When music files finish syncing to USB", icon: MusicNoteIcon },
   { key: "keep_accessory", label: "Keep Accessory", description: "When the Pi releases 12V accessory power at home and is about to go offline", icon: PowerIcon },
   { key: "storage_repair", label: "Storage Auto Repair", description: "When boot-time repair of dashcam storage succeeds, fails, or needs manual action", icon: BuildIcon },

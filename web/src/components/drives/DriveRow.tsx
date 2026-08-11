@@ -1,4 +1,4 @@
-import { AutoAwesomeIcon, ScheduleIcon, SettingsRemoteIcon, SpeedIcon } from "@/components/icons"
+import { Robot2Icon, ScheduleIcon, SettingsRemoteIcon, SpeedIcon } from "@/components/icons"
 import { useNavigate } from "react-router-dom"
 import { cn } from "@/lib/utils"
 import { formatDistance, formatDuration, formatPercent } from "@/lib/drive-format"
@@ -115,7 +115,7 @@ export function DriveRow({
             </Chip>
           ) : (
             <Chip emphasis>
-              <AutoAwesomeIcon className="h-3.5 w-3.5" />
+              <Robot2Icon className="h-3.5 w-3.5" />
               FSD {fsdDisplay}%
               {fsdFull && (
                 <span className="ml-0.5 text-amber-300" aria-hidden>

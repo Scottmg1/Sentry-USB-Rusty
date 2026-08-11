@@ -1,9 +1,23 @@
 import {
   BatteryAndroidFrame1Icon,
   BatteryAndroidFrame2Icon,
+  BatteryAndroidFrame3Icon,
   BatteryAndroidFrame4Icon,
+  BatteryAndroidFrame5Icon,
+  BatteryAndroidFrame6Icon,
   BatteryAndroidFrameFullIcon,
 } from "@/components/icons"
+
+// The full battery_android_frame ladder. Material ships six partial fills
+// plus full, so the range splits into seven even bands of ~14.3%.
+const STEPS = [
+  BatteryAndroidFrame1Icon,
+  BatteryAndroidFrame2Icon,
+  BatteryAndroidFrame3Icon,
+  BatteryAndroidFrame4Icon,
+  BatteryAndroidFrame5Icon,
+  BatteryAndroidFrame6Icon,
+]
 
 /**
  * Battery glyph that tracks the state of charge shown beside it, so a 20%
@@ -19,12 +33,8 @@ export function BatteryLevelIcon({
   className?: string
 }) {
   const Icon =
-    pct === undefined || pct >= 75
+    pct === undefined || pct >= (100 * 6) / 7
       ? BatteryAndroidFrameFullIcon
-      : pct >= 40
-        ? BatteryAndroidFrame4Icon
-        : pct >= 15
-          ? BatteryAndroidFrame2Icon
-          : BatteryAndroidFrame1Icon
+      : STEPS[Math.max(0, Math.min(5, Math.floor((pct / 100) * 7)))]
   return <Icon className={className} aria-hidden />
 }

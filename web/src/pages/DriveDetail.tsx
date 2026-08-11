@@ -4,7 +4,7 @@ import {
   AirIcon,
   AlbumIcon,
   ArrowBackIcon,
-  AutoAwesomeIcon,
+  Robot2Icon,
   DataUsageIcon,
   DeviceThermostatIcon,
   LineEndIcon,
@@ -229,7 +229,7 @@ function DriveDetailContent({ drive, onSaveTags }: DriveDetailContentProps) {
             )}
             aria-pressed={showFsdEvents}
           >
-            <AutoAwesomeIcon className="h-3.5 w-3.5" />
+            <Robot2Icon className="h-3.5 w-3.5" />
             Toggle FSD Markers
           </button>
         </div>
@@ -301,7 +301,7 @@ function DriveDetailContent({ drive, onSaveTags }: DriveDetailContentProps) {
           <StatTile
             label="Self-driving"
             value={`${formatPercent(drive.fsdPercent)}%`}
-            icon={<AutoAwesomeIcon className="h-4 w-4" />}
+            icon={<Robot2Icon className="h-4 w-4" />}
             star={fsdFull}
             info="Percentage of the drive's distance with FSD engaged."
             size="headline"
@@ -410,7 +410,7 @@ function AssistedSection({ drive, metric }: AssistedSectionProps) {
             <StatTile
               label="FSD"
               value={`${formatPercent(drive.fsdPercent)}%`}
-              icon={<AutoAwesomeIcon className="h-4 w-4" />}
+              icon={<Robot2Icon className="h-4 w-4" />}
               info="Time + distance share with Full Self-Driving (Supervised) engaged."
             />
             <StatTile
@@ -437,7 +437,7 @@ function AssistedSection({ drive, metric }: AssistedSectionProps) {
             <StatTile
               label="Autopilot"
               value={`${formatPercent(drive.autosteerPercent)}%`}
-              icon={<AutoAwesomeIcon className="h-4 w-4" />}
+              icon={<Robot2Icon className="h-4 w-4" />}
               info="Autosteer share (lane-keeping without FSD)."
             />
             <StatTile
@@ -452,7 +452,7 @@ function AssistedSection({ drive, metric }: AssistedSectionProps) {
             <StatTile
               label="TACC"
               value={`${formatPercent(drive.taccPercent)}%`}
-              icon={<AutoAwesomeIcon className="h-4 w-4" />}
+              icon={<Robot2Icon className="h-4 w-4" />}
               info="Traffic-Aware Cruise Control share (speed regulation only)."
             />
             <StatTile

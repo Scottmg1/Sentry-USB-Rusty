@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef } from "react"
 import {
-  BatteryFullAltIcon,
+  BatteryAndroidFrameFullIcon,
   DeviceThermostatIcon,
   LocationOnIcon,
   SearchIcon,
@@ -363,7 +363,7 @@ export function AdvancedStep({ data, onChange, setupAlreadyFinished }: StepProps
       {isPi5 && (
         <div>
           <div className="mb-3 flex items-center gap-2">
-            <BatteryFullAltIcon className="h-4 w-4 text-blue-400" />
+            <BatteryAndroidFrameFullIcon className="h-4 w-4 text-blue-400" />
             <h3 className="text-sm font-semibold uppercase tracking-wider text-slate-400">
               RTC Battery
             </h3>

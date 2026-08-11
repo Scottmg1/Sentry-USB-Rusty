@@ -3,7 +3,6 @@ import { Link } from "react-router-dom"
 import {
   AlbumIcon,
   BatteryAndroidFrameBoltIcon,
-  BatteryAndroidFrameFullIcon,
   ChevronRightIcon,
   DeviceThermostatIcon,
   DirectionsCarIcon,
@@ -12,6 +11,7 @@ import {
   MusicNoteIcon,
   WarningIcon,
 } from "@/components/icons"
+import { BatteryLevelIcon } from "@/components/drives/BatteryLevelIcon"
 import type { TireHistoryResponse } from "./TirePressureCard"
 import type { CurrentCharge } from "@/types/charging"
 import { fmtRangeUnit, fmtToFull } from "@/lib/charge-format"
@@ -290,7 +290,7 @@ export function CarStatusCard({
             charging ? (
               <BatteryAndroidFrameBoltIcon className="h-3.5 w-3.5 animate-pulse" />
             ) : (
-              <BatteryAndroidFrameFullIcon className="h-3.5 w-3.5" />
+              <BatteryLevelIcon pct={batterySoc ?? undefined} className="h-3.5 w-3.5" />
             )
           }
           label={charging ? "Charging" : "Battery"}
