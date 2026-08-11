@@ -1,6 +1,6 @@
-import { BatteryFullAltIcon } from "@/components/icons"
 import { cn } from "@/lib/utils"
 import { formatRelativeTime } from "@/lib/drive-format"
+import { BatteryLevelIcon } from "./BatteryLevelIcon"
 
 interface DualPinBlockProps {
   origin: { label: string; batteryPct?: number; timestamp: string }
@@ -58,7 +58,7 @@ function Row({ label, batteryPct, timestamp, labelClass }: RowProps) {
       <div className="mt-0.5 flex items-center gap-1.5 text-xs text-slate-500">
         {batteryPct !== undefined && (
           <span className="flex items-center gap-1">
-            <BatteryFullAltIcon className="h-3 w-3" aria-hidden />
+            <BatteryLevelIcon pct={batteryPct} className="h-3 w-3" />
             {Math.round(batteryPct)}%
           </span>
         )}

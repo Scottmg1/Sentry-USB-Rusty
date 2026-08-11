@@ -5,10 +5,6 @@ import {
   AlbumIcon,
   ArrowBackIcon,
   AutoAwesomeIcon,
-  BatteryAndroidFrame1Icon,
-  BatteryAndroidFrame2Icon,
-  BatteryAndroidFrame4Icon,
-  BatteryAndroidFrameFullIcon,
   DataUsageIcon,
   DeviceThermostatIcon,
   LineEndIcon,
@@ -36,6 +32,7 @@ import {
 import type { DriveDetail as DriveDetailType } from "@/types/drives"
 import { DriveMap } from "@/components/drives/DriveMap"
 import { DriveScrubber } from "@/components/drives/DriveScrubber"
+import { BatteryLevelIcon } from "@/components/drives/BatteryLevelIcon"
 import { DualPinBlock } from "@/components/drives/DualPinBlock"
 import { SectionHeading, StatTile } from "@/components/drives/StatTile"
 import { TagPopover } from "@/components/drives/TagPopover"
@@ -512,19 +509,6 @@ function OdometerSection({
       </div>
     </>
   )
-}
-
-/** Battery glyph matching the state of charge; full when unknown. */
-function BatteryLevelIcon({ pct }: { pct?: number }) {
-  const Icon =
-    pct === undefined || pct >= 75
-      ? BatteryAndroidFrameFullIcon
-      : pct >= 40
-        ? BatteryAndroidFrame4Icon
-        : pct >= 15
-          ? BatteryAndroidFrame2Icon
-          : BatteryAndroidFrame1Icon
-  return <Icon className="h-4 w-4" />
 }
 
 function BatterySection({ drive }: { drive: DriveDetailType }) {
