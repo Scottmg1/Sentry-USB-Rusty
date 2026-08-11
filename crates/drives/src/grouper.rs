@@ -20,7 +20,7 @@ use crate::types::*;
 // ---------------------------------------------------------------------------
 
 /// Time gap (ms) that splits clips into separate drives (5 minutes).
-const DRIVE_GAP_MS: i64 = 5 * 60 * 1000;
+pub(crate) const DRIVE_GAP_MS: i64 = 5 * 60 * 1000;
 
 /// Minimum gap (ms) between consecutive RecentClips timestamps that counts
 /// as a recording hole (≥1 missing minute-clip; normal spacing is ~60s).
