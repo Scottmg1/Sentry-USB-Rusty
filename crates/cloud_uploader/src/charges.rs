@@ -172,24 +172,33 @@ pub async fn sweep_once(state: Arc<CloudStateInner>) -> Result<u32> {
     // The full charge-row scan + grouping is sync DB/CPU work — blocking
     // pool, so the 10-minute safety sweep can't stall the reactor.
     let store = state.store.clone();
-    let (pending, tag_map, cost_map, dirty) = {
+    let pending = {
         let store = store.clone();
         tokio::task::spawn_blocking(move || -> Result<_> {
-            let uploads = store.charge_uploads_map().context("charge_uploads_map")?;
-
             let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
-            let (from, full_scan) = store.with_read_conn(|conn| -> Result<_> {
+            // Raw cursor string doubles as a CAS token: an import deletes
+            // the key mid-sweep, and overwriting that deletion with a
+            // stale frontier would hide restored history until the next
+            // daily full scan.
+            let (from, full_scan, cursor_token) = store.with_read_conn(|conn| -> Result<_> {
+                let token = schema::meta_get(conn, CHARGE_SWEEP_CURSOR_KEY)?;
                 if schema::meta_get(conn, CHARGE_SWEEP_FULL_DATE_KEY)?.as_deref()
                     != Some(today.as_str())
                 {
-                    return Ok((0, true));
+                    return Ok((0, true, token));
                 }
-                let cursor = schema::meta_get(conn, CHARGE_SWEEP_CURSOR_KEY)?
+                let cursor = token
+                    .as_deref()
                     .and_then(|s| s.parse::<i64>().ok())
                     .unwrap_or(0);
-                Ok((cursor, false))
+                Ok((cursor, false, token))
             })?;
 
+            // Sessions in scope all start at or after `from`, so uploads
+            // before it can never be consulted.
+            let uploads = store
+                .charge_uploads_map_since(from)
+                .context("charge_uploads_map")?;
             let rows = store
                 .with_read_conn(|conn| -> Result<_> { charging::load_charge_rows(conn, from, None) })
                 .context("load charge rows")?;
@@ -210,6 +219,11 @@ pub async fn sweep_once(state: Arc<CloudStateInner>) -> Result<u32> {
             // too conservative.
             let frontier = sweep_frontier(&sessions, now_secs, |ts| uploads.contains_key(&ts));
             store.with_locked_conn(|conn| -> Result<()> {
+                if schema::meta_get(conn, CHARGE_SWEEP_CURSOR_KEY)? != cursor_token {
+                    // Import raced us; keep its reset. FULL_DATE stays
+                    // unstamped too, so the next sweep rescans from 0.
+                    return Ok(());
+                }
                 if let Some(ts) = frontier {
                     schema::meta_set(conn, CHARGE_SWEEP_CURSOR_KEY, &ts.to_string())?;
                 }
@@ -223,19 +237,7 @@ pub async fn sweep_once(state: Arc<CloudStateInner>) -> Result<u32> {
                 .into_iter()
                 .filter(|s| closed(s) && !handled(s))
                 .collect();
-
-            let tag_map = store.get_all_charge_tags().unwrap_or_default();
-            let cost_map = store.get_all_charge_costs().unwrap_or_default();
-            // Dirty rows we're about to fold into upload payloads — cleared on
-            // stored/duplicate so the sync push doesn't re-send the same state.
-            let dirty: std::collections::HashMap<String, i64> = store
-                .dirty_mutables()
-                .unwrap_or_default()
-                .into_iter()
-                .filter(|(kind, _, _)| kind == "charge")
-                .map(|(_, key, at)| (key, at))
-                .collect();
-            Ok((pending, tag_map, cost_map, dirty))
+            Ok(pending)
         })
         .await
         .map_err(|e| anyhow!("charge prep task: {}", e))??
@@ -243,6 +245,38 @@ pub async fn sweep_once(state: Arc<CloudStateInner>) -> Result<u32> {
     if pending.is_empty() {
         return Ok(0);
     }
+
+    // Tags, costs and dirty rows only for the sessions actually going up.
+    let (tag_map, cost_map, dirty) = {
+        let store = store.clone();
+        let ids: Vec<i64> = pending.iter().filter_map(|s| s.first().map(|r| r.ts)).collect();
+        tokio::task::spawn_blocking(move || {
+            let mut tag_map = std::collections::HashMap::new();
+            let mut cost_map = std::collections::HashMap::new();
+            for id in ids {
+                if let Ok(tags) = store.get_charge_tags(id) {
+                    if !tags.is_empty() {
+                        tag_map.insert(id, tags);
+                    }
+                }
+                if let Ok(Some(cost)) = store.get_charge_cost(id) {
+                    cost_map.insert(id, cost);
+                }
+            }
+            // Cleared on stored/duplicate so the sync push doesn't re-send
+            // the same state.
+            let dirty: std::collections::HashMap<String, i64> = store
+                .dirty_mutables()
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|(kind, _, _)| kind == "charge")
+                .map(|(_, key, at)| (key, at))
+                .collect();
+            (tag_map, cost_map, dirty)
+        })
+        .await
+        .map_err(|e| anyhow!("charge maps task: {}", e))?
+    };
 
     let client =
         CloudClient::new(&creds_snapshot.cloud_base_url).with_bearer(&unlocked.pi_auth_token);

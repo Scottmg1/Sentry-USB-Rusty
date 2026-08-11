@@ -1289,6 +1289,34 @@ impl DriveStore {
         Ok(())
     }
 
+    /// [`charge_uploads_map`] bounded to sessions starting at or after
+    /// `from` — the charge sweep's scan window.
+    pub fn charge_uploads_map_since(
+        &self,
+        from: i64,
+    ) -> Result<std::collections::HashMap<i64, (String, String, i64)>> {
+        self.with_read_conn(|conn| {
+            let mut stmt = conn.prepare_cached(
+                "SELECT session_ts, cloud_charge_id, wrapped_charge_key, uploaded_at \
+                 FROM charge_uploads WHERE session_ts >= ?1",
+            )?;
+            let rows = stmt.query_map(params![from], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, i64>(3)?,
+                ))
+            })?;
+            let mut out = std::collections::HashMap::new();
+            for r in rows {
+                let (ts, id, key, at) = r?;
+                out.insert(ts, (id, key, at));
+            }
+            Ok(out)
+        })
+    }
+
     /// session_ts → (cloud_charge_id, wrapped_charge_key b64, uploaded_at)
     /// for every uploaded (or skipped) charge session.
     pub fn charge_uploads_map(
@@ -1499,8 +1527,10 @@ impl DriveStore {
             let s = crate::json_compat::import_json(&mut conn, path, on_progress)?;
             // Imported telemetry carries historical timestamps, which sit
             // below the charge sweep's cursor — those sessions would never
-            // be swept again.
-            let _ = schema::meta_del(&conn, schema::CHARGE_SWEEP_CURSOR_KEY);
+            // be swept again. Propagated: a failed delete here means the
+            // meta table itself is broken.
+            schema::meta_del(&conn, schema::CHARGE_SWEEP_CURSOR_KEY)
+                .context("import: reset charge sweep cursor")?;
             let _ = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)");
             // Persist the diagnostics record while we still hold the writer
             // lock. Best-effort — a failure here is logged but not fatal,
@@ -3043,7 +3073,8 @@ fn run_one_shot_import(conn: &mut Connection, candidates: &[&str]) -> Result<()>
 
     // Same reason as the manual import path: imported telemetry lands
     // below the charge sweep's cursor.
-    let _ = schema::meta_del(conn, schema::CHARGE_SWEEP_CURSOR_KEY);
+    schema::meta_del(conn, schema::CHARGE_SWEEP_CURSOR_KEY)
+        .context("one-shot import: reset charge sweep cursor")?;
 
     // Set the marker BEFORE renaming. If we die between these two steps,
     // the worst outcome on next boot is an orphan JSON left alone (the
