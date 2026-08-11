@@ -15,4 +15,4 @@ serde = { workspace = true }
 chrono = { workspace = true }
 tracing = { workspace = true }
 regex = "1"
-toml = "0.8"
+toml = "1.1"
