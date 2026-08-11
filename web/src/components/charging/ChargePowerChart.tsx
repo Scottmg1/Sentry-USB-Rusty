@@ -22,8 +22,8 @@ const SOC_COLOR = "#60a5fa" // blue — battery level
 const LEFT_MARGIN = 4
 const RIGHT_MARGIN = 8
 const YAXIS_WIDTH = 40
-// Bold horizontal unit captions sitting below each axis's values, on the
-// same baseline as the time ticks — which get squeezed between them.
+// Bold horizontal unit captions sitting above each axis's values, clear
+// of the time ticks along the bottom edge.
 const AXIS_LABEL_STYLE = {
   fill: "#94a3b8",
   fontSize: 11,
@@ -72,7 +72,7 @@ function ChargePowerChart({
       <ResponsiveContainer minHeight={0} minWidth={0}>
         <LineChart
           data={data}
-          margin={{ top: 10, right: RIGHT_MARGIN, bottom: 24, left: LEFT_MARGIN }}
+          margin={{ top: 24, right: RIGHT_MARGIN, bottom: 24, left: LEFT_MARGIN }}
         >
           <CartesianGrid stroke="#1e242f" strokeDasharray="3 3" vertical={false} />
           <XAxis
@@ -98,7 +98,7 @@ function ChargePowerChart({
             tickMargin={4}
             width={YAXIS_WIDTH}
             domain={[0, "dataMax + 2"]}
-            label={{ value: "kW", position: "bottom", offset: 8, style: AXIS_LABEL_STYLE }}
+            label={{ value: "kW", position: "top", offset: 14, style: AXIS_LABEL_STYLE }}
           />
           <YAxis
             yAxisId="soc"
@@ -112,7 +112,7 @@ function ChargePowerChart({
             width={YAXIS_WIDTH}
             domain={[0, 100]}
             ticks={[0, 25, 50, 75, 100]}
-            label={{ value: "SoC", position: "bottom", offset: 8, style: AXIS_LABEL_STYLE }}
+            label={{ value: "SoC", position: "top", offset: 14, style: AXIS_LABEL_STYLE }}
           />
           <Tooltip
             content={({ active, payload }) => {
