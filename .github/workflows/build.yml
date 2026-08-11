@@ -5,8 +5,10 @@ on:
     tags: ['v*']
   # Compile-test pull requests (e.g. Dependabot bumps) so a breaking
   # dependency update is caught in review instead of at the next release.
-  # Only the `test` job runs here — see its `if` guard on `build`. The
-  # release job is tag-gated, so PRs never publish a release.
+  # `test` and `lint-web` run on every PR; a PR that touches the cargo
+  # graph additionally builds the two representative ARM slices, because
+  # a green host build says nothing about the binaries the Pi actually
+  # runs. The release job is tag-gated, so PRs never publish a release.
   pull_request:
     branches: [main, main-dev]
   workflow_dispatch:
@@ -15,12 +17,151 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  plan_build:
+    name: Plan ARM builds
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: read
+    outputs:
+      run_build: ${{ steps.plan.outputs.run_build }}
+      matrix: ${{ steps.plan.outputs.matrix }}
+    steps:
+      # Only PRs need history, and only to diff base against head.
+      - uses: actions/checkout@v7
+        if: github.event_name == 'pull_request'
+        with:
+          fetch-depth: 0
+
+      # Single source of truth for the build matrix. Tags and
+      # workflow_dispatch take every slice; a PR takes the `smoke_on_pr`
+      # subset, and only when it touches the cargo graph. Selecting here
+      # rather than in the `build` job's own `if` is forced: a job-level
+      # `if` is evaluated BEFORE matrix expansion, so `matrix` is empty
+      # there and a matrix-based gate would silently never fire.
+      #
+      # Gating on changed paths rather than a label or `github.actor`
+      # deliberately covers hand-written dependency PRs too — a gate that
+      # depends on someone remembering a label reintroduces the very gap
+      # this job exists to close.
+      #
+      # aarch64 is split into three CPU-tuned variants so each Pi runs
+      # code matched to its microarchitecture. The runtime picker script
+      # (pi-gen-sources/.../files/sentryusb-pick-binary) selects the
+      # right one at boot based on /proc/cpuinfo:
+      #   * a76 → Pi 5 (Cortex-A76, ARMv8.2 with LSE atomics)
+      #   * a72 → Pi 4, Radxa ROCK 4C+ perf cluster (Cortex-A72)
+      #   * a53 → Pi 3, Pi Zero 2 W, Allwinner H618 boards (Cortex-A53)
+      # The cpu field is consumed via the RUSTFLAGS env in the build step.
+      # cpu_features: LLVM's cortex-a53/a72/a76 CPU definitions all
+      # assume the OPTIONAL ARMv8 Cryptographic Extension (+aes,+sha2)
+      # — but Broadcom never licensed it: BCM2710 (Pi 3 / Zero 2 W,
+      # A53) and BCM2711 (Pi 4, A72) have no crypto instructions.
+      # RustCrypto's sha1/sha2/aes skip runtime CPU detection when the
+      # feature is enabled at compile time, so a build with crypto
+      # baked in executes SHA/AES instructions unconditionally and
+      # dies with SIGILL on those boards the moment the BLE stack
+      # hashes the VIN (issue #88 — the real root cause; the binaries
+      # were illegal on the very CPUs they were tuned for). Strip the
+      # crypto features from a53/a72; software SHA/AES is microseconds
+      # at our message sizes. a76 keeps crypto — the Pi 5's BCM2712
+      # does implement it (and the picker requires the `aes` hwcap
+      # before selecting a76).
+      #
+      # smoke_on_pr marks the two structurally distinct build paths: a53
+      # is native aarch64 carrying the crypto strip, ARMv7 is the only
+      # x86→armhf cross-compile (foreign-arch apt, PKG_CONFIG_ALLOW_CROSS,
+      # GNU ld instead of mold). a72/a76 are microarch variants of a53's
+      # path and add no signal for a dependency bump.
+      - name: Select build matrix
+        id: plan
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          all_matrix=$(jq -c . <<'JSON'
+            {
+              "include": [
+                {
+                  "name": "ARM64 a53 (Pi 3 / Pi Zero 2 W / Allwinner H618)",
+                  "runs_on": "ubuntu-22.04-arm",
+                  "target": "aarch64-unknown-linux-gnu",
+                  "cpu": "cortex-a53",
+                  "cpu_features": "-C target-feature=-aes,-sha2",
+                  "linker": "cc",
+                  "gcc": "",
+                  "artifact_suffix": "linux-arm64-a53",
+                  "smoke_on_pr": true
+                },
+                {
+                  "name": "ARM64 a72 (Pi 4 / Radxa ROCK 4C+)",
+                  "runs_on": "ubuntu-22.04-arm",
+                  "target": "aarch64-unknown-linux-gnu",
+                  "cpu": "cortex-a72",
+                  "cpu_features": "-C target-feature=-aes,-sha2",
+                  "linker": "cc",
+                  "gcc": "",
+                  "artifact_suffix": "linux-arm64-a72",
+                  "smoke_on_pr": false
+                },
+                {
+                  "name": "ARM64 a76 (Pi 5)",
+                  "runs_on": "ubuntu-22.04-arm",
+                  "target": "aarch64-unknown-linux-gnu",
+                  "cpu": "cortex-a76",
+                  "cpu_features": "",
+                  "linker": "cc",
+                  "gcc": "",
+                  "artifact_suffix": "linux-arm64-a76",
+                  "smoke_on_pr": false
+                },
+                {
+                  "name": "ARMv7 (Pi 2/3/Zero2W 32-bit)",
+                  "runs_on": "ubuntu-22.04",
+                  "target": "armv7-unknown-linux-gnueabihf",
+                  "cpu": "cortex-a7",
+                  "cpu_features": "",
+                  "linker": "arm-linux-gnueabihf-gcc",
+                  "gcc": "gcc-arm-linux-gnueabihf",
+                  "artifact_suffix": "linux-armv7",
+                  "smoke_on_pr": true
+                }
+              ]
+            }
+          JSON
+          )
+
+          run_build=true
+          selected=$all_matrix
+
+          if [ "$GITHUB_EVENT_NAME" = "pull_request" ]; then
+            selected=$(jq -c '{include: [.include[] | select(.smoke_on_pr)]}' <<<"$all_matrix")
+            # `git diff --quiet` exits 0 when identical, 1 when they differ,
+            # and >1 on real errors — which must not be read as "no changes".
+            if git diff --quiet "$BASE_SHA...$HEAD_SHA" -- \
+                Cargo.lock Cargo.toml \
+                ':(glob)**/Cargo.lock' ':(glob)**/Cargo.toml'
+            then
+              run_build=false
+            else
+              diff_exit=$?
+              if [ "$diff_exit" -ne 1 ]; then
+                exit "$diff_exit"
+              fi
+            fi
+          fi
+
+          echo "run_build=$run_build" >> "$GITHUB_OUTPUT"
+          echo "matrix=$selected" >> "$GITHUB_OUTPUT"
+          echo "run_build=$run_build"
+          jq -r '.include[] | "selected: \(.name)"' <<<"$selected"
+
   build:
     name: Build ${{ matrix.name }}
-    # PRs only need the `test` job (which compiles the whole workspace on
-    # the host) to catch breakage — skip the four expensive ARM cross-builds
-    # here. The full build matrix + release run on version tags only.
-    if: github.event_name != 'pull_request'
+    # Slice selection and the PR cargo-path gate both live in `plan_build`
+    # above; this job runs whatever matrix it hands back.
+    needs: plan_build
+    if: needs.plan_build.outputs.run_build == 'true'
     # Pin to 22.04 (glibc 2.35). `ubuntu-latest` now points at 24.04
     # (glibc 2.39) and Pi OS Bookworm only ships glibc 2.36 — anything
     # built on 24.04 fails on every Pi with:
@@ -35,62 +176,8 @@ jobs:
     # the same complexity as x86→armhf with no payoff.
     runs-on: ${{ matrix.runs_on }}
     strategy:
-      matrix:
-        # aarch64 is split into three CPU-tuned variants so each Pi runs
-        # code matched to its microarchitecture. The runtime picker script
-        # (pi-gen-sources/.../files/sentryusb-pick-binary) selects the
-        # right one at boot based on /proc/cpuinfo:
-        #   * a76 → Pi 5 (Cortex-A76, ARMv8.2 with LSE atomics)
-        #   * a72 → Pi 4, Radxa ROCK 4C+ perf cluster (Cortex-A72)
-        #   * a53 → Pi 3, Pi Zero 2 W, Allwinner H618 boards (Cortex-A53)
-        # The cpu field is consumed via the RUSTFLAGS env in the build step.
-        # cpu_features: LLVM's cortex-a53/a72/a76 CPU definitions all
-        # assume the OPTIONAL ARMv8 Cryptographic Extension (+aes,+sha2)
-        # — but Broadcom never licensed it: BCM2710 (Pi 3 / Zero 2 W,
-        # A53) and BCM2711 (Pi 4, A72) have no crypto instructions.
-        # RustCrypto's sha1/sha2/aes skip runtime CPU detection when the
-        # feature is enabled at compile time, so a build with crypto
-        # baked in executes SHA/AES instructions unconditionally and
-        # dies with SIGILL on those boards the moment the BLE stack
-        # hashes the VIN (issue #88 — the real root cause; the binaries
-        # were illegal on the very CPUs they were tuned for). Strip the
-        # crypto features from a53/a72; software SHA/AES is microseconds
-        # at our message sizes. a76 keeps crypto — the Pi 5's BCM2712
-        # does implement it (and the picker requires the `aes` hwcap
-        # before selecting a76).
-        include:
-          - name: ARM64 a53 (Pi 3 / Pi Zero 2 W / Allwinner H618)
-            runs_on: ubuntu-22.04-arm
-            target: aarch64-unknown-linux-gnu
-            cpu: cortex-a53
-            cpu_features: "-C target-feature=-aes,-sha2"
-            linker: cc
-            gcc: ""
-            artifact_suffix: linux-arm64-a53
-          - name: ARM64 a72 (Pi 4 / Radxa ROCK 4C+)
-            runs_on: ubuntu-22.04-arm
-            target: aarch64-unknown-linux-gnu
-            cpu: cortex-a72
-            cpu_features: "-C target-feature=-aes,-sha2"
-            linker: cc
-            gcc: ""
-            artifact_suffix: linux-arm64-a72
-          - name: ARM64 a76 (Pi 5)
-            runs_on: ubuntu-22.04-arm
-            target: aarch64-unknown-linux-gnu
-            cpu: cortex-a76
-            cpu_features: ""
-            linker: cc
-            gcc: ""
-            artifact_suffix: linux-arm64-a76
-          - name: ARMv7 (Pi 2/3/Zero2W 32-bit)
-            runs_on: ubuntu-22.04
-            target: armv7-unknown-linux-gnueabihf
-            cpu: cortex-a7
-            cpu_features: ""
-            linker: arm-linux-gnueabihf-gcc
-            gcc: gcc-arm-linux-gnueabihf
-            artifact_suffix: linux-armv7
+      # Defined in `plan_build` — see the slice rationale there.
+      matrix: ${{ fromJSON(needs.plan_build.outputs.matrix) }}
     steps:
       - uses: actions/checkout@v7
 
@@ -181,16 +268,30 @@ jobs:
           # ARM-native runners while armv7/armv6 stay on x86 cross — the
           # cached build artifacts are host-arch-specific and must not
           # be reused across hosts.
-          key: ${{ runner.os }}-${{ runner.arch }}-cargo-${{ matrix.target }}-${{ matrix.cpu }}-${{ hashFiles('**/Cargo.lock', 'web/src/**', 'web/public/**', 'web/package-lock.json', 'web/package.json', 'web/index.html', 'web/vite.config.*', 'web/tsconfig*.json') }}
+          # PR smoke builds embed a placeholder frontend instead of the real
+          # one, so they get their own key prefix rather than poisoning the
+          # release cache with a target/ dir built against different assets.
+          key: ${{ runner.os }}-${{ runner.arch }}-cargo-${{ github.event_name == 'pull_request' && 'smoke' || 'release' }}-${{ matrix.target }}-${{ matrix.cpu }}-${{ hashFiles('**/Cargo.lock', 'web/src/**', 'web/public/**', 'web/package-lock.json', 'web/package.json', 'web/index.html', 'web/vite.config.*', 'web/tsconfig*.json') }}
 
       - name: Set up Node.js
+        if: github.event_name != 'pull_request'
         uses: actions/setup-node@v7
         with:
           node-version: '22'
           cache: 'npm'
           cache-dependency-path: web/package-lock.json
 
+      # PR smoke builds only need to prove the cargo graph still compiles
+      # and links for ARM. rust-embed just needs the directory to be
+      # non-empty; `lint-web` builds the real bundle on the same PR.
+      - name: Supply placeholder frontend (PR smoke)
+        if: github.event_name == 'pull_request'
+        run: |
+          mkdir -p crates/sentryusb/static
+          echo '<!DOCTYPE html><html><body>ci</body></html>' > crates/sentryusb/static/index.html
+
       - name: Build frontend
+        if: github.event_name != 'pull_request'
         run: |
           set -e
           cd web
@@ -265,6 +366,10 @@ jobs:
           CARGO_TARGET_ARMV7_UNKNOWN_LINUX_GNUEABIHF_LINKER: ${{ matrix.linker }}
 
       - name: Package binaries
+        # Skipped on PR smoke builds: those embed a placeholder frontend,
+        # so the binaries are compile-proof only and must never be
+        # mistaken for something installable.
+        if: github.event_name != 'pull_request'
         # Both artifacts use the same `artifact_suffix` so the in-app
         # updater (update.rs) and the picker script can fetch them via a
         # predictable URL pattern: sentryusb-${suffix},
@@ -289,6 +394,7 @@ jobs:
           ls -lh release/
 
       - name: Upload artifacts
+        if: github.event_name != 'pull_request'
         uses: actions/upload-artifact@v7
         with:
           name: sentryusb-${{ matrix.artifact_suffix }}-bundle
@@ -340,6 +446,19 @@ jobs:
           cd web
           npm ci
           npx eslint . --max-warnings 30
+      - name: Production build
+        # eslint does not exercise vite/rolldown, so a frontend dependency
+        # bump could break the bundle with every check green. Tags and
+        # workflow_dispatch already build it inside each release slice;
+        # this covers the PR path.
+        if: github.event_name == 'pull_request'
+        run: |
+          cd web
+          npm run build
+          if [ ! -s "dist/index.html" ]; then
+            echo "::error::web/dist/index.html missing or empty after npm run build"
+            exit 1
+          fi
       - name: Icons up to date
         # src/components/icons.tsx is generated from scripts/icons/symbols.mjs.
         # Hand-editing it silently drifts from the Material Symbols source (a
