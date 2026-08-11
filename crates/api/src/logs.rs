@@ -38,15 +38,21 @@ pub async fn get_log(
     State(s): State<AppState>,
     Path(name): Path<String>,
 ) -> Response {
-    if name.contains("..") || name.contains('/') || name.contains('\\') {
-        return (StatusCode::BAD_REQUEST, "invalid log name").into_response();
-    }
-
     // Special-case: the Bluetooth tab isn't a static file — it's a
     // live dump built from systemctl + sysfs + telemetry DB +
     // journalctl. Delegate to the dedicated handler.
     if name == "bluetooth" {
         return crate::ble_debug::get_ble_debug(State(s)).await;
+    }
+    get_log_tail(Path(name)).await
+}
+
+/// State-free tail read — also mounted by the degraded router, where no
+/// AppState exists (bluetooth's live dump needs the full app, so only
+/// the plain-file path is available there).
+pub async fn get_log_tail(Path(name): Path<String>) -> Response {
+    if name.contains("..") || name.contains('/') || name.contains('\\') {
+        return (StatusCode::BAD_REQUEST, "invalid log name").into_response();
     }
 
     // Tail-reading a log seeks + reads up to 512 KB off the SD card — keep
@@ -138,7 +144,6 @@ pub struct LogPageQuery {
 /// The cursor travels in the body because the BLE proxy drops response
 /// headers.
 pub async fn get_log_page(
-    State(_s): State<AppState>,
     Path(name): Path<String>,
     Query(q): Query<LogPageQuery>,
 ) -> Response {

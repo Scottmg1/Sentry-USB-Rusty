@@ -195,22 +195,48 @@ async fn main() {
             Arc::new(sentryusb_drives::DriveStore::open_memory().expect("failed to create in-memory DB"))
         }
         Err(e) => {
-            // A real device whose DB will not open gets a restart loop,
-            // not an empty in-memory store: serving empty history is
-            // indistinguishable, in the UI, from "all my drives were
-            // deleted", and every background job (ingest, cloud sweep)
-            // would run against fiction whose writes vanish on reboot.
-            // systemd's Restart=always/5s retries — a transient cause
-            // (mount ordering, a lock, fsck) heals on its own; a
-            // persistent one keeps a loud, honest journal instead of a
-            // lying UI. An explicit degraded mode (banner + 503s +
-            // recovery allowlist) is the designed follow-up.
+            // A real device whose DB will not open must not serve an
+            // empty in-memory store: empty history is indistinguishable,
+            // in the UI, from "all my drives were deleted", and every
+            // background job would run against fiction whose writes
+            // vanish on reboot. Serve an explicit degraded mode instead:
+            // the SPA plus a banner, 503 on every data endpoint, and a
+            // recovery allowlist (logs, storage health/repair, reboot).
+            // No store, processor, or cloud uploader is constructed. A
+            // periodic reopen probe exits cleanly once the DB comes back
+            // — a transient cause (mount ordering, a lock, fsck) heals
+            // on its own via systemd's Restart=always.
             tracing::error!(
-                "Failed to open drive DB at {}: {}. Exiting so systemd retries —                  common causes are a full disk, a locked DB, or a damaged file.                  Do NOT re-run setup before checking the DB file.",
+                "Failed to open drive DB at {}: {}. Entering degraded mode —                  common causes are a full disk, a locked DB, or a damaged file.                  Do NOT re-run setup before checking the DB file.",
                 db_path,
                 e
             );
-            std::process::exit(1);
+            tokio::spawn(async {
+                let mut tick = tokio::time::interval(std::time::Duration::from_secs(30));
+                tick.tick().await; // skip the immediate tick
+                loop {
+                    tick.tick().await;
+                    let ok = tokio::task::spawn_blocking(|| {
+                        sentryusb_drives::DriveStore::open(sentryusb_drives::DEFAULT_DB_PATH).is_ok()
+                    })
+                    .await
+                    .unwrap_or(false);
+                    if ok {
+                        tracing::info!(
+                            "drive DB opens again — exiting degraded mode; systemd restarts into normal service"
+                        );
+                        std::process::exit(0);
+                    }
+                }
+            });
+            let degraded = sentryusb_api::degraded::DegradedState {
+                auth: auth.clone(),
+                hub: hub.clone(),
+                reason: std::sync::Arc::new(e.to_string()),
+            };
+            let app = sentryusb_api::degraded::build_degraded_router(degraded);
+            serve_with_common_layers(app, auth, args.port, args.dev, t0).await;
+            return;
         }
     };
     // Remove orphaned files older binaries wrote to /mutable (drive-data.json
@@ -341,8 +367,22 @@ async fn main() {
     phase!("startup_tasks_spawned");
 
     // Build the API router
-    let mut app = sentryusb_api::build_router(app_state.clone());
+    let app = sentryusb_api::build_router(app_state.clone());
+    phase!("router_built");
 
+    serve_with_common_layers(app, auth, args.port, args.dev, t0).await;
+}
+
+/// Shared serving tail for normal and degraded startup: media mounts,
+/// SPA fallback, compression, auth gate, slow-request journal, bind,
+/// serve. Runs until shutdown.
+async fn serve_with_common_layers(
+    mut app: axum::Router,
+    auth: sentryusb_api::auth::AuthState,
+    port: u16,
+    dev: bool,
+    t0: std::time::Instant,
+) {
     // Serve TeslaCam video files via the bind mount of /mutable/TeslaCam
     // at /var/www/html/TeslaCam. Modern browsers (Chrome 80+, Firefox 70+,
     // Safari iOS 13+, ExoPlayer) parse Tesla's `ctts` atom natively, so
@@ -359,7 +399,7 @@ async fn main() {
     );
 
     // Static file serving with SPA fallback (unless dev mode)
-    if !args.dev {
+    if !dev {
         app = app.fallback(embed::spa_handler);
         info!("Serving embedded static files");
     } else {
@@ -433,15 +473,14 @@ async fn main() {
     app = app.layer(axum::middleware::from_fn(
         sentryusb_api::router::slow_request_log,
     ));
-    phase!("router_built");
 
-    let addr = std::net::SocketAddr::from((std::net::Ipv6Addr::UNSPECIFIED, args.port));
+    let addr = std::net::SocketAddr::from((std::net::Ipv6Addr::UNSPECIFIED, port));
     info!("SentryUSB server listening on {}", addr);
 
     let listener = tokio::net::TcpListener::bind(addr)
         .await
         .expect("failed to bind address");
-    phase!("listener_bound");
+    info!(boot_phase = "listener_bound", elapsed_ms = t0.elapsed().as_millis() as u64);
 
     info!(
         boot_phase = "ready",

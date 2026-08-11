@@ -1,5 +1,6 @@
 pub mod auth;
 pub mod ble;
+pub mod degraded;
 pub mod ble_debug;
 pub mod router;
 pub mod drives_handler;

@@ -992,7 +992,7 @@ fn read_boot_id() -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
-pub async fn get_version(State(_s): State<AppState>) -> (StatusCode, Json<serde_json::Value>) {
+pub async fn get_version() -> (StatusCode, Json<serde_json::Value>) {
     let version = env!("CARGO_PKG_VERSION");
     let sbc_model = get_sbc_model();
 

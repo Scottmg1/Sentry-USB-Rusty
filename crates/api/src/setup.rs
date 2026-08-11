@@ -133,7 +133,7 @@ pub fn auto_resume_setup(hub: sentryusb_ws::Hub) {
 }
 
 /// GET /api/setup/status
-pub async fn get_setup_status(State(_s): State<AppState>) -> (StatusCode, Json<serde_json::Value>) {
+pub async fn get_setup_status() -> (StatusCode, Json<serde_json::Value>) {
     let running = SETUP_RUNNING.load(Ordering::Relaxed);
     let finished = is_setup_finished();
 

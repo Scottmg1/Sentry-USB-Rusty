@@ -355,7 +355,6 @@ use axum::Json;
 use axum::response::IntoResponse;
 use serde::Deserialize;
 
-use crate::router::AppState;
 
 /// Per-IP failed-login throttle: 5 failures in 5 minutes locks the IP
 /// out until the window drains. Same policy as the web terminal's
@@ -407,11 +406,11 @@ pub struct LoginRequest {
 
 /// POST /api/auth/login
 pub async fn handle_login(
-    axum::extract::State(state): axum::extract::State<AppState>,
+    axum::extract::State(auth): axum::extract::State<AuthState>,
     axum::extract::ConnectInfo(addr): axum::extract::ConnectInfo<std::net::SocketAddr>,
     Json(req): Json<LoginRequest>,
 ) -> Response {
-    if !state.auth.auth_required() {
+    if !auth.auth_required() {
         return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "Authentication is not configured"}))).into_response();
     }
 
@@ -427,13 +426,13 @@ pub async fn handle_login(
             .into_response();
     }
 
-    if !state.auth.check_credentials(&req.username, &req.password) {
+    if !auth.check_credentials(&req.username, &req.password) {
         record_login_failure(&ip);
         warn!("[auth] Failed login attempt for user {:?} from {}", req.username, ip);
         return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({"error": "Invalid username or password"}))).into_response();
     }
 
-    let token = match state.auth.create_session() {
+    let token = match auth.create_session() {
         Some(t) => t,
         None => {
             return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": "Failed to create session"}))).into_response();
@@ -457,7 +456,7 @@ pub async fn handle_login(
 
 /// POST /api/auth/logout
 pub async fn handle_logout(
-    axum::extract::State(state): axum::extract::State<AppState>,
+    axum::extract::State(auth): axum::extract::State<AuthState>,
     req: Request,
 ) -> impl axum::response::IntoResponse {
     let cookie_header = req
@@ -467,7 +466,7 @@ pub async fn handle_logout(
         .unwrap_or("");
 
     if let Some(token) = extract_cookie(cookie_header, SESSION_COOKIE_NAME) {
-        state.auth.remove_session(token);
+        auth.remove_session(token);
     }
 
     let clear_cookie = format!(
@@ -486,10 +485,10 @@ pub async fn handle_logout(
 
 /// GET /api/auth/check
 pub async fn handle_auth_check(
-    axum::extract::State(state): axum::extract::State<AppState>,
+    axum::extract::State(auth): axum::extract::State<AuthState>,
     req: Request,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    let auth_required = state.auth.auth_required();
+    let auth_required = auth.auth_required();
     let mut authenticated = !auth_required;
 
     if auth_required {
@@ -500,7 +499,7 @@ pub async fn handle_auth_check(
             .unwrap_or("");
 
         if let Some(token) = extract_cookie(cookie_header, SESSION_COOKIE_NAME) {
-            authenticated = state.auth.validate_session(token);
+            authenticated = auth.validate_session(token);
         }
     }
 
