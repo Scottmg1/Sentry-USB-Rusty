@@ -4,6 +4,7 @@
 //! operations on `/sys/kernel/config/usb_gadget/sentryusb`.
 
 pub mod cycle_lock;
+pub mod reflink;
 pub mod snapshot;
 pub mod space;
 

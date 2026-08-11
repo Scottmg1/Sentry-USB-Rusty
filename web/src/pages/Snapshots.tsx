@@ -10,7 +10,19 @@ import {
 
 interface SnapshotEntry {
   id: string
-  size_bytes: number
+  /**
+   * Bytes deleting THIS snapshot alone would actually reclaim.
+   *
+   * null means not measured yet, or not measurable. It must never render
+   * as "0 B" — that reads as "safe to delete, frees nothing", which is a
+   * different (and wrong) claim.
+   *
+   * Replaces the old `size_bytes`, which was a `du` of the snapshot
+   * directory. Snapshots are XFS reflink clones, so `du` charged every
+   * shared block to every snapshot: rows said 45-64 GB, deleting one
+   * returned ~5 GB, and 89 rows "summed" to several times the disk.
+   */
+  reclaimable_bytes: number | null
   created_unix: number
 }
 
@@ -59,6 +71,9 @@ export default function Snapshots() {
   // they need to delete to free space, so the first row is the most
   // useful action by default. Allow re-sorting for browsing.
   const [sortMode, setSortMode] = useState<SortMode>("oldest")
+  // Measuring reclaimable size walks each image's extent map, so it runs
+  // off the request path. While it's running rows have no number yet.
+  const [sizesPending, setSizesPending] = useState(false)
 
   const refresh = useCallback(async () => {
     setError(null)
@@ -75,6 +90,7 @@ export default function Snapshots() {
           ? listData.total_allocated_bytes
           : 0,
       )
+      setSizesPending(listData?.sizes_pending === true)
       if (spaceRes.ok) {
         const spaceData = await spaceRes.json()
         setFree(spaceData)
@@ -90,11 +106,34 @@ export default function Snapshots() {
     refresh()
   }, [refresh])
 
+  // Poll while a measurement is running so the numbers appear on their
+  // own. Deliberately stops as soon as they land — this walks extent maps
+  // on a Pi, so it must not become a background load.
+  useEffect(() => {
+    if (!sizesPending) return
+    const t = setInterval(refresh, 4000)
+    return () => clearInterval(t)
+  }, [sizesPending, refresh])
+
   const sortedSnapshots = useMemo(() => {
     const arr = [...snapshots]
     if (sortMode === "oldest") arr.sort((a, b) => a.created_unix - b.created_unix)
     else if (sortMode === "newest") arr.sort((a, b) => b.created_unix - a.created_unix)
-    else if (sortMode === "largest") arr.sort((a, b) => b.size_bytes - a.size_bytes)
+    // "Largest" now means largest RECLAIMABLE, which is what the label
+    // always implied. Sorting by the old du figure effectively sorted by
+    // how full the cam disk happened to be when each snapshot was taken —
+    // near enough to newest-first wearing a disguise. Unmeasured rows sort
+    // last: we don't know their size, so they can't be claimed to be small.
+    else if (sortMode === "largest") {
+      arr.sort((a, b) => {
+        const av = a.reclaimable_bytes
+        const bv = b.reclaimable_bytes
+        if (av === null && bv === null) return a.created_unix - b.created_unix
+        if (av === null) return 1
+        if (bv === null) return -1
+        return bv - av
+      })
+    }
     return arr
   }, [snapshots, sortMode])
 
@@ -138,6 +177,13 @@ export default function Snapshots() {
           Snapshots are point-in-time copies of your dashcam footage stored on
           the backingfiles partition. Delete oldest snapshots here to free
           space — for example, before growing the dashcam drive size.
+        </p>
+        <p className="mt-2 text-xs text-slate-500">
+          Snapshots share storage with each other and with the live dashcam
+          drive, so a snapshot's size is not the whole footage it covers — it
+          is an estimate of the part only that snapshot is holding. Deleting it
+          frees roughly that much; the exact figure can differ slightly, or
+          take a moment to appear.
         </p>
       </div>
 
@@ -234,7 +280,20 @@ export default function Snapshots() {
                     <span className="mx-1.5 text-slate-700">•</span>
                     {relativeTime(s.created_unix)}
                     <span className="mx-1.5 text-slate-700">•</span>
-                    {formatBytes(s.size_bytes)}
+                    {s.reclaimable_bytes !== null ? (
+                      <span title="Estimated space currently held only by this snapshot. The actual free-space gain may differ, or arrive a moment later.">
+                        ~{formatBytes(s.reclaimable_bytes)} held only here
+                      </span>
+                    ) : sizesPending ? (
+                      <span className="text-slate-600">measuring…</span>
+                    ) : (
+                      <span
+                        className="text-slate-600"
+                        title="Could not measure this snapshot. It may be in use, or on a filesystem without reflink accounting."
+                      >
+                        size unavailable
+                      </span>
+                    )}
                   </p>
                 </div>
                 {isConfirming ? (
