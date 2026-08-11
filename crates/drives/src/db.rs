@@ -1423,9 +1423,17 @@ impl DriveStore {
         uploaded_at: i64,
     ) -> Result<()> {
         let conn = self.conn.lock().unwrap();
+        // The delete-outbox guard lives INSIDE the writer statement:
+        // a bulk_delete that queued this session (atomically retiring
+        // its charge_uploads row) must never be overwritten by an
+        // in-flight upload ack, or a later re-import of the same
+        // session_ts would read as already-uploaded forever. A separate
+        // read-then-write check has a window; this does not, because
+        // both writers serialize on the connection mutex.
         conn.execute(
             "INSERT INTO charge_uploads(session_ts, cloud_charge_id, wrapped_charge_key, uploaded_at) \
-             VALUES(?1, ?2, ?3, ?4) \
+             SELECT ?1, ?2, ?3, ?4 \
+             WHERE NOT EXISTS(SELECT 1 FROM charge_delete_outbox WHERE session_ts = ?1) \
              ON CONFLICT(session_ts) DO UPDATE SET \
                cloud_charge_id = ?2, wrapped_charge_key = ?3, uploaded_at = ?4",
             params![session_ts, cloud_charge_id, wrapped_charge_key_b64, uploaded_at],
@@ -4183,6 +4191,28 @@ mod tests {
             vec![(2000, "bb".into(), false)]
         );
         assert!(!store.charge_delete_outbox_contains(1000).unwrap());
+    }
+
+    /// The outbox guard inside charge_upload_mark: an ack for a session
+    /// the user deleted mid-flight must not resurrect its upload record.
+    #[test]
+    fn charge_upload_mark_refuses_outboxed_sessions() {
+        let store = DriveStore::open_memory().unwrap();
+        {
+            let conn = store.conn.lock().unwrap();
+            conn.execute(
+                "INSERT INTO charge_delete_outbox(session_ts, cloud_charge_id, queued_at)                  VALUES(1000, 'aa', 1)",
+                [],
+            )
+            .unwrap();
+        }
+        store.charge_upload_mark(1000, "aa", "k", 5).unwrap();
+        assert!(
+            store.charge_uploads_map().unwrap().is_empty(),
+            "outboxed session must not be marked uploaded"
+        );
+        store.charge_upload_mark(2000, "bb", "k", 5).unwrap();
+        assert!(store.charge_uploads_map().unwrap().contains_key(&2000));
     }
 
     /// A non-overlapping Tessie import in the suffix region must survive

@@ -239,7 +239,7 @@ pub async fn sweep_once(state: Arc<CloudStateInner>) -> Result<u32> {
             // daily full scan.
             let outboxed: std::collections::HashSet<i64> = store
                 .charge_delete_outbox_all()
-                .unwrap_or_default()
+                .context("charge delete outbox")?
                 .into_iter()
                 .map(|(ts, _, _)| ts)
                 .collect();
@@ -389,10 +389,11 @@ pub async fn sweep_once(state: Arc<CloudStateInner>) -> Result<u32> {
                         total_stored += 1;
                     }
                     // A local delete may have queued this session after
-                    // prep; marking it uploaded now would leave the Pi
-                    // claiming "uploaded" over an empty cloud once the
-                    // delete stage (later this sweep) retires it.
-                    if store.charge_delete_outbox_contains(*session_ts).unwrap_or(false) {
+                    // prep. charge_upload_mark itself refuses outboxed
+                    // sessions atomically; this check just also skips the
+                    // dirty-clear below (bulk_delete already dropped the
+                    // row) and fails CLOSED on a read error.
+                    if store.charge_delete_outbox_contains(*session_ts).unwrap_or(true) {
                         continue;
                     }
                     if let Err(e) = store.charge_upload_mark(
