@@ -17,6 +17,9 @@ use tracing::{info, warn};
 use sentryusb_drives::charging::{
     self, ChargeSessionSummary, SESSION_GAP_SECS,
 };
+use sentryusb_drives::schema::{
+    self, CHARGE_SWEEP_CURSOR_KEY, CHARGE_SWEEP_FULL_DATE_KEY,
+};
 
 use crate::client::CloudClient;
 use crate::credentials_store::UnlockedCreds;
@@ -64,6 +67,90 @@ struct UploadResult {
     status: String,
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sentryusb_drives::charging::ChargeRow;
+
+    const NOW: i64 = 1_000_000;
+
+    fn session(start: i64, len: i64) -> Vec<ChargeRow> {
+        (0..len)
+            .map(|i| ChargeRow { ts: start + i * 60, ..Default::default() })
+            .collect()
+    }
+
+    /// Long finished — outside the gap window.
+    fn old(start: i64) -> Vec<ChargeRow> {
+        session(start, 3)
+    }
+
+    #[test]
+    fn settled_history_advances_to_the_newest_session() {
+        let sessions = vec![old(1_000), old(50_000), old(100_000)];
+        assert_eq!(
+            sweep_frontier(&sessions, NOW, |_| true),
+            Some(100_000),
+            "everything sent and closed — start at the newest session"
+        );
+    }
+
+    #[test]
+    fn holds_at_the_oldest_unsent_session() {
+        let sessions = vec![old(1_000), old(50_000), old(100_000)];
+        // The middle one failed to upload; the cursor must not pass it.
+        assert_eq!(
+            sweep_frontier(&sessions, NOW, |ts| ts != 50_000),
+            Some(50_000)
+        );
+    }
+
+    /// A session still inside the gap window may still grow, so its rows
+    /// must stay in scope.
+    #[test]
+    fn holds_at_a_still_open_session() {
+        let mut sessions = vec![old(1_000)];
+        sessions.push(session(NOW - 60, 2));
+        assert_eq!(sweep_frontier(&sessions, NOW, |_| true), Some(NOW - 60));
+    }
+
+    #[test]
+    fn no_sessions_leaves_the_cursor_alone() {
+        assert_eq!(sweep_frontier(&[], NOW, |_| true), None);
+    }
+
+    /// The frontier is a session START, never a row inside one — session
+    /// identity is that timestamp.
+    #[test]
+    fn frontier_is_always_a_session_start() {
+        let sessions = vec![old(1_000), old(50_000)];
+        let f = sweep_frontier(&sessions, NOW, |ts| ts != 50_000).unwrap();
+        assert!(sessions.iter().any(|s| s[0].ts == f));
+    }
+}
+
+/// Where the next sweep may start: the oldest session that is still open
+/// or still unsent, so a transient upload failure is retried rather than
+/// skipped. Falls back to the newest session's start once everything is
+/// settled. Always a session's FIRST ts — never a point inside one.
+fn sweep_frontier(
+    sessions: &[Vec<charging::ChargeRow>],
+    now_secs: i64,
+    handled: impl Fn(i64) -> bool,
+) -> Option<i64> {
+    let settled = |s: &Vec<charging::ChargeRow>| {
+        let closed = s.last().is_some_and(|l| now_secs - l.ts > SESSION_GAP_SECS);
+        closed && s.first().is_some_and(|f| handled(f.ts))
+    };
+    sessions
+        .iter()
+        .filter(|s| !s.is_empty())
+        .find(|s| !settled(s))
+        .or_else(|| sessions.iter().rfind(|s| !s.is_empty()))
+        .and_then(|s| s.first())
+        .map(|r| r.ts)
+}
+
 /// One sweep pass. Returns the number of sessions newly stored.
 pub async fn sweep_once(state: Arc<CloudStateInner>) -> Result<u32> {
     let creds_snapshot = {
@@ -89,17 +176,52 @@ pub async fn sweep_once(state: Arc<CloudStateInner>) -> Result<u32> {
         let store = store.clone();
         tokio::task::spawn_blocking(move || -> Result<_> {
             let uploads = store.charge_uploads_map().context("charge_uploads_map")?;
+
+            let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+            let (from, full_scan) = store.with_read_conn(|conn| -> Result<_> {
+                if schema::meta_get(conn, CHARGE_SWEEP_FULL_DATE_KEY)?.as_deref()
+                    != Some(today.as_str())
+                {
+                    return Ok((0, true));
+                }
+                let cursor = schema::meta_get(conn, CHARGE_SWEEP_CURSOR_KEY)?
+                    .and_then(|s| s.parse::<i64>().ok())
+                    .unwrap_or(0);
+                Ok((cursor, false))
+            })?;
+
             let rows = store
-                .with_read_conn(|conn| -> Result<_> { charging::load_charge_rows(conn, 0, None) })
+                .with_read_conn(|conn| -> Result<_> { charging::load_charge_rows(conn, from, None) })
                 .context("load charge rows")?;
             let now_secs = now_ms() / 1000;
-            let pending: Vec<Vec<charging::ChargeRow>> = charging::group_sessions(rows)
+            let sessions = charging::group_sessions(rows);
+
+            // `>` not `>=`, matching group_sessions' `<=` continuation:
+            // at exactly the gap a straggler row still joins the session,
+            // so calling it closed there could upload one about to grow.
+            let closed = |s: &Vec<charging::ChargeRow>| {
+                s.last().is_some_and(|l| now_secs - l.ts > SESSION_GAP_SECS)
+            };
+            let handled = |s: &Vec<charging::ChargeRow>| {
+                s.first().is_some_and(|f| uploads.contains_key(&f.ts))
+            };
+
+            // Computed BEFORE the uploads below, so it can only ever be
+            // too conservative.
+            let frontier = sweep_frontier(&sessions, now_secs, |ts| uploads.contains_key(&ts));
+            store.with_locked_conn(|conn| -> Result<()> {
+                if let Some(ts) = frontier {
+                    schema::meta_set(conn, CHARGE_SWEEP_CURSOR_KEY, &ts.to_string())?;
+                }
+                if full_scan {
+                    schema::meta_set(conn, CHARGE_SWEEP_FULL_DATE_KEY, &today)?;
+                }
+                Ok(())
+            })?;
+
+            let pending: Vec<Vec<charging::ChargeRow>> = sessions
                 .into_iter()
-                .filter(|s| {
-                    let Some(first) = s.first() else { return false };
-                    let Some(last) = s.last() else { return false };
-                    now_secs - last.ts >= SESSION_GAP_SECS && !uploads.contains_key(&first.ts)
-                })
+                .filter(|s| closed(s) && !handled(s))
                 .collect();
 
             let tag_map = store.get_all_charge_tags().unwrap_or_default();

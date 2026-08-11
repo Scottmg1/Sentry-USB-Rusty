@@ -212,6 +212,17 @@ const TELEMETRY_CHARGE_INDEX: &str =
         OR charger_power_kw IS NOT NULL \
         OR charge_rate_mph IS NOT NULL";
 
+/// Meta key: ts the next cloud charge sweep may scan from. Only ever a
+/// session's FIRST row ts — identity IS that ts, so starting mid-session
+/// would mint a different session. Cleared on JSON import, which inserts
+/// telemetry below the cursor.
+pub const CHARGE_SWEEP_CURSOR_KEY: &str = "charge_sweep_cursor";
+
+/// Meta key: UTC date of the last full (`from = 0`) charge sweep. One
+/// sweep a day ignores the cursor, so a restore or clock rollback that
+/// lands rows below it still gets seen without instrumenting every writer.
+pub const CHARGE_SWEEP_FULL_DATE_KEY: &str = "charge_sweep_full_date";
+
 /// `route_sync_info_by_cloud_id` reverse lookup (cloud sync pull).
 const CLOUD_ROUTE_ID_INDEX: &str =
     "CREATE INDEX IF NOT EXISTS idx_routes_cloud_route_id \
@@ -806,6 +817,12 @@ pub fn meta_set(conn: &Connection, key: &str, value: &str) -> Result<()> {
          ON CONFLICT(key) DO UPDATE SET value = excluded.value",
         params![key, value],
     )?;
+    Ok(())
+}
+
+/// Remove a `meta` key. No-op when it isn't set.
+pub fn meta_del(conn: &Connection, key: &str) -> Result<()> {
+    conn.execute("DELETE FROM meta WHERE key = ?1", params![key])?;
     Ok(())
 }
 

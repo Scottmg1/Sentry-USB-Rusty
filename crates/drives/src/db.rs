@@ -1497,6 +1497,10 @@ impl DriveStore {
         let (stats, diag) = {
             let mut conn = self.conn.lock().unwrap();
             let s = crate::json_compat::import_json(&mut conn, path, on_progress)?;
+            // Imported telemetry carries historical timestamps, which sit
+            // below the charge sweep's cursor — those sessions would never
+            // be swept again.
+            let _ = schema::meta_del(&conn, schema::CHARGE_SWEEP_CURSOR_KEY);
             let _ = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)");
             // Persist the diagnostics record while we still hold the writer
             // lock. Best-effort — a failure here is logged but not fatal,
@@ -3036,6 +3040,10 @@ fn run_one_shot_import(conn: &mut Connection, candidates: &[&str]) -> Result<()>
     if let Err(e) = persist_import_history(conn, &stats, &diag) {
         warn!("[drives] failed to persist import history: {}", e);
     }
+
+    // Same reason as the manual import path: imported telemetry lands
+    // below the charge sweep's cursor.
+    let _ = schema::meta_del(conn, schema::CHARGE_SWEEP_CURSOR_KEY);
 
     // Set the marker BEFORE renaming. If we die between these two steps,
     // the worst outcome on next boot is an orphan JSON left alone (the
