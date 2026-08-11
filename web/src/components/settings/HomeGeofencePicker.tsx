@@ -142,12 +142,20 @@ export function HomeGeofencePicker({
     // only in formatting (" 30.5 , -97.6 " for a stored 30.50000, -97.60000)
     // parses to the value the parent already holds, so no prop changes and the
     // sync block above never runs — the field would keep the raw typed text.
-    setCoordText(formatCoords(lat, normalizedLon))
+    const committedText = formatCoords(lat, normalizedLon)
+    setCoordText(committedText)
     // Only persist a real change: a focus/blur with no edit must not fire a
-    // PUT (which remounts the Pi's read-only root) or re-center the map, and
-    // must not quietly round a stored value down to formatCoords' 5 decimals.
-    // Mirrors the `clamped !== values.radiusM` guard on the radius field.
-    if (lat !== values.homeLat || normalizedLon !== values.homeLon) {
+    // PUT (which remounts the Pi's read-only root) or re-center the map.
+    // Compare FORMATTED text, not the raw numbers: the backend persists 6
+    // decimals but coordText's initial value is toFixed(5), so an untouched
+    // field re-parses to a value that differs from values.homeLat/homeLon at
+    // the 6th decimal — a raw `lat !== values.homeLat` guard would treat that
+    // rounding artifact as a real edit and fire onChange on a plain
+    // focus/blur, silently truncating the stored precision. Formatting both
+    // sides to the same 5-decimal string before comparing makes the check
+    // round-trip-stable. Mirrors the `clamped !== values.radiusM` guard on
+    // the radius field, adapted for the precision mismatch here.
+    if (committedText !== formatCoords(values.homeLat, values.homeLon)) {
       onChange({ homeLat: lat, homeLon: normalizedLon })
     }
   }
