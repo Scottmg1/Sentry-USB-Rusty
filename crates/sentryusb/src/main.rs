@@ -186,71 +186,40 @@ async fn main() {
 
     // Drive store (SQLite)
     let db_path = sentryusb_drives::DEFAULT_DB_PATH;
-    // `true` when the persistent store could not be opened on a real
-    // device and we are running on an ephemeral in-memory one. Startup
-    // steps whose safety depends on a SUCCESSFUL open must be skipped in
-    // that state (see the legacy-cleanup call below).
-    let mut store_degraded = false;
     let store = match sentryusb_drives::DriveStore::open(db_path) {
         Ok(s) => Arc::new(s),
-        Err(e) => {
-            // Dev machines have no /backingfiles, so in-memory is the
-            // correct fallback there. On a REAL device the same fallback
-            // silently serves an empty history and makes that boot's
-            // ingest ephemeral — indistinguishable, in the UI, from
-            // "all my drives were deleted". Log accordingly so the
-            // journal names the actual condition instead of a passing
-            // warning. (Deliberately still non-fatal: exiting would
-            // crash-loop the daemon under systemd's Restart=always and
-            // take the web UI with it, leaving no way to free space or
-            // run recovery on a device that is merely full. Making this
-            // fatal is a real product tradeoff — data-truth versus
-            // remote access — and is tracked separately.)
-            let looks_like_device = std::path::Path::new(db_path)
-                .parent()
-                .is_some_and(|p| p.exists());
-            if looks_like_device {
-                store_degraded = true;
-                tracing::error!(
-                    "Failed to open drive DB at {}: {}. SERVING AN EMPTY IN-MEMORY STORE: \
-                     this boot shows no drives and anything ingested now is lost on reboot. \
-                     Common causes are a full disk, a locked DB, or a damaged file — free \
-                     space and restart, and do NOT re-run setup before checking the DB.",
-                    db_path,
-                    e
-                );
-            } else {
-                tracing::warn!(
-                    "Failed to open drive DB at {}: {}. Using in-memory (no {} — dev machine?).",
-                    db_path,
-                    e,
-                    std::path::Path::new(db_path)
-                        .parent()
-                        .map(|p| p.display().to_string())
-                        .unwrap_or_default()
-                );
-            }
+        Err(e) if args.dev => {
+            // Explicit dev mode: no /backingfiles exists, in-memory is
+            // the intended store.
+            tracing::warn!("Failed to open drive DB at {}: {}. Using in-memory (--dev).", db_path, e);
             Arc::new(sentryusb_drives::DriveStore::open_memory().expect("failed to create in-memory DB"))
+        }
+        Err(e) => {
+            // A real device whose DB will not open gets a restart loop,
+            // not an empty in-memory store: serving empty history is
+            // indistinguishable, in the UI, from "all my drives were
+            // deleted", and every background job (ingest, cloud sweep)
+            // would run against fiction whose writes vanish on reboot.
+            // systemd's Restart=always/5s retries — a transient cause
+            // (mount ordering, a lock, fsck) heals on its own; a
+            // persistent one keeps a loud, honest journal instead of a
+            // lying UI. An explicit degraded mode (banner + 503s +
+            // recovery allowlist) is the designed follow-up.
+            tracing::error!(
+                "Failed to open drive DB at {}: {}. Exiting so systemd retries —                  common causes are a full disk, a locked DB, or a damaged file.                  Do NOT re-run setup before checking the DB file.",
+                db_path,
+                e
+            );
+            std::process::exit(1);
         }
     };
     // Remove orphaned files older binaries wrote to /mutable (drive-data.json
     // moved to /backingfiles, plus a couple of pre-Rust state files). Runs
     // after DriveStore::open so any one-shot importer that needs the legacy
-    // path has already had a chance to consume it.
-    // ONLY safe after a successful persistent open. The cleanup deletes
-    // /mutable/drive-data.json on the documented premise that
-    // DriveStore::open already imported it — but when open FAILED that
-    // import never ran, so deleting it would destroy the user's last
-    // remaining copy of their drive history at exactly the moment the
-    // database is unavailable. Keep it as a recovery source instead.
-    if store_degraded {
-        tracing::error!(
-            "skipping legacy-file cleanup: the persistent store never opened, so nothing \
-             was imported — preserving /mutable/drive-data.json as a recovery source"
-        );
-    } else {
-        sentryusb_drives::cleanup_legacy_mutable_files();
-    }
+    // path has already had a chance to consume it. Only reached after a
+    // successful persistent open (an open failure exits above), so the
+    // legacy JSON can never be deleted without having been imported.
+    sentryusb_drives::cleanup_legacy_mutable_files();
     phase!("drive_store_opened");
 
     // Legacy-JSON migration is now handled automatically inside
