@@ -730,8 +730,14 @@ impl DriveStore {
 
         tx.commit()?;
         drop(conn);
-        self.drive_cache_dirty.store(true, Ordering::Release);
-        self.route_overview_gen.fetch_add(1, Ordering::Release);
+        // A pointless mark-processed (no GPS -> no route row) can't change
+        // the drive list, stats, or overview — leave the caches alone.
+        // During ingest of a mostly-parked card these were the majority of
+        // calls, each one forcing a grouper rebuild on the next poll.
+        if !points.is_empty() {
+            self.drive_cache_dirty.store(true, Ordering::Release);
+            self.route_overview_gen.fetch_add(1, Ordering::Release);
+        }
         self.processed_count
             .fetch_add(pf_inserted as i64, Ordering::Relaxed);
         self.route_count.fetch_add(route_inserted, Ordering::Relaxed);
@@ -976,9 +982,55 @@ impl DriveStore {
             mark_mutable_dirty(&tx, "drive", drive_key)?;
         }
         tx.commit()?;
-        self.drive_cache_dirty.store(true, Ordering::Release);
-        self.route_overview_gen.fetch_add(1, Ordering::Release);
+        drop(conn);
+
+        // Tags never enter grouping, stats, FSD analytics, or the map
+        // overview (RouteOverview has no tags field) — they are joined
+        // into the list JSON after grouping, keyed on the drive's
+        // startTime. So a tag edit patches the cached list in place
+        // instead of dirtying everything, which used to re-run the full
+        // grouper AND the overview rebuild per tag click.
+        if !self.patch_cached_drive_tags(drive_key, tags)? {
+            self.drive_cache_dirty.store(true, Ordering::Release);
+        }
         Ok(())
+    }
+
+    /// Patch `tags` for the drive whose startTime is `drive_key` directly
+    /// in the cached list JSON. False → caller must dirty the cache (no
+    /// cache yet, cache already dirty, or the key isn't a visible drive —
+    /// e.g. one hidden by the Tessie/SEI overlap filter).
+    fn patch_cached_drive_tags(&self, drive_key: &str, tags: &[String]) -> Result<bool> {
+        // rebuild_lock so a concurrent rebuild can't write a list built
+        // from pre-edit tag rows after we patch (lock order: rebuild_lock
+        // before conn, as everywhere else).
+        let _rebuild = self.rebuild_lock.lock().unwrap();
+        if self.drive_cache_dirty.load(Ordering::Acquire) {
+            return Ok(false);
+        }
+        let Some(json) = self.with_read_conn(|conn| schema::meta_get(conn, "drive_list_cache"))?
+        else {
+            return Ok(false);
+        };
+        if json.is_empty() {
+            return Ok(false);
+        }
+        // Typed round-trip, not Value: Value's map re-serializes keys in
+        // sorted order, drifting the cached bytes away from what a full
+        // rebuild emits. Vec<DriveSummary> reproduces the rebuild's
+        // serializer exactly.
+        let mut list: Vec<crate::types::DriveSummary> = match serde_json::from_str(&json) {
+            Ok(v) => v,
+            Err(_) => return Ok(false),
+        };
+        let Some(entry) = list.iter_mut().find(|d| d.start_time == drive_key) else {
+            return Ok(false);
+        };
+        entry.tags = tags.iter().filter(|t| !t.is_empty()).cloned().collect();
+        let patched = serde_json::to_string(&list)?;
+        let conn = self.conn.lock().unwrap();
+        schema::meta_set(&conn, "drive_list_cache", &patched)?;
+        Ok(true)
     }
 
     /// Tags for a drive, or an empty vec.
@@ -3359,6 +3411,68 @@ mod tests {
         // Stats + FSD caches were written by the same rebuild.
         let stats = store.get_cached_drive_stats_json().unwrap();
         assert!(stats.contains("drives_count"));
+    }
+
+    /// Tag edits patch the cached list in place. The patched bytes must
+    /// be indistinguishable from a full rebuild's, and the stats cache
+    /// must not even be touched.
+    #[test]
+    fn tag_edit_patches_list_cache_identically_to_full_rebuild() {
+        let store = DriveStore::open_memory().unwrap();
+        let pts: Vec<GpsPoint> = vec![[37.7749, -122.4194], [37.7760, -122.4180]];
+        // Two separate drives (2.5h apart).
+        store
+            .add_route("a/2025-01-01_10-00-00-front.mp4", "a", &pts, &[4, 4], &[0, 0], &[20.0, 21.0], &[0.0, 0.0], 0, 2, &[], &[])
+            .unwrap();
+        store
+            .add_route("a/2025-01-01_12-30-00-front.mp4", "a", &pts, &[4, 4], &[0, 0], &[20.0, 21.0], &[0.0, 0.0], 0, 2, &[], &[])
+            .unwrap();
+        let list_before = store.get_cached_drives_json().unwrap();
+        let stats_before = store.get_cached_drive_stats_json().unwrap();
+
+        // Key of the first drive, straight from the built list.
+        let parsed: Vec<crate::types::DriveSummary> =
+            serde_json::from_str(&list_before).unwrap();
+        let key = parsed[0].start_time.clone();
+
+        // Patched path: cache stays clean, list carries the tag.
+        store
+            .set_drive_tags(&key, &["roadtrip".to_string()])
+            .unwrap();
+        assert!(
+            !store.drive_cache_dirty.load(Ordering::Acquire),
+            "tag edit must not dirty the caches"
+        );
+        let patched = store.get_cached_drives_json().unwrap();
+        assert!(patched.contains("roadtrip"));
+
+        // Oracle: force the full rebuild and compare bytes.
+        store.drive_cache_dirty.store(true, Ordering::Release);
+        let rebuilt = store.get_cached_drives_json().unwrap();
+        assert_eq!(patched, rebuilt, "patched list must match a full rebuild");
+
+        // Stats never contain tags; the edit must have left them alone.
+        assert_eq!(store.get_cached_drive_stats_json().unwrap(), stats_before);
+    }
+
+    /// A no-GPS clip only marks the file processed — it cannot change any
+    /// cache, so it must not invalidate them.
+    #[test]
+    fn add_route_without_points_leaves_caches_clean() {
+        let store = DriveStore::open_memory().unwrap();
+        let pts: Vec<GpsPoint> = vec![[37.7749, -122.4194], [37.7760, -122.4180]];
+        store
+            .add_route("a/2025-01-01_10-00-00-front.mp4", "a", &pts, &[4, 4], &[0, 0], &[20.0, 21.0], &[0.0, 0.0], 0, 2, &[], &[])
+            .unwrap();
+        let _ = store.get_cached_drives_json().unwrap();
+        let gen_before = store.route_overview_gen.load(Ordering::Acquire);
+
+        store
+            .add_route("a/2025-01-01_10-01-00-front.mp4", "a", &[], &[], &[], &[], &[], 0, 0, &[], &[])
+            .unwrap();
+        assert!(!store.drive_cache_dirty.load(Ordering::Acquire));
+        assert_eq!(store.route_overview_gen.load(Ordering::Acquire), gen_before);
+        assert!(store.is_processed("a/2025-01-01_10-01-00-front.mp4").unwrap());
     }
 
     #[test]
