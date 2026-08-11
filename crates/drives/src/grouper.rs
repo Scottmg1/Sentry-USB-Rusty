@@ -628,13 +628,37 @@ pub(crate) fn telemetry_has_driving(
     raw_park_count: u32,
     raw_frame_count: u32,
 ) -> bool {
-    gear_runs.iter().any(|r| r.gear != GEAR_PARK)
-        || gear_states.iter().any(|&g| g != GEAR_PARK)
-        || (gear_runs.is_empty()
-            && gear_states.is_empty()
+    telemetry_has_driving_core(
+        gear_runs.iter().any(|r| r.gear != GEAR_PARK),
+        gear_runs.is_empty(),
+        gear_states.iter().any(|&g| g != GEAR_PARK),
+        gear_states.is_empty(),
+        raw_park_count,
+        raw_frame_count,
+        speeds.iter().any(|&s| s.abs() > GAP_FILL_MIN_SPEED_MPS),
+    )
+}
+
+/// [`telemetry_has_driving`] over pre-reduced scalars, so the overview
+/// planner can evaluate it from metadata without loading the arrays.
+/// One source of truth: the array version above delegates here.
+#[allow(clippy::fn_params_excessive_bools)]
+pub(crate) fn telemetry_has_driving_core(
+    gear_runs_non_park: bool,
+    gear_runs_empty: bool,
+    gear_states_non_park: bool,
+    gear_states_empty: bool,
+    raw_park_count: u32,
+    raw_frame_count: u32,
+    speeds_driving: bool,
+) -> bool {
+    gear_runs_non_park
+        || gear_states_non_park
+        || (gear_runs_empty
+            && gear_states_empty
             && raw_frame_count > 0
             && raw_park_count < raw_frame_count)
-        || speeds.iter().any(|&s| s.abs() > GAP_FILL_MIN_SPEED_MPS)
+        || speeds_driving
 }
 
 /// POSITIVE gear evidence only: at least one non-Park gear frame.
@@ -1400,20 +1424,35 @@ fn split_by_gear_state_legacy(group: Vec<TimedRoute>) -> Vec<Vec<TimedRoute>> {
 
 /// Returns true if the clip is majority Park (legacy heuristic).
 fn clip_is_mostly_parked_legacy(clip: &TimedRoute) -> bool {
-    if clip.route.raw_frame_count > 0 {
-        return (clip.route.raw_park_count as f64 / clip.route.raw_frame_count as f64)
-            > calc::PARK_MAJORITY_FRACTION;
-    }
-    if clip.route.gear_states.is_empty() {
-        return false;
-    }
     let park_count = clip
         .route
         .gear_states
         .iter()
         .filter(|&&g| g == GEAR_PARK)
         .count();
-    park_count > clip.route.gear_states.len() / 2
+    mostly_parked_legacy_core(
+        clip.route.raw_park_count,
+        clip.route.raw_frame_count,
+        park_count,
+        clip.route.gear_states.len(),
+    )
+}
+
+/// [`clip_is_mostly_parked_legacy`] over pre-reduced scalars, shared
+/// with the overview planner. The array version delegates here.
+pub(crate) fn mostly_parked_legacy_core(
+    raw_park_count: u32,
+    raw_frame_count: u32,
+    gear_park_count: usize,
+    gear_states_len: usize,
+) -> bool {
+    if raw_frame_count > 0 {
+        return (raw_park_count as f64 / raw_frame_count as f64) > calc::PARK_MAJORITY_FRACTION;
+    }
+    if gear_states_len == 0 {
+        return false;
+    }
+    gear_park_count > gear_states_len / 2
 }
 
 // ---------------------------------------------------------------------------
