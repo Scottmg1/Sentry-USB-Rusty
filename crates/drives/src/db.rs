@@ -1481,11 +1481,15 @@ impl DriveStore {
         Ok(())
     }
 
-    /// Grace round complete — drop the settled row.
+    /// Grace round complete — drop the settled row. Conditional on it
+    /// still being settled: a second bulk_delete of a re-imported
+    /// session re-queues the row (acked_at back to NULL) and a stale
+    /// sweep snapshot must not erase that pending generation.
     pub fn charge_delete_remove(&self, session_ts: i64) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "DELETE FROM charge_delete_outbox WHERE session_ts = ?1",
+            "DELETE FROM charge_delete_outbox \
+             WHERE session_ts = ?1 AND acked_at IS NOT NULL",
             params![session_ts],
         )?;
         Ok(())
