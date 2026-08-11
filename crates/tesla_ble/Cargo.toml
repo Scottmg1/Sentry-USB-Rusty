@@ -70,7 +70,7 @@ rand = "0.10"
 # NIST P-256 ECDH for the session handshake.
 # `pem` reads the on-disk private key file Tesla pairing produced.
 p256 = { version = "0.13", features = ["ecdh", "pem", "pkcs8"] }
-pem = "3"
+pem = "4"
 
 # AES-128-GCM for signed-command authentication.
 # `std` is explicit so `InvalidLength` implements `std::error::Error`
