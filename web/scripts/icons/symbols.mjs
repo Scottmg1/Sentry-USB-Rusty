@@ -70,13 +70,12 @@ export const SYMBOLS = [
   "group", // was Lucide Users
   "hard_drive", // was Lucide HardDrive
   "home",
+  "horizontal_align_right", // odometer "End" tile
   "info", // was Lucide Info
   "key", // was Lucide Key
   "lan", // was Lucide EthernetPort
   "last_page", // was Lucide ChevronLast
   "layers", // was Lucide Layers
-  "line_end",
-  "line_start",
   "local_fire_department", // was Lucide Flame
   "location_on", // was Lucide MapPin
   "lock", // was Lucide Lock
@@ -118,6 +117,7 @@ export const SYMBOLS = [
   "skip_previous", // was Lucide SkipBack
   "smart_toy", // was Lucide Bot
   "speed", // was Lucide Gauge
+  "start", // odometer "Start" tile
   "stethoscope", // was Lucide Stethoscope
   "straighten", // was Lucide Ruler
   "swap_vert", // was Lucide ArrowUpDown

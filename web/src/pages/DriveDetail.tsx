@@ -8,12 +8,12 @@ import {
   Robot2Icon,
   DataUsageIcon,
   DeviceThermostatIcon,
-  LineEndIcon,
-  LineStartIcon,
+  HorizontalAlignRightIcon,
   ProgressActivityIcon,
   ScheduleIcon,
   SettingsRemoteIcon,
   SpeedIcon,
+  StartIcon,
 } from "@/components/icons"
 import { cn } from "@/lib/utils"
 import { monotonicTrack } from "@/lib/drive-track"
@@ -487,7 +487,7 @@ function OdometerSection({
               ? formatOdometer(drive.odometerMiStart, metric)
               : "—"
           }
-          icon={<LineStartIcon className="h-4 w-4" />}
+          icon={<StartIcon className="h-4 w-4" />}
         />
         <StatTile
           label="End"
@@ -496,7 +496,7 @@ function OdometerSection({
               ? formatOdometer(drive.odometerMiEnd, metric)
               : "—"
           }
-          icon={<LineEndIcon className="h-4 w-4" />}
+          icon={<HorizontalAlignRightIcon className="h-4 w-4" />}
         />
         <StatTile
           label="Driven"

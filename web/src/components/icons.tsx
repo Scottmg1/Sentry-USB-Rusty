@@ -460,6 +460,13 @@ export const HomeIcon = (props: SVGProps<SVGSVGElement>) => (
     </svg>
 )
 
+/** Material Symbols `horizontal_align_right`. */
+export const HorizontalAlignRightIcon = (props: SVGProps<SVGSVGElement>) => (
+  <svg viewBox="0 -960 960 960" width="24" height="24" fill="currentColor" {...props}>
+      <path d="M780-160v-640h60v640h-60ZM526-286l-43-43 121-121H120v-60h484L487-627l43-43 190 190-194 194Z"/>
+    </svg>
+)
+
 /** Material Symbols `info` (was Lucide Info). */
 export const InfoIcon = (props: SVGProps<SVGSVGElement>) => (
   <svg viewBox="0 -960 960 960" width="24" height="24" fill="currentColor" {...props}>
@@ -492,20 +499,6 @@ export const LastPageIcon = (props: SVGProps<SVGSVGElement>) => (
 export const LayersIcon = (props: SVGProps<SVGSVGElement>) => (
   <svg viewBox="0 -960 960 960" width="24" height="24" fill="currentColor" {...props}>
       <path d="M480-130 120-410l50-37 310 241 310-241 50 37-360 280Zm0-152L120-562l360-280 360 280-360 280Zm0-301Zm0 225 262-204-262-204-262 204 262 204Z"/>
-    </svg>
-)
-
-/** Material Symbols `line_end`. */
-export const LineEndIcon = (props: SVGProps<SVGSVGElement>) => (
-  <svg viewBox="0 -960 960 960" width="24" height="24" fill="currentColor" {...props}>
-      <path d="M790-390q-29.09 0-52.54-17Q714-424 705-450H80v-60h625q9-26 32.46-43 23.45-17 52.54-17 37.8 0 63.9 26.14t26.1 64Q880-442 853.9-416T790-390Z"/>
-    </svg>
-)
-
-/** Material Symbols `line_start`. */
-export const LineStartIcon = (props: SVGProps<SVGSVGElement>) => (
-  <svg viewBox="0 -960 960 960" width="24" height="24" fill="currentColor" {...props}>
-      <path d="M170-390q-37.8 0-63.9-26.14t-26.1-64Q80-518 106.1-544t63.9-26q29.09 0 52.54 17Q246-536 255-510h625v60H255q-9 26-32.46 43-23.45 17-52.54 17Z"/>
     </svg>
 )
 
@@ -793,6 +786,13 @@ export const SmartToyIcon = (props: SVGProps<SVGSVGElement>) => (
 export const SpeedIcon = (props: SVGProps<SVGSVGElement>) => (
   <svg viewBox="0 -960 960 960" width="24" height="24" fill="currentColor" {...props}>
       <path d="M473.5-303.5Q517-305 537-336l216-339-335 219q-30 20-32 64t21 67q23 23 66.5 21.5ZM478-799q57 0 119 18.5T716-717l-52 37q-45-30-96.5-44.5T477.98-739q-140.47 0-239.23 100.22Q140-538.57 140-396.02 140-351 152.5-305q12.5 46 35.5 85h579q22-36 35-84t13-94q0-42-12.5-90.5T758-578l39-52q38 56 57 112.5T875-404q2 60-12 113t-41 98q-12 23-25.5 28t-33.5 5H192q-17 0-33.5-8.5T134-193q-26-48-40-97.5T80-396q0-83 31.5-156.5t85.5-128Q251-735 323.68-767T478-799Zm-9 331Z"/>
+    </svg>
+)
+
+/** Material Symbols `start`. */
+export const StartIcon = (props: SVGProps<SVGSVGElement>) => (
+  <svg viewBox="0 -960 960 960" width="24" height="24" fill="currentColor" {...props}>
+      <path d="M80-240v-480h60v480H80Zm559 1-43-42 169-169H239v-60h526L597-679l42-42 241 241-241 241Z"/>
     </svg>
 )
 
