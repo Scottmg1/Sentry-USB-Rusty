@@ -465,30 +465,68 @@ impl Processor {
         self.scan_dir(clip_dir, &mut files)?;
         files.sort();
 
-        // Filter out already-processed files. One bulk query into a
-        // HashSet rather than a locked `SELECT EXISTS` per file (which
-        // is N round-trips on the connection mutex before any work
-        // starts). `processed_set` normalizes stored paths to forward
-        // slashes and `scan_dir` already pushes forward-slash paths, so
-        // membership here matches `is_processed` exactly. Propagate a
-        // query failure instead of silently treating everything as
-        // unprocessed and re-ingesting the whole tree.
-        let processed = self.store.processed_set()?;
+        // Event tree scanned up front: its paths join the membership
+        // query, and its timestamps seed the anchor window below.
+        let event_files = self.scan_event_files()?;
+
+        // Membership for exactly the paths on disk this pass — chunked
+        // indexed lookups, not the whole lifetime history into a HashSet.
+        // Keys are normalized on both sides, so membership matches
+        // `is_processed` exactly. Propagate a query failure instead of
+        // silently treating everything as unprocessed and re-ingesting
+        // the whole tree.
+        let disk_keys: Vec<String> = files
+            .iter()
+            .chain(event_files.iter())
+            .map(|f| crate::db::normalize_path(f))
+            .collect();
+        let processed = self.store.processed_subset(&disk_keys)?;
 
         // Continuous-recording timeline for gap-fill hole detection: the
-        // disk scan ∪ already-processed keys (clips rotated off disk still
-        // anchor historical holes). Event keys are excluded — a gap-filled
-        // clip must keep reading as a filled hole, not a new slot.
+        // disk scan ∪ already-processed keys near any on-disk event clip
+        // (clips rotated off disk still anchor historical holes). Every
+        // admission rule — duplicate window, hole width, chain hop,
+        // anchor cap — is bounded by GAP_FILL_MAX_MS, so an anchor more
+        // than that from every event timestamp cannot change a decision:
+        // a hole narrow enough to admit a seed puts each of its edges
+        // within the cap of that seed. No event clips on disk → nothing
+        // to admit → the disk timeline alone suffices. Event keys are
+        // excluded — a gap-filled clip must keep reading as a filled
+        // hole, not a new slot.
         let mut recent_ts: Vec<chrono::NaiveDateTime> = files
             .iter()
             .filter_map(|f| crate::grouper::parse_clip_timestamp(f))
             .collect();
-        recent_ts.extend(
-            processed
+        let seeds: Vec<chrono::NaiveDateTime> = event_files
+            .iter()
+            .filter_map(|f| crate::grouper::parse_clip_timestamp(f))
+            .collect();
+        if !seeds.is_empty() {
+            // Day dirs covering seed ± cap, plus a day each side for
+            // folder/filename date mismatches around midnight.
+            let half = chrono::Duration::milliseconds(crate::grouper::GAP_FILL_MAX_MS + 60_000);
+            let mut days: Vec<String> = seeds
                 .iter()
-                .filter(|k| !crate::grouper::is_event_folder_path(k))
-                .filter_map(|k| crate::grouper::parse_clip_timestamp(k)),
-        );
+                .flat_map(|ts| {
+                    [*ts - half - chrono::Duration::days(1), *ts - half, *ts + half, *ts + half + chrono::Duration::days(1)]
+                })
+                .map(|ts| ts.format("%Y-%m-%d").to_string())
+                .collect();
+            days.sort();
+            days.dedup();
+            recent_ts.extend(
+                self.store
+                    .processed_files_for_days(&days)?
+                    .iter()
+                    .filter_map(|k| crate::grouper::parse_clip_timestamp(k))
+                    .filter(|ts| {
+                        seeds.iter().any(|s| {
+                            let d = *ts - *s;
+                            d <= half && d >= -half
+                        })
+                    }),
+            );
+        }
         recent_ts.sort();
         recent_ts.dedup();
 
@@ -506,7 +544,7 @@ impl Processor {
         // Gap-fill: append event clips that cover RecentClips holes. They
         // ride the same extraction loop (throttle, progress, resume via
         // processed_files) and land keyed at their real event-folder path.
-        match self.scan_event_gap_fill(&recent_ts, &processed) {
+        match self.scan_event_gap_fill(&recent_ts, &processed, &event_files) {
             Ok(gap_fill) if !gap_fill.is_empty() => {
                 info!(
                     "gap-fill: {} event clip(s) cover RecentClips holes",
@@ -771,9 +809,8 @@ impl Processor {
         &self,
         recent_sorted_ts: &[chrono::NaiveDateTime],
         processed: &std::collections::HashSet<String>,
+        event_files: &[String],
     ) -> Result<Vec<String>> {
-        let event_files = self.scan_event_files()?;
-
         let cands: Vec<(chrono::NaiveDateTime, &str)> = event_files
             .iter()
             .filter(|f| !processed.contains(crate::db::normalize_path(f).as_str()))
@@ -985,6 +1022,50 @@ mod tests {
             stamps,
             vec!["2026-07-15_04-50-00", "2026-07-15_04-55-00"],
             "interior parked fills listed; the occupied-slot twin excluded"
+        );
+    }
+
+    /// The trap case for bounding `recent_ts`: an interior hole whose
+    /// RecentClips anchors have rotated OFF DISK and exist only in
+    /// processed_files. The anchor window derived from on-disk event
+    /// timestamps must still surface them, so the event clip is selected
+    /// into the pass — selection is provable from it ending up marked
+    /// processed. A control clip nowhere near any hole must stay
+    /// untouched.
+    #[tokio::test]
+    async fn gap_fill_still_sees_rotated_off_disk_anchors() {
+        let root = tempfile::TempDir::new().unwrap();
+        let clip_dir = root.path().join("TeslaCam");
+        std::fs::create_dir_all(clip_dir.join("RecentClips")).unwrap();
+        let event_dir = clip_dir.join("SavedClips/2026-07-15_04-59-30");
+        std::fs::create_dir_all(&event_dir).unwrap();
+        std::fs::write(event_dir.join("2026-07-15_04-50-00-front.mp4"), b"x").unwrap();
+        let far_dir = clip_dir.join("SavedClips/2026-07-20_12-00-00");
+        std::fs::create_dir_all(&far_dir).unwrap();
+        std::fs::write(far_dir.join("2026-07-20_12-00-00-front.mp4"), b"x").unwrap();
+
+        let store = Arc::new(crate::db::DriveStore::open_memory().unwrap());
+        // Hole anchors 04:49 -> 05:00, on record but not on disk.
+        store.mark_processed("2026-07-15/2026-07-15_04-49-09-front.mp4").unwrap();
+        store.mark_processed("2026-07-15/2026-07-15_05-00-03-front.mp4").unwrap();
+
+        let processor = Processor::with_clip_dir_for_test(
+            store.clone(),
+            clip_dir.to_string_lossy().to_string(),
+        );
+        processor.process_new().await.unwrap();
+
+        assert!(
+            store
+                .is_processed("SavedClips/2026-07-15_04-59-30/2026-07-15_04-50-00-front.mp4")
+                .unwrap(),
+            "interior fill with rotated-off anchors must be selected into the pass"
+        );
+        assert!(
+            !store
+                .is_processed("SavedClips/2026-07-20_12-00-00/2026-07-20_12-00-00-front.mp4")
+                .unwrap(),
+            "an event clip near no hole must not be selected"
         );
     }
 

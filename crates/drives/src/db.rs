@@ -603,6 +603,58 @@ impl DriveStore {
 
     /// Return the set of all processed file paths (normalized to forward
     /// slashes). Called once per ProcessDirectory run.
+    /// Which of `keys` (already-normalized paths) are processed. Chunked
+    /// IN-lookups on the `WITHOUT ROWID` primary key — O(keys), not
+    /// O(lifetime history) like [`Self::processed_set`].
+    pub fn processed_subset(
+        &self,
+        keys: &[String],
+    ) -> Result<std::collections::HashSet<String>> {
+        const CHUNK: usize = 400;
+        self.with_read_conn(|conn| {
+            let mut out = std::collections::HashSet::with_capacity(keys.len());
+            for chunk in keys.chunks(CHUNK) {
+                let placeholders = vec!["?"; chunk.len()].join(",");
+                let mut stmt = conn.prepare(&format!(
+                    "SELECT file FROM processed_files WHERE file IN ({placeholders})"
+                ))?;
+                let params = rusqlite::params_from_iter(chunk.iter());
+                let rows = stmt.query_map(params, |row| row.get::<_, String>(0))?;
+                for r in rows {
+                    out.insert(r?);
+                }
+            }
+            Ok(out)
+        })
+    }
+
+    /// Processed non-event keys under the given `YYYY-MM-DD` day dirs,
+    /// via primary-key range scans (`day/` ..= `day0`). Event keys live
+    /// under `SavedClips/` / `SentryClips/` and fall outside every range.
+    /// Keys not laid out as `date-dir/file` (non-TeslaCam layouts) are
+    /// missed — callers union with on-disk paths, which covers anything
+    /// still present regardless of layout.
+    pub fn processed_files_for_days(&self, days: &[String]) -> Result<Vec<String>> {
+        self.with_read_conn(|conn| {
+            let mut out = Vec::new();
+            let mut stmt = conn.prepare_cached(
+                "SELECT file FROM processed_files WHERE file >= ?1 AND file < ?2",
+            )?;
+            for day in days {
+                // '0' is the successor of '/' in ASCII, so this half-open
+                // range is exactly the `day/` prefix.
+                let rows = stmt.query_map(
+                    params![format!("{day}/"), format!("{day}0")],
+                    |row| row.get::<_, String>(0),
+                )?;
+                for r in rows {
+                    out.push(r?);
+                }
+            }
+            Ok(out)
+        })
+    }
+
     pub fn processed_set(&self) -> Result<std::collections::HashSet<String>> {
         self.with_read_conn(|conn| {
             let mut stmt = conn.prepare_cached("SELECT file FROM processed_files")?;
