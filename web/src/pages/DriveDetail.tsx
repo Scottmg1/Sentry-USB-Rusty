@@ -11,7 +11,7 @@ import {
   LineStartIcon,
   ProgressActivityIcon,
   ScheduleIcon,
-  SensorsIcon,
+  SettingsRemoteIcon,
   SpeedIcon,
 } from "@/components/icons"
 import { cn } from "@/lib/utils"
@@ -293,7 +293,7 @@ function DriveDetailContent({ drive, onSaveTags }: DriveDetailContentProps) {
           <StatTile
             label="Self-driving"
             value="Summon"
-            icon={<SensorsIcon className="h-4 w-4" />}
+            icon={<SettingsRemoteIcon className="h-4 w-4" />}
             info="The car drove itself via Summon. FSD % doesn't apply — summon telemetry reports no autopilot state."
             size="headline"
           />

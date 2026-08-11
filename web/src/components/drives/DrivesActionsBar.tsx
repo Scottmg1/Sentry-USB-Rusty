@@ -6,7 +6,7 @@ import {
   ExpandMoreIcon,
   PlayArrowIcon,
   ProgressActivityIcon,
-  SensorsIcon,
+  SettingsRemoteIcon,
   UploadIcon,
 } from "@/components/icons"
 import { cn } from "@/lib/utils"
@@ -181,7 +181,7 @@ export function DrivesActionsBar({ onChanged }: DrivesActionsBarProps) {
                 onClick={() => runProcess("all")}
               />
               <MenuItem
-                icon={<SensorsIcon className="h-3.5 w-3.5 text-violet-400" />}
+                icon={<SettingsRemoteIcon className="h-3.5 w-3.5 text-violet-400" />}
                 title="Scan for Summon drives"
                 hint="Re-read slow clips for summon evidence"
                 onClick={() => runProcess("summon")}

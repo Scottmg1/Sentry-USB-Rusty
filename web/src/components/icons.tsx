@@ -728,6 +728,13 @@ export const SettingsIcon = (props: SVGProps<SVGSVGElement>) => (
     </svg>
 )
 
+/** Material Symbols `settings_remote`. */
+export const SettingsRemoteIcon = (props: SVGProps<SVGSVGElement>) => (
+  <svg viewBox="0 -960 960 960" width="24" height="24" fill="currentColor" {...props}>
+      <path d="M358-40q-16 0-27-11t-11-27v-484q0-16 11-27t27-11h244q16 0 27 11t11 27v484q0 16-11 27t-27 11H358Zm122-358q17 0 29.5-12.5T522-440q0-18-12-31t-30-13q-18 0-31 13t-13 31q0 18 13 30t31 12ZM324-676l-42-42q40-40 91-61t107-21q56 0 107 21t91 61l-42 42q-32-31-72-47.5T480-740q-44 0-84 16.5T324-676ZM210-789l-42-43q63-61 143.5-94.5T480-960q88 0 168.5 33.5T790-830l-43 42q-53-54-122.5-83T480-900q-76 0-146 28.5T210-789Zm170 689h200v-440H380v440Zm0 0h200-200Z"/>
+    </svg>
+)
+
 /** Material Symbols `shield` (was Lucide Shield). */
 export const ShieldIcon = (props: SVGProps<SVGSVGElement>) => (
   <svg viewBox="0 -960 960 960" width="24" height="24" fill="currentColor" {...props}>

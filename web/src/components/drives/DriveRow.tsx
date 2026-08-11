@@ -1,4 +1,4 @@
-import { AutoAwesomeIcon, ScheduleIcon, SensorsIcon, SpeedIcon } from "@/components/icons"
+import { AutoAwesomeIcon, ScheduleIcon, SettingsRemoteIcon, SpeedIcon } from "@/components/icons"
 import { useNavigate } from "react-router-dom"
 import { cn } from "@/lib/utils"
 import { formatDistance, formatDuration, formatPercent } from "@/lib/drive-format"
@@ -110,7 +110,7 @@ export function DriveRow({
           </Chip>
           {drive.summon ? (
             <Chip summon>
-              <SensorsIcon className="h-3.5 w-3.5" />
+              <SettingsRemoteIcon className="h-3.5 w-3.5" />
               Summon
             </Chip>
           ) : (

@@ -108,6 +108,7 @@ export const SYMBOLS = [
   "send", // was Lucide Send
   "sensors", // was Lucide Radio
   "settings", // was Lucide Settings/Cog
+  "settings_remote",
   "shield", // was Lucide Shield
   "shuffle", // was Lucide Shuffle
   "skip_next", // was Lucide SkipForward
