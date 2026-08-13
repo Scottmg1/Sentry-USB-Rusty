@@ -26,7 +26,7 @@ const HOME_ICON = L.divIcon({
 export function KeepAccessoryMap({
   lat: rawLat,
   lon: rawLon,
-  radiusM,
+  radiusM: rawRadiusM,
   onPlace,
 }: {
   lat: number | null
@@ -42,6 +42,9 @@ export function KeepAccessoryMap({
   // Legacy configs may hold a world-copy longitude (e.g. -221 for 139°E);
   // wrap so the pin and the readout agree with what gets stored.
   const lon = Number.isFinite(rawLon) ? normalizeLon(rawLon as number) : null
+  // Same junk-config path for the radius: L.circle throws on a NaN radius.
+  // 120 m is the app-wide default (KeepAwakeStep, useAwayMode).
+  const radiusM = Number.isFinite(rawRadiusM) ? rawRadiusM : 120
   const containerRef = useRef<HTMLDivElement>(null)
   const mapRef = useRef<L.Map | null>(null)
   const markerRef = useRef<L.Marker | null>(null)
