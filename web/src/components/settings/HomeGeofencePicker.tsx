@@ -1,6 +1,7 @@
 import { useEffect, useState, type ReactNode } from "react"
 import { LocationOnIcon, ProgressActivityIcon } from "@/components/icons"
 import { cn } from "@/lib/utils"
+import { normalizeLon } from "@/lib/geo"
 import { KeepAccessoryMap } from "@/components/settings/KeepAccessoryMap"
 
 export interface HomeGeofenceValues {
@@ -12,6 +13,17 @@ export interface HomeGeofenceValues {
 const RADIUS_PRESETS = [50, 100, 200, 500]
 const RADIUS_MIN = 20
 const RADIUS_MAX = 2000
+
+function formatCoords(lat: number | null, lon: number | null): string {
+  // Number.isFinite, not `== null`: a NaN coordinate (the parent does
+  // `Number(cfg)` on a junk config string, which yields NaN) is not null and
+  // would reach `.toFixed(5)` below, rendering the literal text "NaN, ..."
+  // in the field — while haveHome's own Number.isFinite check correctly
+  // hides the "No home set" hint for the same value, so the two would
+  // disagree.
+  if (lat == null || lon == null || !Number.isFinite(lat) || !Number.isFinite(lon)) return ""
+  return `${lat.toFixed(5)}, ${normalizeLon(lon).toFixed(5)}`
+}
 
 /**
  * Shared home-geofence editor: interactive map (pin + radius circle), a
@@ -61,6 +73,93 @@ export function HomeGeofencePicker({
     if (clamped !== values.radiusM) onChange({ radiusM: clamped })
   }
 
+  // Manual "lat, lon" entry — the map requires scrolling/zooming to find a
+  // pin-accurate spot, which is slow with no street labels. Same free-typing
+  // + commit-on-blur/Enter pattern as the radius field above.
+  const [coordText, setCoordText] = useState(() => formatCoords(values.homeLat, values.homeLon))
+  const [coordError, setCoordError] = useState<string | null>(null)
+  // A geofence needs BOTH halves as real numbers: {lat: 53, lon: null} is not
+  // a home, and neither is a NaN the parent produced by `Number(cfg)` on a
+  // junk config string — `NaN != null` is true, so a null-only test would call
+  // that "set", hide the hint, and render "NaN, ..." in the field.
+  // `Number.isFinite` rejects null and NaN alike. Kept independent of
+  // coordError — an unparseable entry and an unset home are different states
+  // that can hold at the same time.
+  const haveHome = Number.isFinite(values.homeLat) && Number.isFinite(values.homeLon)
+  // Re-sync while rendering rather than from an effect: every map click and
+  // pin drag pushes new coords through onChange, and an effect would make
+  // each one cost a second render pass. This is React's documented "adjust
+  // state when a prop changes" shape, and it keeps the file clear of the
+  // repo's react-hooks/set-state-in-effect warning budget.
+  // `Object.is`, not `!==`: a NaN coord (the parent does `Number(cfg)` on a
+  // truthy config string, which yields NaN for junk) never equals itself
+  // under `!==`, so the condition would hold on every render and re-enter
+  // setState forever. `Object.is(NaN, NaN)` is true, so this converges.
+  const [syncedFrom, setSyncedFrom] = useState({ lat: values.homeLat, lon: values.homeLon })
+  if (!Object.is(values.homeLat, syncedFrom.lat) || !Object.is(values.homeLon, syncedFrom.lon)) {
+    setSyncedFrom({ lat: values.homeLat, lon: values.homeLon })
+    setCoordText(formatCoords(values.homeLat, values.homeLon))
+    // Stale parse error must not survive a coordinate change from the map.
+    setCoordError(null)
+  }
+
+  function commitCoords() {
+    const trimmed = coordText.trim()
+    if (trimmed === "") {
+      setCoordError(null)
+      setCoordText(formatCoords(values.homeLat, values.homeLon)) // revert to last good
+      return
+    }
+    // Both halves must actually carry a number. `Number("")` is 0, and a
+    // stray comma still splits into two parts, so "53.5461," / ", -113.4938"
+    // / "," would each commit 0 for the missing side — and 0 passes every
+    // finite/latitude check below.
+    const parts = trimmed.split(",")
+    const rawLat = parts.length === 2 ? parts[0].trim() : ""
+    const rawLon = parts.length === 2 ? parts[1].trim() : ""
+    const lat = rawLat === "" ? NaN : Number(rawLat)
+    const lon = rawLon === "" ? NaN : Number(rawLon)
+    if (!Number.isFinite(lat) || !Number.isFinite(lon)) {
+      setCoordError(
+        'Couldn\'t parse that — enter as "latitude, longitude" (e.g. 30.22214, -97.61833).',
+      )
+      return
+    }
+    // Range-check what was TYPED. normalizeLon exists for Leaflet's repeated
+    // world copies (a click on Japan can report -221.4), not for hand entry:
+    // running it on a typo folds -976.1833 into a perfectly plausible +103.82
+    // and stores the wrong side of the planet without a word. formatCoords
+    // still normalizes for DISPLAY, so a geofence written out of range by an
+    // older build stays readable and is rewritten canonically as soon as this
+    // field is committed — only fresh input has to stay inside the real range.
+    if (Math.abs(lat) > 90 || Math.abs(lon) > 180) {
+      setCoordError("Out of range — latitude must be within ±90, longitude within ±180.")
+      return
+    }
+    const normalizedLon = normalizeLon(lon)
+    setCoordError(null)
+    // Snap the field to the committed value ourselves. An entry that differs
+    // only in formatting (" 30.5 , -97.6 " for a stored 30.50000, -97.60000)
+    // parses to the value the parent already holds, so no prop changes and the
+    // sync block above never runs — the field would keep the raw typed text.
+    const committedText = formatCoords(lat, normalizedLon)
+    setCoordText(committedText)
+    // Only persist a real change: a focus/blur with no edit must not fire a
+    // PUT (which remounts the Pi's read-only root) or re-center the map.
+    // Compare FORMATTED text, not the raw numbers: the backend persists 6
+    // decimals but coordText's initial value is toFixed(5), so an untouched
+    // field re-parses to a value that differs from values.homeLat/homeLon at
+    // the 6th decimal — a raw `lat !== values.homeLat` guard would treat that
+    // rounding artifact as a real edit and fire onChange on a plain
+    // focus/blur, silently truncating the stored precision. Formatting both
+    // sides to the same 5-decimal string before comparing makes the check
+    // round-trip-stable. Mirrors the `clamped !== values.radiusM` guard on
+    // the radius field, adapted for the precision mismatch here.
+    if (committedText !== formatCoords(values.homeLat, values.homeLon)) {
+      onChange({ homeLat: lat, homeLon: normalizedLon })
+    }
+  }
+
   async function useCurrent() {
     if (!onUseCurrentLocation) return
     setLocating(true)
@@ -78,8 +177,6 @@ export function HomeGeofencePicker({
       setLocating(false)
     }
   }
-
-  const haveHome = values.homeLat != null && values.homeLon != null
 
   return (
     <div className="space-y-3 rounded-lg border border-white/5 bg-white/[0.02] p-3">
@@ -108,15 +205,39 @@ export function HomeGeofencePicker({
         onPlace={(la, lo) => onChange({ homeLat: la, homeLon: lo })}
       />
       {mapHint && <p className="text-xs text-slate-600">{mapHint}</p>}
-      {haveHome ? (
-        <p className="text-xs text-slate-400">
-          📍 {values.homeLat!.toFixed(5)}, {values.homeLon!.toFixed(5)}
+
+      {/* Manual coordinate entry — faster than hunting for a spot on an
+          unlabeled map, and the only option where GPS ("Use current
+          location") isn't available. */}
+      <div>
+        <label className="mb-1 block text-xs font-medium text-slate-400">
+          Coordinates
+        </label>
+        <input
+          type="text"
+          inputMode="text"
+          autoComplete="off"
+          spellCheck={false}
+          value={coordText}
+          onChange={(e) => setCoordText(e.target.value)}
+          onBlur={commitCoords}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") (e.target as HTMLInputElement).blur()
+          }}
+          placeholder="30.22214, -97.61833"
+          className="w-full rounded-lg border border-white/10 bg-white/5 px-3 py-2 text-sm text-slate-100 outline-none transition placeholder:text-slate-600 focus:border-blue-500/50 focus:ring-1 focus:ring-blue-500/25"
+        />
+        <p className="mt-1 text-xs text-slate-600">
+          Latitude, longitude — north &amp; east are positive, south &amp; west are negative.
         </p>
-      ) : (
+        {coordError && <p className="mt-1 text-xs text-red-400">{coordError}</p>}
+      </div>
+      {!haveHome && (
         <p className="text-xs text-amber-400/80">
-          No home set — tap the map to drop your home pin.
+          No home set — tap the map or enter coordinates above to drop your home pin.
         </p>
       )}
+
       {locError && <p className="text-xs text-red-400">{locError}</p>}
       {saveError && <p className="text-xs text-red-400">{saveError}</p>}
 

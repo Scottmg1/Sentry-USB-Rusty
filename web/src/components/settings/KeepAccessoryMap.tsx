@@ -3,7 +3,10 @@ import L from "leaflet"
 import "leaflet/dist/leaflet.css"
 import { normalizeLon } from "@/lib/geo"
 
-const TILES = "https://{s}.basemaps.cartocdn.com/dark_nolabels/{z}/{x}/{y}{r}.png"
+// `dark_all` (not `dark_nolabels`) so street names, place names, and
+// landmarks render — without them there's no way to judge whether the
+// pin actually sits on the right spot.
+const TILES = "https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png"
 
 // Simple CSS pin (a divIcon) — avoids Leaflet's default-marker image URLs,
 // which break under bundlers. Draggable.
@@ -21,7 +24,7 @@ const HOME_ICON = L.divIcon({
  * setup). The radius circle resizes live as the parent changes `radiusM`.
  */
 export function KeepAccessoryMap({
-  lat,
+  lat: rawLat,
   lon: rawLon,
   radiusM,
   onPlace,
@@ -31,9 +34,14 @@ export function KeepAccessoryMap({
   radiusM: number
   onPlace: (lat: number, lon: number) => void
 }) {
+  // Sanitize NaN to null on the way in. The parent builds these with
+  // `Number(cfg)` over config strings, so junk yields NaN — and `NaN != null`
+  // is true, which would let it reach setView/L.latLng, where Leaflet throws
+  // "Invalid LatLng object" and takes the whole settings page down.
+  const lat = Number.isFinite(rawLat) ? (rawLat as number) : null
   // Legacy configs may hold a world-copy longitude (e.g. -221 for 139°E);
   // wrap so the pin and the readout agree with what gets stored.
-  const lon = rawLon != null ? normalizeLon(rawLon) : null
+  const lon = Number.isFinite(rawLon) ? normalizeLon(rawLon as number) : null
   const containerRef = useRef<HTMLDivElement>(null)
   const mapRef = useRef<L.Map | null>(null)
   const markerRef = useRef<L.Marker | null>(null)
