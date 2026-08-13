@@ -164,6 +164,14 @@ export CAM_SIZE=40G
 # the duration of that delay
 # export ARCHIVE_DELAY=20
 
+# CIFS/NFS archiving aborts a transfer when the archive server stops
+# answering connection probes AND no file has completed for this many
+# seconds (30-240; 60 by default, 180 in Travel Mode). Raise it if your
+# Pi parks at the edge of wifi range and archives die on brief signal
+# dropouts that the transfer itself would survive. Probes failing for a
+# full 300s always abort, regardless of this setting.
+# export ARCHIVE_STALL_GRACE_SECONDS=60
+
 # Uncomment if you want to override the default hostname of "sentryusb"
 # export SENTRYUSB_HOSTNAME=sentryusb-Model3
 

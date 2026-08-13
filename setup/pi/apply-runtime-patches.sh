@@ -892,6 +892,265 @@ RCLONEREACH_EOF
     log "rclone-watchdog: archive scripts refreshed (probe ARCHIVE_SERVER, scoped kill)"
 }
 
+# ── CIFS/NFS archive watchdog: dual-signal, scoped kill ─────────────────
+#
+# The shipped cifs/nfs archive-clips.sh killed rsync after five
+# consecutive failed port probes (~35s). A probe only tests whether a NEW
+# TCP connection can be opened; at the edge of WiFi range a loss burst
+# blocks fresh SYNs while the established SMB/NFS session keeps
+# retransmitting and delivering, so healthy transfers were aborted
+# mid-run. The replacement monitor treats "probe up OR file completed" as
+# alive, kills after ARCHIVE_STALL_GRACE_SECONDS of neither (60s default,
+# 300s absolute ceiling), and scopes the kill to this run's rsync.
+# /root/bin scripts are only rewritten at wizard time, so existing
+# installs need this refresh.
+#
+# The heredocs below MUST stay byte-identical to
+# run/mounted-archive-monitor.sh, run/cifs_archive/archive-clips.sh and
+# run/nfs_archive/archive-clips.sh.
+apply_mounted_archive_watchdog() {
+    local clips=/root/bin/archive-clips.sh
+    # Only cifs/nfs installs rsync onto $ARCHIVE_MOUNT; the rsync-ssh
+    # (pushes to $RSYNC_SERVER), rclone and none variants keep their own
+    # archive-clips.sh untouched.
+    if ! grep -q 'ARCHIVE_MOUNT' "$clips" 2>/dev/null \
+       || grep -q 'rclone --config' "$clips" 2>/dev/null \
+       || grep -q 'RSYNC_SERVER' "$clips" 2>/dev/null; then
+        log "mounted-watchdog: not applicable"
+        return 0
+    fi
+    if grep -q 'MOUNTED_ARCHIVE_MONITOR_V1' "$clips" 2>/dev/null \
+       && grep -q 'MOUNTED_ARCHIVE_MONITOR_V1' /root/bin/mounted-archive-monitor.sh 2>/dev/null; then
+        log "mounted-watchdog: already patched"
+        return 0
+    fi
+
+    # NFS keeps --no-o --no-g for root-squashed shares; that flag pair is
+    # the only difference between the two variants and identifies which
+    # one is installed.
+    local variant=cifs
+    grep -q -- '--no-o --no-g' "$clips" 2>/dev/null && variant=nfs
+
+    local ro_before=no
+    findmnt -no OPTIONS / 2>/dev/null | grep -qE '(^|,)ro(,|$)' && ro_before=yes
+    if [ "$ro_before" = yes ]; then
+        [ -x /root/bin/remountfs_rw ] && /root/bin/remountfs_rw >/dev/null 2>&1 \
+            || mount -o remount,rw / 2>/dev/null || true
+    fi
+    _mounted_wd_relock() {
+        [ "$ro_before" = yes ] || return 0
+        sync
+        mount -o remount,ro / 2>/dev/null || true
+    }
+
+    # Staged + atomic rename, monitor first: archive-clips.sh sources it
+    # by absolute path, so the helper must be live before the script that
+    # needs it.
+    cat > /root/bin/mounted-archive-monitor.sh.new <<'MOUNTEDMON_EOF'
+#!/bin/bash -eu
+
+# MOUNTED_ARCHIVE_MONITOR_V1: dual-signal connection monitor for mounted
+# (CIFS/NFS) clip archiving. Sourced by archive-clips.sh.
+#
+# The previous monitor killed rsync after five consecutive failed port
+# probes (~35s). A probe only tests whether a NEW TCP connection can be
+# opened; at the edge of WiFi range a loss burst blocks fresh SYNs while
+# the established SMB/NFS session keeps retransmitting and delivering, so
+# transfers that would have completed were aborted mid-run.
+#
+# Liveness is now either signal:
+#   - a successful reachability probe, or
+#   - a new completed-file record in rsync's --log-file. The rsync
+#     invocation must pass a --log-file-format containing %b: a
+#     transfer-statistic escape makes rsync log at the END of each file's
+#     transfer, where the default format logs before it. Received regular
+#     files itemize as ">f"; pre-transfer names, vanished-file warnings
+#     and directory records never match.
+#
+# Kill when both signals have been absent for ARCHIVE_STALL_GRACE_SECONDS
+# (default 60, 180 under Travel Mode, clamped 30-240), or unconditionally
+# after 300s of continuous probe failure: writes into a dead CIFS mount
+# can complete into page cache for a while, so completed-file records can
+# lag reality — the ceiling bounds a real drive-away so archiveloop gets
+# the gadget back to normal housekeeping.
+#
+# The kill is scoped to this run's rsync via its unique --log-file path;
+# `killall rsync` would also take out an unrelated music or media sync.
+
+MONITOR_RSYNC_LOG=/tmp/archive-rsync-cmd.log
+
+function connectionmonitor {
+  local grace
+  local -r hard_cap=300
+  if [ "${TRAVEL_MODE_ACTIVE:-0}" = "1" ]
+  then
+    grace="${ARCHIVE_STALL_GRACE_SECONDS:-180}"
+  else
+    grace="${ARCHIVE_STALL_GRACE_SECONDS:-60}"
+  fi
+  case "$grace" in
+    ''|*[!0-9]*) grace=60 ;;
+  esac
+  if [ "$grace" -lt 30 ]; then grace=30; fi
+  if [ "$grace" -gt 240 ]; then grace=240; fi
+
+  local now probe_down stalled
+  local probe_failed_since=0
+  local completed prev_completed=0
+  local last_progress
+  last_progress=$(date +%s)
+
+  while true
+  do
+    if timeout 6 /root/bin/archive-is-reachable.sh "$ARCHIVE_SERVER"
+    then
+      probe_failed_since=0
+    elif [ "$probe_failed_since" = 0 ]
+    then
+      probe_failed_since=$(date +%s)
+    fi
+
+    completed=$(grep -c ' >f' "$MONITOR_RSYNC_LOG" 2>/dev/null || true)
+    completed="${completed:-0}"
+    if [ "$completed" != "$prev_completed" ]
+    then
+      # != rather than -gt: archive-clips.sh truncates the log per run, so
+      # a shrinking count is a fresh run, not a stall.
+      prev_completed=$completed
+      last_progress=$(date +%s)
+    fi
+
+    if [ "$probe_failed_since" != 0 ]
+    then
+      now=$(date +%s)
+      probe_down=$(( now - probe_failed_since ))
+      stalled=$(( now - last_progress ))
+      if [ "$probe_down" -ge "$hard_cap" ] || { [ "$probe_down" -ge "$grace" ] && [ "$stalled" -ge "$grace" ]; }
+      then
+        log "connection dead (probes failing ${probe_down}s, no completed file for ${stalled}s), killing archive-clips"
+        # TERM first: rsync may still delete already-archived source files.
+        pkill -f 'rsync .*--log-file=/tmp/archive-rsync-cmd\.log' || true
+        sleep 2
+        pkill -9 -f 'rsync .*--log-file=/tmp/archive-rsync-cmd\.log' || true
+        kill -9 "$1" || true
+        return
+      fi
+    fi
+    sleep 5
+  done
+}
+MOUNTEDMON_EOF
+
+    if [ "$variant" = nfs ]; then
+        cat > "$clips.new" <<'NFSCLIPS_EOF'
+#!/bin/bash -eu
+
+# MOUNTED_ARCHIVE_MONITOR_V1: the connection watchdog lives in
+# mounted-archive-monitor.sh (shared with the CIFS variant) and only kills
+# rsync when probes fail AND no file has completed for a grace window —
+# probe-only monitoring aborted healthy transfers on lossy WiFi links.
+source /root/bin/mounted-archive-monitor.sh
+
+# Truncate before the monitor starts: a stale log from the previous run
+# would seed the monitor's completed-file counter with the old total.
+rm -f /tmp/archive-rsync-cmd.log /tmp/archive-error.log
+
+connectionmonitor $$ &
+
+# rsync's temp files may be left behind if the connection is lost,
+# but rsync doesn't clean these up on subsequent runs. Putting
+# them in a temp dir allows them to be easily cleaned up.
+rsynctmp=".sentryusbtmp"
+rm -rf "$ARCHIVE_MOUNT/${rsynctmp:?}" || true
+mkdir -p "$ARCHIVE_MOUNT/$rsynctmp"
+
+while [ -n "${1+x}" ]
+do
+  # Using --no-o --no-g to prevent permission errors on NFS root squashed shares
+  # Low I/O + CPU priority so the archive reads never starve the car's
+  # dashcam writes on the same disk (see run/rsync_archive/archive-clips.sh
+  # for the full rationale; -c2 -n7 not -c3 so progress is guaranteed).
+  # --log-file-format contains %b so records are written at the END of each
+  # file's transfer — the watchdog counts them as its progress signal.
+  if ! (ionice -c2 -n7 nice -n19 rsync -avhRL --no-o --no-g --remove-source-files --temp-dir="$rsynctmp" --no-perms --omit-dir-times --stats \
+        --log-file=/tmp/archive-rsync-cmd.log --log-file-format='%i %b %n%L' --ignore-missing-args \
+        --files-from="$2" "$1/" "$ARCHIVE_MOUNT" &> /tmp/rsynclog || [[ "$?" = "24" ]] )
+  then
+    cat /tmp/archive-rsync-cmd.log /tmp/rsynclog > /tmp/archive-error.log
+    exit 1
+  fi
+
+  shift 2
+done
+
+rm -rf "$ARCHIVE_MOUNT/${rsynctmp:?}" || true
+
+kill %1 || true
+NFSCLIPS_EOF
+    else
+        cat > "$clips.new" <<'CIFSCLIPS_EOF'
+#!/bin/bash -eu
+
+# MOUNTED_ARCHIVE_MONITOR_V1: the connection watchdog lives in
+# mounted-archive-monitor.sh (shared with the NFS variant) and only kills
+# rsync when probes fail AND no file has completed for a grace window —
+# probe-only monitoring aborted healthy transfers on lossy WiFi links.
+source /root/bin/mounted-archive-monitor.sh
+
+# Truncate before the monitor starts: a stale log from the previous run
+# would seed the monitor's completed-file counter with the old total.
+rm -f /tmp/archive-rsync-cmd.log /tmp/archive-error.log
+
+connectionmonitor $$ &
+
+# rsync's temp files may be left behind if the connection is lost,
+# but rsync doesn't clean these up on subsequent runs. Putting
+# them in a temp dir allows them to be easily cleaned up.
+rsynctmp=".sentryusbtmp"
+rm -rf "$ARCHIVE_MOUNT/${rsynctmp:?}" || true
+mkdir -p "$ARCHIVE_MOUNT/$rsynctmp"
+
+while [ -n "${1+x}" ]
+do
+  # Low I/O + CPU priority so the archive reads never starve the car's
+  # dashcam writes on the same disk (see run/rsync_archive/archive-clips.sh
+  # for the full rationale; -c2 -n7 not -c3 so progress is guaranteed).
+  # --log-file-format contains %b so records are written at the END of each
+  # file's transfer — the watchdog counts them as its progress signal.
+  if ! (ionice -c2 -n7 nice -n19 rsync -avhRL --remove-source-files --temp-dir="$rsynctmp" --no-perms --omit-dir-times --stats \
+        --log-file=/tmp/archive-rsync-cmd.log --log-file-format='%i %b %n%L' --ignore-missing-args \
+        --files-from="$2" "$1/" "$ARCHIVE_MOUNT" &> /tmp/rsynclog || [[ "$?" = "24" ]] )
+  then
+    cat /tmp/archive-rsync-cmd.log /tmp/rsynclog > /tmp/archive-error.log
+    exit 1
+  fi
+
+  shift 2
+done
+
+rm -rf "$ARCHIVE_MOUNT/${rsynctmp:?}" || true
+
+kill %1 || true
+CIFSCLIPS_EOF
+    fi
+
+    chmod 755 /root/bin/mounted-archive-monitor.sh.new "$clips.new" 2>/dev/null || true
+
+    if ! bash -n /root/bin/mounted-archive-monitor.sh.new 2>/dev/null \
+       || ! bash -n "$clips.new" 2>/dev/null \
+       || ! grep -q 'MOUNTED_ARCHIVE_MONITOR_V1' "$clips.new"; then
+        err "mounted-watchdog: staged script failed verification (disk full? truncated write?)"
+        rm -f /root/bin/mounted-archive-monitor.sh.new "$clips.new"
+        _mounted_wd_relock
+        return 1
+    fi
+
+    mv /root/bin/mounted-archive-monitor.sh.new /root/bin/mounted-archive-monitor.sh
+    mv "$clips.new" "$clips"
+    _mounted_wd_relock
+    log "mounted-watchdog: $variant archive-clips.sh refreshed (dual-signal monitor, scoped kill)"
+}
+
 # ── Rock 4C+ WiFi NVRAM: remove the TX-collapsing AP6256 relink ──────────
 # The old 4C+ installer symlinked the board WiFi NVRAM to nvram_ap6256.txt,
 # which collapses TX to ~6 Mbit/s (sole TX-power source, no txcap_blob).
@@ -1262,6 +1521,7 @@ run_patch apply_rfkill_unblock_wifi
 run_patch apply_4cplus_wifi_nvram_fix
 run_patch apply_rclone_config_mutable_migration
 run_patch apply_rclone_watchdog_fix
+run_patch apply_mounted_archive_watchdog
 run_patch apply_snapshot_eviction_by_age
 run_patch apply_snapshot_slot_pick_hardening
 run_patch apply_malloc_arena_cap

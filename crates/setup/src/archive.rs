@@ -556,6 +556,9 @@ fn copy_tree_no_clobber(src: &std::path::Path, dst: &std::path::Path) -> Result<
 // follow-up wizard run with a different system swaps the files cleanly
 // because we always write the full set.
 
+// Shared by the CIFS and NFS variants of archive-clips.sh.
+const MOUNTED_ARCHIVE_MONITOR: &str = include_str!("../../../run/mounted-archive-monitor.sh");
+
 const CIFS_ARCHIVE_CLIPS: &str = include_str!("../../../run/cifs_archive/archive-clips.sh");
 const CIFS_ARCHIVE_IS_REACHABLE: &str = include_str!("../../../run/cifs_archive/archive-is-reachable.sh");
 const CIFS_CONNECT_ARCHIVE: &str = include_str!("../../../run/cifs_archive/connect-archive.sh");
@@ -598,6 +601,7 @@ fn install_archive_scripts(system: ArchiveSystem, emitter: &SetupEmitter) -> Res
     let scripts: &[(&str, &str)] = match system {
         ArchiveSystem::Cifs => &[
             ("archive-clips.sh", CIFS_ARCHIVE_CLIPS),
+            ("mounted-archive-monitor.sh", MOUNTED_ARCHIVE_MONITOR),
             ("archive-is-reachable.sh", CIFS_ARCHIVE_IS_REACHABLE),
             ("connect-archive.sh", CIFS_CONNECT_ARCHIVE),
             ("copy-music.sh", CIFS_COPY_MUSIC),
@@ -606,6 +610,7 @@ fn install_archive_scripts(system: ArchiveSystem, emitter: &SetupEmitter) -> Res
         ],
         ArchiveSystem::Nfs => &[
             ("archive-clips.sh", NFS_ARCHIVE_CLIPS),
+            ("mounted-archive-monitor.sh", MOUNTED_ARCHIVE_MONITOR),
             ("archive-is-reachable.sh", NFS_ARCHIVE_IS_REACHABLE),
             ("connect-archive.sh", NFS_CONNECT_ARCHIVE),
             ("copy-music.sh", NFS_COPY_MUSIC),

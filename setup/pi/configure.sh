@@ -404,6 +404,11 @@ function install_archive_scripts () {
   copy_script "$archive_module"/connect-archive.sh "$install_path"
   copy_script "$archive_module"/disconnect-archive.sh "$install_path"
   copy_script "$archive_module"/archive-is-reachable.sh "$install_path"
+  # Shared watchdog sourced by the cifs/nfs archive-clips.sh variants.
+  if grep -qE "cifs|nfs" <<< "$archive_module"
+  then
+    copy_script run/mounted-archive-monitor.sh "$install_path"
+  fi
   if [ -n "${MUSIC_SHARE_NAME:+x}" ] && grep -E "cifs|nfs|rsync" <<< "$archive_module"
   then
     copy_script "$archive_module"/copy-music.sh "$install_path"
