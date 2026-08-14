@@ -186,6 +186,8 @@ export interface SafetyDayStats {
   manualMovingMs: number
   hardBrakeMs: number
   aggrTurnMs: number
+  brakeAnyMs: number
+  turnAnyMs: number
 }
 
 export interface SafetyAnalytics {
@@ -203,6 +205,8 @@ export interface SafetyAnalytics {
   aggrTurnEvents: number
   aggrTurnMs: number
   speedingMs: number
+  brakeAnyMs: number
+  turnAnyMs: number
   nightMi: number
   nightKm: number
   assistedPercent: number

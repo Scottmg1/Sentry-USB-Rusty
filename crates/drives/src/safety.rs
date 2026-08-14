@@ -33,8 +33,17 @@ use crate::types::{FlagRun, Route, AUTOPILOT_OFF, FLAG_BRAKE};
 /// Hard-braking threshold, m/s² (0.30 g — matches Tesla's factor).
 pub const HARD_BRAKE_MPS2: f64 = 0.30 * 9.80665;
 
+/// Any-braking threshold, m/s² (0.10 g). Denominator of the hard-braking
+/// ratio, mirroring Tesla's conditional definition: time above 0.3g
+/// RELATIVE to time braking above 0.1g — not to all driving time.
+pub const ANY_BRAKE_MPS2: f64 = 0.10 * 9.80665;
+
 /// Aggressive-turning lateral threshold, m/s² (0.40 g — matches Tesla).
 pub const AGGR_TURN_MPS2: f64 = 0.40 * 9.80665;
+
+/// Any-turning threshold, m/s² (0.20 g). Denominator of the aggressive-
+/// turning ratio (Tesla: >0.4g relative to turning time >0.2g).
+pub const ANY_TURN_MPS2: f64 = 0.20 * 9.80665;
 
 /// Excessive-speeding threshold, m/s (85 mph, Tesla's cutoff).
 pub const SPEEDING_MPS: f64 = 38.0;
@@ -81,19 +90,28 @@ pub const MIN_SCORED_MILES: f64 = 0.5;
 // full weight is charged; the sub-linear gamma makes the first
 // occurrences cost the most, mirroring the shape of Tesla's factors.
 
-/// Factor weights (sum = 100).
-pub const WEIGHT_HARD_BRAKE: f64 = 35.0;
-pub const WEIGHT_AGGR_TURN: f64 = 25.0;
+/// Factor weights (sum = 100). Braking dominates and turning is light,
+/// matching the ~3:1 impact ratio in Tesla's published v1 PCF model —
+/// and turning is also our noisiest derived metric.
+pub const WEIGHT_HARD_BRAKE: f64 = 45.0;
+pub const WEIGHT_AGGR_TURN: f64 = 15.0;
 pub const WEIGHT_SPEEDING: f64 = 25.0;
 pub const WEIGHT_NIGHT: f64 = 15.0;
 
-/// Rate caps (proportion of the relevant denominator at which the factor
-/// saturates): 2% of manual moving time hard-braking, 2% turning
-/// aggressively, 5% of moving time above 85 mph, 30% of miles late-night.
-pub const CAP_HARD_BRAKE: f64 = 0.02;
-pub const CAP_AGGR_TURN: f64 = 0.02;
+/// Rate caps at which a factor saturates. Braking/turning are Tesla's
+/// own published caps for the SAME conditional ratios (v2.2: hard
+/// braking capped at 5.2% of braking time; aggressive turning at 17.1%
+/// of turning time). Speeding/night are ours (absolute proportions).
+pub const CAP_HARD_BRAKE: f64 = 0.052;
+pub const CAP_AGGR_TURN: f64 = 0.171;
 pub const CAP_SPEEDING: f64 = 0.05;
 pub const CAP_NIGHT: f64 = 0.30;
+
+/// Conditional-ratio denominator floor, ms. A short drive may contain
+/// seconds of >0.1g braking; one hard stop would then read as a huge
+/// ratio. Flooring the denominator at one minute blends toward the
+/// absolute rate exactly when the conditional one is under-sampled.
+pub const MIN_RATE_DENOM_MS: i64 = 60_000;
 
 /// Sub-linear penalty exponent.
 pub const CURVE_GAMMA: f64 = 0.6;
@@ -104,6 +122,21 @@ pub const CURVE_GAMMA: f64 = 0.6;
 /// remaining manual-driving penalties — capped at half so a wild manual
 /// driver can't hide behind FSD mileage.
 pub const FSD_RELIEF_MAX: f64 = 0.5;
+
+/// Late-night risk weight per local wall-clock hour, mirroring Tesla's
+/// v2 change ("impact reduced earlier in the night and increased later").
+/// Applied to night MILES when computing the penalty; the displayed
+/// night share stays unweighted. Hours outside 10pm–4am weigh 0.
+pub fn night_weight(hour: u32) -> f64 {
+    match hour {
+        22 => 0.5,
+        23 => 0.75,
+        0 => 1.0,
+        1 => 1.25,
+        2 | 3 => 1.5,
+        _ => 0.0,
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Per-clip metrics
@@ -120,6 +153,10 @@ pub struct ClipSafety {
     pub speeding_ms: i64,
     pub moving_ms: i64,
     pub manual_moving_ms: i64,
+    /// Conditional-ratio denominators: manual time decelerating above
+    /// 0.1g / turning above 0.2g (same gating as their numerators).
+    pub brake_any_ms: i64,
+    pub turn_any_ms: i64,
 }
 
 /// Frame-domain brake-pedal intervals in clip-ms, built from `flag_runs`
@@ -247,6 +284,12 @@ pub fn compute_clip_safety(r: &Route) -> ClipSafety {
             if v_avg >= 1.0 {
                 let pair_dt = (d / v_avg).clamp(PAIR_DT_MIN_S, PAIR_DT_MAX_S);
                 let decel = (vp - vc) / pair_dt;
+                // Denominator first: any deliberate braking (>0.1g). No
+                // pedal gate here — regen alone reaches 0.1g and Tesla's
+                // denominator is plain deceleration time.
+                if decel >= ANY_BRAKE_MPS2 {
+                    out.brake_any_ms += dt_ms as i64;
+                }
                 if decel >= HARD_BRAKE_MPS2 && brake_near(i as f64 * dt_ms) {
                     braking_here = true;
                     out.hard_brake_ms += dt_ms as i64;
@@ -271,6 +314,9 @@ pub fn compute_clip_safety(r: &Route) -> ClipSafety {
                 let hop_b = calc::geodesic_m(p1[0], p1[1], p2[0], p2[1]);
                 if hop_a >= TURN_MIN_HOP_M && hop_b >= TURN_MIN_HOP_M {
                     let lateral = v * v * menger_curvature(p0, p1, p2);
+                    if lateral >= ANY_TURN_MPS2 {
+                        out.turn_any_ms += dt_ms as i64;
+                    }
                     if lateral >= AGGR_TURN_MPS2 {
                         turning_here = true;
                         turn_streak += 1;
@@ -303,6 +349,8 @@ pub struct SafetyTotals {
     pub distance_mi: f64,
     pub assisted_mi: f64,
     pub night_mi: f64,
+    /// Night miles scaled by [`night_weight`] — the penalty input.
+    pub night_weighted_mi: f64,
     pub moving_ms: i64,
     pub manual_moving_ms: i64,
     pub hard_brake_ms: i64,
@@ -310,6 +358,8 @@ pub struct SafetyTotals {
     pub aggr_turn_ms: i64,
     pub aggr_turn_events: i32,
     pub speeding_ms: i64,
+    pub brake_any_ms: i64,
+    pub turn_any_ms: i64,
 }
 
 /// The score plus its full per-factor decomposition (all f64s rounded to
@@ -345,25 +395,22 @@ pub fn compute_safety_score(t: &SafetyTotals) -> Option<SafetyScore> {
     if t.moving_ms < MIN_SCORED_MOVING_MS || t.distance_mi < MIN_SCORED_MILES {
         return None;
     }
-    let hb_rate = if t.manual_moving_ms > 0 {
-        t.hard_brake_ms as f64 / t.manual_moving_ms as f64
-    } else {
-        0.0
-    };
-    let at_rate = if t.manual_moving_ms > 0 {
-        t.aggr_turn_ms as f64 / t.manual_moving_ms as f64
-    } else {
-        0.0
-    };
+    // Conditional ratios (Tesla-style): harsh time relative to time spent
+    // braking/turning at all, with a floored denominator so a single stop
+    // in an under-sampled window can't read as a saturated ratio.
+    let hb_rate =
+        t.hard_brake_ms as f64 / (t.brake_any_ms.max(MIN_RATE_DENOM_MS)) as f64;
+    let at_rate = t.aggr_turn_ms as f64 / (t.turn_any_ms.max(MIN_RATE_DENOM_MS)) as f64;
     let sp_rate = t.speeding_ms as f64 / t.moving_ms as f64;
     let ln_rate = (t.night_mi / t.distance_mi).clamp(0.0, 1.0);
+    let ln_weighted_rate = (t.night_weighted_mi / t.distance_mi).clamp(0.0, 1.0);
     let fsd_share = (t.assisted_mi / t.distance_mi).clamp(0.0, 1.0);
     let relief = 1.0 - FSD_RELIEF_MAX * fsd_share;
 
     let hb_pen = WEIGHT_HARD_BRAKE * curve(hb_rate, CAP_HARD_BRAKE) * relief;
     let at_pen = WEIGHT_AGGR_TURN * curve(at_rate, CAP_AGGR_TURN) * relief;
     let sp_pen = WEIGHT_SPEEDING * curve(sp_rate, CAP_SPEEDING);
-    let ln_pen = WEIGHT_NIGHT * curve(ln_rate, CAP_NIGHT);
+    let ln_pen = WEIGHT_NIGHT * curve(ln_weighted_rate, CAP_NIGHT);
 
     let score = (100.0 - hb_pen - at_pen - sp_pen - ln_pen).clamp(0.0, 100.0);
     Some(SafetyScore {
@@ -433,6 +480,31 @@ mod tests {
         assert_eq!(cs.hard_brake_events, 1, "one contiguous event");
         assert!(cs.hard_brake_ms >= 3000, "≥3 qualifying seconds, got {}", cs.hard_brake_ms);
         assert!(cs.moving_ms > 0 && cs.manual_moving_ms == cs.moving_ms);
+        assert!(
+            cs.brake_any_ms >= cs.hard_brake_ms,
+            "0.1g denominator must include all 0.3g time: {} vs {}",
+            cs.brake_any_ms,
+            cs.hard_brake_ms
+        );
+    }
+
+    #[test]
+    fn gentle_braking_counts_toward_denominator_only() {
+        // 25 → 5 over 20 s ≈ 0.1 g: above ANY_BRAKE, below HARD_BRAKE.
+        let mut v = vec![25.0_f32; 61];
+        for k in 0..20 {
+            v[25 + k] = 25.0 - (k as f32 + 1.0);
+        }
+        for s in v.iter_mut().skip(45) {
+            *s = 5.0;
+        }
+        let cs = compute_clip_safety(&route_with_speeds(v));
+        assert_eq!(cs.hard_brake_events, 0);
+        assert!(
+            cs.brake_any_ms >= 15_000,
+            "~20 s of ~0.1 g braking should land in the denominator, got {}",
+            cs.brake_any_ms
+        );
     }
 
     #[test]
@@ -462,20 +534,6 @@ mod tests {
         ];
         let cs = compute_clip_safety(&r);
         assert_eq!(cs.hard_brake_events, 1);
-    }
-
-    #[test]
-    fn gentle_braking_not_flagged() {
-        // 25 → 5 over 20 s = 1 m/s² ≈ 0.1 g.
-        let mut v = vec![25.0_f32; 61];
-        for k in 0..20 {
-            v[25 + k] = 25.0 - (k as f32 + 1.0);
-        }
-        for s in v.iter_mut().skip(45) {
-            *s = 5.0;
-        }
-        let cs = compute_clip_safety(&route_with_speeds(v));
-        assert_eq!(cs.hard_brake_events, 0);
     }
 
     #[test]
@@ -518,6 +576,7 @@ mod tests {
         let cs = compute_clip_safety(&r);
         assert!(cs.aggr_turn_events >= 1, "sustained 0.5 g arc must flag");
         assert!(cs.aggr_turn_ms >= 2000);
+        assert!(cs.turn_any_ms >= cs.aggr_turn_ms, "0.2g denominator covers 0.4g time");
 
         // Same geometry at 5 m/s (below TURN_MIN_MPS): lateral ≈ 0.05 g
         // anyway, but the speed floor must keep it silent even for tight
@@ -564,10 +623,13 @@ mod tests {
     #[test]
     fn saturated_everything_scores_0() {
         let mut t = base_totals();
-        t.hard_brake_ms = t.manual_moving_ms; // rate 1.0 ≫ cap
-        t.aggr_turn_ms = t.manual_moving_ms;
+        t.brake_any_ms = t.manual_moving_ms;
+        t.hard_brake_ms = t.brake_any_ms; // ratio 1.0 ≫ cap
+        t.turn_any_ms = t.manual_moving_ms;
+        t.aggr_turn_ms = t.turn_any_ms;
         t.speeding_ms = t.moving_ms;
         t.night_mi = t.distance_mi;
+        t.night_weighted_mi = t.distance_mi;
         let s = compute_safety_score(&t).unwrap();
         assert_eq!(s.score, 0.0);
     }
@@ -575,7 +637,8 @@ mod tests {
     #[test]
     fn fsd_share_relieves_behavior_penalties_only() {
         let mut t = base_totals();
-        t.hard_brake_ms = 72_000; // 0.5% of manual time → mid-curve
+        t.brake_any_ms = 3_600_000; // 1 h of braking time
+        t.hard_brake_ms = 72_000; // 2% of it → mid-curve
         t.speeding_ms = 72_000;
         let manual = compute_safety_score(&t).unwrap();
 
@@ -585,6 +648,37 @@ mod tests {
         assert!(assisted.hard_brake_penalty < manual.hard_brake_penalty);
         assert_eq!(assisted.speeding_penalty, manual.speeding_penalty);
         assert_eq!(assisted.fsd_relief_pct, 40.0);
+    }
+
+    #[test]
+    fn denominator_floor_tempers_undersampled_ratios() {
+        // One second of hard braking against only 2 s of total braking
+        // would be a 50% ratio; the 60 s floor keeps it at ~1.7% instead
+        // of instantly saturating the 5.2% cap.
+        let mut t = base_totals();
+        t.brake_any_ms = 2_000;
+        t.hard_brake_ms = 1_000;
+        let s = compute_safety_score(&t).unwrap();
+        assert!(
+            s.hard_brake_pct < 2.0,
+            "floored ratio should be ~1.7%, got {}",
+            s.hard_brake_pct
+        );
+        assert!(s.hard_brake_penalty < WEIGHT_HARD_BRAKE, "must not saturate");
+    }
+
+    #[test]
+    fn night_weighting_scales_penalty_not_display() {
+        let mut early = base_totals();
+        early.night_mi = 30.0;
+        early.night_weighted_mi = 30.0 * night_weight(22); // 10pm — half weight
+        let mut late = base_totals();
+        late.night_mi = 30.0;
+        late.night_weighted_mi = 30.0 * night_weight(3); // 3am — 1.5×
+        let se = compute_safety_score(&early).unwrap();
+        let sl = compute_safety_score(&late).unwrap();
+        assert_eq!(se.night_pct, sl.night_pct, "displayed share is unweighted");
+        assert!(sl.night_penalty > se.night_penalty, "3am must cost more than 10pm");
     }
 
     #[test]
@@ -606,5 +700,13 @@ mod tests {
         assert!(!is_night_hour(4));
         assert!(!is_night_hour(12));
         assert!(!is_night_hour(21));
+        // Risk curve: monotonically rising through the night, zero outside.
+        assert!(night_weight(22) < night_weight(23));
+        assert!(night_weight(23) < night_weight(0));
+        assert!(night_weight(0) < night_weight(1));
+        assert!(night_weight(1) < night_weight(2));
+        assert_eq!(night_weight(2), night_weight(3));
+        assert_eq!(night_weight(4), 0.0);
+        assert_eq!(night_weight(12), 0.0);
     }
 }

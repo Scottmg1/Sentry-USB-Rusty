@@ -230,6 +230,7 @@ fn build_safety_analytics(summaries: &[DriveSummary], period: &str) -> SafetyAna
         totals.distance_mi += d.distance_mi;
         totals.assisted_mi += assisted_mi;
         totals.night_mi += d.safety_night_mi;
+        totals.night_weighted_mi += d.safety_night_weighted_mi;
         totals.moving_ms += d.safety_moving_ms;
         totals.manual_moving_ms += d.safety_manual_moving_ms;
         totals.hard_brake_ms += d.safety_hard_brake_ms;
@@ -237,6 +238,8 @@ fn build_safety_analytics(summaries: &[DriveSummary], period: &str) -> SafetyAna
         totals.aggr_turn_ms += d.safety_aggr_turn_ms;
         totals.aggr_turn_events += d.safety_aggr_turn_events;
         totals.speeding_ms += d.safety_speeding_ms;
+        totals.brake_any_ms += d.safety_brake_any_ms;
+        totals.turn_any_ms += d.safety_turn_any_ms;
         total_dist_km += d.distance_km;
         assisted_dist_km +=
             d.fsd_distance_km + d.autosteer_distance_km + d.tacc_distance_km;
@@ -266,6 +269,7 @@ fn build_safety_analytics(summaries: &[DriveSummary], period: &str) -> SafetyAna
             acc.totals.distance_mi += d.distance_mi;
             acc.totals.assisted_mi += assisted_mi;
             acc.totals.night_mi += d.safety_night_mi;
+            acc.totals.night_weighted_mi += d.safety_night_weighted_mi;
             acc.totals.moving_ms += d.safety_moving_ms;
             acc.totals.manual_moving_ms += d.safety_manual_moving_ms;
             acc.totals.hard_brake_ms += d.safety_hard_brake_ms;
@@ -273,6 +277,8 @@ fn build_safety_analytics(summaries: &[DriveSummary], period: &str) -> SafetyAna
             acc.totals.aggr_turn_ms += d.safety_aggr_turn_ms;
             acc.totals.aggr_turn_events += d.safety_aggr_turn_events;
             acc.totals.speeding_ms += d.safety_speeding_ms;
+            acc.totals.brake_any_ms += d.safety_brake_any_ms;
+            acc.totals.turn_any_ms += d.safety_turn_any_ms;
             acc.drives += 1;
             acc.distance_km += d.distance_km;
         }
@@ -297,6 +303,8 @@ fn build_safety_analytics(summaries: &[DriveSummary], period: &str) -> SafetyAna
                 manual_moving_ms: acc.totals.manual_moving_ms,
                 hard_brake_ms: acc.totals.hard_brake_ms,
                 aggr_turn_ms: acc.totals.aggr_turn_ms,
+                brake_any_ms: acc.totals.brake_any_ms,
+                turn_any_ms: acc.totals.turn_any_ms,
             }
         })
         .collect();
@@ -334,6 +342,8 @@ fn build_safety_analytics(summaries: &[DriveSummary], period: &str) -> SafetyAna
         aggr_turn_events: totals.aggr_turn_events,
         aggr_turn_ms: totals.aggr_turn_ms,
         speeding_ms: totals.speeding_ms,
+        brake_any_ms: totals.brake_any_ms,
+        turn_any_ms: totals.turn_any_ms,
         night_mi: round2(totals.night_mi),
         night_km: round2(night_km),
         assisted_percent,
@@ -3589,8 +3599,11 @@ fn build_summary_from_aggregates(
     let mut safety_speeding_ms: f64 = 0.0;
     let mut safety_moving_ms: f64 = 0.0;
     let mut safety_manual_moving_ms: f64 = 0.0;
+    let mut safety_brake_any_ms: f64 = 0.0;
+    let mut safety_turn_any_ms: f64 = 0.0;
     let mut safety_night_ms: f64 = 0.0;
     let mut safety_night_m: f64 = 0.0;
+    let mut safety_night_weighted_m: f64 = 0.0;
 
     let mut start_point: Option<GpsPoint> = None;
     let mut end_point: Option<GpsPoint> = None;
@@ -3641,9 +3654,13 @@ fn build_summary_from_aggregates(
         safety_speeding_ms += a.safety_speeding_ms.unwrap_or(0) as f64 * f;
         safety_moving_ms += a.safety_moving_ms.unwrap_or(0) as f64 * f;
         safety_manual_moving_ms += a.safety_manual_moving_ms.unwrap_or(0) as f64 * f;
+        safety_brake_any_ms += a.safety_brake_any_ms.unwrap_or(0) as f64 * f;
+        safety_turn_any_ms += a.safety_turn_any_ms.unwrap_or(0) as f64 * f;
         if crate::safety::is_night_hour(clip.timestamp.hour()) {
             safety_night_ms += 60_000.0 * f;
             safety_night_m += a.distance_m * f;
+            safety_night_weighted_m +=
+                a.distance_m * f * crate::safety::night_weight(clip.timestamp.hour());
         }
 
         // Per-file (not per-sub-clip) aggregates.
@@ -3820,6 +3837,7 @@ fn build_summary_from_aggregates(
         distance_mi: total_dist_m / calc::M_PER_MILE,
         assisted_mi: assisted_dist_m / calc::M_PER_MILE,
         night_mi: safety_night_m / calc::M_PER_MILE,
+        night_weighted_mi: safety_night_weighted_m / calc::M_PER_MILE,
         moving_ms: safety_moving_ms.round() as i64,
         manual_moving_ms: safety_manual_moving_ms.round() as i64,
         hard_brake_ms: safety_hard_brake_ms.round() as i64,
@@ -3827,6 +3845,8 @@ fn build_summary_from_aggregates(
         aggr_turn_ms: safety_aggr_turn_ms.round() as i64,
         aggr_turn_events: safety_aggr_turn_events,
         speeding_ms: safety_speeding_ms.round() as i64,
+        brake_any_ms: safety_brake_any_ms.round() as i64,
+        turn_any_ms: safety_turn_any_ms.round() as i64,
     };
     let safety_score = if source_is_sei && !summon {
         crate::safety::compute_safety_score(&safety_totals).map(|s| s.score)
@@ -3908,6 +3928,9 @@ fn build_summary_from_aggregates(
         safety_manual_moving_ms: safety_totals.manual_moving_ms,
         safety_night_ms: safety_night_ms.round() as i64,
         safety_night_mi: round2(safety_night_m / calc::M_PER_MILE),
+        safety_night_weighted_mi: round2(safety_night_weighted_m / calc::M_PER_MILE),
+        safety_brake_any_ms: safety_totals.brake_any_ms,
+        safety_turn_any_ms: safety_totals.turn_any_ms,
         safety_score,
     }
 }

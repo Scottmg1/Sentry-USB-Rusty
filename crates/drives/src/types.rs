@@ -422,6 +422,13 @@ pub struct DriveSummary {
     pub safety_night_ms: i64,
     #[serde(default)]
     pub safety_night_mi: f64,
+    /// Night miles scaled by the per-hour risk curve (`night_weight`).
+    #[serde(default)]
+    pub safety_night_weighted_mi: f64,
+    #[serde(default)]
+    pub safety_brake_any_ms: i64,
+    #[serde(default)]
+    pub safety_turn_any_ms: i64,
     /// This drive's own 0–100 score, `None` when the drive is too short,
     /// imported, a summon session, or carries no SEI safety data.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -506,6 +513,9 @@ pub struct SafetyDayStats {
     pub manual_moving_ms: i64,
     pub hard_brake_ms: i64,
     pub aggr_turn_ms: i64,
+    /// v18 conditional denominators (braking >0.1g / turning >0.2g time).
+    pub brake_any_ms: i64,
+    pub turn_any_ms: i64,
 }
 
 /// Safety Score analytics over a period. Totals are summed across the
@@ -532,6 +542,8 @@ pub struct SafetyAnalytics {
     pub aggr_turn_events: i32,
     pub aggr_turn_ms: i64,
     pub speeding_ms: i64,
+    pub brake_any_ms: i64,
+    pub turn_any_ms: i64,
     pub night_mi: f64,
     pub night_km: f64,
     pub assisted_percent: f64,
@@ -685,6 +697,10 @@ pub struct RouteAggregates {
     pub safety_speeding_ms: Option<i64>,
     pub safety_moving_ms: Option<i64>,
     pub safety_manual_moving_ms: Option<i64>,
+    /// v18 conditional-ratio denominators (see `safety.rs`): manual time
+    /// decelerating above 0.1g / turning above 0.2g.
+    pub safety_brake_any_ms: Option<i64>,
+    pub safety_turn_any_ms: Option<i64>,
 }
 
 /// Per-clip telemetry rollup populated from `telemetry_samples` rows

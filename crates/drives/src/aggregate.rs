@@ -327,6 +327,8 @@ pub fn compute_route_aggregates(r: &Route) -> RouteAggregates {
     agg.safety_speeding_ms = Some(cs.speeding_ms);
     agg.safety_moving_ms = Some(cs.moving_ms);
     agg.safety_manual_moving_ms = Some(cs.manual_moving_ms);
+    agg.safety_brake_any_ms = Some(cs.brake_any_ms);
+    agg.safety_turn_any_ms = Some(cs.turn_any_ms);
 
     agg
 }

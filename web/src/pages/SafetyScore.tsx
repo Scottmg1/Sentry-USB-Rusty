@@ -16,8 +16,14 @@ const TESLA_BLUE = "#3e6ae1"
 
 // Rate caps (percent of the factor's denominator) at which a factor's
 // penalty saturates — MUST mirror the CAP_* constants in
-// crates/drives/src/safety.rs. Used to bucket the severity segments.
-const FACTOR_CAPS = { hardBrake: 2.0, aggrTurn: 2.0, speeding: 5.0, night: 30.0 }
+// crates/drives/src/safety.rs. Braking/turning are Tesla's published
+// caps for the same conditional ratios. Used to bucket the severity
+// segments and scale the daily factor charts.
+const FACTOR_CAPS = { hardBrake: 5.2, aggrTurn: 17.1, speeding: 5.0, night: 30.0 }
+
+// Conditional-ratio denominator floor (ms) — mirrors MIN_RATE_DENOM_MS
+// in safety.rs so the daily charts match the backend's rate math.
+const MIN_RATE_DENOM_MS = 60_000
 
 // Adapts untyped backend JSON (camelCase from serde, snake_case from any
 // older cache) with every field defaulted, like normalizeFsdAnalytics.
@@ -58,6 +64,8 @@ function normalizeSafety(raw: any): SafetyAnalyticsData | null {
         manualMovingMs: d?.manualMovingMs ?? d?.manual_moving_ms ?? 0,
         hardBrakeMs: d?.hardBrakeMs ?? d?.hard_brake_ms ?? 0,
         aggrTurnMs: d?.aggrTurnMs ?? d?.aggr_turn_ms ?? 0,
+        brakeAnyMs: d?.brakeAnyMs ?? d?.brake_any_ms ?? 0,
+        turnAnyMs: d?.turnAnyMs ?? d?.turn_any_ms ?? 0,
       }))
     : []
   return {
@@ -75,6 +83,8 @@ function normalizeSafety(raw: any): SafetyAnalyticsData | null {
     aggrTurnEvents: raw.aggrTurnEvents ?? raw.aggr_turn_events ?? 0,
     aggrTurnMs: raw.aggrTurnMs ?? raw.aggr_turn_ms ?? 0,
     speedingMs: raw.speedingMs ?? raw.speeding_ms ?? 0,
+    brakeAnyMs: raw.brakeAnyMs ?? raw.brake_any_ms ?? 0,
+    turnAnyMs: raw.turnAnyMs ?? raw.turn_any_ms ?? 0,
     nightMi: raw.nightMi ?? raw.night_mi ?? 0,
     nightKm: raw.nightKm ?? raw.night_km ?? 0,
     assistedPercent: raw.assistedPercent ?? raw.assisted_percent ?? 0,
@@ -184,9 +194,9 @@ export default function SafetyScore() {
           label: "Hard Braking",
           value: `${score.hardBrakePct}%`,
           frac: Math.min(score.hardBrakePct / FACTOR_CAPS.hardBrake, 1),
-          description: "Proportion of manual driving time spent braking harder than 0.3g. Braking while FSD or Autopilot is engaged is not counted.",
+          description: "Proportion of braking time (deceleration above 0.1g) spent braking harder than 0.3g — the same conditional measure Tesla uses. Braking while FSD or Autopilot is engaged is not counted.",
           avg: score.hardBrakePct,
-          series: daily.map((d) => (d.manualMovingMs > 0 ? (d.hardBrakeMs / d.manualMovingMs) * 100 : 0)),
+          series: daily.map((d) => (d.hardBrakeMs / Math.max(d.brakeAnyMs, MIN_RATE_DENOM_MS)) * 100),
           relieved: score.fsdReliefPct > 0,
         },
         {
@@ -194,9 +204,9 @@ export default function SafetyScore() {
           label: "Aggressive Turning",
           value: `${score.aggrTurnPct}%`,
           frac: Math.min(score.aggrTurnPct / FACTOR_CAPS.aggrTurn, 1),
-          description: "Proportion of manual driving time turning with lateral force above 0.4g. Turns under FSD or Autopilot are not counted.",
+          description: "Proportion of turning time (lateral force above 0.2g) done with force above 0.4g — the same conditional measure Tesla uses. Turns under FSD or Autopilot are not counted.",
           avg: score.aggrTurnPct,
-          series: daily.map((d) => (d.manualMovingMs > 0 ? (d.aggrTurnMs / d.manualMovingMs) * 100 : 0)),
+          series: daily.map((d) => (d.aggrTurnMs / Math.max(d.turnAnyMs, MIN_RATE_DENOM_MS)) * 100),
           relieved: score.fsdReliefPct > 0,
         },
         {
@@ -214,7 +224,7 @@ export default function SafetyScore() {
           label: "Late Night Driving",
           value: `${score.nightPct}%`,
           frac: Math.min(score.nightPct / FACTOR_CAPS.night, 1),
-          description: `Proportion of miles driven between 10pm and 4am (${nightDist.toFixed(1)} ${distUnit} in this period).`,
+          description: `Proportion of miles driven between 10pm and 4am (${nightDist.toFixed(1)} ${distUnit} in this period). Risk-weighted by hour like Tesla's: driving at 3am counts three times as much as 10pm.`,
           avg: score.nightPct,
           series: daily.map((d) => (d.distanceMi > 0 ? (d.nightMi / d.distanceMi) * 100 : 0)),
           relieved: false,
@@ -306,9 +316,10 @@ export default function SafetyScore() {
         <p className="mt-2 rounded-lg bg-white/[0.03] p-3 text-xs leading-relaxed text-slate-400">
           This score is estimated from dashcam SEI telemetry: braking and turning G-forces are
           derived from speed and GPS between ~1 Hz samples, so it is not Tesla's official Safety
-          Score and reads events conservatively. Each factor's proportion is charged against a
-          weighted cap (braking 35, turning 25, speeding 25, late-night 15 points); driving on
-          FSD reduces what can count against you.
+          Score and reads events conservatively. Braking and turning use Tesla's conditional
+          measures and caps (harsh time relative to braking/turning time, capped at 5.2% and
+          17.1%), charged against weighted points (braking 45, turning 15, speeding 25,
+          late-night 15); driving on FSD reduces what can count against you.
         </p>
       )}
 

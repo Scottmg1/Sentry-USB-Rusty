@@ -292,8 +292,10 @@ fn backfill_one_batch(conn: &mut Connection) -> Result<i64> {
                 safety_aggr_turn_events  = ?28,
                 safety_speeding_ms       = ?29,
                 safety_moving_ms         = ?30,
-                safety_manual_moving_ms  = ?31
-             WHERE file = ?32",
+                safety_manual_moving_ms  = ?31,
+                safety_brake_any_ms      = ?32,
+                safety_turn_any_ms       = ?33
+             WHERE file = ?34",
         )?;
         for (file, a) in &decoded {
             stmt.execute(params![
@@ -328,6 +330,8 @@ fn backfill_one_batch(conn: &mut Connection) -> Result<i64> {
                 a.safety_speeding_ms,
                 a.safety_moving_ms,
                 a.safety_manual_moving_ms,
+                a.safety_brake_any_ms,
+                a.safety_turn_any_ms,
                 file,
             ])
             .with_context(|| format!("update {}", file))?;

@@ -119,7 +119,12 @@ const ARCHIVE_SYNC_EXPORT_DATE_KEY: &str = "archive_sync_export_date";
 // v10 (2026-08-13): Safety Score — per-drive safety totals + score on
 // DriveSummary (v17 columns, safety.rs). Stale v9 caches lack the
 // fields entirely.
-const DRIVE_LIST_CACHE_ALGO_VERSION: &str = "10";
+//
+// v11 (2026-08-14): Safety Score recalibration — Tesla-style conditional
+// braking/turning ratios (v18 denominator columns), rebalanced weights,
+// hour-weighted late-night miles. Stale v10 caches hold v1-formula
+// scores computed from absolute rates.
+const DRIVE_LIST_CACHE_ALGO_VERSION: &str = "11";
 
 /// Version tag for the per-clip aggregate FORMULA (compute_route_aggregates).
 /// Distinct from the cache algo version above: this gates a one-shot
@@ -135,8 +140,10 @@ const DRIVE_LIST_CACHE_ALGO_VERSION: &str = "10";
 /// central angle (calc.rs) that fixes the short-segment undercount.
 /// "safety-5" adds the v17 per-clip Safety Score scalars
 /// (compute_clip_safety) — the gate recomputes every row so existing
-/// archives get safety data without re-extraction.
-const AGGREGATE_FORMULA_VERSION: &str = "safety-5";
+/// archives get safety data without re-extraction. "safety-cond-6" adds
+/// the v18 conditional-ratio denominators (brake >0.1g / turn >0.2g
+/// time) and recomputes all safety columns under the same walk.
+const AGGREGATE_FORMULA_VERSION: &str = "safety-cond-6";
 
 /// Version tag for the route `file` KEY format. Gates a one-shot rewrite of
 /// `routes.file` / `processed_files.file` to the canonical form (see
@@ -557,7 +564,8 @@ impl DriveStore {
                      safety_hard_brake_ms = NULL, safety_hard_brake_events = NULL, \
                      safety_aggr_turn_ms = NULL, safety_aggr_turn_events = NULL, \
                      safety_speeding_ms = NULL, safety_moving_ms = NULL, \
-                     safety_manual_moving_ms = NULL",
+                     safety_manual_moving_ms = NULL, \
+                     safety_brake_any_ms = NULL, safety_turn_any_ms = NULL",
                     [],
                 )?;
                 info!(
@@ -3116,7 +3124,8 @@ fn insert_or_update_route(
             flag_runs_blob, sei_speed_abs_max,
             safety_hard_brake_ms, safety_hard_brake_events,
             safety_aggr_turn_ms, safety_aggr_turn_events,
-            safety_speeding_ms, safety_moving_ms, safety_manual_moving_ms)
+            safety_speeding_ms, safety_moving_ms, safety_manual_moving_ms,
+            safety_brake_any_ms, safety_turn_any_ms)
          VALUES(
             ?1, ?2, ?3, ?4, ?5,
             NULL, NULL, ?6, ?7, ?8,
@@ -3132,7 +3141,8 @@ fn insert_or_update_route(
             ?46, ?47, ?48, ?49,
             ?50, ?51, ?52, ?53, ?54,
             ?55, ?56,
-            ?57, ?58, ?59, ?60, ?61, ?62, ?63)
+            ?57, ?58, ?59, ?60, ?61, ?62, ?63,
+            ?64, ?65)
          ON CONFLICT(file) DO UPDATE SET
             date_dir            = excluded.date_dir,
             point_count         = excluded.point_count,
@@ -3195,7 +3205,9 @@ fn insert_or_update_route(
             safety_aggr_turn_events  = excluded.safety_aggr_turn_events,
             safety_speeding_ms       = excluded.safety_speeding_ms,
             safety_moving_ms         = excluded.safety_moving_ms,
-            safety_manual_moving_ms  = excluded.safety_manual_moving_ms",
+            safety_manual_moving_ms  = excluded.safety_manual_moving_ms,
+            safety_brake_any_ms      = excluded.safety_brake_any_ms,
+            safety_turn_any_ms       = excluded.safety_turn_any_ms",
         params![
             norm_file,
             &r.date,
@@ -3260,6 +3272,8 @@ fn insert_or_update_route(
             a.safety_speeding_ms,
             a.safety_moving_ms,
             a.safety_manual_moving_ms,
+            a.safety_brake_any_ms,
+            a.safety_turn_any_ms,
         ],
     )?;
     Ok(())
@@ -3559,7 +3573,8 @@ fn select_route_summaries_where(
                 flag_runs_blob, sei_speed_abs_max,
                 safety_hard_brake_ms, safety_hard_brake_events,
                 safety_aggr_turn_ms, safety_aggr_turn_events,
-                safety_speeding_ms, safety_moving_ms, safety_manual_moving_ms
+                safety_speeding_ms, safety_moving_ms, safety_manual_moving_ms,
+                safety_brake_any_ms, safety_turn_any_ms
          FROM routes
          {where_sql}
          ORDER BY file",
@@ -3631,7 +3646,7 @@ fn select_route_summaries_where(
                 row.get::<_, Option<Vec<u8>>>(44)?,
                 row.get::<_, Option<f64>>(45)?,
             ),
-            // v17 safety scalars
+            // v17 safety scalars + v18 denominators
             (
                 row.get::<_, Option<i64>>(46)?,
                 row.get::<_, Option<i64>>(47)?,
@@ -3640,6 +3655,8 @@ fn select_route_summaries_where(
                 row.get::<_, Option<i64>>(50)?,
                 row.get::<_, Option<i64>>(51)?,
                 row.get::<_, Option<i64>>(52)?,
+                row.get::<_, Option<i64>>(53)?,
+                row.get::<_, Option<i64>>(54)?,
             ),
         ))
     })?;
@@ -3691,6 +3708,8 @@ fn select_route_summaries_where(
                 safety_speeding_ms,
                 safety_moving_ms,
                 safety_manual_moving_ms,
+                safety_brake_any_ms,
+                safety_turn_any_ms,
             ),
         ) = r?;
 
@@ -3740,6 +3759,8 @@ fn select_route_summaries_where(
                 safety_speeding_ms,
                 safety_moving_ms,
                 safety_manual_moving_ms,
+                safety_brake_any_ms,
+                safety_turn_any_ms,
             },
             source,
             external_signature,
