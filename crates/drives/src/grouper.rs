@@ -6,7 +6,7 @@
 
 use std::collections::HashMap;
 
-use chrono::{Datelike, NaiveDate, NaiveDateTime};
+use chrono::{Datelike, NaiveDate, NaiveDateTime, Timelike};
 use tracing::{info, warn};
 
 use crate::calc;
@@ -156,6 +156,192 @@ pub fn fsd_analytics_from_summaries_for_period(
 /// cache rebuild path so `group_summaries_fast` is not called a second time.
 pub fn fsd_analytics_from_drives(drives: &[DriveSummary]) -> FsdAnalytics {
     build_fsd_analytics(drives, "week")
+}
+
+/// BLOB-free Safety Score analytics with explicit period
+/// ("day" / "week" / "month" / "all"). Used by
+/// `GET /api/drives/safety-analytics`.
+pub fn safety_analytics_from_summaries_for_period(
+    summaries: &[RouteSummary],
+    period: &str,
+) -> SafetyAnalytics {
+    let empty_tags = HashMap::new();
+    let drives = group_summaries_fast(summaries, &empty_tags);
+    build_safety_analytics(&drives, period)
+}
+
+/// Safety Score analytics over an already-grouped drive list. The window
+/// score comes from SUMMED totals scored once (mileage/time-weighted by
+/// construction), matching `safety.rs` semantics — averaging per-drive
+/// scores would over-weight short drives.
+fn build_safety_analytics(summaries: &[DriveSummary], period: &str) -> SafetyAnalytics {
+    let now = chrono::Local::now().naive_local();
+    let today = now.date();
+
+    let period_start: Option<NaiveDate> = match period {
+        "day" => Some(today),
+        "week" => Some(today - chrono::Duration::days(7)),
+        "month" => Some(today - chrono::Duration::days(30)),
+        _ => None, // "all" — no filter
+    };
+    let period_start_str = period_start
+        .map(|d| d.format("%Y-%m-%d").to_string())
+        .unwrap_or_default();
+
+    // Same exclusions as FSD analytics: imported drives carry no SEI
+    // safety data, summon sessions have no human driver to score.
+    let period_drives: Vec<&DriveSummary> = summaries
+        .iter()
+        .filter(|d| {
+            if is_imported(&d.source) || d.summon {
+                return false;
+            }
+            if let Some(ps) = period_start {
+                if let Ok(dt) =
+                    NaiveDateTime::parse_from_str(&d.start_time, "%Y-%m-%dT%H:%M:%S")
+                {
+                    return dt.date() >= ps;
+                }
+                return false;
+            }
+            true
+        })
+        .collect();
+
+    let mut totals = crate::safety::SafetyTotals::default();
+    let mut total_dist_km: f64 = 0.0;
+    let mut assisted_dist_km: f64 = 0.0;
+    let mut night_km: f64 = 0.0;
+    let mut scored_drives: i32 = 0;
+    let mut fsd_disengagements: i32 = 0;
+
+    // Daily accumulation: per-day SafetyTotals plus display counters.
+    struct DayAcc {
+        day_name: String,
+        totals: crate::safety::SafetyTotals,
+        drives: i32,
+        distance_km: f64,
+    }
+    let mut daily_map: HashMap<String, DayAcc> = HashMap::new();
+
+    for d in &period_drives {
+        let assisted_mi =
+            d.fsd_distance_mi + d.autosteer_distance_mi + d.tacc_distance_mi;
+        totals.distance_mi += d.distance_mi;
+        totals.assisted_mi += assisted_mi;
+        totals.night_mi += d.safety_night_mi;
+        totals.moving_ms += d.safety_moving_ms;
+        totals.manual_moving_ms += d.safety_manual_moving_ms;
+        totals.hard_brake_ms += d.safety_hard_brake_ms;
+        totals.hard_brake_events += d.safety_hard_brake_events;
+        totals.aggr_turn_ms += d.safety_aggr_turn_ms;
+        totals.aggr_turn_events += d.safety_aggr_turn_events;
+        totals.speeding_ms += d.safety_speeding_ms;
+        total_dist_km += d.distance_km;
+        assisted_dist_km +=
+            d.fsd_distance_km + d.autosteer_distance_km + d.tacc_distance_km;
+        night_km += d.safety_night_mi * calc::M_PER_MILE / 1000.0;
+        if d.safety_moving_ms > 0 {
+            scored_drives += 1;
+        }
+        fsd_disengagements += d.fsd_disengagements;
+
+        if let Ok(dt) = NaiveDateTime::parse_from_str(&d.start_time, "%Y-%m-%dT%H:%M:%S") {
+            let date_key = dt.format("%Y-%m-%d").to_string();
+            let day_name = match dt.weekday() {
+                chrono::Weekday::Mon => "Mon",
+                chrono::Weekday::Tue => "Tue",
+                chrono::Weekday::Wed => "Wed",
+                chrono::Weekday::Thu => "Thu",
+                chrono::Weekday::Fri => "Fri",
+                chrono::Weekday::Sat => "Sat",
+                chrono::Weekday::Sun => "Sun",
+            };
+            let acc = daily_map.entry(date_key).or_insert_with(|| DayAcc {
+                day_name: day_name.to_string(),
+                totals: crate::safety::SafetyTotals::default(),
+                drives: 0,
+                distance_km: 0.0,
+            });
+            acc.totals.distance_mi += d.distance_mi;
+            acc.totals.assisted_mi += assisted_mi;
+            acc.totals.night_mi += d.safety_night_mi;
+            acc.totals.moving_ms += d.safety_moving_ms;
+            acc.totals.manual_moving_ms += d.safety_manual_moving_ms;
+            acc.totals.hard_brake_ms += d.safety_hard_brake_ms;
+            acc.totals.hard_brake_events += d.safety_hard_brake_events;
+            acc.totals.aggr_turn_ms += d.safety_aggr_turn_ms;
+            acc.totals.aggr_turn_events += d.safety_aggr_turn_events;
+            acc.totals.speeding_ms += d.safety_speeding_ms;
+            acc.drives += 1;
+            acc.distance_km += d.distance_km;
+        }
+    }
+
+    let mut daily: Vec<SafetyDayStats> = daily_map
+        .into_iter()
+        .map(|(date, acc)| {
+            let score = crate::safety::compute_safety_score(&acc.totals).map(|s| s.score);
+            SafetyDayStats {
+                date,
+                day_name: acc.day_name,
+                score,
+                drives: acc.drives,
+                distance_mi: round2(acc.totals.distance_mi),
+                distance_km: round2(acc.distance_km),
+                hard_brake_events: acc.totals.hard_brake_events,
+                aggr_turn_events: acc.totals.aggr_turn_events,
+                speeding_ms: acc.totals.speeding_ms,
+                night_mi: round2(acc.totals.night_mi),
+                moving_ms: acc.totals.moving_ms,
+                manual_moving_ms: acc.totals.manual_moving_ms,
+                hard_brake_ms: acc.totals.hard_brake_ms,
+                aggr_turn_ms: acc.totals.aggr_turn_ms,
+            }
+        })
+        .collect();
+    daily.sort_by(|a, b| a.date.cmp(&b.date));
+
+    let mut best_day = String::new();
+    let mut best_day_score: Option<f64> = None;
+    for ds in &daily {
+        if let Some(s) = ds.score {
+            if best_day_score.is_none_or(|b| s > b) {
+                best_day = ds.date.clone();
+                best_day_score = Some(s);
+            }
+        }
+    }
+
+    let assisted_percent = if total_dist_km > 0.0 {
+        round1(assisted_dist_km / total_dist_km * 100.0)
+    } else {
+        0.0
+    };
+
+    SafetyAnalytics {
+        period: period.to_string(),
+        period_start: period_start_str,
+        total_drives: period_drives.len() as i32,
+        scored_drives,
+        score: crate::safety::compute_safety_score(&totals),
+        total_distance_mi: round2(totals.distance_mi),
+        total_distance_km: round2(total_dist_km),
+        moving_ms: totals.moving_ms,
+        manual_moving_ms: totals.manual_moving_ms,
+        hard_brake_events: totals.hard_brake_events,
+        hard_brake_ms: totals.hard_brake_ms,
+        aggr_turn_events: totals.aggr_turn_events,
+        aggr_turn_ms: totals.aggr_turn_ms,
+        speeding_ms: totals.speeding_ms,
+        night_mi: round2(totals.night_mi),
+        night_km: round2(night_km),
+        assisted_percent,
+        fsd_disengagements,
+        daily,
+        best_day,
+        best_day_score,
+    }
 }
 
 /// Resolve a drive id (numeric index or start-time string) to the
@@ -3391,6 +3577,21 @@ fn build_summary_from_aggregates(
     let mut fsd_disengagements: i32 = 0;
     let mut fsd_accel_pushes: i32 = 0;
 
+    // v17 Safety Score accumulators (see safety.rs). Time quantities
+    // scale by sub-clip fraction like the FSD ms totals; event counts
+    // are per-parent-file like disengagements. Night exposure is
+    // classified by each sub-clip's local start hour — 60 s granularity
+    // is plenty for a 6-hour window.
+    let mut safety_hard_brake_ms: f64 = 0.0;
+    let mut safety_hard_brake_events: i32 = 0;
+    let mut safety_aggr_turn_ms: f64 = 0.0;
+    let mut safety_aggr_turn_events: i32 = 0;
+    let mut safety_speeding_ms: f64 = 0.0;
+    let mut safety_moving_ms: f64 = 0.0;
+    let mut safety_manual_moving_ms: f64 = 0.0;
+    let mut safety_night_ms: f64 = 0.0;
+    let mut safety_night_m: f64 = 0.0;
+
     let mut start_point: Option<GpsPoint> = None;
     let mut end_point: Option<GpsPoint> = None;
 
@@ -3434,6 +3635,17 @@ fn build_summary_from_aggregates(
         tacc_dist_m += a.tacc_distance_m * f;
         assisted_dist_m += a.assisted_distance_m * f;
 
+        // Safety time totals (NULL columns = pre-v17 row = contribute 0).
+        safety_hard_brake_ms += a.safety_hard_brake_ms.unwrap_or(0) as f64 * f;
+        safety_aggr_turn_ms += a.safety_aggr_turn_ms.unwrap_or(0) as f64 * f;
+        safety_speeding_ms += a.safety_speeding_ms.unwrap_or(0) as f64 * f;
+        safety_moving_ms += a.safety_moving_ms.unwrap_or(0) as f64 * f;
+        safety_manual_moving_ms += a.safety_manual_moving_ms.unwrap_or(0) as f64 * f;
+        if crate::safety::is_night_hour(clip.timestamp.hour()) {
+            safety_night_ms += 60_000.0 * f;
+            safety_night_m += a.distance_m * f;
+        }
+
         // Per-file (not per-sub-clip) aggregates.
         let is_first_subclip_of_file = seen_files.insert(clip.summary.file.as_str());
         if is_first_subclip_of_file {
@@ -3443,6 +3655,8 @@ fn build_summary_from_aggregates(
             }
             fsd_disengagements += a.fsd_disengagements;
             fsd_accel_pushes += a.fsd_accel_pushes;
+            safety_hard_brake_events += a.safety_hard_brake_events.unwrap_or(0) as i32;
+            safety_aggr_turn_events += a.safety_aggr_turn_events.unwrap_or(0) as i32;
             if clip.start_frame == 0 {
                 if let Some(p) = pend_prev_ms {
                     let rem = 2000.0 - p;
@@ -3593,6 +3807,33 @@ fn build_summary_from_aggregates(
     let start_time_str = start_time.format("%Y-%m-%dT%H:%M:%S").to_string();
     let drive_tags = tags.get(&start_time_str).cloned().unwrap_or_default();
 
+    // ── Safety Score for this drive ──
+    // Imported and summon drives carry no (or meaningless) safety data;
+    // everything else scores through the shared formula, which itself
+    // returns None below the minimum-mileage/-time floors.
+    let source_is_sei = first_clip
+        .summary
+        .source
+        .as_deref()
+        .map_or(true, |s| s.is_empty() || s == "sei");
+    let safety_totals = crate::safety::SafetyTotals {
+        distance_mi: total_dist_m / calc::M_PER_MILE,
+        assisted_mi: assisted_dist_m / calc::M_PER_MILE,
+        night_mi: safety_night_m / calc::M_PER_MILE,
+        moving_ms: safety_moving_ms.round() as i64,
+        manual_moving_ms: safety_manual_moving_ms.round() as i64,
+        hard_brake_ms: safety_hard_brake_ms.round() as i64,
+        hard_brake_events: safety_hard_brake_events,
+        aggr_turn_ms: safety_aggr_turn_ms.round() as i64,
+        aggr_turn_events: safety_aggr_turn_events,
+        speeding_ms: safety_speeding_ms.round() as i64,
+    };
+    let safety_score = if source_is_sei && !summon {
+        crate::safety::compute_safety_score(&safety_totals).map(|s| s.score)
+    } else {
+        None
+    };
+
     DriveSummary {
         id: idx as i32,
         // See `build_summary` above — derive from start_time so the web
@@ -3658,6 +3899,16 @@ fn build_summary_from_aggregates(
         ),
         external_signature: first_clip.summary.external_signature.clone(),
         tessie_autopilot_percent: None,
+        safety_hard_brake_ms: safety_totals.hard_brake_ms,
+        safety_hard_brake_events,
+        safety_aggr_turn_ms: safety_totals.aggr_turn_ms,
+        safety_aggr_turn_events,
+        safety_speeding_ms: safety_totals.speeding_ms,
+        safety_moving_ms: safety_totals.moving_ms,
+        safety_manual_moving_ms: safety_totals.manual_moving_ms,
+        safety_night_ms: safety_night_ms.round() as i64,
+        safety_night_mi: round2(safety_night_m / calc::M_PER_MILE),
+        safety_score,
     }
 }
 

@@ -316,6 +316,18 @@ pub fn compute_route_aggregates(r: &Route) -> RouteAggregates {
         agg.sei_speed_abs_max = Some(sei_abs_max);
     }
 
+    // v17 Safety Score scalars. Always Some once computed — a clip
+    // without SEI speeds stores zeros ("no safety data"), while NULL
+    // columns mean "row predates v17, not yet backfilled".
+    let cs = crate::safety::compute_clip_safety(r);
+    agg.safety_hard_brake_ms = Some(cs.hard_brake_ms);
+    agg.safety_hard_brake_events = Some(cs.hard_brake_events as i64);
+    agg.safety_aggr_turn_ms = Some(cs.aggr_turn_ms);
+    agg.safety_aggr_turn_events = Some(cs.aggr_turn_events as i64);
+    agg.safety_speeding_ms = Some(cs.speeding_ms);
+    agg.safety_moving_ms = Some(cs.moving_ms);
+    agg.safety_manual_moving_ms = Some(cs.manual_moving_ms);
+
     agg
 }
 

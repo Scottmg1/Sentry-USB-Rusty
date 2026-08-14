@@ -19,6 +19,7 @@ import {
   SmartToyIcon,
   Terminal2Icon,
   TimerIcon,
+  VerifiedUserIcon,
   VideocamIcon,
   VolumeUpIcon,
   WifiIcon,
@@ -55,7 +56,11 @@ function buildNavItems(
   // so the two telemetry views sit together.
   const items = baseNavItems.flatMap((item) =>
     item.to === "/drives"
-      ? [item, { to: "/charging", icon: ChargerIcon, label: "Charging" }]
+      ? [
+          item,
+          { to: "/charging", icon: ChargerIcon, label: "Charging" },
+          { to: "/safety", icon: VerifiedUserIcon, label: "Safety Score" },
+        ]
       : [item],
   )
   return items

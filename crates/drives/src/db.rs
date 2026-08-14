@@ -115,7 +115,11 @@ const ARCHIVE_SYNC_EXPORT_DATE_KEY: &str = "archive_sync_export_date";
 // gear-verified ego movement now form drives even when no RecentClips
 // route sits within the chain window (a user save can move an entire
 // short drive out of RecentClips). Stale v8 caches hide those drives.
-const DRIVE_LIST_CACHE_ALGO_VERSION: &str = "9";
+//
+// v10 (2026-08-13): Safety Score — per-drive safety totals + score on
+// DriveSummary (v17 columns, safety.rs). Stale v9 caches lack the
+// fields entirely.
+const DRIVE_LIST_CACHE_ALGO_VERSION: &str = "10";
 
 /// Version tag for the per-clip aggregate FORMULA (compute_route_aggregates).
 /// Distinct from the cache algo version above: this gates a one-shot
@@ -129,7 +133,10 @@ const DRIVE_LIST_CACHE_ALGO_VERSION: &str = "9";
 /// wall-time to the incoming clip's autopilot mode. "geodesic-stable-4"
 /// recomputes per-clip distances with the numerically-stable geodesic
 /// central angle (calc.rs) that fixes the short-segment undercount.
-const AGGREGATE_FORMULA_VERSION: &str = "geodesic-stable-4";
+/// "safety-5" adds the v17 per-clip Safety Score scalars
+/// (compute_clip_safety) — the gate recomputes every row so existing
+/// archives get safety data without re-extraction.
+const AGGREGATE_FORMULA_VERSION: &str = "safety-5";
 
 /// Version tag for the route `file` KEY format. Gates a one-shot rewrite of
 /// `routes.file` / `processed_files.file` to the canonical form (see
@@ -546,7 +553,11 @@ impl DriveStore {
                      autosteer_distance_m = NULL, tacc_distance_m = NULL, \
                      fsd_pend_ms_end = NULL, park_ms_start = NULL, \
                      fsd_at_end = NULL, fsd_accel_pushes_early = NULL, \
-                     ap_at_start = NULL",
+                     ap_at_start = NULL, \
+                     safety_hard_brake_ms = NULL, safety_hard_brake_events = NULL, \
+                     safety_aggr_turn_ms = NULL, safety_aggr_turn_events = NULL, \
+                     safety_speeding_ms = NULL, safety_moving_ms = NULL, \
+                     safety_manual_moving_ms = NULL",
                     [],
                 )?;
                 info!(
@@ -3102,7 +3113,10 @@ fn insert_or_update_route(
             location_name_start, location_name_end,
             fsd_pend_ms_end, park_ms_start, fsd_at_end, fsd_accel_pushes_early,
             ap_at_start,
-            flag_runs_blob, sei_speed_abs_max)
+            flag_runs_blob, sei_speed_abs_max,
+            safety_hard_brake_ms, safety_hard_brake_events,
+            safety_aggr_turn_ms, safety_aggr_turn_events,
+            safety_speeding_ms, safety_moving_ms, safety_manual_moving_ms)
          VALUES(
             ?1, ?2, ?3, ?4, ?5,
             NULL, NULL, ?6, ?7, ?8,
@@ -3117,7 +3131,8 @@ fn insert_or_update_route(
             ?42, ?43, ?44, ?45,
             ?46, ?47, ?48, ?49,
             ?50, ?51, ?52, ?53, ?54,
-            ?55, ?56)
+            ?55, ?56,
+            ?57, ?58, ?59, ?60, ?61, ?62, ?63)
          ON CONFLICT(file) DO UPDATE SET
             date_dir            = excluded.date_dir,
             point_count         = excluded.point_count,
@@ -3173,7 +3188,14 @@ fn insert_or_update_route(
             fsd_accel_pushes_early = excluded.fsd_accel_pushes_early,
             ap_at_start         = excluded.ap_at_start,
             flag_runs_blob      = excluded.flag_runs_blob,
-            sei_speed_abs_max   = excluded.sei_speed_abs_max",
+            sei_speed_abs_max   = excluded.sei_speed_abs_max,
+            safety_hard_brake_ms     = excluded.safety_hard_brake_ms,
+            safety_hard_brake_events = excluded.safety_hard_brake_events,
+            safety_aggr_turn_ms      = excluded.safety_aggr_turn_ms,
+            safety_aggr_turn_events  = excluded.safety_aggr_turn_events,
+            safety_speeding_ms       = excluded.safety_speeding_ms,
+            safety_moving_ms         = excluded.safety_moving_ms,
+            safety_manual_moving_ms  = excluded.safety_manual_moving_ms",
         params![
             norm_file,
             &r.date,
@@ -3231,6 +3253,13 @@ fn insert_or_update_route(
             a.ap_at_start,
             fb,
             a.sei_speed_abs_max,
+            a.safety_hard_brake_ms,
+            a.safety_hard_brake_events,
+            a.safety_aggr_turn_ms,
+            a.safety_aggr_turn_events,
+            a.safety_speeding_ms,
+            a.safety_moving_ms,
+            a.safety_manual_moving_ms,
         ],
     )?;
     Ok(())
@@ -3527,7 +3556,10 @@ fn select_route_summaries_where(
                 location_name_start, location_name_end,
                 fsd_pend_ms_end, park_ms_start, fsd_at_end, fsd_accel_pushes_early,
                 ap_at_start,
-                flag_runs_blob, sei_speed_abs_max
+                flag_runs_blob, sei_speed_abs_max,
+                safety_hard_brake_ms, safety_hard_brake_events,
+                safety_aggr_turn_ms, safety_aggr_turn_events,
+                safety_speeding_ms, safety_moving_ms, safety_manual_moving_ms
          FROM routes
          {where_sql}
          ORDER BY file",
@@ -3599,6 +3631,16 @@ fn select_route_summaries_where(
                 row.get::<_, Option<Vec<u8>>>(44)?,
                 row.get::<_, Option<f64>>(45)?,
             ),
+            // v17 safety scalars
+            (
+                row.get::<_, Option<i64>>(46)?,
+                row.get::<_, Option<i64>>(47)?,
+                row.get::<_, Option<i64>>(48)?,
+                row.get::<_, Option<i64>>(49)?,
+                row.get::<_, Option<i64>>(50)?,
+                row.get::<_, Option<i64>>(51)?,
+                row.get::<_, Option<i64>>(52)?,
+            ),
         ))
     })?;
 
@@ -3641,6 +3683,15 @@ fn select_route_summaries_where(
             (location_name_start, location_name_end),
             (fsd_pend_ms_end, park_ms_start, fsd_at_end, fsd_accel_pushes_early, ap_at_start),
             (fb, sei_speed_abs_max),
+            (
+                safety_hard_brake_ms,
+                safety_hard_brake_events,
+                safety_aggr_turn_ms,
+                safety_aggr_turn_events,
+                safety_speeding_ms,
+                safety_moving_ms,
+                safety_manual_moving_ms,
+            ),
         ) = r?;
 
         let gear_runs = decode_gear_runs(rb.as_deref())
@@ -3682,6 +3733,13 @@ fn select_route_summaries_where(
                 end_lat,
                 end_lng: end_lon,
                 sei_speed_abs_max,
+                safety_hard_brake_ms,
+                safety_hard_brake_events,
+                safety_aggr_turn_ms,
+                safety_aggr_turn_events,
+                safety_speeding_ms,
+                safety_moving_ms,
+                safety_manual_moving_ms,
             },
             source,
             external_signature,

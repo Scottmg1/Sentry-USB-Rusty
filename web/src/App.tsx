@@ -27,6 +27,7 @@ const PreviewCharging = import.meta.env.DEV
 const Support = lazy(() => import("@/pages/Support"))
 const Terminal = lazy(() => import("@/pages/Terminal"))
 const FSDAnalytics = lazy(() => import("@/pages/FSDAnalytics"))
+const SafetyScore = lazy(() => import("@/pages/SafetyScore"))
 const Community = lazy(() => import("@/pages/Community"))
 const Notifications = lazy(() => import("@/pages/Notifications"))
 const Snapshots = lazy(() => import("@/pages/Snapshots"))
@@ -295,6 +296,7 @@ function AppContent() {
             <Route path="/charging" element={<Charging />} />
             <Route path="/charging/:id" element={<ChargeSessionDetail />} />
             <Route path="/fsd" element={<FSDAnalytics />} />
+            <Route path="/safety" element={<SafetyScore />} />
             <Route path="/support" element={<Support />} />
             <Route path="/terminal" element={<Terminal />} />
             <Route path="/community" element={<Community />} />
