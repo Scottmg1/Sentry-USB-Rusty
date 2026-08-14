@@ -95,13 +95,37 @@ export function presentBleHealth(
  */
 export function deriveVehicleStatusLabel(
   health: BleHealthPresentation,
-  isDriving: boolean,
+  shiftState: string | null,
   charging: boolean,
 ): string {
   if (health.severity !== "green") return health.label
   if (charging) return "Charging"
-  if (isDriving) return "Driving"
+  if (
+    shiftState === "Drive" ||
+    shiftState === "Reverse" ||
+    shiftState === "Neutral"
+  ) {
+    return "Driving"
+  }
+  if (shiftState === "Park" || shiftState === "Unknown") return "Parked"
   return "Idle"
+}
+
+/** Accept gear only while the daemon gate snapshot itself is fresh. */
+export function freshVehicleShiftState(
+  shiftState: string | null | undefined,
+  shiftStateSecondsAgo: number | null | undefined,
+): string | null {
+  if (
+    shiftState == null ||
+    shiftStateSecondsAgo == null ||
+    !Number.isFinite(shiftStateSecondsAgo) ||
+    shiftStateSecondsAgo < 0 ||
+    shiftStateSecondsAgo > 120
+  ) {
+    return null
+  }
+  return shiftState
 }
 
 /** Vehicle-changing controls need both authenticated BLE health and the

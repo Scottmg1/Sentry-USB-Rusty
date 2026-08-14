@@ -1314,6 +1314,79 @@ mod tests {
     }
 
     #[test]
+    fn migrate_from_v16_adds_v17_columns_without_losing_telemetry() {
+        // Recreate the shape an existing v16 install has: all route columns
+        // through v16 and all telemetry columns through v14, but none of the
+        // new charging-control fields.
+        let conn = open();
+        for stmt in V1_SCHEMA {
+            conn.execute(stmt, []).unwrap();
+        }
+        for stmt in V6_NEW_TABLES {
+            conn.execute(stmt, []).unwrap();
+        }
+        for (name, typ) in V2_ROUTE_AGGREGATE_COLUMNS
+            .iter()
+            .chain(V3_ROUTE_CLOUD_COLUMNS.iter())
+            .chain(V4_ROUTE_TESSIE_COLUMNS.iter())
+            .chain(V6_ROUTE_TELEMETRY_COLUMNS.iter())
+            .chain(V7_ROUTE_TPMS_COLUMNS.iter())
+            .chain(V9_ROUTE_COLUMNS.iter())
+            .chain(V10_ROUTE_COLUMNS.iter())
+            .chain(V15_ROUTE_BOUNDARY_COLUMNS.iter())
+            .chain(V16_ROUTE_FLAG_COLUMNS.iter())
+        {
+            conn.execute(&format!("ALTER TABLE routes ADD COLUMN {} {}", name, typ), [])
+                .unwrap();
+        }
+        for (name, typ) in V7_TELEMETRY_TPMS_COLUMNS
+            .iter()
+            .chain(V9_TELEMETRY_COLUMNS.iter())
+            .chain(V10_TELEMETRY_COLUMNS.iter())
+            .chain(V11_TELEMETRY_CHARGE_COLUMNS.iter())
+            .chain(V12_TELEMETRY_GPS_COLUMNS.iter())
+            .chain(V13_TELEMETRY_MINUTES_COLUMN.iter())
+            .chain(V14_TELEMETRY_CHARGE_PHASE_COLUMN.iter())
+        {
+            conn.execute(
+                &format!("ALTER TABLE telemetry_samples ADD COLUMN {} {}", name, typ),
+                [],
+            )
+            .unwrap();
+        }
+        conn.execute(
+            "INSERT INTO telemetry_samples (ts, source, battery_pct) VALUES (?1, ?2, ?3)",
+            params![1_700_000_000_i64, "state", 73.0_f64],
+        )
+        .unwrap();
+        meta_set(&conn, "schema_version", "16").unwrap();
+
+        migrate(&conn).unwrap();
+
+        let cols = list_telemetry_columns(&conn).unwrap();
+        for (name, _) in V17_TELEMETRY_CHARGING_CONTROL_COLUMNS {
+            assert!(
+                cols.contains(*name),
+                "telemetry_samples.{name} missing after v17",
+            );
+        }
+        let retained: (f64, Option<i64>, Option<i64>, Option<i64>) = conn
+            .query_row(
+                "SELECT battery_pct, charging_amps_set, charge_current_request_max, \
+                        charge_port_door_open \
+                 FROM telemetry_samples WHERE ts = ?1",
+                [1_700_000_000_i64],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(retained, (73.0, None, None, None));
+        assert_eq!(
+            meta_get(&conn, "schema_version").unwrap().as_deref(),
+            Some("17")
+        );
+    }
+
+    #[test]
     fn migrate_from_v6_adds_v7_tpms_columns() {
         // Stand up a v6 DB (everything but v7's tpms cols) and
         // confirm migrate adds them to BOTH routes and

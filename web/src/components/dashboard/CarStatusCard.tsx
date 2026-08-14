@@ -25,6 +25,7 @@ import {
 } from "@/lib/charge-format"
 import {
   deriveVehicleStatusLabel,
+  freshVehicleShiftState,
   presentBleHealth,
   shouldShowChargingControls,
   type BleHealth,
@@ -43,6 +44,9 @@ export interface CarStatusSample {
   seconds_ago?: number | null
   // Live gear: "Park" / "Drive" / "Reverse" / "Neutral" / "Unknown".
   shift_state?: string | null
+  // Age of the gate snapshot that supplied shift_state. It is independent
+  // of seconds_ago, which belongs to the latest database sample.
+  shift_state_seconds_ago?: number | null
   battery_pct?: number | null
   interior_temp_c?: number | null
   exterior_temp_c?: number | null
@@ -189,13 +193,14 @@ export function CarStatusCard({
 
   // Live gear decides Parked vs Driving. Gate on freshness so a stale
   // Drive sample from before the car slept doesn't read "Driving".
+  const freshShiftState = freshVehicleShiftState(
+    sample?.shift_state,
+    sample?.shift_state_seconds_ago,
+  )
   const isDriving =
-    (sample?.shift_state === "Drive" ||
-      sample?.shift_state === "Reverse" ||
-      sample?.shift_state === "Neutral") &&
-    sample?.seconds_ago != null &&
-    sample.seconds_ago >= 0 &&
-    sample.seconds_ago <= 120
+    freshShiftState === "Drive" ||
+    freshShiftState === "Reverse" ||
+    freshShiftState === "Neutral"
   const healthPresentation = presentBleHealth(
     bleHealth,
     sample?.seconds_ago ?? null,
@@ -213,7 +218,7 @@ export function CarStatusCard({
   )
   const statusLabel = deriveVehicleStatusLabel(
     healthPresentation,
-    isDriving,
+    freshShiftState,
     charging,
   )
   const statusHalo = healthPresentation.severity === "red"

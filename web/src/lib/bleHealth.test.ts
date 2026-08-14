@@ -40,19 +40,65 @@ test("fresh fallback remains connected", () => {
   assert.equal(got.code, "connected")
 })
 
-test("fresh stationary telemetry is labeled Idle, never Asleep", () => {
+test("fresh Park telemetry is labeled Parked", () => {
   const deriveVehicleStatusLabel = (
     bleHealthModule as typeof bleHealthModule & {
       deriveVehicleStatusLabel: (
         health: ReturnType<typeof presentBleHealth>,
-        isDriving: boolean,
+        shiftState: string | null,
         charging: boolean,
       ) => string
     }
   ).deriveVehicleStatusLabel
 
   const connected = presentBleHealth(undefined, 15)
-  assert.equal(deriveVehicleStatusLabel(connected, false, false), "Idle")
+  assert.equal(deriveVehicleStatusLabel(connected, "Park", false), "Parked")
+})
+
+test("fresh Unknown shift telemetry is treated as Parked", () => {
+  const deriveVehicleStatusLabel = (
+    bleHealthModule as typeof bleHealthModule & {
+      deriveVehicleStatusLabel: (
+        health: ReturnType<typeof presentBleHealth>,
+        shiftState: string | null,
+        charging: boolean,
+      ) => string
+    }
+  ).deriveVehicleStatusLabel
+
+  const connected = presentBleHealth(undefined, 15)
+  assert.equal(deriveVehicleStatusLabel(connected, "Unknown", false), "Parked")
+})
+
+test("missing or stale shift telemetry remains Idle", () => {
+  const deriveVehicleStatusLabel = (
+    bleHealthModule as typeof bleHealthModule & {
+      deriveVehicleStatusLabel: (
+        health: ReturnType<typeof presentBleHealth>,
+        shiftState: string | null,
+        charging: boolean,
+      ) => string
+    }
+  ).deriveVehicleStatusLabel
+
+  const connected = presentBleHealth(undefined, 15)
+  assert.equal(deriveVehicleStatusLabel(connected, null, false), "Idle")
+})
+
+test("shift freshness uses the gate-file age, not the database envelope age", () => {
+  const freshVehicleShiftState = (
+    bleHealthModule as typeof bleHealthModule & {
+      freshVehicleShiftState: (
+        shiftState: string | null | undefined,
+        shiftStateSecondsAgo: number | null | undefined,
+      ) => string | null
+    }
+  ).freshVehicleShiftState
+
+  assert.equal(freshVehicleShiftState("Park", 15), "Park")
+  assert.equal(freshVehicleShiftState("Drive", 121), null)
+  assert.equal(freshVehicleShiftState("Unknown", null), null)
+  assert.equal(freshVehicleShiftState("Park", -1), null)
 })
 
 test("charging is shown only while BLE health is green", () => {
@@ -60,18 +106,18 @@ test("charging is shown only while BLE health is green", () => {
     bleHealthModule as typeof bleHealthModule & {
       deriveVehicleStatusLabel: (
         health: ReturnType<typeof presentBleHealth>,
-        isDriving: boolean,
+        shiftState: string | null,
         charging: boolean,
       ) => string
     }
   ).deriveVehicleStatusLabel
 
   assert.equal(
-    deriveVehicleStatusLabel(presentBleHealth(undefined, 15), false, true),
+    deriveVehicleStatusLabel(presentBleHealth(undefined, 15), "Park", true),
     "Charging",
   )
   assert.equal(
-    deriveVehicleStatusLabel(presentBleHealth(undefined, 86_400), false, true),
+    deriveVehicleStatusLabel(presentBleHealth(undefined, 86_400), "Park", true),
     "Telemetry idle",
   )
 })

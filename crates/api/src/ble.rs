@@ -705,15 +705,17 @@ fn read_radio_owner() -> Option<String> {
 /// mirrors `GATE_STATUS_PATH` in the daemon.
 const GATE_STATUS_PATH: &str = "/mutable/sentryusb-ble-gate.txt";
 
-/// `(sentry, charging, shift)` from the gate file, `None` each if unwritten.
+/// `(sentry, charging, shift, updated_ts)` from the gate file, `None` each if
+/// unwritten. `updated_ts` belongs to this file; the database sample age is
+/// independent and must not be used to decide whether shift is fresh.
 /// `"unknown"` is kept (not nulled) — it means the daemon couldn't read it.
-fn read_gate_status() -> (Option<String>, Option<String>, Option<String>) {
-    let Ok(body) = std::fs::read_to_string(GATE_STATUS_PATH) else {
-        return (None, None, None);
-    };
+fn parse_gate_status(
+    body: &str,
+) -> (Option<String>, Option<String>, Option<String>, Option<i64>) {
     let mut sentry = None;
     let mut charging = None;
     let mut shift = None;
+    let mut updated = None;
     for line in body.lines() {
         if let Some(v) = line.strip_prefix("sentry_mode=") {
             sentry = Some(v.trim().to_string());
@@ -721,9 +723,32 @@ fn read_gate_status() -> (Option<String>, Option<String>, Option<String>) {
             charging = Some(v.trim().to_string());
         } else if let Some(v) = line.strip_prefix("shift_state=") {
             shift = Some(v.trim().to_string());
+        } else if let Some(v) = line.strip_prefix("updated=") {
+            updated = v.trim().parse::<i64>().ok();
         }
     }
-    (sentry, charging, shift)
+    (sentry, charging, shift, updated)
+}
+
+fn read_gate_status() -> (Option<String>, Option<String>, Option<String>, Option<i64>) {
+    let Ok(body) = std::fs::read_to_string(GATE_STATUS_PATH) else {
+        return (None, None, None, None);
+    };
+    parse_gate_status(&body)
+}
+
+const DASHBOARD_SHIFT_FRESH_SECS: i64 = 120;
+
+fn fresh_gate_shift_state(
+    shift_state: Option<String>,
+    updated_ts: Option<i64>,
+    now_ts: i64,
+) -> (Option<String>, Option<i64>) {
+    let age = updated_ts.and_then(|updated| now_ts.checked_sub(updated));
+    let fresh = age
+        .map(|seconds| (0..=DASHBOARD_SHIFT_FRESH_SECS).contains(&seconds))
+        .unwrap_or(false);
+    (if fresh { shift_state } else { None }, age)
 }
 
 /// Returns the most recent row from `telemetry_samples` so the UI can
@@ -929,7 +954,9 @@ pub async fn ble_latest_sample(
         .unwrap_or(0);
 
     // Live sentry/charge/shift from the daemon's gate file (not the DB).
-    let (sentry_mode, charging_state, shift_state) = read_gate_status();
+    let (sentry_mode, charging_state, shift_state, gate_updated_ts) = read_gate_status();
+    let (shift_state, shift_state_seconds_ago) =
+        fresh_gate_shift_state(shift_state, gate_updated_ts, now);
 
     match result {
         Some((
@@ -998,6 +1025,7 @@ pub async fn ble_latest_sample(
                 "sentry_mode": sentry_mode,
                 "charging_state": charging_state,
                 "shift_state": shift_state,
+                "shift_state_seconds_ago": shift_state_seconds_ago,
                 "source": source,
                 // Null if we've never seen a body-controller poll. The
                 // UI uses recent body-controller-but-stale-state to
@@ -1338,6 +1366,46 @@ mod tests {
             false,
             1_040,
         ));
+    }
+
+    #[test]
+    fn gate_status_parser_keeps_its_own_update_timestamp() {
+        let parsed = parse_gate_status(
+            "sentry_mode=Off\ncharging_state=Complete\nshift_state=Park\nupdated=1700000000\n",
+        );
+        assert_eq!(
+            parsed,
+            (
+                Some("Off".to_string()),
+                Some("Complete".to_string()),
+                Some("Park".to_string()),
+                Some(1_700_000_000),
+            )
+        );
+    }
+
+    #[test]
+    fn gate_shift_freshness_suppresses_untrusted_timestamps() {
+        assert_eq!(
+            fresh_gate_shift_state(Some("Park".to_string()), Some(980), 1_000),
+            (Some("Park".to_string()), Some(20)),
+        );
+        assert_eq!(
+            fresh_gate_shift_state(Some("Drive".to_string()), Some(879), 1_000),
+            (None, Some(121)),
+        );
+        assert_eq!(
+            fresh_gate_shift_state(Some("Unknown".to_string()), None, 1_000),
+            (None, None),
+        );
+        assert_eq!(
+            fresh_gate_shift_state(Some("Park".to_string()), Some(1_001), 1_000),
+            (None, Some(-1)),
+        );
+        assert_eq!(
+            fresh_gate_shift_state(Some("Drive".to_string()), Some(i64::MIN), i64::MAX),
+            (None, None),
+        );
     }
 
     fn cfg(pairs: &[(&str, &str)]) -> sentryusb_config::SetupConfig {
