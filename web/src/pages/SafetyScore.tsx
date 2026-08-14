@@ -321,7 +321,7 @@ export default function SafetyScore() {
           and caps.
           <br />
           <br />
-          Driving on FSD reduces what can count against you.
+          Using FSD (Supervised) reduces some scoring factor impacts.
         </p>
       )}
 
