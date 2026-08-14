@@ -315,8 +315,10 @@ export default function SafetyScore() {
       {showLearnMore && (
         <p className="mt-2 rounded-lg bg-white/[0.03] p-3 text-xs leading-relaxed text-slate-400">
           This score is estimated from your dashcam SEI telemetry. Braking and turning G-forces
-          are derived from speed and GPS data - as such, events are read conservatively. Braking
-          and turning factors are tuned to be similar to Tesla's conditional measures and caps.
+          come from the vehicle's own accelerometer when the footage includes it; older clips
+          fall back to estimates derived from speed and GPS data and are read conservatively.
+          Braking and turning factors are tuned to be similar to Tesla's conditional measures
+          and caps.
           <br />
           <br />
           Driving on FSD reduces what can count against you.
