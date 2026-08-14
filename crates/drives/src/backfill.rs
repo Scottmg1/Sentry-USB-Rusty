@@ -175,6 +175,8 @@ fn backfill_one_batch(conn: &mut Connection) -> Result<i64> {
         acb: Option<Vec<u8>>,
         rb: Option<Vec<u8>>,
         fb: Option<Vec<u8>>,
+        axb: Option<Vec<u8>>,
+        ayb: Option<Vec<u8>>,
     }
 
     let mut batch: Vec<Row> = Vec::new();
@@ -182,7 +184,8 @@ fn backfill_one_batch(conn: &mut Connection) -> Result<i64> {
         let mut stmt = conn.prepare(
             "SELECT file, date_dir, raw_park_count, raw_frame_count,
                     points_blob, gear_states_blob, ap_states_blob,
-                    speeds_blob, accel_blob, gear_runs_blob, flag_runs_blob
+                    speeds_blob, accel_blob, gear_runs_blob, flag_runs_blob,
+                    accel_x_blob, accel_y_blob
              FROM routes
              WHERE max_speed_mps IS NULL
              LIMIT ?1",
@@ -200,6 +203,8 @@ fn backfill_one_batch(conn: &mut Connection) -> Result<i64> {
                 acb: row.get(8)?,
                 rb: row.get(9)?,
                 fb: row.get(10)?,
+                axb: row.get(11)?,
+                ayb: row.get(12)?,
             })
         })?;
         for r in rows {
@@ -233,6 +238,12 @@ fn backfill_one_batch(conn: &mut Connection) -> Result<i64> {
         let flag_runs = decode_flag_runs(r.fb.as_deref())
             .with_context(|| format!("decode flag_runs {}", r.file))?
             .unwrap_or_default();
+        let accel_x = decode_f32s(r.axb.as_deref())
+            .with_context(|| format!("decode accel_x {}", r.file))?
+            .unwrap_or_default();
+        let accel_y = decode_f32s(r.ayb.as_deref())
+            .with_context(|| format!("decode accel_y {}", r.file))?
+            .unwrap_or_default();
 
         let route = Route {
             file: r.file.clone(),
@@ -246,6 +257,8 @@ fn backfill_one_batch(conn: &mut Connection) -> Result<i64> {
             raw_frame_count: r.raw_frame_count,
             gear_runs,
             flag_runs,
+            accel_x,
+            accel_y,
             source: None,
             external_signature: None,
             tessie_autopilot_percent: None,

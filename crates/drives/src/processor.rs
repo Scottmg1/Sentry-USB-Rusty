@@ -50,19 +50,7 @@ fn summon_one_clip(store: &DriveStore, file: &str, full_path: &str) -> SummonCli
             let mut updated = false;
             if gps.raw_frame_count > 0 {
                 let date: &str = file.split('/').next().unwrap_or("");
-                match store.add_route(
-                    file,
-                    date,
-                    &gps.points,
-                    &gps.gear_states,
-                    &gps.autopilot_states,
-                    &gps.speeds,
-                    &gps.accel_positions,
-                    gps.raw_park_count,
-                    gps.raw_frame_count,
-                    &gps.gear_runs,
-                    &gps.flag_runs,
-                ) {
+                match store.add_route_extracted(file, date, &gps) {
                     Ok(()) => updated = true,
                     Err(e) => warn!("check summon: save failed for {}: {}", file, e),
                 }
@@ -177,22 +165,11 @@ fn process_one_clip(store: &DriveStore, file: &str, full_path: &str) -> ClipOutc
             if !gps.points.is_empty() {
                 out.had_gps = true;
             }
-            // add_route both marks the file processed AND writes
-            // the route row (with v2 aggregate columns). Single
-            // transaction per clip — durable on return.
-            match store.add_route(
-                file,
-                date,
-                &gps.points,
-                &gps.gear_states,
-                &gps.autopilot_states,
-                &gps.speeds,
-                &gps.accel_positions,
-                gps.raw_park_count,
-                gps.raw_frame_count,
-                &gps.gear_runs,
-                &gps.flag_runs,
-            ) {
+            // add_route_extracted both marks the file processed AND
+            // writes the route row (with aggregate columns + the v19
+            // IMU accel channels). Single transaction per clip —
+            // durable on return.
+            match store.add_route_extracted(file, date, &gps) {
                 Ok(()) => out.route_added = true,
                 Err(e) => {
                     warn!("failed to save route for {}: {}", file, e);

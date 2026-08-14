@@ -750,6 +750,59 @@ impl DriveStore {
         gear_runs: &[GearRun],
         flag_runs: &[FlagRun],
     ) -> Result<()> {
+        let route = Route {
+            file: relative_path.to_string(),
+            date: date_dir.to_string(),
+            points: points.to_vec(),
+            gear_states: gears.to_vec(),
+            autopilot_states: ap_states.to_vec(),
+            speeds: speeds.to_vec(),
+            accel_positions: accel_positions.to_vec(),
+            raw_park_count,
+            raw_frame_count,
+            gear_runs: gear_runs.to_vec(),
+            flag_runs: flag_runs.to_vec(),
+            source: None,
+            external_signature: None,
+            tessie_autopilot_percent: None,
+            // BLE telemetry rollup is written separately by
+            // `write_route_telemetry` after this insert lands; leave
+            // None here.
+            ..Default::default()
+        };
+        self.add_route_obj(relative_path, route)
+    }
+
+    /// [`Self::add_route`] variant taking the full extraction result —
+    /// the ingest path, which alone carries the v19 IMU accel channels.
+    pub fn add_route_extracted(
+        &self,
+        relative_path: &str,
+        date_dir: &str,
+        gps: &crate::types::ExtractedGps,
+    ) -> Result<()> {
+        let route = Route {
+            file: relative_path.to_string(),
+            date: date_dir.to_string(),
+            points: gps.points.clone(),
+            gear_states: gps.gear_states.clone(),
+            autopilot_states: gps.autopilot_states.clone(),
+            speeds: gps.speeds.clone(),
+            accel_positions: gps.accel_positions.clone(),
+            raw_park_count: gps.raw_park_count,
+            raw_frame_count: gps.raw_frame_count,
+            gear_runs: gps.gear_runs.clone(),
+            flag_runs: gps.flag_runs.clone(),
+            accel_x: gps.accel_x.clone(),
+            accel_y: gps.accel_y.clone(),
+            ..Default::default()
+        };
+        self.add_route_obj(relative_path, route)
+    }
+
+    /// Shared body of the two `add_route*` fronts.
+    fn add_route_obj(&self, relative_path: &str, route: Route) -> Result<()> {
+        let points = route.points.clone();
         let norm = normalize_path(relative_path);
         let now = now_unix();
 
@@ -763,26 +816,6 @@ impl DriveStore {
 
         let mut route_inserted: i64 = 0;
         if !points.is_empty() {
-            let route = Route {
-                file: relative_path.to_string(),
-                date: date_dir.to_string(),
-                points: points.to_vec(),
-                gear_states: gears.to_vec(),
-                autopilot_states: ap_states.to_vec(),
-                speeds: speeds.to_vec(),
-                accel_positions: accel_positions.to_vec(),
-                raw_park_count,
-                raw_frame_count,
-                gear_runs: gear_runs.to_vec(),
-                flag_runs: flag_runs.to_vec(),
-                source: None,
-                external_signature: None,
-                tessie_autopilot_percent: None,
-                // BLE telemetry rollup is written separately by
-                // `write_route_telemetry` after this insert lands; leave
-                // None here.
-                ..Default::default()
-            };
             let agg = compute_route_aggregates(&route);
             // Indexed point lookup so the counter update below knows
             // insert vs upsert — replaces a full COUNT(*) per clip.
@@ -3085,6 +3118,10 @@ fn insert_or_update_route(
     } else {
         encode_flag_runs(Some(&r.flag_runs))
     };
+    // v19 IMU accel channels: same NULL-for-absent rule — pre-IMU
+    // firmware and old extractions must read as "no channel".
+    let axb = if r.accel_x.is_empty() { None } else { encode_f32s(Some(&r.accel_x)) };
+    let ayb = if r.accel_y.is_empty() { None } else { encode_f32s(Some(&r.accel_y)) };
 
     let first_lat: Option<f64> = r.points.first().map(|p| p[0]);
     let first_lon: Option<f64> = r.points.first().map(|p| p[1]);
@@ -3125,7 +3162,8 @@ fn insert_or_update_route(
             safety_hard_brake_ms, safety_hard_brake_events,
             safety_aggr_turn_ms, safety_aggr_turn_events,
             safety_speeding_ms, safety_moving_ms, safety_manual_moving_ms,
-            safety_brake_any_ms, safety_turn_any_ms)
+            safety_brake_any_ms, safety_turn_any_ms,
+            accel_x_blob, accel_y_blob)
          VALUES(
             ?1, ?2, ?3, ?4, ?5,
             NULL, NULL, ?6, ?7, ?8,
@@ -3142,7 +3180,8 @@ fn insert_or_update_route(
             ?50, ?51, ?52, ?53, ?54,
             ?55, ?56,
             ?57, ?58, ?59, ?60, ?61, ?62, ?63,
-            ?64, ?65)
+            ?64, ?65,
+            ?66, ?67)
          ON CONFLICT(file) DO UPDATE SET
             date_dir            = excluded.date_dir,
             point_count         = excluded.point_count,
@@ -3207,7 +3246,9 @@ fn insert_or_update_route(
             safety_moving_ms         = excluded.safety_moving_ms,
             safety_manual_moving_ms  = excluded.safety_manual_moving_ms,
             safety_brake_any_ms      = excluded.safety_brake_any_ms,
-            safety_turn_any_ms       = excluded.safety_turn_any_ms",
+            safety_turn_any_ms       = excluded.safety_turn_any_ms,
+            accel_x_blob             = excluded.accel_x_blob,
+            accel_y_blob             = excluded.accel_y_blob",
         params![
             norm_file,
             &r.date,
@@ -3274,6 +3315,8 @@ fn insert_or_update_route(
             a.safety_manual_moving_ms,
             a.safety_brake_any_ms,
             a.safety_turn_any_ms,
+            axb,
+            ayb,
         ],
     )?;
     Ok(())
@@ -3292,7 +3335,7 @@ fn select_all_routes(conn: &Connection) -> Result<Vec<Route>> {
                 tire_fl_psi, tire_fr_psi, tire_rl_psi, tire_rr_psi,
                 odometer_mi_start, odometer_mi_end,
                 location_name_start, location_name_end,
-                flag_runs_blob
+                flag_runs_blob, accel_x_blob, accel_y_blob
          FROM routes
          ORDER BY file",
     )?;
@@ -3411,7 +3454,7 @@ fn select_routes_by_files(conn: &Connection, files: &[&str]) -> Result<Vec<Route
                 tire_fl_psi, tire_fr_psi, tire_rl_psi, tire_rr_psi,
                 odometer_mi_start, odometer_mi_end,
                 location_name_start, location_name_end,
-                flag_runs_blob
+                flag_runs_blob, accel_x_blob, accel_y_blob
          FROM routes
          WHERE file IN ({})
          ORDER BY file",
@@ -3453,6 +3496,9 @@ type RouteRow = (
     Option<String>, Option<String>,
     // v16 flag_runs_blob — appended last to keep prior indices stable.
     Option<Vec<u8>>,
+    // v19 IMU accel blobs (lateral, longitudinal).
+    Option<Vec<u8>>,
+    Option<Vec<u8>>,
 );
 
 /// Shared row mapper for the two route SELECTs above. The column order
@@ -3487,6 +3533,8 @@ fn route_row_mapper(row: &rusqlite::Row<'_>) -> rusqlite::Result<RouteRow> {
         row.get::<_, Option<String>>(25)?,
         row.get::<_, Option<String>>(26)?,
         row.get::<_, Option<Vec<u8>>>(27)?,
+        row.get::<_, Option<Vec<u8>>>(28)?,
+        row.get::<_, Option<Vec<u8>>>(29)?,
     ))
 }
 
@@ -3502,7 +3550,7 @@ fn build_route_from_row(r: RouteRow) -> Result<Route> {
         tire_fl_psi, tire_fr_psi, tire_rl_psi, tire_rr_psi,
         odometer_mi_start, odometer_mi_end,
         location_name_start, location_name_end,
-        fb,
+        fb, axb, ayb,
     ) = r;
     let points = decode_points(pb.as_deref())
         .with_context(|| format!("decode points {}", file))?
@@ -3521,10 +3569,16 @@ fn build_route_from_row(r: RouteRow) -> Result<Route> {
     let flag_runs = decode_flag_runs(fb.as_deref())
         .with_context(|| format!("decode flag_runs {}", file))?
         .unwrap_or_default();
+    let accel_x = decode_f32s(axb.as_deref())
+        .with_context(|| format!("decode accel_x {}", file))?
+        .unwrap_or_default();
+    let accel_y = decode_f32s(ayb.as_deref())
+        .with_context(|| format!("decode accel_y {}", file))?
+        .unwrap_or_default();
     Ok(Route {
         file, date, points, gear_states, autopilot_states,
         speeds, accel_positions, raw_park_count, raw_frame_count, gear_runs,
-        flag_runs,
+        flag_runs, accel_x, accel_y,
         source, external_signature, tessie_autopilot_percent,
         battery_pct_start, battery_pct_end,
         interior_temp_min, interior_temp_max, exterior_temp_avg,

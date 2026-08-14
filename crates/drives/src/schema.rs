@@ -107,7 +107,15 @@ use rusqlite::{params, Connection, OptionalExtension};
 /// become Tesla-style conditional proportions (harsh time ÷ braking/
 /// turning time) instead of shares of all driving time. Recomputed for
 /// existing rows by the same formula-version backfill as v17.
-pub const CURRENT_SCHEMA_VERSION: i32 = 18;
+///
+/// v18 -> v19: add `accel_x_blob` / `accel_y_blob` to `routes` — the SEI
+/// stream's IMU linear acceleration (proto fields 14/15, lateral /
+/// longitudinal m/s² per deduped point, peak-preserved through GPS
+/// dedup). MEASURED G-force for the Safety Score; rows without the
+/// blobs (pre-v19 extractions, firmware without the fields) fall back
+/// to the speed/GPS-derived estimates. No backfill: like flag_runs,
+/// the channel only exists by re-extracting the MP4's SEI stream.
+pub const CURRENT_SCHEMA_VERSION: i32 = 19;
 
 /// v1 DDL. Each statement is idempotent (`IF NOT EXISTS`) so `migrate()`
 /// is safe on every startup. Column shapes and names match Go exactly â€”
@@ -442,6 +450,12 @@ pub const V18_ROUTE_SAFETY_DENOM_COLUMNS: &[(&str, &str)] = &[
     ("safety_turn_any_ms", "INTEGER"),
 ];
 
+/// v19 IMU accel channels on `routes` (see `CURRENT_SCHEMA_VERSION`).
+pub const V19_ROUTE_IMU_COLUMNS: &[(&str, &str)] = &[
+    ("accel_x_blob", "BLOB"),
+    ("accel_y_blob", "BLOB"),
+];
+
 /// v9 rollups on `routes`. Odometer start/end let the UI show a
 /// per-trip mileage delta that's more accurate than GPS distance
 /// (GPS over-estimates curves, drops in tunnels, can drift).
@@ -690,6 +704,7 @@ pub fn migrate(conn: &Connection) -> Result<()> {
         .chain(V16_ROUTE_FLAG_COLUMNS.iter())
         .chain(V17_ROUTE_SAFETY_COLUMNS.iter())
         .chain(V18_ROUTE_SAFETY_DENOM_COLUMNS.iter())
+        .chain(V19_ROUTE_IMU_COLUMNS.iter())
     {
         if existing.contains(*name) {
             continue;
@@ -920,7 +935,7 @@ mod tests {
         migrate(&conn).unwrap();
         assert_eq!(
             meta_get(&conn, "schema_version").unwrap().as_deref(),
-            Some("18"),
+            Some("19"),
         );
         assert!(meta_get(&conn, "created_at").unwrap().is_some());
     }
@@ -958,7 +973,7 @@ mod tests {
         }
         assert_eq!(
             meta_get(&conn, "schema_version").unwrap().as_deref(),
-            Some("18")
+            Some("19")
         );
     }
 
@@ -990,7 +1005,7 @@ mod tests {
         }
         assert_eq!(
             meta_get(&conn, "schema_version").unwrap().as_deref(),
-            Some("18")
+            Some("19")
         );
     }
 
@@ -1024,7 +1039,7 @@ mod tests {
         }
         assert_eq!(
             meta_get(&conn, "schema_version").unwrap().as_deref(),
-            Some("18")
+            Some("19")
         );
     }
 
@@ -1131,7 +1146,7 @@ mod tests {
         assert!(surviving_processed.starts_with("RecentClips/"));
         assert_eq!(
             meta_get(&conn, "schema_version").unwrap().as_deref(),
-            Some("18")
+            Some("19")
         );
     }
 
@@ -1182,7 +1197,7 @@ mod tests {
         assert_eq!(count_routes(&conn), 1, "fresh-DB seed must not run v5 cleanup");
         assert_eq!(
             meta_get(&conn, "schema_version").unwrap().as_deref(),
-            Some("18")
+            Some("19")
         );
     }
 
@@ -1235,7 +1250,7 @@ mod tests {
         assert_eq!(table_exists, 1, "v6 must create telemetry_samples");
         assert_eq!(
             meta_get(&conn, "schema_version").unwrap().as_deref(),
-            Some("18")
+            Some("19")
         );
     }
 
@@ -1272,7 +1287,7 @@ mod tests {
         }
         assert_eq!(
             meta_get(&conn, "schema_version").unwrap().as_deref(),
-            Some("18")
+            Some("19")
         );
     }
 
@@ -1310,7 +1325,7 @@ mod tests {
         }
         assert_eq!(
             meta_get(&conn, "schema_version").unwrap().as_deref(),
-            Some("18")
+            Some("19")
         );
     }
 
@@ -1349,7 +1364,7 @@ mod tests {
         }
         assert_eq!(
             meta_get(&conn, "schema_version").unwrap().as_deref(),
-            Some("18")
+            Some("19")
         );
     }
 
@@ -1389,7 +1404,48 @@ mod tests {
         }
         assert_eq!(
             meta_get(&conn, "schema_version").unwrap().as_deref(),
-            Some("18")
+            Some("19")
+        );
+    }
+
+    #[test]
+    fn migrate_from_v18_adds_v19_imu_columns() {
+        // Stand up a v18 DB (everything but the IMU blobs) and confirm
+        // migrate adds them.
+        let conn = open();
+        for stmt in V1_SCHEMA {
+            conn.execute(stmt, []).unwrap();
+        }
+        for stmt in V6_NEW_TABLES {
+            conn.execute(stmt, []).unwrap();
+        }
+        for (name, typ) in V2_ROUTE_AGGREGATE_COLUMNS
+            .iter()
+            .chain(V3_ROUTE_CLOUD_COLUMNS.iter())
+            .chain(V4_ROUTE_TESSIE_COLUMNS.iter())
+            .chain(V6_ROUTE_TELEMETRY_COLUMNS.iter())
+            .chain(V7_ROUTE_TPMS_COLUMNS.iter())
+            .chain(V9_ROUTE_COLUMNS.iter())
+            .chain(V10_ROUTE_COLUMNS.iter())
+            .chain(V15_ROUTE_BOUNDARY_COLUMNS.iter())
+            .chain(V16_ROUTE_FLAG_COLUMNS.iter())
+            .chain(V17_ROUTE_SAFETY_COLUMNS.iter())
+            .chain(V18_ROUTE_SAFETY_DENOM_COLUMNS.iter())
+        {
+            conn.execute(&format!("ALTER TABLE routes ADD COLUMN {} {}", name, typ), [])
+                .unwrap();
+        }
+        meta_set(&conn, "schema_version", "18").unwrap();
+
+        migrate(&conn).unwrap();
+
+        let cols = list_route_columns(&conn).unwrap();
+        for (name, _) in V19_ROUTE_IMU_COLUMNS {
+            assert!(cols.contains(*name), "routes.{} missing after v19", name);
+        }
+        assert_eq!(
+            meta_get(&conn, "schema_version").unwrap().as_deref(),
+            Some("19")
         );
     }
 
@@ -1432,7 +1488,7 @@ mod tests {
         }
         assert_eq!(
             meta_get(&conn, "schema_version").unwrap().as_deref(),
-            Some("18")
+            Some("19")
         );
     }
 

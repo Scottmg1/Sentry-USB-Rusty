@@ -211,10 +211,16 @@ fn menger_curvature(p0: [f64; 2], p1: [f64; 2], p2: [f64; 2]) -> f64 {
 /// uniform dt over deduped points for DURATIONS, null-island pairs
 /// skipped, channel presence detected by length match.
 ///
-/// The braking DERIVATIVE alone uses a per-pair real-time estimate
-/// (`distance / avg speed`) instead of uniform dt — deduped stationary
-/// points stretch the uniform dt exactly in the clips that contain
-/// stops, which would halve derived decel right where braking happens.
+/// G-force source, in preference order:
+///   1. MEASURED — the SEI stream's IMU fields (Route.accel_x/accel_y,
+///      v19): real lateral/longitudinal acceleration, peak-preserved
+///      through GPS dedup. No pedal gate, no consecutive-sample gate,
+///      no speed floor beyond "moving" — the sensor is trusted.
+///   2. DERIVED — clips extracted before v19 (or firmware without the
+///      IMU fields): longitudinal from the speed derivative over a
+///      `distance / avg speed` pair-time estimate (uniform dt stretches
+///      when deduped stationary points collapse), lateral from GPS
+///      curvature ×v², with the noise gates those estimates need.
 pub fn compute_clip_safety(r: &Route) -> ClipSafety {
     let mut out = ClipSafety::default();
     let n = r.points.len();
@@ -243,13 +249,17 @@ pub fn compute_clip_safety(r: &Route) -> ClipSafety {
 
     let manual_at = |i: usize| -> bool { !has_ap || r.autopilot_states[i] == AUTOPILOT_OFF };
     let valid = |i: usize| -> bool { !calc::is_null_island(r.points[i][0], r.points[i][1]) };
+    // Measured IMU channel present (v19+ extraction, firmware emits it).
+    let has_imu = r.accel_x.len() == n && r.accel_y.len() == n;
 
     let mut in_brake_run = false;
+    let mut in_turn_run = false;
     let mut turn_streak: u32 = 0;
 
     for i in 1..n {
         if !valid(i) || !valid(i - 1) {
             in_brake_run = false;
+            in_turn_run = false;
             turn_streak = 0;
             continue;
         }
@@ -270,6 +280,51 @@ pub fn compute_clip_safety(r: &Route) -> ClipSafety {
             }
         }
 
+        // ── Measured path: real IMU acceleration per sample ──
+        if has_imu {
+            if manual_at(i) && vc.abs() >= MOVING_MPS {
+                // Sanity: |30 m/s²| ≈ 3g is beyond any road event.
+                let decel = -(r.accel_y[i] as f64);
+                let lateral = (r.accel_x[i] as f64).abs();
+                let braking_here = if decel.abs() < 30.0 && decel >= ANY_BRAKE_MPS2 {
+                    out.brake_any_ms += dt_ms as i64;
+                    if decel >= HARD_BRAKE_MPS2 {
+                        out.hard_brake_ms += dt_ms as i64;
+                        if !in_brake_run {
+                            out.hard_brake_events += 1;
+                        }
+                        true
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                };
+                in_brake_run = braking_here;
+
+                let turning_here = if lateral < 30.0 && lateral >= ANY_TURN_MPS2 {
+                    out.turn_any_ms += dt_ms as i64;
+                    if lateral >= AGGR_TURN_MPS2 {
+                        out.aggr_turn_ms += dt_ms as i64;
+                        if !in_turn_run {
+                            out.aggr_turn_events += 1;
+                        }
+                        true
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                };
+                in_turn_run = turning_here;
+            } else {
+                in_brake_run = false;
+                in_turn_run = false;
+            }
+            continue;
+        }
+
+        // ── Derived path (pre-v19 rows / no IMU fields) ──
         // Hard braking: decel between consecutive samples over estimated
         // real pair time, manual-only, pedal-confirmed when possible.
         let mut braking_here = false;
@@ -436,7 +491,7 @@ pub fn is_night_hour(hour: u32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{FlagRun, Route, AUTOPILOT_FSD, AUTOPILOT_OFF, FLAG_BRAKE};
+    use crate::types::{FlagRun, Route, AUTOPILOT_FSD, FLAG_BRAKE};
 
     /// Straight-line 61-point route (dt = 1000 ms) heading north at the
     /// given per-sample speeds (m/s). Point spacing follows the speeds so
@@ -584,6 +639,39 @@ mod tests {
         r.speeds = vec![5.0; n];
         let cs = compute_clip_safety(&r);
         assert_eq!(cs.aggr_turn_events, 0);
+    }
+
+    #[test]
+    fn measured_imu_overrides_derived_math() {
+        // Constant speed (derived path would find NOTHING), but the IMU
+        // channel carries a hard-brake spike and a cornering spike.
+        let mut r = route_with_speeds(vec![25.0; 61]);
+        let mut ax = vec![0.0_f32; 61];
+        let mut ay = vec![0.0_f32; 61];
+        for k in 30..33 {
+            ay[k] = -4.0; // 0.41 g deceleration
+        }
+        ay[40] = -1.5; // 0.15 g — denominator only
+        for k in 45..47 {
+            ax[k] = 5.0; // 0.51 g lateral
+        }
+        ax[50] = 2.5; // 0.25 g — denominator only
+        r.accel_x = ax;
+        r.accel_y = ay;
+
+        let cs = compute_clip_safety(&r);
+        assert_eq!(cs.hard_brake_events, 1, "IMU brake spike must flag");
+        assert!((2000..=4000).contains(&cs.hard_brake_ms), "got {}", cs.hard_brake_ms);
+        assert_eq!(cs.aggr_turn_events, 1, "single measured sample suffices — no streak gate");
+        assert!(cs.brake_any_ms > cs.hard_brake_ms);
+        assert!(cs.turn_any_ms > cs.aggr_turn_ms);
+
+        // Same clip under FSD: nothing counts.
+        r.autopilot_states = vec![AUTOPILOT_FSD; 61];
+        let cs = compute_clip_safety(&r);
+        assert_eq!(cs.hard_brake_events, 0);
+        assert_eq!(cs.aggr_turn_events, 0);
+        assert_eq!(cs.brake_any_ms, 0);
     }
 
     #[test]

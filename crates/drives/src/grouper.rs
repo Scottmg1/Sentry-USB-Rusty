@@ -1909,6 +1909,16 @@ fn split_clip_at_park_gaps(clip: &TimedRoute) -> Vec<ClipSegment> {
         } else {
             Vec::new()
         };
+        let seg_ax = if clip.route.accel_x.len() >= end_idx {
+            clip.route.accel_x[start_idx..end_idx].to_vec()
+        } else {
+            Vec::new()
+        };
+        let seg_ay = if clip.route.accel_y.len() >= end_idx {
+            clip.route.accel_y[start_idx..end_idx].to_vec()
+        } else {
+            Vec::new()
+        };
 
         let offset = chrono::Duration::seconds(seg.offset_secs);
 
@@ -1931,6 +1941,8 @@ fn split_clip_at_park_gaps(clip: &TimedRoute) -> Vec<ClipSegment> {
                     // them to the segment would corrupt the frame
                     // indexing.
                     flag_runs: clip.route.flag_runs.clone(),
+                    accel_x: seg_ax,
+                    accel_y: seg_ay,
                     source: clip.route.source.clone(),
                     external_signature: clip.route.external_signature.clone(),
                     tessie_autopilot_percent: clip.route.tessie_autopilot_percent,

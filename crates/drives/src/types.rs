@@ -153,6 +153,14 @@ pub struct Route {
     /// detector treats such drives as unverifiable, never as summon.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub flag_runs: Vec<FlagRun>,
+    /// IMU linear acceleration per deduped point, m/s² (see
+    /// [`ExtractedGps::accel_x`]). Empty on routes written before v19 or
+    /// on firmware without the SEI IMU fields — the Safety Score falls
+    /// back to speed/GPS-derived G-forces for those.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub accel_x: Vec<f32>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub accel_y: Vec<f32>,
     /// Provenance: "sei" (native dashcam) or "tessie" (imported from Tessie).
     /// Absent / null defaults to "sei" for backwards compatibility.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -588,6 +596,12 @@ pub struct ExtractedGps {
     pub raw_frame_count: u32,
     pub gear_runs: Vec<GearRun>,
     pub flag_runs: Vec<FlagRun>,
+    /// IMU linear acceleration per deduped point, m/s² (SEI proto fields
+    /// 14/15): X lateral (positive = rightward force), Y longitudinal
+    /// (negative = deceleration). Peak-|value| per collapsed GPS run.
+    /// Empty when the clip's firmware doesn't emit the IMU fields.
+    pub accel_x: Vec<f32>,
+    pub accel_y: Vec<f32>,
 }
 
 /// Processing progress status.
