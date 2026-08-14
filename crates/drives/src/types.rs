@@ -153,6 +153,14 @@ pub struct Route {
     /// detector treats such drives as unverifiable, never as summon.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub flag_runs: Vec<FlagRun>,
+    /// IMU linear acceleration per deduped point, m/s² (see
+    /// [`ExtractedGps::accel_x`]). Empty on routes written before v20 or
+    /// on firmware without the SEI IMU fields — the Safety Score falls
+    /// back to speed/GPS-derived G-forces for those.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub accel_x: Vec<f32>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub accel_y: Vec<f32>,
     /// Provenance: "sei" (native dashcam) or "tessie" (imported from Tessie).
     /// Absent / null defaults to "sei" for backwards compatibility.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -401,6 +409,38 @@ pub struct DriveSummary {
     pub external_signature: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tessie_autopilot_percent: Option<f64>,
+    /// v18 Safety Score totals for this drive (see `safety.rs`). All
+    /// `#[serde(default)]` so pre-v18 `drive_list_cache` JSON still
+    /// deserializes on the append fast path.
+    #[serde(default)]
+    pub safety_hard_brake_ms: i64,
+    #[serde(default)]
+    pub safety_hard_brake_events: i32,
+    #[serde(default)]
+    pub safety_aggr_turn_ms: i64,
+    #[serde(default)]
+    pub safety_aggr_turn_events: i32,
+    #[serde(default)]
+    pub safety_speeding_ms: i64,
+    #[serde(default)]
+    pub safety_moving_ms: i64,
+    #[serde(default)]
+    pub safety_manual_moving_ms: i64,
+    #[serde(default)]
+    pub safety_night_ms: i64,
+    #[serde(default)]
+    pub safety_night_mi: f64,
+    /// Night miles scaled by the per-hour risk curve (`night_weight`).
+    #[serde(default)]
+    pub safety_night_weighted_mi: f64,
+    #[serde(default)]
+    pub safety_brake_any_ms: i64,
+    #[serde(default)]
+    pub safety_turn_any_ms: i64,
+    /// This drive's own 0–100 score, `None` when the drive is too short,
+    /// imported, a summon session, or carries no SEI safety data.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub safety_score: Option<f64>,
 }
 
 // AggregateStats was removed with the Route-walking stats path — the
@@ -457,6 +497,75 @@ pub struct FsdAnalytics {
     pub assisted_percent: f64,
 }
 
+/// Daily Safety Score row for the analytics breakdown.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SafetyDayStats {
+    pub date: String,
+    pub day_name: String,
+    /// Day's own score, `None` when the day's mileage is below the
+    /// scoring floor.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub score: Option<f64>,
+    pub drives: i32,
+    pub distance_mi: f64,
+    pub distance_km: f64,
+    pub hard_brake_events: i32,
+    pub aggr_turn_events: i32,
+    pub speeding_ms: i64,
+    pub night_mi: f64,
+    /// Day-level time denominators/numerators so the UI can chart each
+    /// factor as a daily PROPORTION (mirroring the Tesla app's per-factor
+    /// daily graphs) instead of raw counts.
+    pub moving_ms: i64,
+    pub manual_moving_ms: i64,
+    pub hard_brake_ms: i64,
+    pub aggr_turn_ms: i64,
+    /// v19 conditional denominators (braking >0.1g / turning >0.2g time).
+    pub brake_any_ms: i64,
+    pub turn_any_ms: i64,
+}
+
+/// Safety Score analytics over a period. Totals are summed across the
+/// period's SEI drives and scored ONCE (mileage/time-weighted by
+/// construction) — never an average of per-drive scores.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SafetyAnalytics {
+    pub period: String,
+    pub period_start: String,
+    pub total_drives: i32,
+    /// Drives that carried safety data (SEI, non-summon, non-imported).
+    pub scored_drives: i32,
+    /// The window score + factor breakdown, `None` when the window has
+    /// too little scored driving.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub score: Option<crate::safety::SafetyScore>,
+    pub total_distance_mi: f64,
+    pub total_distance_km: f64,
+    pub moving_ms: i64,
+    pub manual_moving_ms: i64,
+    pub hard_brake_events: i32,
+    pub hard_brake_ms: i64,
+    pub aggr_turn_events: i32,
+    pub aggr_turn_ms: i64,
+    pub speeding_ms: i64,
+    pub brake_any_ms: i64,
+    pub turn_any_ms: i64,
+    pub night_mi: f64,
+    pub night_km: f64,
+    pub assisted_percent: f64,
+    /// ALL FSD/Autosteer disengagements in the period. Informational
+    /// only (weight 0 in the score): the SEI stream cannot distinguish
+    /// Tesla's "forced" disengagements (strikeouts) from normal driver
+    /// takeovers.
+    pub fsd_disengagements: i32,
+    pub daily: Vec<SafetyDayStats>,
+    pub best_day: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub best_day_score: Option<f64>,
+}
+
 /// Overview route for map display (downsampled points).
 ///
 /// `start_time` is included so the Drives list page can reliably
@@ -487,6 +596,12 @@ pub struct ExtractedGps {
     pub raw_frame_count: u32,
     pub gear_runs: Vec<GearRun>,
     pub flag_runs: Vec<FlagRun>,
+    /// IMU linear acceleration per deduped point, m/s² (SEI proto fields
+    /// 14/15): X lateral (positive = rightward force), Y longitudinal
+    /// (negative = deceleration). Peak-|value| per collapsed GPS run.
+    /// Empty when the clip's firmware doesn't emit the IMU fields.
+    pub accel_x: Vec<f32>,
+    pub accel_y: Vec<f32>,
 }
 
 /// Processing progress status.
@@ -586,6 +701,20 @@ pub struct RouteAggregates {
     /// GPS-derived speed, which jitters past walking pace on a car that
     /// barely moved (mirrors Sentry-Drive's `hasSeiSpeeds` gate).
     pub sei_speed_abs_max: Option<f64>,
+    /// v18 Safety Score scalars (see `safety.rs`). `None` = row not yet
+    /// backfilled; a clip without a usable SEI speed channel backfills to
+    /// `Some(0)` everywhere (no safety data, honestly recorded).
+    pub safety_hard_brake_ms: Option<i64>,
+    pub safety_hard_brake_events: Option<i64>,
+    pub safety_aggr_turn_ms: Option<i64>,
+    pub safety_aggr_turn_events: Option<i64>,
+    pub safety_speeding_ms: Option<i64>,
+    pub safety_moving_ms: Option<i64>,
+    pub safety_manual_moving_ms: Option<i64>,
+    /// v19 conditional-ratio denominators (see `safety.rs`): manual time
+    /// decelerating above 0.1g / turning above 0.2g.
+    pub safety_brake_any_ms: Option<i64>,
+    pub safety_turn_any_ms: Option<i64>,
 }
 
 /// Per-clip telemetry rollup populated from `telemetry_samples` rows

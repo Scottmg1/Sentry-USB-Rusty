@@ -9,6 +9,7 @@ pub mod extract;
 pub mod grouper;
 pub mod json_compat;
 pub mod processor;
+pub mod safety;
 pub mod schema;
 pub mod syncguard;
 pub mod types;

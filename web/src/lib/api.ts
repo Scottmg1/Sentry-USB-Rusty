@@ -157,6 +157,65 @@ export interface FSDAnalytics {
   assisted_percent: number
 }
 
+export interface SafetyScoreBreakdown {
+  score: number
+  hardBrakePct: number
+  aggrTurnPct: number
+  speedingPct: number
+  nightPct: number
+  hardBrakePenalty: number
+  aggrTurnPenalty: number
+  speedingPenalty: number
+  nightPenalty: number
+  fsdSharePct: number
+  fsdReliefPct: number
+}
+
+export interface SafetyDayStats {
+  date: string
+  dayName: string
+  score: number | null
+  drives: number
+  distanceMi: number
+  distanceKm: number
+  hardBrakeEvents: number
+  aggrTurnEvents: number
+  speedingMs: number
+  nightMi: number
+  movingMs: number
+  manualMovingMs: number
+  hardBrakeMs: number
+  aggrTurnMs: number
+  brakeAnyMs: number
+  turnAnyMs: number
+}
+
+export interface SafetyAnalytics {
+  period: string
+  periodStart: string
+  totalDrives: number
+  scoredDrives: number
+  score: SafetyScoreBreakdown | null
+  totalDistanceMi: number
+  totalDistanceKm: number
+  movingMs: number
+  manualMovingMs: number
+  hardBrakeEvents: number
+  hardBrakeMs: number
+  aggrTurnEvents: number
+  aggrTurnMs: number
+  speedingMs: number
+  brakeAnyMs: number
+  turnAnyMs: number
+  nightMi: number
+  nightKm: number
+  assistedPercent: number
+  fsdDisengagements: number
+  daily: SafetyDayStats[]
+  bestDay: string
+  bestDayScore: number | null
+}
+
 export interface TelemetryFrame {
   t: number
   lat: number
@@ -210,6 +269,8 @@ export const api = {
   getDriveStatus: () => request<DriveStatus>("/drives/status"),
   getFSDAnalytics: (period: string = "week") =>
     request<FSDAnalytics>(`/drives/fsd-analytics?period=${period}`),
+  getSafetyAnalytics: (period: string = "month") =>
+    request<SafetyAnalytics>(`/drives/safety-analytics?period=${period}`),
   getClipTelemetry: (clipPath: string, file: string) =>
     request<ClipTelemetry>(`/clips/telemetry?path=${encodeURIComponent(clipPath)}&file=${encodeURIComponent(file)}`),
 }

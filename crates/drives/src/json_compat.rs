@@ -489,6 +489,17 @@ fn insert_imported_route(
     } else {
         crate::blob::encode_flag_runs(Some(&r.flag_runs))
     };
+    // v20 IMU channels: NULL-for-absent, like flag_runs.
+    let axb = if r.accel_x.is_empty() {
+        None
+    } else {
+        crate::blob::encode_f32s(Some(&r.accel_x))
+    };
+    let ayb = if r.accel_y.is_empty() {
+        None
+    } else {
+        crate::blob::encode_f32s(Some(&r.accel_y))
+    };
 
     let first_lat: Option<f64> = r.points.first().map(|p| p[0]);
     let first_lon: Option<f64> = r.points.first().map(|p| p[1]);
@@ -525,7 +536,12 @@ fn insert_imported_route(
             location_name_start, location_name_end,
             fsd_pend_ms_end, park_ms_start, fsd_at_end, fsd_accel_pushes_early,
             ap_at_start,
-            flag_runs_blob, sei_speed_abs_max)
+            flag_runs_blob, sei_speed_abs_max,
+            safety_hard_brake_ms, safety_hard_brake_events,
+            safety_aggr_turn_ms, safety_aggr_turn_events,
+            safety_speeding_ms, safety_moving_ms, safety_manual_moving_ms,
+            safety_brake_any_ms, safety_turn_any_ms,
+            accel_x_blob, accel_y_blob)
          VALUES(
             ?1, ?2, ?3, ?4, ?5,
             NULL, NULL, ?6, ?7, ?8,
@@ -540,7 +556,9 @@ fn insert_imported_route(
             ?42, ?43, ?44, ?45,
             ?46, ?47, ?48, ?49,
             ?50, ?51, ?52, ?53, ?54,
-            ?55, ?56)
+            ?55, ?56,
+            ?57, ?58, ?59, ?60, ?61, ?62, ?63, ?64, ?65,
+            ?66, ?67)
          ON CONFLICT(file) DO UPDATE SET
             date_dir            = excluded.date_dir,
             point_count         = excluded.point_count,
@@ -596,7 +614,18 @@ fn insert_imported_route(
             fsd_accel_pushes_early = excluded.fsd_accel_pushes_early,
             ap_at_start         = excluded.ap_at_start,
             flag_runs_blob      = excluded.flag_runs_blob,
-            sei_speed_abs_max   = excluded.sei_speed_abs_max",
+            sei_speed_abs_max   = excluded.sei_speed_abs_max,
+            safety_hard_brake_ms     = excluded.safety_hard_brake_ms,
+            safety_hard_brake_events = excluded.safety_hard_brake_events,
+            safety_aggr_turn_ms      = excluded.safety_aggr_turn_ms,
+            safety_aggr_turn_events  = excluded.safety_aggr_turn_events,
+            safety_speeding_ms       = excluded.safety_speeding_ms,
+            safety_moving_ms         = excluded.safety_moving_ms,
+            safety_manual_moving_ms  = excluded.safety_manual_moving_ms,
+            safety_brake_any_ms      = excluded.safety_brake_any_ms,
+            safety_turn_any_ms       = excluded.safety_turn_any_ms,
+            accel_x_blob        = COALESCE(excluded.accel_x_blob, accel_x_blob),
+            accel_y_blob        = COALESCE(excluded.accel_y_blob, accel_y_blob)",
         params![
             norm, r.date, r.points.len() as i64, r.raw_park_count as i64, r.raw_frame_count as i64,
             a.distance_m, first_lat, first_lon,
@@ -616,6 +645,11 @@ fn insert_imported_route(
             a.fsd_pend_ms_end, a.park_ms_start, a.fsd_at_end as i64, a.fsd_accel_pushes_early,
             a.ap_at_start,
             fb, a.sei_speed_abs_max,
+            a.safety_hard_brake_ms, a.safety_hard_brake_events,
+            a.safety_aggr_turn_ms, a.safety_aggr_turn_events,
+            a.safety_speeding_ms, a.safety_moving_ms, a.safety_manual_moving_ms,
+            a.safety_brake_any_ms, a.safety_turn_any_ms,
+            axb, ayb,
         ],
     )?;
     Ok(())
@@ -855,7 +889,7 @@ impl<'a> serde::Serialize for RouteStream<'a> {
                         tire_fl_psi, tire_fr_psi, tire_rl_psi, tire_rr_psi,
                         odometer_mi_start, odometer_mi_end,
                         location_name_start, location_name_end,
-                        flag_runs_blob
+                        flag_runs_blob, accel_x_blob, accel_y_blob
                  FROM routes
                  ORDER BY file",
             )
@@ -1001,6 +1035,14 @@ impl<'a> serde::Serialize for RouteStream<'a> {
                 *self.error.borrow_mut() = Some(e);
                 S::Error::custom("col flag_runs_blob")
             })?;
+            let axb: Option<Vec<u8>> = row.get(28).map_err(|e| {
+                *self.error.borrow_mut() = Some(e);
+                S::Error::custom("col accel_x_blob")
+            })?;
+            let ayb: Option<Vec<u8>> = row.get(29).map_err(|e| {
+                *self.error.borrow_mut() = Some(e);
+                S::Error::custom("col accel_y_blob")
+            })?;
 
             let points: Vec<GpsPoint> = decode_points(pb.as_deref())
                 .map_err(|e| S::Error::custom(format!("decode points {}: {}", file, e)))?
@@ -1019,6 +1061,12 @@ impl<'a> serde::Serialize for RouteStream<'a> {
             let flag_runs: Vec<FlagRun> = decode_flag_runs(fb.as_deref())
                 .map_err(|e| S::Error::custom(format!("decode flag_runs {}: {}", file, e)))?
                 .unwrap_or_default();
+            let accel_x = decode_f32s(axb.as_deref())
+                .map_err(|e| S::Error::custom(format!("decode accel_x {}: {}", file, e)))?
+                .unwrap_or_default();
+            let accel_y = decode_f32s(ayb.as_deref())
+                .map_err(|e| S::Error::custom(format!("decode accel_y {}: {}", file, e)))?
+                .unwrap_or_default();
 
             let route = Route {
                 file,
@@ -1032,6 +1080,8 @@ impl<'a> serde::Serialize for RouteStream<'a> {
                 raw_frame_count,
                 gear_runs,
                 flag_runs,
+                accel_x,
+                accel_y,
                 source,
                 external_signature,
                 tessie_autopilot_percent,

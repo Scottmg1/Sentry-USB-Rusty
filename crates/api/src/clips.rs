@@ -213,7 +213,7 @@ fn clip_telemetry_blocking(
     // Use raw extraction (no dedup) — dedup destroys the frame-to-time
     // mapping needed for accurate telemetry overlay. GPS SEI at ~10fps means
     // ~595 frames per 60s clip, which is small enough to serve directly.
-    let (points, gear_states, ap_states, speeds, accel_positions, flag_bytes) =
+    let (points, gear_states, ap_states, speeds, accel_positions, flag_bytes, accel_x, accel_y) =
         match sentryusb_drives::extract::extract_gps_from_file_raw(cleaned_str.as_ref()) {
             Ok(raw) => raw,
             Err(e) => return crate::json_error(StatusCode::NOT_FOUND, &format!("could not read file: {}", e)),
@@ -243,6 +243,11 @@ fn clip_telemetry_blocking(
         // Bitfield: 1 left blinker, 2 right blinker, 4 brake, 8 accelerator.
         // Decoded per frame all along; it just never left the extractor.
         let flags = *flag_bytes.get(i).unwrap_or(&0);
+        // v20 IMU linear acceleration (m/s²): lateral / longitudinal —
+        // 0.0 on firmware without the SEI fields. Same shape Sentry-Six's
+        // G-force meter consumes.
+        let gx = *accel_x.get(i).unwrap_or(&0.0);
+        let gy = *accel_y.get(i).unwrap_or(&0.0);
         frames.push(serde_json::json!({
             "t": t,
             "lat": pt[0],
@@ -252,6 +257,8 @@ fn clip_telemetry_blocking(
             "autopilot": ap,
             "accel_pos": accel,
             "flags": flags,
+            "accel_mps2_x": gx,
+            "accel_mps2_y": gy,
         }));
     }
     let duration_sec = if video_duration > 0.0 { video_duration } else { 0.0 };

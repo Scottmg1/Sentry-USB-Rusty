@@ -672,6 +672,52 @@ pub async fn fsd_analytics(
     }
 }
 
+/// GET /api/drives/safety-analytics?period=day|week|month|all — Safety
+/// Score analytics. Always recomputed live through the BLOB-free
+/// `with_route_summaries` path (no meta cache — same cost profile as
+/// the FSD day/all branches, O(routes)).
+pub async fn safety_analytics(
+    State(state): State<AppState>,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let period = params.get("period").map(|s| s.as_str()).unwrap_or("month");
+    let period = match period {
+        "day" | "week" | "month" | "all" => period,
+        _ => "month",
+    };
+
+    let store = state.drives.store.clone();
+    let period_owned = period.to_string();
+    let result = tokio::task::spawn_blocking(move || {
+        store.with_route_summaries(|summaries| {
+            sentryusb_drives::grouper::safety_analytics_from_summaries_for_period(
+                summaries,
+                &period_owned,
+            )
+        })
+    })
+    .await;
+    match result {
+        Ok(Ok(analytics)) => match serde_json::to_value(&analytics) {
+            Ok(v) => (StatusCode::OK, Json(v)).into_response(),
+            Err(e) => crate::json_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("safety analytics serialize: {}", e),
+            )
+            .into_response(),
+        },
+        Ok(Err(e)) => {
+            crate::json_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()).into_response()
+        }
+        Err(e) => crate::json_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("safety analytics task: {}", e),
+        )
+        .into_response(),
+    }
+}
+
 /// GET /api/drives/data/download — download drive data as JSON.
 ///
 /// Streams the exported JSON directly from a tempfile to the HTTP

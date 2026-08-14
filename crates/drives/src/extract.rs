@@ -42,9 +42,18 @@ pub fn extract_gps_from_file(path: &str) -> Result<ExtractedGps> {
         return Ok(ExtractedGps::empty());
     }
 
-    let (points, gears, ap_states, speeds, accel_positions, flags) =
+    let (points, gears, ap_states, speeds, accel_positions, flags, accel_x, accel_y) =
         extract_from_mdat(&mut f, mdat_offset, mdat_size)?;
-    Ok(assemble_extracted(points, gears, ap_states, speeds, accel_positions, flags))
+    Ok(assemble_extracted(
+        points,
+        gears,
+        ap_states,
+        speeds,
+        accel_positions,
+        flags,
+        accel_x,
+        accel_y,
+    ))
 }
 
 /// Assemble the final [`ExtractedGps`] from raw per-frame arrays: raw
@@ -65,6 +74,8 @@ fn assemble_extracted(
     mut speeds: Vec<f32>,
     mut accel_positions: Vec<f32>,
     flags: Vec<u8>,
+    mut accel_x: Vec<f32>,
+    mut accel_y: Vec<f32>,
 ) -> ExtractedGps {
     // Raw-frame-space values BEFORE dedup — raw_frame_count is the true
     // number of SEI frames in the video, needed for correct t = index/FPS
@@ -74,8 +85,24 @@ fn assemble_extracted(
     let gear_runs = compute_gear_runs(&gears);
     let flag_runs = compute_flag_runs(&flags, Some(&speeds));
 
+    // An all-zero IMU channel means the firmware doesn't emit fields
+    // 14/15 — store nothing so consumers can distinguish "no channel"
+    // from "flat road, gentle drive".
+    if accel_x.iter().all(|&v| v == 0.0) && accel_y.iter().all(|&v| v == 0.0) {
+        accel_x = Vec::new();
+        accel_y = Vec::new();
+    }
+
     // Deduplicate consecutive identical GPS points
-    dedup_consecutive(&mut points, &mut gears, &mut ap_states, &mut speeds, &mut accel_positions);
+    dedup_consecutive(
+        &mut points,
+        &mut gears,
+        &mut ap_states,
+        &mut speeds,
+        &mut accel_positions,
+        &mut accel_x,
+        &mut accel_y,
+    );
 
     ExtractedGps {
         points,
@@ -87,6 +114,8 @@ fn assemble_extracted(
         raw_frame_count,
         gear_runs,
         flag_runs,
+        accel_x,
+        accel_y,
     }
 }
 
@@ -98,14 +127,12 @@ fn assemble_extracted(
 /// The trailing array is the per-frame flags byte (FLAG_BLINKER_LEFT etc.).
 /// It was previously dropped here, which is why the clip telemetry endpoint
 /// could not report turn signals or braking despite both being decoded.
-pub fn extract_gps_from_file_raw(
-    path: &str,
-) -> Result<(Vec<GpsPoint>, Vec<u8>, Vec<u8>, Vec<f32>, Vec<f32>, Vec<u8>)> {
+pub fn extract_gps_from_file_raw(path: &str) -> Result<RawFrameArrays> {
     let mut f = File::open(path)
         .with_context(|| format!("failed to open MP4 file: {}", path))?;
     let (mdat_offset, mdat_size) = find_mdat_box(&mut f)?;
     if mdat_size == 0 {
-        return Ok((Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new()));
+        return Ok(Default::default());
     }
     extract_from_mdat(&mut f, mdat_offset, mdat_size)
 }
@@ -170,8 +197,18 @@ fn find_mdat_box(f: &mut File) -> Result<(u64, u64)> {
 /// the buffer only when the skip lands outside it, so large video frames
 /// don't get pulled into memory.
 /// Raw per-frame arrays out of the SEI scan, 1:1 with SEI frames:
-/// (points, gears, autopilot states, speeds, accel positions, flag bytes).
-type RawFrameArrays = (Vec<GpsPoint>, Vec<u8>, Vec<u8>, Vec<f32>, Vec<f32>, Vec<u8>);
+/// (points, gears, autopilot states, speeds, accel positions, flag bytes,
+/// IMU lateral accel m/s², IMU longitudinal accel m/s²).
+type RawFrameArrays = (
+    Vec<GpsPoint>,
+    Vec<u8>,
+    Vec<u8>,
+    Vec<f32>,
+    Vec<f32>,
+    Vec<u8>,
+    Vec<f32>,
+    Vec<f32>,
+);
 
 fn extract_from_mdat(f: &mut File, offset: u64, size: u64) -> Result<RawFrameArrays> {
     use std::io::BufReader;
@@ -183,6 +220,8 @@ fn extract_from_mdat(f: &mut File, offset: u64, size: u64) -> Result<RawFrameArr
     let mut speeds = Vec::new();
     let mut accel_positions = Vec::new();
     let mut flags = Vec::new();
+    let mut accel_x = Vec::new();
+    let mut accel_y = Vec::new();
 
     let end = offset + size;
     let mut cursor = offset;
@@ -226,6 +265,8 @@ fn extract_from_mdat(f: &mut File, offset: u64, size: u64) -> Result<RawFrameArr
                     ap_states.push(frame.ap_state);
                     speeds.push(frame.speed);
                     accel_positions.push(frame.accel_pos);
+                    accel_x.push(frame.accel_x);
+                    accel_y.push(frame.accel_y);
                     flags.push(
                         (if frame.blinker_left { FLAG_BLINKER_LEFT } else { 0 })
                             | (if frame.blinker_right { FLAG_BLINKER_RIGHT } else { 0 })
@@ -246,7 +287,7 @@ fn extract_from_mdat(f: &mut File, offset: u64, size: u64) -> Result<RawFrameArr
         cursor += nal_size;
     }
 
-    Ok((points, gears, ap_states, speeds, accel_positions, flags))
+    Ok((points, gears, ap_states, speeds, accel_positions, flags, accel_x, accel_y))
 }
 
 /// One decoded SEI frame's worth of Tesla metadata.
@@ -260,6 +301,12 @@ struct SeiFrame {
     blinker_left: bool,
     blinker_right: bool,
     brake: bool,
+    /// IMU linear acceleration, m/s² (proto fields 14/15). X is lateral
+    /// (positive = rightward force), Y is longitudinal (negative =
+    /// deceleration) — the axis convention Sentry-Six's G-force meter
+    /// renders. proto3 omits zeros, so absent decodes as 0.0.
+    accel_x: f32,
+    accel_y: f32,
 }
 
 /// Finds the Tesla magic bytes (0x42...0x69) in a SEI NAL and decodes GPS + metadata.
@@ -312,6 +359,8 @@ fn strip_emulation_bytes(data: &[u8]) -> Vec<u8> {
 /// - blinker_on_left / blinker_on_right (fields 7/8, varint) — steady
 ///   switch state, not lamp flash
 /// - brake_applied (field 9, varint) — pedal-only
+/// - linear_acceleration_mps2_x / _y (fields 14/15, double) — IMU
+///   lateral / longitudinal acceleration (Sentry-Six dashcam.proto)
 ///
 /// proto3 omits false/zero fields from the wire, so absent simply
 /// decodes as off. Hand-parses protobuf wire format to avoid external
@@ -326,6 +375,8 @@ fn decode_sei_gps(data: &[u8]) -> Option<SeiFrame> {
     let mut blinker_left = false;
     let mut blinker_right = false;
     let mut brake = false;
+    let mut accel_x: f32 = 0.0;
+    let mut accel_y: f32 = 0.0;
 
     let mut i = 0;
     while i < data.len() {
@@ -373,6 +424,10 @@ fn decode_sei_gps(data: &[u8]) -> Option<SeiFrame> {
                     lat = val;
                 } else if field_num == 12 {
                     lon = val;
+                } else if field_num == 14 {
+                    accel_x = val as f32;
+                } else if field_num == 15 {
+                    accel_y = val as f32;
                 }
             }
             2 => {
@@ -411,6 +466,9 @@ fn decode_sei_gps(data: &[u8]) -> Option<SeiFrame> {
         && lon.abs() <= 180.0;
 
     if ok {
+        // NaN/inf IMU samples (never observed, but the field is a raw
+        // double) degrade to 0.0 = "no data" rather than poisoning math.
+        let clean = |v: f32| if v.is_finite() { v } else { 0.0 };
         Some(SeiFrame {
             lat,
             lon,
@@ -421,6 +479,8 @@ fn decode_sei_gps(data: &[u8]) -> Option<SeiFrame> {
             blinker_left,
             blinker_right,
             brake,
+            accel_x: clean(accel_x),
+            accel_y: clean(accel_y),
         })
     } else {
         None
@@ -445,16 +505,27 @@ fn decode_varint(data: &[u8]) -> (u64, usize) {
 }
 
 /// Deduplicate consecutive identical GPS points (same lat/lon).
+///
+/// The IMU accel arrays (when present) keep the PEAK |value| of each
+/// collapsed run instead of the first frame's sample: GPS updates ~1 Hz
+/// while SEI frames arrive at video rate, so a sub-second braking or
+/// cornering spike between fixes would otherwise vanish. This biases
+/// "time above threshold" up slightly for one-frame spikes — acceptable
+/// against silently losing the very events the Safety Score exists to
+/// catch.
 fn dedup_consecutive(
     points: &mut Vec<GpsPoint>,
     gears: &mut Vec<u8>,
     ap_states: &mut Vec<u8>,
     speeds: &mut Vec<f32>,
     accel_positions: &mut Vec<f32>,
+    accel_x: &mut Vec<f32>,
+    accel_y: &mut Vec<f32>,
 ) {
     if points.len() <= 1 {
         return;
     }
+    let has_imu = accel_x.len() == points.len() && accel_y.len() == points.len();
 
     let mut write = 0;
     for read in 1..points.len() {
@@ -465,6 +536,19 @@ fn dedup_consecutive(
             ap_states[write] = ap_states[read];
             speeds[write] = speeds[read];
             accel_positions[write] = accel_positions[read];
+            if has_imu {
+                accel_x[write] = accel_x[read];
+                accel_y[write] = accel_y[read];
+            }
+        } else if has_imu {
+            // Collapsed frame: fold its IMU sample into the retained
+            // point, keeping the strongest magnitude (sign preserved).
+            if accel_x[read].abs() > accel_x[write].abs() {
+                accel_x[write] = accel_x[read];
+            }
+            if accel_y[read].abs() > accel_y[write].abs() {
+                accel_y[write] = accel_y[read];
+            }
         }
     }
     let new_len = write + 1;
@@ -473,6 +557,10 @@ fn dedup_consecutive(
     ap_states.truncate(new_len);
     speeds.truncate(new_len);
     accel_positions.truncate(new_len);
+    if has_imu {
+        accel_x.truncate(new_len);
+        accel_y.truncate(new_len);
+    }
 }
 
 /// Compute contiguous gear runs from a gear state array.
@@ -574,6 +662,8 @@ impl ExtractedGps {
             raw_frame_count: 0,
             gear_runs: Vec::new(),
             flag_runs: Vec::new(),
+            accel_x: Vec::new(),
+            accel_y: Vec::new(),
         }
     }
 }
@@ -617,8 +707,22 @@ mod tests {
         let mut ap = vec![0, 0, 1, 1, 0];
         let mut speeds = vec![10.0, 10.0, 20.0, 20.0, 0.0];
         let mut accel = vec![0.5, 0.5, 0.6, 0.6, 0.0];
+        // IMU: a strong spike on a collapsed frame must survive into the
+        // retained point (peak-preserving fold), sign intact.
+        let mut ax = vec![0.1, -2.5, 0.2, 0.3, 0.0];
+        let mut ay = vec![-0.5, -4.0, 0.1, -0.2, 0.0];
 
-        dedup_consecutive(&mut points, &mut gears, &mut ap, &mut speeds, &mut accel);
+        dedup_consecutive(
+            &mut points,
+            &mut gears,
+            &mut ap,
+            &mut speeds,
+            &mut accel,
+            &mut ax,
+            &mut ay,
+        );
+        assert_eq!(ax, vec![-2.5, 0.3, 0.0]);
+        assert_eq!(ay, vec![-4.0, -0.2, 0.0]);
 
         assert_eq!(points.len(), 3);
         assert_eq!(points[0], [1.0, 2.0]);
@@ -720,6 +824,8 @@ mod tests {
             speeds,
             vec![0.0; n],
             flags,
+            Vec::new(),
+            Vec::new(),
         );
 
         assert_eq!(out.raw_frame_count, 553);
