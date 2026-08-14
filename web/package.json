@@ -8,6 +8,7 @@
     "build": "tsc -b && vite build",
     "lint": "eslint .",
     "icons": "node scripts/icons/generate.mjs",
+    "test": "node --experimental-strip-types --test src/lib/bleHealth.test.ts src/lib/charge-format.test.ts",
     "test:ble-health": "node --experimental-strip-types --test src/lib/bleHealth.test.ts",
     "preview": "vite preview"
   },

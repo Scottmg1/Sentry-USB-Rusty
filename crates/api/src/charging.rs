@@ -884,6 +884,10 @@ struct CurrentCharge {
     soc: Option<f64>,
     limit_soc: Option<i64>,
     power_kw: Option<i64>,
+    current_a: Option<i64>,
+    voltage_v: Option<i64>,
+    rate_mph: Option<f64>,
+    energy_added_kwh: Option<f64>,
     minutes_to_full: Option<i64>,
     range_mi: Option<f64>,
 }
@@ -895,8 +899,45 @@ impl CurrentCharge {
             soc: None,
             limit_soc: None,
             power_kw: None,
+            current_a: None,
+            voltage_v: None,
+            rate_mph: None,
+            energy_added_kwh: None,
             minutes_to_full: None,
             range_mi: None,
+        }
+    }
+
+    fn from_latest(latest: Option<LatestCharge>, now: i64) -> Self {
+        let Some(l) = latest else {
+            return Self::idle();
+        };
+        let age = now - l.ts;
+        let charging = match phase_is_active(l.charging_state.as_deref()) {
+            Some(true) => age <= CHARGE_STALE_SECS,
+            Some(false) => false,
+            None => age <= 600 && is_charging(l.power_kw, l.rate_mph),
+        };
+        let soc = if age <= CHARGE_STALE_SECS { l.soc } else { None };
+        Self {
+            charging,
+            soc,
+            limit_soc: if charging { l.limit_soc } else { None },
+            power_kw: if charging { l.power_kw } else { None },
+            current_a: if charging {
+                display_current_a(l.power_kw, l.voltage_v, l.current_a)
+            } else {
+                None
+            },
+            voltage_v: if charging { l.voltage_v } else { None },
+            rate_mph: if charging { l.rate_mph } else { None },
+            energy_added_kwh: if charging { l.energy_added_kwh } else { None },
+            minutes_to_full: if charging { l.minutes_to_full } else { None },
+            range_mi: if charging {
+                l.range_mi
+            } else {
+                l.range_mi.filter(|_| soc.is_some())
+            },
         }
     }
 }
@@ -908,7 +949,10 @@ struct LatestCharge {
     soc: Option<f64>,
     limit_soc: Option<i64>,
     power_kw: Option<i64>,
+    current_a: Option<i64>,
+    voltage_v: Option<i64>,
     rate_mph: Option<f64>,
+    energy_added_kwh: Option<f64>,
     minutes_to_full: Option<i64>,
     range_mi: Option<f64>,
     charging_state: Option<String>,
@@ -940,7 +984,8 @@ pub async fn current_charging(
         store.with_read_conn(|conn| {
             conn.query_row(
                 "SELECT ts, battery_pct, charge_limit_soc, charger_power_kw, \
-                        charge_rate_mph, charge_minutes_to_full, battery_range_mi, \
+                        charger_actual_current_a, charger_voltage_v, charge_rate_mph, \
+                        charge_energy_added_kwh, charge_minutes_to_full, battery_range_mi, \
                         charging_state \
                  FROM telemetry_samples \
                  WHERE charging_state IS NOT NULL \
@@ -954,10 +999,13 @@ pub async fn current_charging(
                         soc: r.get(1)?,
                         limit_soc: r.get(2)?,
                         power_kw: r.get(3)?,
-                        rate_mph: r.get(4)?,
-                        minutes_to_full: r.get(5)?,
-                        range_mi: r.get(6)?,
-                        charging_state: r.get(7)?,
+                        current_a: r.get(4)?,
+                        voltage_v: r.get(5)?,
+                        rate_mph: r.get(6)?,
+                        energy_added_kwh: r.get(7)?,
+                        minutes_to_full: r.get(8)?,
+                        range_mi: r.get(9)?,
+                        charging_state: r.get(10)?,
                     })
                 },
             )
@@ -970,42 +1018,11 @@ pub async fn current_charging(
         .await
         .flatten();
 
-        let cur = match latest {
-            Some(l) => {
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_secs() as i64)
-                    .unwrap_or(l.ts);
-                let age = now - l.ts;
-                let charging = match phase_is_active(l.charging_state.as_deref()) {
-                    // Phase says actively charging — hold the banner the whole
-                    // charge; only the 24h backstop can drop it.
-                    Some(true) => age <= CHARGE_STALE_SECS,
-                    // Phase says stopped/complete/disconnected — done, no banner.
-                    Some(false) => false,
-                    // Pre-v14 row with no phase — old heuristic.
-                    None => age <= 600 && is_charging(l.power_kw, l.rate_mph),
-                };
-                // Battery % is shown for the persistent car-status banner as
-                // long as the data is reasonably fresh (<= 24h), so the banner
-                // doesn't vanish the moment a charge ends. The charging-only
-                // fields are present only while actively charging.
-                let soc = if age <= CHARGE_STALE_SECS { l.soc } else { None };
-                CurrentCharge {
-                    charging,
-                    soc,
-                    limit_soc: if charging { l.limit_soc } else { None },
-                    power_kw: if charging { l.power_kw } else { None },
-                    minutes_to_full: if charging { l.minutes_to_full } else { None },
-                    range_mi: if charging {
-                        l.range_mi
-                    } else {
-                        l.range_mi.filter(|_| soc.is_some())
-                    },
-                }
-            }
-            None => CurrentCharge::idle(),
-        };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or_default();
+    let cur = CurrentCharge::from_latest(latest, now);
     (StatusCode::OK, Json(serde_json::to_value(cur).unwrap()))
 }
 
@@ -1414,6 +1431,62 @@ mod tests {
             assert!(jp.contains(&format!("\"{key}\"")), "point must emit {key}: {jp}");
         }
         assert!(!jp.contains("\"power_kw\""), "point must NOT emit snake_case: {jp}");
+    }
+
+    #[test]
+    fn current_charge_wire_shape_includes_live_electrical_details() {
+        let value = serde_json::to_value(CurrentCharge::idle()).unwrap();
+        for key in ["currentA", "voltageV", "rateMph", "energyAddedKwh"] {
+            assert_eq!(
+                value.get(key),
+                Some(&serde_json::Value::Null),
+                "idle current-charge response must include nullable {key}: {value}",
+            );
+        }
+    }
+
+    #[test]
+    fn active_current_charge_carries_latest_live_details() {
+        let latest = LatestCharge {
+            ts: 1_000,
+            soc: Some(64.0),
+            limit_soc: Some(80),
+            power_kw: Some(7),
+            current_a: Some(32),
+            voltage_v: Some(240),
+            rate_mph: Some(28.5),
+            energy_added_kwh: Some(12.3),
+            minutes_to_full: Some(75),
+            range_mi: Some(172.0),
+            charging_state: Some("charging".into()),
+        };
+
+        let value = serde_json::to_value(CurrentCharge::from_latest(Some(latest), 1_060)).unwrap();
+        assert_eq!(value["charging"], true);
+        assert_eq!(value["currentA"], 32);
+        assert_eq!(value["voltageV"], 240);
+        assert_eq!(value["rateMph"], 28.5);
+        assert_eq!(value["energyAddedKwh"], 12.3);
+    }
+
+    #[test]
+    fn active_dc_charge_derives_current_when_tesla_reports_zero_amps() {
+        let latest = LatestCharge {
+            ts: 1_000,
+            soc: Some(64.0),
+            limit_soc: Some(80),
+            power_kw: Some(158),
+            current_a: Some(0),
+            voltage_v: Some(389),
+            rate_mph: Some(600.0),
+            energy_added_kwh: Some(12.3),
+            minutes_to_full: Some(20),
+            range_mi: Some(172.0),
+            charging_state: Some("charging".into()),
+        };
+
+        let value = serde_json::to_value(CurrentCharge::from_latest(Some(latest), 1_060)).unwrap();
+        assert_eq!(value["currentA"], 406);
     }
 
     // ── Cost + efficiency ──────────────────────────────────────────────

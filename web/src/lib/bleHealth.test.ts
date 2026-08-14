@@ -2,6 +2,7 @@ import assert from "node:assert/strict"
 import test from "node:test"
 
 import { presentBleHealth, type BleHealth } from "./bleHealth.ts"
+import * as bleHealthModule from "./bleHealth.ts"
 
 const repairRequired: BleHealth = {
   severity: "red",
@@ -37,4 +38,40 @@ test("fresh fallback remains connected", () => {
   const got = presentBleHealth(undefined, 15)
   assert.equal(got.severity, "green")
   assert.equal(got.code, "connected")
+})
+
+test("fresh stationary telemetry is labeled Idle, never Asleep", () => {
+  const deriveVehicleStatusLabel = (
+    bleHealthModule as typeof bleHealthModule & {
+      deriveVehicleStatusLabel: (
+        health: ReturnType<typeof presentBleHealth>,
+        isDriving: boolean,
+        charging: boolean,
+      ) => string
+    }
+  ).deriveVehicleStatusLabel
+
+  const connected = presentBleHealth(undefined, 15)
+  assert.equal(deriveVehicleStatusLabel(connected, false, false), "Idle")
+})
+
+test("charging is shown only while BLE health is green", () => {
+  const deriveVehicleStatusLabel = (
+    bleHealthModule as typeof bleHealthModule & {
+      deriveVehicleStatusLabel: (
+        health: ReturnType<typeof presentBleHealth>,
+        isDriving: boolean,
+        charging: boolean,
+      ) => string
+    }
+  ).deriveVehicleStatusLabel
+
+  assert.equal(
+    deriveVehicleStatusLabel(presentBleHealth(undefined, 15), false, true),
+    "Charging",
+  )
+  assert.equal(
+    deriveVehicleStatusLabel(presentBleHealth(undefined, 86_400), false, true),
+    "Telemetry idle",
+  )
 })

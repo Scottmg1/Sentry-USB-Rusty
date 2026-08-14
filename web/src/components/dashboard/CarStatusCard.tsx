@@ -14,8 +14,19 @@ import {
 import { BatteryLevelIcon } from "@/components/drives/BatteryLevelIcon"
 import type { TireHistoryResponse } from "./TirePressureCard"
 import type { CurrentCharge } from "@/types/charging"
-import { fmtRangeUnit, fmtToFull } from "@/lib/charge-format"
-import { presentBleHealth, type BleHealth } from "@/lib/bleHealth"
+import {
+  fmtChargeRateUnit,
+  fmtCurrent,
+  fmtEnergy,
+  fmtRangeUnit,
+  fmtToFull,
+  fmtVoltage,
+} from "@/lib/charge-format"
+import {
+  deriveVehicleStatusLabel,
+  presentBleHealth,
+  type BleHealth,
+} from "@/lib/bleHealth"
 
 // Lazy-load the chart only when the user expands the Tires chip —
 // recharts (380 KB) stays out of the dashboard's initial bundle for
@@ -190,11 +201,12 @@ export function CarStatusCard({
     sample?.seconds_ago ?? null,
   )
   const showHealthWarning = healthPresentation.severity !== "green"
-  const statusLabel = showHealthWarning
-    ? healthPresentation.label
-    : isDriving
-      ? "Driving"
-      : "Parked"
+  const charging = !!currentCharge?.charging
+  const statusLabel = deriveVehicleStatusLabel(
+    healthPresentation,
+    isDriving,
+    charging,
+  )
   const statusHalo = healthPresentation.severity === "red"
     ? "halo-red"
     : healthPresentation.severity === "yellow"
@@ -223,7 +235,6 @@ export function CarStatusCard({
   const haveTireData =
     !!tireHistory && tireHistory.points.length > 0 && tireStatus.kind !== "none"
 
-  const charging = !!currentCharge?.charging
   // Prefer the live charge SoC over the last BLE sample's battery_pct.
   const batterySoc = currentCharge?.soc ?? sample?.battery_pct
   const haveChargeDetail =
@@ -364,6 +375,24 @@ export function CarStatusCard({
             )}
             {charging && currentCharge.powerKw != null && (
               <MiniStat label="Power" value={`${currentCharge.powerKw} kW`} />
+            )}
+            {charging && currentCharge.currentA != null && (
+              <MiniStat label="Current" value={fmtCurrent(currentCharge.currentA)} />
+            )}
+            {charging && currentCharge.voltageV != null && (
+              <MiniStat label="Voltage" value={fmtVoltage(currentCharge.voltageV)} />
+            )}
+            {charging && currentCharge.rateMph != null && (
+              <MiniStat
+                label="Charge rate"
+                value={fmtChargeRateUnit(currentCharge.rateMph, metric)}
+              />
+            )}
+            {charging && currentCharge.energyAddedKwh != null && (
+              <MiniStat
+                label="Energy added"
+                value={fmtEnergy(currentCharge.energyAddedKwh)}
+              />
             )}
             {charging && currentCharge.limitSoc != null && (
               <MiniStat label="Charge limit" value={`${currentCharge.limitSoc}%`} />

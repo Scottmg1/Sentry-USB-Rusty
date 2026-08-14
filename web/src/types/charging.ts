@@ -70,6 +70,10 @@ export interface CurrentCharge {
   soc: number | null
   limitSoc: number | null
   powerKw: number | null
+  currentA: number | null
+  voltageV: number | null
+  rateMph: number | null
+  energyAddedKwh: number | null
   minutesToFull: number | null
   rangeMi: number | null
 }

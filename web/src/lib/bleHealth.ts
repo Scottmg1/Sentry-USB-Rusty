@@ -87,3 +87,19 @@ export function presentBleHealth(
     repairRequired: false,
   }
 }
+
+/**
+ * Turn confirmed BLE health plus live motion/charge signals into the
+ * dashboard's vehicle-state label. A non-green health state always wins:
+ * missing power or stale telemetry is not evidence that the car is asleep.
+ */
+export function deriveVehicleStatusLabel(
+  health: BleHealthPresentation,
+  isDriving: boolean,
+  charging: boolean,
+): string {
+  if (health.severity !== "green") return health.label
+  if (charging) return "Charging"
+  if (isDriving) return "Driving"
+  return "Idle"
+}
