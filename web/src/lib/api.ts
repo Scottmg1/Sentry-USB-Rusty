@@ -1,10 +1,5 @@
 const API_BASE = "/api"
 
-// Backend API base URL for resolving relative attachment/media URLs.
-// The Pi proxies API requests locally, but media assets are served directly
-// by the backend. Override via Vite env for staging/dev.
-export const BACKEND_BASE_URL = import.meta.env.VITE_SENTRY_API_URL || "https://api.sentry-six.com"
-
 async function request<T>(path: string, options?: RequestInit): Promise<T> {
   const res = await fetch(`${API_BASE}${path}`, {
     headers: {
@@ -28,12 +23,7 @@ export interface PiStatus {
   free_space: string
   uptime: string
   drives_active: string
-  /**
-   * Host-link state from /sys/class/udc ("configured" = the car is
-   * actually enumerated and talking). drives_active only reflects the
-   * configfs binding — the Pi's intent to present — and stays "yes"
-   * through a dead link. Present only on backends ≥ v3.13.4.
-   */
+  /** UDC host-link state; unlike drives_active, "configured" confirms enumeration. */
   udc_state?: string
   /** Seconds since the car last wrote to cam_disk.bin, -1 when unknown. */
   cam_last_write_secs?: number
@@ -44,7 +34,7 @@ export interface PiStatus {
   ether_speed: string
   fan_speed: string
   sbc_model?: string
-  /** Negative integer parsed from iwconfig "Signal level=-48 dBm". Present only on backends ≥ v2.7.4. */
+  /** Negative dBm value parsed from iwconfig. */
   wifi_signal_dbm?: number
   wifi_rx_bps?: number
   wifi_tx_bps?: number
@@ -162,6 +152,65 @@ export interface FSDAnalytics {
   assisted_percent: number
 }
 
+export interface SafetyScoreBreakdown {
+  score: number
+  hardBrakePct: number
+  aggrTurnPct: number
+  speedingPct: number
+  nightPct: number
+  hardBrakePenalty: number
+  aggrTurnPenalty: number
+  speedingPenalty: number
+  nightPenalty: number
+  fsdSharePct: number
+  fsdReliefPct: number
+}
+
+export interface SafetyDayStats {
+  date: string
+  dayName: string
+  score: number | null
+  drives: number
+  distanceMi: number
+  distanceKm: number
+  hardBrakeEvents: number
+  aggrTurnEvents: number
+  speedingMs: number
+  nightMi: number
+  movingMs: number
+  manualMovingMs: number
+  hardBrakeMs: number
+  aggrTurnMs: number
+  brakeAnyMs: number
+  turnAnyMs: number
+}
+
+export interface SafetyAnalytics {
+  period: string
+  periodStart: string
+  totalDrives: number
+  scoredDrives: number
+  score: SafetyScoreBreakdown | null
+  totalDistanceMi: number
+  totalDistanceKm: number
+  movingMs: number
+  manualMovingMs: number
+  hardBrakeEvents: number
+  hardBrakeMs: number
+  aggrTurnEvents: number
+  aggrTurnMs: number
+  speedingMs: number
+  brakeAnyMs: number
+  turnAnyMs: number
+  nightMi: number
+  nightKm: number
+  assistedPercent: number
+  fsdDisengagements: number
+  daily: SafetyDayStats[]
+  bestDay: string
+  bestDayScore: number | null
+}
+
 export interface TelemetryFrame {
   t: number
   lat: number
@@ -180,13 +229,8 @@ export interface ClipTelemetry {
 }
 
 export const api = {
-  // Travel Mode (secret menu): keep the USB gadget connected to the car while
-  // still archiving on the road. Persisted in sentryusb.conf: the master
-  // toggle plus an optional "half snapshots" cadence flag (snapshot+archive
-  // every SNAPSHOT_INTERVAL/2 instead of the full interval while traveling)
-  // and a "fast retry" flag (retry ~every minute after a failed archive —
-  // for intermittent uplinks like Starlink). Omitted optional flags leave
-  // the persisted values untouched.
+  // Travel Mode keeps the USB gadget connected while archiving. Omitted
+  // optional cadence and retry flags leave their persisted values unchanged.
   getTravelMode: () =>
     request<{
       enabled: boolean
@@ -215,6 +259,8 @@ export const api = {
   getDriveStatus: () => request<DriveStatus>("/drives/status"),
   getFSDAnalytics: (period: string = "week") =>
     request<FSDAnalytics>(`/drives/fsd-analytics?period=${period}`),
+  getSafetyAnalytics: (period: string = "month") =>
+    request<SafetyAnalytics>(`/drives/safety-analytics?period=${period}`),
   getClipTelemetry: (clipPath: string, file: string) =>
     request<ClipTelemetry>(`/clips/telemetry?path=${encodeURIComponent(clipPath)}&file=${encodeURIComponent(file)}`),
 }

@@ -11,12 +11,9 @@ pub struct PendingRoute {
 }
 
 pub fn select_pending(store: &DriveStore, limit: i64) -> Result<Vec<PendingRoute>> {
-    let files: Vec<(String, Option<String>)> = store.with_locked_conn(|conn| -> Result<_> {
-        // `start_ts` is always NULL (insert_or_update_route binds it NULL),
-        // so it can't actually order anything — without a tiebreaker the
-        // upload order is undefined. `file ASC` makes it deterministic, and
-        // since Tesla clip paths embed the timestamp it's also chronological
-        // (oldest-first), which is the intent. Matches `pending_queue`.
+    let files: Vec<(String, Option<String>)> = store.with_read_conn(|conn| -> Result<_> {
+        // `start_ts` is always NULL. File order is deterministic and Tesla
+        // clip paths make it chronological, matching `pending_queue`.
         let mut stmt = conn.prepare(
             "SELECT file, cloud_route_id FROM routes \
              WHERE cloud_uploaded_at IS NULL \
@@ -62,15 +59,13 @@ pub fn select_pending(store: &DriveStore, limit: i64) -> Result<Vec<PendingRoute
     Ok(out)
 }
 
-/// Temperature samples inside a clip's 60s window, for the cloud blob.
-/// Empty when the filename has no parseable timestamp, BLE telemetry
-/// never ran, or no sample landed in the window.
+/// Temperature samples in the clip's 60-second window, if available.
 pub fn temp_samples_for_route(store: &DriveStore, file: &str) -> Vec<TempSample> {
     let Some((start, end)) = window_for_route_file(file) else {
         return Vec::new();
     };
     store
-        .with_locked_conn(|conn| -> Result<Vec<TempSample>> {
+        .with_read_conn(|conn| -> Result<Vec<TempSample>> {
             let mut stmt = conn.prepare_cached(
                 "SELECT ts, interior_temp_c, exterior_temp_c FROM telemetry_samples \
                  WHERE ts BETWEEN ?1 AND ?2 \
@@ -125,16 +120,8 @@ pub fn mark_permanent_skip(store: &DriveStore, file: &str) -> Result<()> {
     })
 }
 
-/// Clear `cloud_uploaded_at` for routes whose BLE telemetry rollup is
-/// populated locally but was uploaded before the BLE columns were added
-/// to the encrypted blob. The next sweep re-encrypts and re-uploads them.
-/// Returns the number of rows reset.
-///
-/// `battery_pct_start` is the canonical signal because it's the most
-/// reliably populated BLE column (every clip whose 60s window crossed at
-/// least one sample has it). Skip-sentinel rows (`= -1`) are never
-/// reset — those were rejected by the cloud for size and re-uploading
-/// won't help.
+/// Queues previously uploaded routes for BLE-field backfill.
+/// `battery_pct_start` is the availability signal; size-rejected rows remain skipped.
 pub fn backfill_ble_reupload(store: &DriveStore) -> Result<i64> {
     store.with_locked_conn(|conn| -> Result<_> {
         let changed = conn.execute(
@@ -150,7 +137,7 @@ pub fn backfill_ble_reupload(store: &DriveStore) -> Result<i64> {
 
 pub fn pending_count(store: &DriveStore) -> i64 {
     store
-        .with_locked_conn(|conn| {
+        .with_read_conn(|conn| {
             conn.query_row(
                 "SELECT count(*) FROM routes \
                  WHERE cloud_uploaded_at IS NULL",
@@ -164,7 +151,7 @@ pub fn pending_count(store: &DriveStore) -> i64 {
 /// Returns `(uploaded_count, last_upload_unix_seconds)`. The `> 0` filter
 /// excludes the [`PERMANENT_SKIP_SENTINEL`] (`-1`) value.
 pub fn upload_summary(store: &DriveStore) -> (i64, Option<i64>) {
-    store.with_locked_conn(|conn| {
+    store.with_read_conn(|conn| {
         conn.query_row(
             "SELECT count(*), max(cloud_uploaded_at) FROM routes \
              WHERE cloud_uploaded_at > 0",
@@ -187,7 +174,7 @@ pub struct QueueEntry {
 }
 
 pub fn pending_queue(store: &DriveStore, limit: i64) -> Result<Vec<QueueEntry>> {
-    store.with_locked_conn(|conn| -> Result<_> {
+    store.with_read_conn(|conn| -> Result<_> {
         let mut stmt = conn.prepare(
             "SELECT file, date_dir, start_ts, \
                     coalesce(length(points_blob), 0) + \

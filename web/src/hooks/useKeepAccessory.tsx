@@ -8,11 +8,7 @@ const DEFAULT: KeepAccessoryValues = {
   radiusM: 120,
 }
 
-/**
- * Settings-side state for the keep-accessory feature. Loads the persisted
- * config, debounces writes (PUT triggers a RO-root remount on the Pi, so we
- * don't want one per keystroke), and exposes the GPS fetch + manual override.
- */
+/** Keep-accessory state; writes are debounced because each PUT remounts root. */
 export function useKeepAccessory() {
   const [values, setValues] = useState<KeepAccessoryValues>(DEFAULT)
   const [loaded, setLoaded] = useState(false)

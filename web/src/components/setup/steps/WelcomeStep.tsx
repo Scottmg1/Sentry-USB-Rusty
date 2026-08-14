@@ -1,5 +1,17 @@
 import { useCallback, useEffect, useRef, useState } from "react"
-import { Shield, Upload, FileText, CheckCircle, X, ChevronDown, ChevronUp, RotateCcw, Loader2, Archive, HardDriveUpload } from "lucide-react"
+import {
+  ArchiveIcon,
+  CheckCircleIcon,
+  CloseIcon,
+  DescriptionIcon,
+  ExpandLessIcon,
+  ExpandMoreIcon,
+  ProgressActivityIcon,
+  RotateLeftIcon,
+  ShieldIcon,
+  UploadFileIcon,
+  UploadIcon,
+} from "@/components/icons"
 import type { StepProps } from "../SetupWizard"
 import { cn } from "@/lib/utils"
 
@@ -21,7 +33,7 @@ const CONFIG_GROUPS: Record<string, { label: string; keys: string[] }> = {
     keys: [
       "ARCHIVE_SYSTEM", "archiveserver", "sharename", "shareuser",
       "sharepassword", "sharepath", "RCLONE_DRIVE", "RCLONE_PATH",
-      "RSYNC_USER", "RSYNC_SERVER", "RSYNC_PATH",
+      "RSYNC_USER", "RSYNC_SERVER", "RSYNC_PATH", "RSYNC_SSH_PORT",
       "NFS_SERVER", "NFS_PATH",
     ],
   },
@@ -405,7 +417,7 @@ export function WelcomeStep({ data: _data, onChange: _onChange, onBatchChange }:
   return (
     <div className="flex flex-col items-center py-6 text-center">
       <div className="mb-6 flex h-20 w-20 items-center justify-center rounded-2xl bg-blue-500/15">
-        <Shield className="h-10 w-10 text-blue-400" />
+        <ShieldIcon className="h-10 w-10 text-blue-400" />
       </div>
       <h2 className="text-2xl font-bold text-slate-100">
         Welcome to Sentry USB Setup
@@ -434,7 +446,7 @@ export function WelcomeStep({ data: _data, onChange: _onChange, onBatchChange }:
                   : "border-white/10 bg-white/[0.02] hover:border-white/20 hover:bg-white/[0.04]"
               )}
             >
-              <Upload className="h-8 w-8 text-slate-500" />
+              <UploadIcon className="h-8 w-8 text-slate-500" />
               <div>
                 <p className="text-sm font-medium text-slate-300">
                   Import existing config
@@ -461,27 +473,27 @@ export function WelcomeStep({ data: _data, onChange: _onChange, onBatchChange }:
                 onClick={() => setShowRestore(true)}
                 className="flex w-full items-center justify-center gap-2 rounded-xl border border-white/10 bg-white/[0.02] px-4 py-3 text-sm text-slate-400 transition-colors hover:border-white/20 hover:bg-white/[0.04] hover:text-slate-300"
               >
-                <RotateCcw className="h-4 w-4" />
+                <RotateLeftIcon className="h-4 w-4" />
                 Restore from backup
               </button>
             ) : (
               <div className="rounded-xl border border-blue-500/20 bg-blue-500/5 p-4">
                 <div className="mb-3 flex items-center justify-between">
                   <div className="flex items-center gap-2">
-                    <Archive className="h-4 w-4 text-blue-400" />
+                    <ArchiveIcon className="h-4 w-4 text-blue-400" />
                     <span className="text-sm font-medium text-blue-300">Available Backups</span>
                   </div>
                   <button
                     onClick={() => setShowRestore(false)}
                     className="rounded-lg p-1 text-slate-500 transition-colors hover:bg-white/5 hover:text-slate-300"
                   >
-                    <X className="h-4 w-4" />
+                    <CloseIcon className="h-4 w-4" />
                   </button>
                 </div>
 
                 {loadingBackups ? (
                   <div className="flex items-center justify-center py-4">
-                    <Loader2 className="h-5 w-5 animate-spin text-blue-400" />
+                    <ProgressActivityIcon className="h-5 w-5 animate-spin text-blue-400" />
                     <span className="ml-2 text-xs text-slate-500">Scanning for backups...</span>
                   </div>
                 ) : backups.length === 0 ? (
@@ -495,9 +507,9 @@ export function WelcomeStep({ data: _data, onChange: _onChange, onBatchChange }:
                       className="flex w-full items-center justify-center gap-2 rounded-lg border border-dashed border-blue-400/30 bg-blue-500/5 px-3 py-3 text-sm text-blue-300 transition-colors hover:border-blue-400/50 hover:bg-blue-500/10 disabled:opacity-50"
                     >
                       {restoringUpload ? (
-                        <Loader2 className="h-4 w-4 animate-spin" />
+                        <ProgressActivityIcon className="h-4 w-4 animate-spin" />
                       ) : (
-                        <HardDriveUpload className="h-4 w-4" />
+                        <UploadFileIcon className="h-4 w-4" />
                       )}
                       {restoringUpload ? "Restoring..." : "Upload backup file from your computer"}
                     </button>
@@ -539,9 +551,9 @@ export function WelcomeStep({ data: _data, onChange: _onChange, onBatchChange }:
                             </p>
                           </div>
                           {restoringDate === b.date ? (
-                            <Loader2 className="h-4 w-4 animate-spin text-blue-400" />
+                            <ProgressActivityIcon className="h-4 w-4 animate-spin text-blue-400" />
                           ) : (
-                            <RotateCcw className="h-3.5 w-3.5 text-slate-500" />
+                            <RotateLeftIcon className="h-3.5 w-3.5 text-slate-500" />
                           )}
                         </button>
                       ))}
@@ -553,9 +565,9 @@ export function WelcomeStep({ data: _data, onChange: _onChange, onBatchChange }:
                         className="flex w-full items-center justify-center gap-2 rounded-lg border border-dashed border-white/10 px-3 py-2 text-xs text-slate-500 transition-colors hover:border-white/20 hover:text-slate-400 disabled:opacity-50"
                       >
                         {restoringUpload ? (
-                          <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                          <ProgressActivityIcon className="h-3.5 w-3.5 animate-spin" />
                         ) : (
-                          <HardDriveUpload className="h-3.5 w-3.5" />
+                          <UploadFileIcon className="h-3.5 w-3.5" />
                         )}
                         {restoringUpload ? "Restoring..." : "Or upload a backup file from your computer"}
                       </button>
@@ -583,7 +595,7 @@ export function WelcomeStep({ data: _data, onChange: _onChange, onBatchChange }:
             {/* Header */}
             <div className="flex items-center justify-between">
               <div className="flex items-center gap-2.5">
-                <CheckCircle className="h-5 w-5 text-emerald-400" />
+                <CheckCircleIcon className="h-5 w-5 text-emerald-400" />
                 <div className="text-left">
                   <p className="text-sm font-medium text-emerald-300">
                     {restoreSource ? "Backup restored" : "Config imported"}
@@ -591,12 +603,12 @@ export function WelcomeStep({ data: _data, onChange: _onChange, onBatchChange }:
                   <p className="text-xs text-slate-500">
                     {restoreSource ? (
                       <>
-                        <RotateCcw className="mr-1 inline h-3 w-3" />
+                        <RotateLeftIcon className="mr-1 inline h-3 w-3" />
                         Backup from {restoreSource} — {totalImported} setting{totalImported !== 1 ? "s" : ""} restored
                       </>
                     ) : (
                       <>
-                        <FileText className="mr-1 inline h-3 w-3" />
+                        <DescriptionIcon className="mr-1 inline h-3 w-3" />
                         {fileName} — {totalImported} setting{totalImported !== 1 ? "s" : ""} loaded
                       </>
                     )}
@@ -608,7 +620,7 @@ export function WelcomeStep({ data: _data, onChange: _onChange, onBatchChange }:
                 className="rounded-lg p-1.5 text-slate-500 transition-colors hover:bg-white/5 hover:text-slate-300"
                 title="Remove imported config"
               >
-                <X className="h-4 w-4" />
+                <CloseIcon className="h-4 w-4" />
               </button>
             </div>
 
@@ -627,9 +639,9 @@ export function WelcomeStep({ data: _data, onChange: _onChange, onBatchChange }:
                       </span>
                     </span>
                     {expandedGroups.has(groupId) ? (
-                      <ChevronUp className="h-3.5 w-3.5 text-slate-600" />
+                      <ExpandLessIcon className="h-3.5 w-3.5 text-slate-600" />
                     ) : (
-                      <ChevronDown className="h-3.5 w-3.5 text-slate-600" />
+                      <ExpandMoreIcon className="h-3.5 w-3.5 text-slate-600" />
                     )}
                   </button>
                   {expandedGroups.has(groupId) && (
@@ -665,9 +677,9 @@ export function WelcomeStep({ data: _data, onChange: _onChange, onBatchChange }:
                       </span>
                     </span>
                     {expandedGroups.has("_other") ? (
-                      <ChevronUp className="h-3.5 w-3.5 text-slate-600" />
+                      <ExpandLessIcon className="h-3.5 w-3.5 text-slate-600" />
                     ) : (
-                      <ChevronDown className="h-3.5 w-3.5 text-slate-600" />
+                      <ExpandMoreIcon className="h-3.5 w-3.5 text-slate-600" />
                     )}
                   </button>
                   {expandedGroups.has("_other") && (

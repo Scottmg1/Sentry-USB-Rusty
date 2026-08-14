@@ -1,5 +1,5 @@
 import { useState } from "react"
-import { Eye, EyeOff } from "lucide-react"
+import { VisibilityIcon, VisibilityOffIcon } from "@/components/icons"
 
 interface SecretInputProps {
   value: string
@@ -26,7 +26,7 @@ export function SecretInput({ value, onChange, placeholder, className }: SecretI
         onClick={() => setVisible((v) => !v)}
         className="absolute right-2 top-1/2 -translate-y-1/2 rounded p-1 text-slate-500 transition-colors hover:text-slate-300"
       >
-        {visible ? <EyeOff className="h-3.5 w-3.5" /> : <Eye className="h-3.5 w-3.5" />}
+        {visible ? <VisibilityOffIcon className="h-3.5 w-3.5" /> : <VisibilityIcon className="h-3.5 w-3.5" />}
       </button>
     </div>
   )

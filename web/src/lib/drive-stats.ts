@@ -1,21 +1,7 @@
 import type { DriveSummary } from "@/types/drives"
 
-// Single source of truth for window-scoped drive aggregates on the client.
-// `useDrivesList` calls this for the Drives-tab summary strip; any future
-// widget/export that needs "stats over a filtered set of drives" should
-// import from here so the formula can't silently diverge again.
-//
-// Formula notes (must stay in sync with the Rust side):
-//   - crates/drives/src/db.rs  (lifetime `drive_stats` cache → /api/drives/stats)
-//   - crates/drives/src/grouper.rs::build_fsd_analytics  (/api/drives/fsd-analytics)
-// Both Rust paths compute FSD% as distance-based and SEI-only. Earlier this
-// helper computed it as engaged-ms / total-ms which produced numbers
-// 10-15 points lower than the FSD Analytics page for the same window.
-//
-// Top-line totals (count, distance, duration) include every drive in the
-// window. FSD/Autopilot ratios are SEI-only — Tessie's autopilot data is
-// inferred rather than read from dashcam SEI telemetry, so mixing it would
-// dilute the score.
+// Must match the distance-based, SEI-only FSD formulas in drives/db.rs and
+// drives/grouper.rs. Top-line totals include imported and Summon drives.
 
 export interface DrivesFilteredStats {
   count: number
@@ -44,33 +30,23 @@ export function computeFilteredStats(
   let fsdDisengagements = 0
   let autopilotEngagedMs = 0
   let tessieCount = 0
-  // SEI-only denominators feed FSD% and Autopilot%. Top-line totals above
-  // still sum every drive in the window.
+  // FSD and Autopilot percentages use only measured SEI telemetry.
   let seiTotalDistanceKm = 0
   let seiAutopilotDistanceKm = 0
 
   for (const d of drives) {
-    // Top-line totals include every drive (matches the backend
-    // `drive_stats` cache in crates/drives/src/db.rs:1061-1063).
     totalDistanceMi += d.distanceMi
     totalDistanceKm += d.distanceKm
     totalDurationMs += d.durationMs
-    // Anything with a non-SEI source (tessie, teslascope, future
-    // importers) is imported data — counted in the top-line totals,
-    // excluded from FSD analytics. Matches the backend's SEI-only rule
-    // and Sentry-Drive's isImportedSource. The strip's "TESSIE" tile
-    // counts every imported drive.
+    // Imported assist data is inferred rather than measured SEI telemetry.
     if (d.source && d.source !== "sei") {
       tessieCount += 1
       continue
     }
-    // Every FSD/AP-attributed metric is SEI-only. Imported autopilot
-    // distance/time fields carry *inferred* numbers (not from dashcam
-    // SEI telemetry), so summing them into the numerator while the
-    // denominator stays SEI-only produces >100% nonsense — and even
-    // when both sides included them, the formula would still report
-    // inferred-vs-measured as a single blended score, which the
-    // backend explicitly avoids.
+    // Summon lacks autopilot_state and would dilute the assist percentages.
+    if (d.summon) {
+      continue
+    }
     seiTotalDistanceKm += d.distanceKm
     fsdEngagedMs += d.fsdEngagedMs
     fsdDistanceMi += d.fsdDistanceMi
@@ -82,9 +58,7 @@ export function computeFilteredStats(
 
   const fsdPercent =
     seiTotalDistanceKm > 0 ? (fsdDistanceKm / seiTotalDistanceKm) * 100 : 0
-  // "Autopilot" here means autosteer + TACC (non-FSD assist), kept as a
-  // distinct stat from FSD. Backend's `assisted_percent` rolls FSD into
-  // this bucket — we don't, so the strip can show FSD and AP separately.
+  // Autopilot here excludes FSD so both percentages remain distinct.
   const autopilotPercent =
     seiTotalDistanceKm > 0
       ? (seiAutopilotDistanceKm / seiTotalDistanceKm) * 100

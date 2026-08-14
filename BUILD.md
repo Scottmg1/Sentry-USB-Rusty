@@ -2,8 +2,8 @@
 
 ## Prerequisites
 
-- Rust stable (1.82+, edition 2024)
-- Node 20+ and npm
+- Rust stable (1.85+, required by edition 2024)
+- Node `^20.19.0 || >=22.12.0` and npm
 - `cross` for cross-compilation: `cargo install cross`
 - Docker (for `cross` and image builds)
 
@@ -70,8 +70,8 @@ bash install-pi.sh /tmp/sentryusb
 ## Testing
 
 - Rust unit tests: `cargo test`
-- Shell harnesses: `tests/*.sh`
-- Lint: `./check.sh` (runs shellcheck against vendored shell scripts)
+- Shell harnesses: `test/*.sh`
+- Lint: `./check.sh` (runs ShellCheck against selected runtime scripts)
 
 ## Releasing
 

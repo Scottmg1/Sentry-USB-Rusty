@@ -1,5 +1,5 @@
 import { useState } from "react"
-import { Plug, Power } from "lucide-react"
+import { PowerIcon, PowerSettingsNewIcon } from "@/components/icons"
 import { PrefCard } from "@/components/settings/PrefCard"
 import { KeepAccessoryConfig } from "@/components/settings/KeepAccessoryConfig"
 import { useKeepAccessory } from "@/hooks/useKeepAccessory"
@@ -9,21 +9,13 @@ interface Props {
   onOpenWizard?: () => void
 }
 
-/**
- * Settings card for the keep-accessory feature (12V-powered Pis): the 12V
- * gate, the home geofence (with "Use current location" + adjustable radius),
- * and a manual ON/OFF override that hits the car over BLE right now.
- */
+/** Settings card for 12V accessory power, its geofence, and BLE override. */
 export function KeepAccessorySection({ onOpenWizard }: Props = {}) {
   const { values, loaded, saving, saveError, update, useCurrentLocation, manualSet } = useKeepAccessory()
   const [msg, setMsg] = useState<string | null>(null)
   const [pending, setPending] = useState(false)
 
-  // Niche, 12V-only feature for glovebox-USB setups. Once it's been enabled in
-  // the session (everOn) we keep showing the full UI even if the user toggles
-  // it back off mid-edit, so settings don't vanish mid-change.
-  // Render-phase state adjustment (React's "storing information from
-  // previous renders" pattern) — sticky for the component's lifetime.
+  // Once shown, keep the form mounted for the session so edits do not disappear.
   const [everOn, setEverOn] = useState(false)
   if (values.enabled && !everOn) setEverOn(true)
   const showDisabled = loaded && !values.enabled && !everOn
@@ -42,7 +34,7 @@ export function KeepAccessorySection({ onOpenWizard }: Props = {}) {
 
   return (
     <PrefCard
-      icon={<Plug className="h-3.5 w-3.5" />}
+      icon={<PowerIcon className="h-3.5 w-3.5" />}
       halo="amber"
       title="Keep Accessory"
       disabled={
@@ -83,7 +75,7 @@ export function KeepAccessorySection({ onOpenWizard }: Props = {}) {
                   disabled={pending}
                   className="inline-flex items-center gap-1.5 rounded-md border border-white/10 bg-white/5 px-2.5 py-1 text-xs text-slate-200 transition-colors hover:border-emerald-500/40 disabled:opacity-50"
                 >
-                  <Power className="h-3 w-3" /> Force ON now
+                  <PowerSettingsNewIcon className="h-3 w-3" /> Force ON now
                 </button>
                 <button
                   type="button"
@@ -91,7 +83,7 @@ export function KeepAccessorySection({ onOpenWizard }: Props = {}) {
                   disabled={pending}
                   className="inline-flex items-center gap-1.5 rounded-md border border-white/10 bg-white/5 px-2.5 py-1 text-xs text-slate-200 transition-colors hover:border-red-500/40 disabled:opacity-50"
                 >
-                  <Power className="h-3 w-3" /> Force OFF now
+                  <PowerSettingsNewIcon className="h-3 w-3" /> Force OFF now
                 </button>
               </div>
               {msg && <p className="text-xs text-slate-500">{msg}</p>}

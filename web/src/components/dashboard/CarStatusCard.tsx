@@ -1,33 +1,48 @@
 import { Suspense, lazy, useEffect, useMemo, useState } from "react"
 import { Link } from "react-router-dom"
 import {
-  BatteryCharging,
-  BatteryMedium,
-  Car,
-  ChevronDown,
-  ChevronRight,
-  ChevronUp,
-  Disc,
-  Music2,
-  Thermometer,
-} from "lucide-react"
+  AlbumIcon,
+  BatteryAndroidFrameBoltIcon,
+  ChevronRightIcon,
+  DeviceThermostatIcon,
+  DirectionsCarIcon,
+  ExpandLessIcon,
+  ExpandMoreIcon,
+  MusicNoteIcon,
+  WarningIcon,
+} from "@/components/icons"
+import { BatteryLevelIcon } from "@/components/drives/BatteryLevelIcon"
+import { sendChargingAction } from "@/api/charging"
 import type { TireHistoryResponse } from "./TirePressureCard"
 import type { CurrentCharge } from "@/types/charging"
-import { fmtRangeUnit, fmtToFull } from "@/lib/charge-format"
+import {
+  fmtChargeRateUnit,
+  fmtCurrent,
+  fmtEnergy,
+  fmtRangeUnit,
+  fmtToFull,
+  fmtVoltage,
+} from "@/lib/charge-format"
+import {
+  deriveVehicleStatusLabel,
+  freshVehicleShiftState,
+  presentBleHealth,
+  shouldShowChargingControls,
+  type BleHealth,
+} from "@/lib/bleHealth"
 
-// Lazy-load the chart only when the user expands the Tires chip —
-// recharts (380 KB) stays out of the dashboard's initial bundle for
-// users who only glance at the summary.
+// Keep Recharts out of the initial bundle until tire history is expanded.
 const TirePressureCard = lazy(() =>
   import("./TirePressureCard").then((m) => ({ default: m.TirePressureCard })),
 )
 
 export interface CarStatusSample {
   ts: number | null
-  // Age of the envelope (most recent state poll), in seconds.
+  // Age of the latest state envelope.
   seconds_ago?: number | null
-  // Live gear: "Park" / "Drive" / "Reverse" / "Neutral" / "Unknown".
   shift_state?: string | null
+  // Gear freshness is independent from the latest database sample.
+  shift_state_seconds_ago?: number | null
   battery_pct?: number | null
   interior_temp_c?: number | null
   exterior_temp_c?: number | null
@@ -35,10 +50,7 @@ export interface CarStatusSample {
   tire_fr_psi?: number | null
   tire_rl_psi?: number | null
   tire_rr_psi?: number | null
-  // Per-field age (seconds) of the shown value. A field can be far older
-  // than `seconds_ago` when its poll has been failing while other polls
-  // keep the envelope fresh — that's what made a stale temp read as
-  // "updated 10s ago". Surfaced so the chip can flag it.
+  // Field ages can exceed the envelope age when one poll source fails.
   field_secs_ago?: {
     battery_pct?: number | null
     interior_temp_c?: number | null
@@ -49,23 +61,17 @@ export interface CarStatusSample {
 
 interface CarStatusCardProps {
   sample: CarStatusSample | null
-  // ISO end-time of the most recent drive — used to derive
-  // "Parked Xh Ym". When the value is null the duration row is
-  // hidden (no drives recorded yet).
+  // Auth failures are errors; sleep, contention, and stale data are warnings.
+  bleHealth?: BleHealth | null
+  // End of the latest drive, used as the parked-since timestamp.
   latestDriveEnd: string | null
-  // Tire history for the expandable chart. Pass undefined to hide
-  // the Tires chip's expand affordance entirely (e.g. no telemetry).
+  // Undefined tire history hides the expand affordance.
   tireHistory?: TireHistoryResponse
   useFahrenheit: boolean
-  // Distance unit for the battery drop-down's range row (true = km).
   metric: boolean
-  // Live charge status. When the car is charging the Battery chip turns
-  // green and pulses; expanding it shows range, time-to-full and power.
-  // null/undefined hides the chip's expand affordance.
+  // Null charge status hides the battery expand affordance.
   currentCharge?: CurrentCharge | null
-  // Name of the currently-active lock-chime sound, if the feature
-  // is configured. null/undefined hides the indicator entirely so
-  // users who don't use lock chimes don't see a confusing chip.
+  // Null hides the lock-chime indicator.
   lockChimeName?: string | null
 }
 
@@ -86,8 +92,7 @@ function deriveTireStatus(sample: CarStatusSample | null): TireStatus {
   if (values.length === 0) {
     return { kind: "none", label: "—", color: "text-slate-500" }
   }
-  // Mirrors the zone thresholds the chart uses: optimal 36–45,
-  // warning bands 28–36 and 45–50, unsafe outside that.
+  // Keep these thresholds aligned with TirePressureCard.
   const anyUnsafe = values.some((v) => v < 28 || v > 50)
   if (anyUnsafe) {
     return { kind: "unsafe", label: "Unsafe", color: "text-rose-400" }
@@ -116,13 +121,9 @@ function formatTemp(c: number | null | undefined, useFahrenheit: boolean): strin
   return `${Math.round(value)}${unit}`
 }
 
-// A shown value older than this is flagged as stale next to the chip, so
-// a last-known reading (car asleep, or a field's poll failing while the
-// envelope stays fresh) can't masquerade as current. 10 min is well past
-// the ~15-30s active poll cadence, so live values are never flagged.
+// Ten minutes is safely beyond the active 15–30 second poll cadence.
 const STALE_AFTER_SECS = 600
 
-// Compact relative age ("4m", "2h", "3d") for a stale-value hint.
 function formatAge(secs: number): string {
   if (secs < 90) return `${Math.max(1, Math.round(secs))}s`
   const m = Math.round(secs / 60)
@@ -132,24 +133,15 @@ function formatAge(secs: number): string {
   return `${Math.round(h / 24)}d`
 }
 
-// Returns "· 2h ago" when the field is older than the threshold, else null.
 function staleHint(secs: number | null | undefined): string | null {
   if (secs == null || secs < STALE_AFTER_SECS) return null
   return `${formatAge(secs)} ago`
 }
 
-/**
- * Top-of-dashboard car-status overview. Replaces the old
- * stand-alone tire-pressure card with a single tile that shows the
- * last-known summary (parked duration, battery, cabin/ambient
- * temps, tire-health verdict) and reveals the tire-pressure history
- * chart inline when the user clicks the Tires chip.
- *
- * The chart bundle is lazy-loaded — clicking Tires is what pulls it
- * in, so users who never expand it pay zero recharts cost.
- */
+/** Dashboard vehicle summary with lazily expanded tire history. */
 export function CarStatusCard({
   sample,
+  bleHealth,
   latestDriveEnd,
   tireHistory,
   useFahrenheit,
@@ -159,31 +151,53 @@ export function CarStatusCard({
 }: CarStatusCardProps) {
   const [tiresOpen, setTiresOpen] = useState(false)
   const [batteryOpen, setBatteryOpen] = useState(false)
-  // Now tick — drives the parked-duration counter forward without
-  // needing to re-render the whole dashboard. 1-minute cadence
-  // matches the granularity of the displayed value ("5h 31m") so
-  // updates aren't wasted. Date.now() lives in the state initialiser
-  // and the interval body, never in render itself (React 19 rule).
+  // A 15-second tick advances parked time and expires stale controls.
   const [nowMs, setNowMs] = useState(() => Date.now())
   useEffect(() => {
-    const id = setInterval(() => setNowMs(Date.now()), 60_000)
+    const id = setInterval(() => setNowMs(Date.now()), 15_000)
     return () => clearInterval(id)
   }, [])
 
-  // Live gear decides Parked vs Driving. Gate on freshness so a stale
-  // Drive sample from before the car slept doesn't read "Driving".
+  // Ignore stale gear snapshots when deriving parked versus driving.
+  const freshShiftState = freshVehicleShiftState(
+    sample?.shift_state,
+    sample?.shift_state_seconds_ago,
+  )
   const isDriving =
-    (sample?.shift_state === "Drive" ||
-      sample?.shift_state === "Reverse" ||
-      sample?.shift_state === "Neutral") &&
-    sample?.seconds_ago != null &&
-    sample.seconds_ago >= 0 &&
-    sample.seconds_ago <= 120
-  const statusLabel = isDriving ? "Driving" : "Parked"
+    freshShiftState === "Drive" ||
+    freshShiftState === "Reverse" ||
+    freshShiftState === "Neutral"
+  const healthPresentation = presentBleHealth(
+    bleHealth,
+    sample?.seconds_ago ?? null,
+  )
+  const showHealthWarning = healthPresentation.severity !== "green"
+  // A persisted charge phase is live only while BLE health is authenticated.
+  const charging =
+    healthPresentation.severity === "green" && !!currentCharge?.charging
+  const showChargingControls = shouldShowChargingControls(
+    healthPresentation,
+    currentCharge?.controlsAvailable === true,
+    currentCharge?.controlsValidUntilTs ?? null,
+    Math.floor(nowMs / 1_000),
+  )
+  const statusLabel = deriveVehicleStatusLabel(
+    healthPresentation,
+    freshShiftState,
+    charging,
+  )
+  const statusHalo = healthPresentation.severity === "red"
+    ? "halo-red"
+    : healthPresentation.severity === "yellow"
+      ? "halo-amber"
+      : "halo-accent"
+  const statusColor = healthPresentation.severity === "red"
+    ? "text-rose-300"
+    : healthPresentation.severity === "yellow"
+      ? "text-amber-300"
+      : "text-slate-100"
 
-  // Derived parked duration. We treat "latest drive ended in the
-  // past" as the parked-since timestamp; if there's no recorded
-  // drive yet we just show the state badge without a duration.
+  // Omit parked duration until a completed drive supplies its start point.
   const parkedDuration = useMemo(() => {
     if (isDriving) return null
     if (!latestDriveEnd) return null
@@ -198,58 +212,65 @@ export function CarStatusCard({
   const haveTireData =
     !!tireHistory && tireHistory.points.length > 0 && tireStatus.kind !== "none"
 
-  const charging = !!currentCharge?.charging
-  // Prefer the live charge SoC over the last BLE sample's battery_pct.
+  // Prefer live charging SoC to the last sampled battery value.
   const batterySoc = currentCharge?.soc ?? sample?.battery_pct
   const haveChargeDetail =
     currentCharge != null &&
-    (currentCharge.charging || currentCharge.rangeMi != null)
+    (currentCharge.charging ||
+      currentCharge.rangeMi != null ||
+      currentCharge.controlsAvailable)
 
   return (
     <div className="glass-card relative p-4">
-      {/* Lock-chime chip pinned to the card's actual top-right
-          corner via absolute positioning, so it sits in the corner
-          regardless of the Parked row's height. Only renders when
-          a chime is active so users without the feature don't see
-          an empty placeholder. Click → /community?view=chimes
-          which lands directly on the lock-chime tab inside
-          Community (the LockChime page is mounted as a sub-view
-          of Community, not its own route). */}
+      {/* Lock chimes open their Community sub-view. */}
       {lockChimeName && (
         <Link
           to="/community?view=chimes"
           title={`Active lock chime: ${lockChimeName}`}
           className="absolute right-3 top-3 inline-flex max-w-[120px] items-center gap-1.5 rounded-full border border-emerald-400/25 bg-emerald-500/10 px-2.5 py-1 text-[11px] font-medium text-emerald-300 transition-colors hover:bg-emerald-500/15 sm:max-w-[180px]"
         >
-          <Music2 className="h-3 w-3 shrink-0" />
+          <MusicNoteIcon className="h-3 w-3 shrink-0" />
           <span className="truncate">{lockChimeName}</span>
-          <ChevronRight className="h-3 w-3 shrink-0 text-emerald-400/60" />
+          <ChevronRightIcon className="h-3 w-3 shrink-0 text-emerald-400/60" />
         </Link>
       )}
 
-      {/* Top row — car state + duration. Right padding reserves room
-          for the absolutely-positioned chime chip when present so
-          long durations / labels can't slide under it. */}
+      {/* Right padding reserves space for the optional chime chip. */}
       <div className={"flex items-center gap-3 " + (lockChimeName ? "pr-32 sm:pr-48" : "")}>
-        <span className="tile-icon halo-accent">
-          <Car className="h-4 w-4" />
+        <span className={`tile-icon ${statusHalo}`}>
+          {showHealthWarning ? (
+            <WarningIcon className="h-4 w-4" />
+          ) : (
+            <DirectionsCarIcon className="h-4 w-4" />
+          )}
         </span>
         <div className="min-w-0 flex-1">
-          <div className="text-sm font-semibold text-slate-100">{statusLabel}</div>
-          {parkedDuration && (
+          <div className={`text-sm font-semibold ${statusColor}`}>{statusLabel}</div>
+          {showHealthWarning ? (
+            <div className="mt-0.5 text-[11px] leading-relaxed text-slate-400">
+              {healthPresentation.guidance}
+              {healthPresentation.repairRequired && (
+                <Link
+                  to="/settings?tab=Car%20%26%20Network"
+                  className="ml-1 whitespace-nowrap font-medium text-rose-300 hover:text-rose-200"
+                >
+                  Open settings <ChevronRightIcon className="inline h-3 w-3" />
+                </Link>
+              )}
+            </div>
+          ) : parkedDuration ? (
             <div className="text-[11px] text-slate-500">{parkedDuration}</div>
-          )}
+          ) : null}
         </div>
       </div>
 
-      {/* Chip row — battery / interior / exterior / tires */}
       <div className="mt-4 flex flex-wrap items-stretch gap-3">
         <StatusChip
           icon={
             charging ? (
-              <BatteryCharging className="h-3.5 w-3.5 animate-pulse" />
+              <BatteryAndroidFrameBoltIcon className="h-3.5 w-3.5 animate-pulse" />
             ) : (
-              <BatteryMedium className="h-3.5 w-3.5" />
+              <BatteryLevelIcon pct={batterySoc ?? undefined} className="h-3.5 w-3.5" />
             )
           }
           label={charging ? "Charging" : "Battery"}
@@ -257,8 +278,7 @@ export function CarStatusCard({
           accent={charging}
           valueClass={charging ? "text-emerald-300" : undefined}
           onClick={haveChargeDetail ? () => setBatteryOpen((o) => !o) : undefined}
-          // Live charge SoC (currentCharge) is always fresh; only the
-          // last-BLE-sample battery_pct can be stale.
+          // Only the fallback BLE battery sample can be stale.
           stale={
             currentCharge?.soc != null
               ? null
@@ -267,27 +287,27 @@ export function CarStatusCard({
           trailing={
             haveChargeDetail ? (
               batteryOpen ? (
-                <ChevronUp className="h-3.5 w-3.5 text-slate-500" />
+                <ExpandLessIcon className="h-3.5 w-3.5 text-slate-500" />
               ) : (
-                <ChevronDown className="h-3.5 w-3.5 text-slate-500" />
+                <ExpandMoreIcon className="h-3.5 w-3.5 text-slate-500" />
               )
             ) : null
           }
         />
         <StatusChip
-          icon={<Thermometer className="h-3.5 w-3.5" />}
+          icon={<DeviceThermostatIcon className="h-3.5 w-3.5" />}
           label="Interior"
           value={formatTemp(sample?.interior_temp_c, useFahrenheit)}
           stale={staleHint(sample?.field_secs_ago?.interior_temp_c)}
         />
         <StatusChip
-          icon={<Thermometer className="h-3.5 w-3.5" />}
+          icon={<DeviceThermostatIcon className="h-3.5 w-3.5" />}
           label="Exterior"
           value={formatTemp(sample?.exterior_temp_c, useFahrenheit)}
           stale={staleHint(sample?.field_secs_ago?.exterior_temp_c)}
         />
         <StatusChip
-          icon={<Disc className="h-3.5 w-3.5" />}
+          icon={<AlbumIcon className="h-3.5 w-3.5" />}
           label="Tires"
           value={tireStatus.label}
           valueClass={tireStatus.color}
@@ -300,17 +320,15 @@ export function CarStatusCard({
           trailing={
             haveTireData ? (
               tiresOpen ? (
-                <ChevronUp className="h-3.5 w-3.5 text-slate-500" />
+                <ExpandLessIcon className="h-3.5 w-3.5 text-slate-500" />
               ) : (
-                <ChevronDown className="h-3.5 w-3.5 text-slate-500" />
+                <ExpandMoreIcon className="h-3.5 w-3.5 text-slate-500" />
               )
             ) : null
           }
         />
       </div>
 
-      {/* Battery drop-down — range / time-to-full / power, shown when the
-          chip is expanded. Only the range row appears when idle. */}
       {batteryOpen && haveChargeDetail && currentCharge && (
         <div className="mt-4 border-t border-white/[0.06] pt-4">
           <div className="grid grid-cols-2 gap-3 sm:grid-cols-3">
@@ -324,22 +342,47 @@ export function CarStatusCard({
             {charging && currentCharge.powerKw != null && (
               <MiniStat label="Power" value={`${currentCharge.powerKw} kW`} />
             )}
+            {charging && currentCharge.currentA != null && (
+              <MiniStat label="Current" value={fmtCurrent(currentCharge.currentA)} />
+            )}
+            {charging && currentCharge.voltageV != null && (
+              <MiniStat label="Voltage" value={fmtVoltage(currentCharge.voltageV)} />
+            )}
+            {charging && currentCharge.rateMph != null && (
+              <MiniStat
+                label="Charge rate"
+                value={fmtChargeRateUnit(currentCharge.rateMph, metric)}
+              />
+            )}
+            {charging && currentCharge.energyAddedKwh != null && (
+              <MiniStat
+                label="Energy added"
+                value={fmtEnergy(currentCharge.energyAddedKwh)}
+              />
+            )}
             {charging && currentCharge.limitSoc != null && (
               <MiniStat label="Charge limit" value={`${currentCharge.limitSoc}%`} />
             )}
           </div>
+          {showChargingControls && (
+            <ChargingControls
+              key={`${currentCharge.charging}-${currentCharge.chargingAmps}-${currentCharge.maxChargingAmps}-${currentCharge.limitSoc}`}
+              charging={currentCharge.charging}
+              chargingAmps={currentCharge.chargingAmps}
+              maxChargingAmps={currentCharge.maxChargingAmps}
+              limitSoc={currentCharge.limitSoc}
+            />
+          )}
           <Link
             to="/charging"
             className="mt-3 inline-flex items-center gap-1 text-xs font-medium text-emerald-300 hover:text-emerald-200"
           >
             View charging history
-            <ChevronRight className="h-3.5 w-3.5" />
+            <ChevronRightIcon className="h-3.5 w-3.5" />
           </Link>
         </div>
       )}
 
-      {/* Expandable chart — only mounts when the user clicks Tires.
-          Lazy-loaded so users who don't expand never pull recharts. */}
       {tiresOpen && haveTireData && tireHistory && (
         <div className="mt-4 border-t border-white/[0.06] pt-4">
           <div className="mb-2 text-[11px] uppercase tracking-wider text-slate-500">
@@ -360,18 +403,162 @@ export function CarStatusCard({
   )
 }
 
+interface ChargingControlsProps {
+  charging: boolean
+  chargingAmps: number | null
+  maxChargingAmps: number | null
+  limitSoc: number | null
+}
+
+function ChargingControls({
+  charging,
+  chargingAmps,
+  maxChargingAmps,
+  limitSoc,
+}: ChargingControlsProps) {
+  const safeMaxAmps =
+    maxChargingAmps != null && maxChargingAmps >= 1 && maxChargingAmps <= 80
+      ? Math.round(maxChargingAmps)
+      : null
+  const initialAmps =
+    chargingAmps == null || safeMaxAmps == null
+      ? null
+      : Math.max(1, Math.min(safeMaxAmps, Math.round(chargingAmps)))
+  const initialLimit =
+    limitSoc == null ? null : Math.max(50, Math.min(100, Math.round(limitSoc)))
+  const [amps, setAmps] = useState(initialAmps)
+  const [limit, setLimit] = useState(initialLimit)
+  const [pending, setPending] = useState<"toggle" | "amps" | "limit" | null>(null)
+  const [feedback, setFeedback] = useState<string | null>(null)
+  const [failed, setFailed] = useState(false)
+
+  async function send(
+    kind: "toggle" | "amps" | "limit",
+    request: Parameters<typeof sendChargingAction>[0],
+  ) {
+    setPending(kind)
+    setFeedback(null)
+    setFailed(false)
+    try {
+      await sendChargingAction(request)
+      setFeedback("Command sent. Waiting for fresh vehicle data.")
+    } catch (error) {
+      setFailed(true)
+      setFeedback(error instanceof Error ? error.message : "Charging command failed")
+    } finally {
+      setPending(null)
+    }
+  }
+
+  return (
+    <div className="mt-4 rounded-xl border border-emerald-400/20 bg-emerald-500/[0.06] p-3">
+      <div className="flex items-center justify-between gap-3">
+        <div>
+          <div className="text-[9px] font-semibold uppercase tracking-wider text-emerald-400/80">
+            Charging controls
+          </div>
+          <div className="mt-0.5 text-[11px] text-slate-400">
+            Available while the charge port is open or charging.
+          </div>
+        </div>
+        <button
+          type="button"
+          disabled={pending !== null}
+          onClick={() =>
+            void send("toggle", { action: charging ? "stop" : "start" })
+          }
+          className="shrink-0 rounded-lg border border-emerald-400/30 bg-emerald-500/15 px-3 py-1.5 text-xs font-semibold text-emerald-200 transition-colors hover:bg-emerald-500/25 disabled:cursor-wait disabled:opacity-50"
+        >
+          {pending === "toggle"
+            ? "Sending…"
+            : charging
+              ? "Stop charging"
+              : "Start charging"}
+        </button>
+      </div>
+
+      {amps != null && safeMaxAmps != null && (
+        <div className="mt-4">
+          <div className="flex items-center justify-between text-xs">
+            <label htmlFor="charging-amps" className="font-medium text-slate-300">
+              Charging current
+            </label>
+            <span className="font-semibold tabular-nums text-slate-100">{amps} A</span>
+          </div>
+          <div className="mt-2 flex items-center gap-3">
+            <input
+              id="charging-amps"
+              type="range"
+              min={1}
+              max={safeMaxAmps}
+              step={1}
+              value={amps}
+              disabled={pending !== null}
+              onChange={(event) => setAmps(Number(event.target.value))}
+              className="min-w-0 flex-1 accent-emerald-400"
+            />
+            <button
+              type="button"
+              disabled={pending !== null || amps === initialAmps}
+              onClick={() => void send("amps", { action: "setAmps", value: amps })}
+              className="rounded-lg border border-white/10 bg-white/[0.04] px-2.5 py-1 text-[11px] font-semibold text-slate-200 transition-colors hover:bg-white/[0.08] disabled:cursor-not-allowed disabled:opacity-40"
+            >
+              {pending === "amps" ? "Applying…" : "Apply"}
+            </button>
+          </div>
+        </div>
+      )}
+
+      {limit != null && (
+        <div className="mt-4">
+          <div className="flex items-center justify-between text-xs">
+            <label htmlFor="charge-limit" className="font-medium text-slate-300">
+              Charge limit
+            </label>
+            <span className="font-semibold tabular-nums text-slate-100">{limit}%</span>
+          </div>
+          <div className="mt-2 flex items-center gap-3">
+            <input
+              id="charge-limit"
+              type="range"
+              min={50}
+              max={100}
+              step={1}
+              value={limit}
+              disabled={pending !== null}
+              onChange={(event) => setLimit(Number(event.target.value))}
+              className="min-w-0 flex-1 accent-emerald-400"
+            />
+            <button
+              type="button"
+              disabled={pending !== null || limit === initialLimit}
+              onClick={() => void send("limit", { action: "setLimit", value: limit })}
+              className="rounded-lg border border-white/10 bg-white/[0.04] px-2.5 py-1 text-[11px] font-semibold text-slate-200 transition-colors hover:bg-white/[0.08] disabled:cursor-not-allowed disabled:opacity-40"
+            >
+              {pending === "limit" ? "Applying…" : "Apply"}
+            </button>
+          </div>
+        </div>
+      )}
+
+      {feedback && (
+        <div className={`mt-3 text-[11px] ${failed ? "text-rose-300" : "text-emerald-300"}`}>
+          {feedback}
+        </div>
+      )}
+    </div>
+  )
+}
+
 interface StatusChipProps {
   icon: React.ReactNode
   label: string
   value: string
   valueClass?: string
-  // Green-tinted chip + icon ring, used for the charging state.
   accent?: boolean
   onClick?: () => void
   trailing?: React.ReactNode
-  // When set (e.g. "2h ago"), the value is older than it looks: render a
-  // muted age suffix and dim the value so a stale reading isn't mistaken
-  // for a live one.
+  // Dim stale values and show their age.
   stale?: string | null
 }
 

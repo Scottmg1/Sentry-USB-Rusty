@@ -1,28 +1,20 @@
-//! Thin wrapper around the same SQLite DB the drives crate uses.
-//! Opens with WAL, applies the drives migrations (so `telemetry_samples`
-//! definitely exists), and exposes a one-shot insert.
+//! Telemetry access to the shared drives SQLite database.
 
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection};
 
 use crate::sample::Sample;
 
-/// Open the canonical drive-data DB and ensure schema v6+ is applied.
-/// The drives crate's `schema::migrate` is idempotent so running it
-/// here alongside the sentryusb-main service is safe.
+/// Opens the canonical database and applies idempotent drives migrations.
 pub fn open() -> Result<Connection> {
     let path = sentryusb_drives::DEFAULT_DB_PATH;
-    // Make sure the parent directory exists before SQLite tries to
-    // create the file — dev / fresh-Pi cases would otherwise fail.
+    // SQLite cannot create a missing parent directory.
     if let Some(parent) = std::path::Path::new(path).parent() {
         let _ = std::fs::create_dir_all(parent);
     }
     let conn = Connection::open(path)
         .with_context(|| format!("failed to open {}", path))?;
-    // busy_timeout matters here: this daemon shares the WAL DB with the
-    // main server process. Without it, a write that lands while the
-    // server holds the write lock fails instantly with SQLITE_BUSY and
-    // the sample is dropped; with it, rusqlite retries for up to 5s.
+    // The timeout covers transient write contention with the main server.
     conn.execute_batch(
         "PRAGMA journal_mode=WAL;
          PRAGMA synchronous=NORMAL;
@@ -33,14 +25,9 @@ pub fn open() -> Result<Connection> {
     Ok(conn)
 }
 
-/// Insert one sample. Duplicate `ts` rows are silently ignored
-/// (`INSERT OR IGNORE`) — the sampler's clock-tick cadence makes
-/// duplicates only possible if the daemon races itself on a clock
-/// adjustment, in which case keeping the older row is fine.
+/// Inserts a sample, preserving the first row when timestamps collide.
 pub fn insert(conn: &Connection, s: &Sample) -> Result<()> {
-    // `software_version` column is intentionally not written —
-    // Tesla doesn't expose `car_version` over BLE. The column stays
-    // nullable in the schema for forward-compat.
+    // BLE does not expose `car_version`; `software_version` remains nullable.
     conn.execute(
         "INSERT OR IGNORE INTO telemetry_samples \
          (ts, battery_pct, battery_temp_c, interior_temp_c, exterior_temp_c, hvac_on, \
@@ -48,10 +35,12 @@ pub fn insert(conn: &Connection, s: &Sample) -> Result<()> {
           odometer_mi, location_name, \
           charger_power_kw, charger_actual_current_a, charger_voltage_v, \
           charge_rate_mph, charge_energy_added_kwh, charge_limit_soc, battery_range_mi, \
+          charging_amps_set, charge_current_request_max, charge_port_door_open, \
           latitude, longitude, \
           source, charge_minutes_to_full, charging_state) \
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, \
-                 ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24)",
+                 ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, \
+                 ?25, ?26, ?27)",
         params![
             s.ts,
             s.battery_pct,
@@ -72,6 +61,9 @@ pub fn insert(conn: &Connection, s: &Sample) -> Result<()> {
             s.charge_energy_added_kwh,
             s.charge_limit_soc,
             s.battery_range_mi,
+            s.charging_amps_set,
+            s.charge_current_request_max,
+            s.charge_port_door_open.map(|b| if b { 1_i64 } else { 0_i64 }),
             s.latitude,
             s.longitude,
             s.source,
@@ -121,6 +113,30 @@ mod tests {
     }
 
     #[test]
+    fn insert_persists_charging_control_telemetry() {
+        let conn = fresh_memory_db();
+        let s = Sample {
+            ts: 1_700_000_050,
+            charging_amps_set: Some(32),
+            charge_current_request_max: Some(48),
+            charge_port_door_open: Some(true),
+            source: "state".into(),
+            ..Sample::default()
+        };
+
+        insert(&conn, &s).unwrap();
+        let values: (Option<i64>, Option<i64>, Option<i64>) = conn
+            .query_row(
+                "SELECT charging_amps_set, charge_current_request_max, charge_port_door_open \
+                 FROM telemetry_samples WHERE ts = ?1",
+                [s.ts],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(values, (Some(32), Some(48), Some(1)));
+    }
+
+    #[test]
     fn insert_sparse_body_controller_sample() {
         let conn = fresh_memory_db();
         let s = Sample {
@@ -149,7 +165,6 @@ mod tests {
             ..Sample::default()
         };
         insert(&conn, &s).unwrap();
-        // Second insert with the same ts must not error.
         insert(&conn, &s).unwrap();
         let count: i64 = conn
             .query_row("SELECT count(*) FROM telemetry_samples", [], |row| row.get(0))

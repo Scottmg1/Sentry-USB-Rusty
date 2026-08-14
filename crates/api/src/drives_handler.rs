@@ -11,8 +11,7 @@ use serde::Deserialize;
 use crate::router::AppState;
 use sentryusb_drives::{DriveStore, aggregate_telemetry, grouper};
 
-/// Path must match what `awake_stop` expects so existing deployments
-/// keep working unchanged.
+/// Shared with `awake_stop`.
 const KEEP_AWAKE_WANTED_FLAG: &str = "/tmp/keep_awake_webui_wanted";
 
 fn keep_awake_owners() -> &'static Mutex<HashSet<String>> {
@@ -20,9 +19,7 @@ fn keep_awake_owners() -> &'static Mutex<HashSet<String>> {
     OWNERS.get_or_init(|| Mutex::new(HashSet::new()))
 }
 
-/// Register `owner` as wanting keep-awake. Writes the wanted-flag on the
-/// 0→1 transition so `awake_stop`'s top-of-script handoff guard sees it.
-/// Idempotent.
+/// Registers an idempotent keep-awake owner and writes the flag on 0→1.
 pub fn register_keep_awake_want(owner: &str) {
     let mut set = keep_awake_owners().lock().unwrap();
     let was_empty = set.is_empty();
@@ -32,7 +29,7 @@ pub fn register_keep_awake_want(owner: &str) {
     }
 }
 
-/// Release `owner`. Removes the wanted-flag on the 1→0 transition.
+/// Releases an owner and removes the flag on 1→0.
 pub fn release_keep_awake_want(owner: &str) {
     let mut set = keep_awake_owners().lock().unwrap();
     set.remove(owner);
@@ -41,26 +38,21 @@ pub fn release_keep_awake_want(owner: &str) {
     }
 }
 
-/// Clear the wanted-flag and reset the registry. Call on startup so a
-/// crashed prior run doesn't leave a stale flag deferring `awake_stop`
-/// forever.
+/// Clears stale in-memory and on-disk keep-awake state at startup.
 pub fn clear_keep_awake_wanted() {
     keep_awake_owners().lock().unwrap().clear();
     let _ = std::fs::remove_file(KEEP_AWAKE_WANTED_FLAG);
 }
 
-/// Drive-specific state.
 #[derive(Clone)]
 pub struct DriveState {
     pub store: Arc<DriveStore>,
     pub processor: Arc<sentryusb_drives::processor::Processor>,
-    /// Set while an external drive-data import (JSON upload) is running;
-    /// blocks processing and reprocessing until the import completes.
+    /// Blocks processing and reprocessing during JSON import.
     pub importing: Arc<AtomicBool>,
 }
 
-/// True if archiveloop is currently archiving: /tmp/archive_status.json
-/// present, mtime within 120s, phase == "archiving".
+/// Returns true for a fresh archive status whose phase is `archiving`.
 pub fn is_archiving() -> bool {
     match read_archive_status() {
         Some(v) => v.get("phase").and_then(|p| p.as_str()) == Some("archiving"),
@@ -68,8 +60,7 @@ pub fn is_archiving() -> bool {
     }
 }
 
-/// Read and parse /tmp/archive_status.json, returning None if absent,
-/// stale, or invalid. Removes the file if its mtime is older than 120s.
+/// Reads archive status and removes it when older than 120 seconds.
 fn read_archive_status() -> Option<serde_json::Value> {
     const STATUS: &str = "/tmp/archive_status.json";
     let meta = std::fs::metadata(STATUS).ok()?;
@@ -85,8 +76,7 @@ fn read_archive_status() -> Option<serde_json::Value> {
     serde_json::from_str(&data).ok()
 }
 
-/// Sources envsetup.sh + exports the shared PID file so awake_start/awake_stop
-/// coordinate with archiveloop's own keep-awake management.
+/// Shell preamble shared with archiveloop's keep-awake management.
 pub(crate) const AWAKE_PREAMBLE: &str = r#"source /root/bin/envsetup.sh 2>/dev/null || true
 declare -F log > /dev/null 2>&1 || {
   function log { echo "$(date): $*" >> "${LOG_FILE:-/mutable/archiveloop.log}" 2>/dev/null || true; }
@@ -100,8 +90,7 @@ pub(crate) fn shell_quote(s: &str) -> String {
     format!("'{}'", escaped)
 }
 
-/// Launch awake_start in the background. `expires_at_unix` is passed through
-/// so nudge logs can show time remaining.
+/// Launches `awake_start` with optional expiry metadata.
 pub(crate) fn start_keep_awake_with(reason: &str, expires_at_unix: Option<i64>) {
     let mut script = AWAKE_PREAMBLE.to_string();
     script.push_str(&format!("export KEEP_AWAKE_REASON={}\n", shell_quote(reason)));
@@ -147,28 +136,17 @@ pub struct ProcessBody {
     pub throttle_ms: Option<u64>,
 }
 
-/// Serve an already-serialized JSON string as the response body without
-/// the parse-into-`Value`-then-reserialize round-trip. The cache already
-/// holds exactly the bytes the client should receive, so hand them back
-/// directly with the JSON content-type. (Round-tripping through
-/// `serde_json::Value` also alphabetized object keys; serving the cache
-/// verbatim preserves the original field order.)
+/// Serves cached JSON verbatim, preserving field order and avoiding reserialization.
 fn cached_json_response(body: String) -> axum::response::Response {
     use axum::http::header;
     use axum::response::IntoResponse;
     ([(header::CONTENT_TYPE, "application/json")], body).into_response()
 }
 
-/// GET /api/drives — list all drives (summaries only).
-///
-/// Returns a pre-computed JSON string stored in the `meta` table. The
-/// cache is built once at startup (or after any mutation) and served
-/// directly on every subsequent request — no grouper work, no BLOB
-/// decoding, no ORDER-BY sorter allocation.
+/// Lists cached drive summaries without decoding route BLOBs.
 pub async fn list_drives(State(state): State<AppState>) -> axum::response::Response {
     use axum::response::IntoResponse;
-    // spawn_blocking: a cache miss runs the grouper over every route
-    // (~400ms on a Pi 5 for 7k routes) — keep that off the async workers.
+    // A cache miss groups every route, so keep it off async workers.
     let store = state.drives.store.clone();
     match tokio::task::spawn_blocking(move || store.get_cached_drives_json()).await {
         Ok(Ok(json)) => cached_json_response(json),
@@ -183,26 +161,12 @@ pub async fn list_drives(State(state): State<AppState>) -> axum::response::Respo
     }
 }
 
-/// GET /api/drives/{id} — single drive with full point data.
-///
-/// Two-stage fetch to keep heap usage proportional to the one drive
-/// being rendered rather than the whole store:
-///
-/// 1. Load BLOB-free summaries and resolve `id` to the list of file
-///    paths that make up that drive (typically 1-20 clips).
-/// 2. Decode full BLOBs for only those files via
-///    `with_routes_by_files`. `build_single_drive` still expects a
-///    `&[Route]` slice, so the second fetch produces exactly that
-///    subset.
+/// Resolves a drive from BLOB-free summaries, then decodes only its route files.
 pub async fn single_drive(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    // The detail page runs the grouper over every route summary AND decodes
-    // the drive's full point BLOBs to build per-point stats — easily
-    // hundreds of ms on a big history. Run it on the blocking pool so it
-    // can't stall the async reactor (which drops the WebSocket heartbeat
-    // and shows "Reconnecting to SentryUSB…").
+    // Grouping and BLOB decoding must not stall the async reactor.
     let store = state.drives.store.clone();
     tokio::task::spawn_blocking(move || single_drive_blocking(store, id))
         .await
@@ -217,12 +181,8 @@ fn single_drive_blocking(
 ) -> (StatusCode, Json<serde_json::Value>) {
     let tags = store.get_all_drive_tags().unwrap_or_default();
 
-    // Resolve the drive id to (idx, files) AND grab the canonical
-    // DriveSummary the list view emits, in a single summary pass. We
-    // overlay the summary's headline aggregates onto the full Drive so
-    // the detail page can't disagree with the list on FSD %, distance,
-    // etc. — the two are computed via different algorithms (point walk
-    // vs per-clip aggregate sum) and drift ~0.1–0.5 % otherwise.
+    // Resolve files and the canonical list summary in one pass; overlay its
+    // aggregates because point-walk and per-clip calculations can drift.
     let (idx, files, summary) = match store
         .with_route_summaries(|summaries| {
             let resolved = grouper::find_drive_files(summaries, &id);
@@ -251,15 +211,18 @@ fn single_drive_blocking(
     match store.with_routes_by_files(&file_refs, |routes| {
         (
             routes.len(),
-            grouper::build_single_drive_from_clips(routes, idx as i32, &tags),
+            // Scope shared clips to the requested park-split segment.
+            grouper::build_single_drive_from_clips(
+                routes,
+                idx as i32,
+                &tags,
+                summary.as_ref().map(|s| s.start_time.as_str()),
+            ),
         )
     }) {
         Ok((_, Some(mut drive))) => {
             if let Some(s) = summary.as_ref() {
-                // Overlay the headline numbers from the canonical
-                // aggregate path. Per-point data (points, fsd_states,
-                // fsd_events) stays from build_drive_stats — those
-                // need the full BLOB walk.
+                // Keep per-point fields from the BLOB walk and headline fields canonical.
                 drive.distance_mi = s.distance_mi;
                 drive.distance_km = s.distance_km;
                 drive.avg_speed_mph = s.avg_speed_mph;
@@ -281,6 +244,8 @@ fn single_drive_blocking(
                 drive.tacc_distance_km = s.tacc_distance_km;
                 drive.tacc_distance_mi = s.tacc_distance_mi;
                 drive.assisted_percent = s.assisted_percent;
+                // Summon classification requires summary segment bounds.
+                drive.summon = s.summon;
             }
             (
                 StatusCode::OK,
@@ -301,38 +266,25 @@ fn single_drive_blocking(
     }
 }
 
-/// GET /api/drives/routes — overview routes for map.
-///
-/// Optional `max_points` query parameter (clamped to 2..=2000, defaults
-/// to 500) controls how aggressively each drive's polyline is
-/// downsampled. The Drives-list mini-map thumbnails request a small
-/// value (e.g. 20) to keep the wire payload manageable when fetching
-/// routes for hundreds of drives at once.
+/// Lists cached route overviews, downsampled to `max_points` (2–2000).
 pub async fn all_routes(
     State(state): State<AppState>,
     Query(q): Query<AllRoutesQuery>,
-) -> (StatusCode, Json<serde_json::Value>) {
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
     let max_points = q.max_points.unwrap_or(500).clamp(2, 2000);
-    // Decodes every route's point BLOBs and downsamples each polyline —
-    // proportional to the whole drive history. Off the reactor so the map
-    // overview can't freeze the live connection.
+    // Cached; a miss runs the grouper over all routes, so keep it off the reactor.
     let store = state.drives.store.clone();
-    let result = tokio::task::spawn_blocking(move || {
-        // get_routes hands the grouper an owned Vec so it can consume the
-        // routes in place — the previous borrow forced a full clone of the
-        // point-heavy set, doubling peak memory on the heaviest endpoint.
-        store.get_routes().map(|routes| grouper::route_overviews(routes, max_points))
-    })
-    .await;
-    match result {
-        Ok(Ok(overviews)) => (
-            StatusCode::OK,
-            Json(serde_json::to_value(overviews).unwrap_or_default()),
-        ),
-        Ok(Err(e)) => crate::json_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
-        Err(e) => {
-            crate::json_error(StatusCode::INTERNAL_SERVER_ERROR, &format!("routes task: {}", e))
+    match tokio::task::spawn_blocking(move || store.get_cached_route_overviews_json(max_points)).await {
+        Ok(Ok(json)) => cached_json_response(json),
+        Ok(Err(e)) => {
+            crate::json_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()).into_response()
         }
+        Err(e) => crate::json_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("routes task: {}", e),
+        )
+        .into_response(),
     }
 }
 
@@ -346,9 +298,13 @@ pub struct AllRoutesQuery {
 pub async fn list_tags(
     State(state): State<AppState>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    match state.drives.store.get_all_tag_names() {
-        Ok(tags) => (StatusCode::OK, Json(serde_json::to_value(tags).unwrap_or_default())),
-        Err(e) => crate::json_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    let store = state.drives.store.clone();
+    match tokio::task::spawn_blocking(move || store.get_all_tag_names()).await {
+        Ok(Ok(tags)) => (StatusCode::OK, Json(serde_json::to_value(tags).unwrap_or_default())),
+        Ok(Err(e)) => crate::json_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+        Err(e) => {
+            crate::json_error(StatusCode::INTERNAL_SERVER_ERROR, &format!("tags task: {}", e))
+        }
     }
 }
 
@@ -370,8 +326,7 @@ pub async fn processing_status(
         resp["process_total"]   = status.total_files.into();
     }
 
-    // Merge archive progress fields (phase, current, total) from archiveloop's
-    // status file so the dashboard progress bar has the data it needs.
+    // Include archiveloop progress in the dashboard status.
     if let Some(archive) = read_archive_status() {
         if let Some(obj) = archive.as_object() {
             for (k, v) in obj {
@@ -383,28 +338,7 @@ pub async fn processing_status(
     (StatusCode::OK, Json(resp))
 }
 
-/// GET /api/drives/migration-status — surface the v1→v2 aggregate
-/// backfill state so the iOS / web app can render a "Migrating drive
-/// data..." banner during a first-boot-after-upgrade. Safe to poll at
-/// 2-3s cadence; reads three atomics + a small mutex-guarded string,
-/// no SQLite contention.
-///
-/// Response shape:
-///
-/// ```json
-/// {
-///   "active": true,
-///   "done": 1234,
-///   "total": 5500,
-///   "pct": 22.4,
-///   "error": "",
-///   "disk_full": false
-/// }
-/// ```
-///
-/// `active=false` + `error=""` + `done==total` ⇒ migration finished.
-/// `active=false` + `error!=""` ⇒ failed/paused; `disk_full=true` means
-/// "free space then reboot".
+/// Returns lock-free v1→v2 aggregate-backfill progress for UI polling.
 pub async fn migration_status(
     State(_state): State<AppState>,
 ) -> (StatusCode, Json<serde_json::Value>) {
@@ -428,11 +362,8 @@ pub async fn migration_status(
     )
 }
 
-/// POST /api/drives/process — start processing new clips.
-///
-/// Query: `post_archive=1` — allow running during archiveloop's post-archive
-/// hook; skip keep-awake (archiveloop manages its own) and bypass the
-/// IsArchiving guard.
+/// Starts processing new clips. `post_archive=1` delegates keep-awake and
+/// archive coordination to archiveloop.
 pub async fn process_files(
     State(state): State<AppState>,
     Query(q): Query<ProcessQuery>,
@@ -506,10 +437,41 @@ pub async fn reprocess_all(
     crate::json_ok()
 }
 
-/// GET /api/drives/stats — aggregate stats
-/// Served from the pre-computed cache; no grouper work or BLOB decoding per request.
-/// `processed_count` is injected live from the atomic counter (it changes on
-/// every processed clip, independent of the route/tags cache invalidation key).
+/// Re-extracts only clips that may contain missing summon evidence.
+pub async fn check_summon(
+    State(state): State<AppState>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    if state.drives.processor.is_running() {
+        return crate::json_error(StatusCode::CONFLICT, "processing already in progress");
+    }
+    if state.drives.importing.load(Ordering::SeqCst) {
+        return crate::json_error(
+            StatusCode::CONFLICT,
+            "drive data import in progress — please wait until it finishes",
+        );
+    }
+    if is_archiving() {
+        return crate::json_error(
+            StatusCode::CONFLICT,
+            "archive is currently running — please wait until it finishes",
+        );
+    }
+
+    let processor = state.drives.processor.clone();
+    tokio::spawn(async move {
+        register_keep_awake_want("processor");
+        start_keep_awake("Drive Processing");
+        let result = processor.check_summon().await;
+        release_keep_awake_want("processor");
+        stop_keep_awake();
+        if let Err(e) = result {
+            tracing::warn!("summon check error: {}", e);
+        }
+    });
+    crate::json_ok()
+}
+
+/// Returns cached aggregate stats with a live processed-file count.
 pub async fn drive_stats(
     State(state): State<AppState>,
 ) -> (StatusCode, Json<serde_json::Value>) {
@@ -540,19 +502,7 @@ pub async fn drive_stats(
     }
 }
 
-/// GET /api/drives/fsd-analytics?period=day|week|all — FSD analytics.
-///
-/// `period=week` (and missing/invalid) is served from the pre-computed
-/// meta cache (no grouper work, no BLOB decoding) — this is what the
-/// FSD page hits on first paint. `period=day` and `period=all` recompute
-/// against the live route_summaries since the cache is week-shaped only.
-///
-/// Earlier the handler ignored the query entirely and always returned
-/// the week cache, so the Day / Week / All Time toggle on the FSD page
-/// silently no-op'd. Combined with a frontend bug that crashed when
-/// `fsd_grade` was undefined, hitting the FSD button on a fresh-DB Pi
-/// produced an unhandled `Cannot read properties of undefined (reading
-/// 'length')` from the toggle's first click.
+/// Returns FSD analytics; week uses the cache, while day/all use live summaries.
 pub async fn fsd_analytics(
     State(state): State<AppState>,
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
@@ -585,9 +535,7 @@ pub async fn fsd_analytics(
         };
     }
 
-    // Day / All — recompute against current route summaries. This is
-    // O(routes), not O(routes * BLOB-size), because we go through the
-    // BLOB-free `with_route_summaries` path.
+    // Day/all are O(routes) through BLOB-free summaries.
     let store = state.drives.store.clone();
     let period_owned = period.to_string();
     let result = tokio::task::spawn_blocking(move || {
@@ -619,15 +567,50 @@ pub async fn fsd_analytics(
     }
 }
 
-/// GET /api/drives/data/download — download drive data as JSON.
-///
-/// Streams the exported JSON directly from a tempfile to the HTTP
-/// response body without ever buffering the full document in memory.
-/// Prior implementation read the tempfile into a `String`, parsed it
-/// into a `serde_json::Value`, then re-serialized — three allocations
-/// of a file that could easily be 10-20 MB. Combined with the
-/// streaming export in `json_compat::export_json`, peak heap for this
-/// endpoint drops from ~30 MB to a few hundred KB.
+/// Returns live safety analytics from BLOB-free summaries.
+pub async fn safety_analytics(
+    State(state): State<AppState>,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let period = params.get("period").map(|s| s.as_str()).unwrap_or("month");
+    let period = match period {
+        "day" | "week" | "month" | "all" => period,
+        _ => "month",
+    };
+
+    let store = state.drives.store.clone();
+    let period_owned = period.to_string();
+    let result = tokio::task::spawn_blocking(move || {
+        store.with_route_summaries(|summaries| {
+            sentryusb_drives::grouper::safety_analytics_from_summaries_for_period(
+                summaries,
+                &period_owned,
+            )
+        })
+    })
+    .await;
+    match result {
+        Ok(Ok(analytics)) => match serde_json::to_value(&analytics) {
+            Ok(v) => (StatusCode::OK, Json(v)).into_response(),
+            Err(e) => crate::json_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("safety analytics serialize: {}", e),
+            )
+            .into_response(),
+        },
+        Ok(Err(e)) => {
+            crate::json_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()).into_response()
+        }
+        Err(e) => crate::json_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("safety analytics task: {}", e),
+        )
+        .into_response(),
+    }
+}
+
+/// Streams an exported JSON tempfile without buffering the full document.
 pub async fn download_data(
     State(state): State<AppState>,
 ) -> axum::response::Response {
@@ -664,9 +647,6 @@ pub async fn download_data(
         }
     };
 
-    // `ReaderStream` pulls 8 KB at a time from the file into Bytes
-    // chunks; those chunks are handed to hyper and flushed to the
-    // socket as they become available. Nothing full-file is resident.
     let stream = tokio_util::io::ReaderStream::new(file);
     axum::response::Response::builder()
         .status(StatusCode::OK)
@@ -677,8 +657,7 @@ pub async fn download_data(
         )
         .body(Body::from_stream(stream))
         .unwrap_or_else(|_| {
-            // Builder only fails on malformed headers (static here);
-            // fall back to a plain JSON error for completeness.
+            // Static headers should be valid; retain a defensive fallback.
             let (status, json) = crate::json_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "response build failed",
@@ -687,18 +666,7 @@ pub async fn download_data(
         })
 }
 
-/// POST /api/drives/data/export-for-sync
-///
-/// Regenerate `/backingfiles/drive-data.json` from the live SQLite store so
-/// `post-archive-process.sh` can ship it to the rsync / rclone archive
-/// server. Returns the byte count of the regenerated file so the shell
-/// script can log it.
-///
-/// Runs on the blocking thread pool so the 3+ minute regeneration on a
-/// well-used Pi (~848 MB on a year of dashcam data) doesn't block any
-/// async runtime worker. `DriveStore::export_json_for_sync` opens its
-/// own read-only SQLite handle, so the writer mutex stays free for
-/// concurrent `/api/drives` requests too.
+/// Regenerates the archive-sync JSON using a read-only handle on the blocking pool.
 pub async fn export_for_sync(
     State(state): State<AppState>,
 ) -> (StatusCode, Json<serde_json::Value>) {
@@ -722,12 +690,7 @@ pub async fn export_for_sync(
     }
 }
 
-/// POST /api/drives/data/upload — upload drive data JSON.
-///
-/// Streams the request body to a temp file chunk-by-chunk, then runs the
-/// JSON import in a blocking task. The import itself runs in a blocking task;
-/// `importing` is held for the duration so concurrent `process`/`reprocess`
-/// requests 409.
+/// Streams an uploaded JSON file to disk, then imports it on the blocking pool.
 pub async fn upload_data(
     State(state): State<AppState>,
     body: axum::body::Body,
@@ -751,7 +714,6 @@ pub async fn upload_data(
 
     let tmp = "/tmp/drive-data-upload.json";
 
-    // Stream body → temp file.
     let stream_result: Result<usize, (StatusCode, String)> = async {
         let file = std::fs::File::create(tmp)
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
@@ -790,9 +752,7 @@ pub async fn upload_data(
         tmp
     );
 
-    // Emit `drive_import` WebSocket events so the web UI can show a
-    // live progress bar during what may be a multi-minute restore.
-    // Phases: starting → progress (every 50 routes) → complete/error.
+    // Broadcast starting, periodic progress, and completion/error phases.
     let hub = state.hub.clone();
     hub.broadcast("drive_import", &serde_json::json!({"phase": "starting"}));
 
@@ -812,7 +772,7 @@ pub async fn upload_data(
     })
     .await;
 
-    // Best-effort cleanup; ignore errors (e.g. already-removed on panic).
+    // Cleanup is best-effort because the importer may already have removed it.
     let _ = std::fs::remove_file(tmp);
 
     match result {
@@ -861,15 +821,15 @@ pub async fn upload_data(
     }
 }
 
-/// GET /api/drives/data/import-history — read-only handler that returns the
-/// last 20 import diagnostics records persisted in the `meta` table. Each
-/// entry is `{ timestamp, stats, diagnostics }` so an operator can see why
-/// drives may have gone missing without scraping logs. Empty array if no
-/// imports have run yet.
+/// Returns the last 20 persisted import diagnostics records.
 pub async fn import_history(
     State(state): State<AppState>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    match state.drives.store.import_history() {
+    let store = state.drives.store.clone();
+    match tokio::task::spawn_blocking(move || store.import_history())
+        .await
+        .unwrap_or_else(|e| Err(anyhow::anyhow!("import-history task: {}", e)))
+    {
         Ok(history) => (
             StatusCode::OK,
             Json(serde_json::json!({ "history": history })),
@@ -917,24 +877,8 @@ pub struct BulkDeleteRequest {
     pub ids: Vec<String>,
 }
 
-/// POST /api/drives/bulk-delete — remove the listed drives from the DB.
-///
-/// Body: `{ "ids": ["<numeric index>" or "<start_time>", ...] }`.
-/// Resolves each id through the grouper to the clip files that make up
-/// the drive, deduplicates across ids (a parent clip can never be
-/// shared between two drives, but the dedupe is a cheap guard against
-/// future grouper changes), then deletes the matching rows from
-/// `routes`, `processed_files`, and `drive_tags` in one transaction.
-///
-/// Guards against the two jobs that actually write to these tables:
-/// the clip processor (`processor.is_running()`) and a JSON import
-/// (`importing`). We deliberately do NOT block on `is_archiving()`:
-/// the archive script copies clip files between disks and doesn't
-/// touch the DB during the archiving phase; the post-archive
-/// reprocess that DOES write goes through `POST /api/drives/process`,
-/// which would trip the processor guard at that point. Blocking on
-/// archive here is what `delete_all_drives` does, but for a
-/// targeted per-drive delete it's just user-hostile latency.
+/// Deletes drives resolved from numeric or start-time IDs in one transaction.
+/// Processing and import block deletion; archive copying does not write this DB.
 pub async fn bulk_delete_drives(
     State(state): State<AppState>,
     Json(body): Json<BulkDeleteRequest>,
@@ -958,8 +902,7 @@ pub async fn bulk_delete_drives(
         );
     }
 
-    // The grouper pass + delete transaction is blocking + CPU; keep it off
-    // the reactor (the guards above are cheap atomic loads and stay async).
+    // Keep grouping and the delete transaction off the async reactor.
     let store = state.drives.store.clone();
     tokio::task::spawn_blocking(move || bulk_delete_drives_blocking(store, body.ids))
         .await
@@ -972,9 +915,7 @@ fn bulk_delete_drives_blocking(
     store: std::sync::Arc<sentryusb_drives::DriveStore>,
     ids: Vec<String>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    // Resolve every id to (drive_key, file_list) in one summary pass —
-    // `with_route_summaries` rebuilds the grouper exactly once, not once
-    // per id.
+    // Resolve all IDs in one summary pass.
     let (files, drive_keys, not_found): (Vec<String>, Vec<String>, Vec<String>) = match store
         .with_route_summaries(|summaries| {
             let mut files = std::collections::HashSet::new();
@@ -1023,23 +964,13 @@ fn bulk_delete_drives_blocking(
     }
 }
 
-/// PUT /api/drives/{id}/tags — set tags for a drive.
-///
-/// `id` from the URL is either the numeric grouper index (what the
-/// drives-list response stamps onto `DriveSummary.id`) or the
-/// `%Y-%m-%dT%H:%M:%S` start_time string (the same form
-/// `/api/drives/{id}` accepts). Either way, the grouper joins tags
-/// onto drives strictly by start_time string, so we MUST resolve the
-/// URL id to that canonical key before writing — otherwise the row
-/// lands under a key like `"3"` that the list endpoint never reads
-/// back, and the tag silently disappears from the UI even though the
-/// PUT returned 200.
+/// Sets tags after resolving numeric or start-time IDs to the canonical start time.
 pub async fn set_drive_tags(
     State(state): State<AppState>,
     Path(id): Path<String>,
     Json(body): Json<SetTagsRequest>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    // Resolving the id runs the grouper over every summary — off the reactor.
+    // ID resolution groups all summaries, so keep it off the reactor.
     let store = state.drives.store.clone();
     tokio::task::spawn_blocking(move || set_drive_tags_blocking(store, id, body.tags))
         .await
@@ -1077,32 +1008,13 @@ pub struct SetTagsRequest {
     pub tags: Vec<String>,
 }
 
-/// GET /api/drives/{id}/temperature-series
-///
-/// Time-series of interior + exterior cabin temperature across the
-/// drive, sourced from `telemetry_samples` (BLE sampler at 60s cadence)
-/// for the union of clip windows that make up the drive. The frontend
-/// renders this as a two-line chart on the DriveDetail Climate section,
-/// one line per temperature source on a shared time axis.
-///
-/// Response shape:
-/// ```json
-/// {
-///   "points": [
-///     { "ts": 1716471234000, "interiorC": 22.3, "exteriorC": 14.1 },
-///     ...
-///   ]
-/// }
-/// ```
-/// `interiorC` / `exteriorC` are omitted when the underlying sample had
-/// NULL in that column — the frontend treats gaps as "no data" rather
-/// than dropping to zero.
+/// Returns interior/exterior temperatures within a drive's clip window.
+/// Null values are omitted so clients preserve gaps rather than plotting zero.
 pub async fn temperature_series(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    // Find files + derive window + query — all touch the connection
-    // mutex, so run the whole chain on the blocking pool.
+    // File lookup, window derivation, and query share the connection mutex.
     let store = state.drives.store.clone();
     let id_err = id.clone();
     let result =
@@ -1114,11 +1026,7 @@ pub async fn temperature_series(
                 None => return Ok(None),
             };
 
-            // Derive the drive's wall-clock window from the min/max of its
-            // clip windows. Files without parseable timestamps (event
-            // folders, manual imports) are silently skipped — they wouldn't
-            // contribute telemetry rows anyway since the sampler keys by
-            // clock time.
+            // Ignore files without clock timestamps when deriving the telemetry window.
             let mut start_ts: Option<i64> = None;
             let mut end_ts: Option<i64> = None;
             for f in &files {
@@ -1132,7 +1040,7 @@ pub async fn temperature_series(
                 _ => return Ok(Some(serde_json::json!({ "points": [] }))),
             };
 
-            let points = store.with_locked_conn(|conn| {
+            let points = store.with_read_conn(|conn| {
                 let mut stmt = conn.prepare(
                     "SELECT ts, interior_temp_c, exterior_temp_c \
                      FROM telemetry_samples \
@@ -1154,8 +1062,7 @@ pub async fn temperature_series(
                 for row in rows {
                     let (ts, interior, exterior) = row?;
                     let mut obj = serde_json::Map::new();
-                    // Ship ts in milliseconds — JS Date and recharts work in
-                    // ms, saves the frontend a multiply per row.
+                    // Client timestamps use milliseconds.
                     obj.insert("ts".to_string(), serde_json::json!(ts * 1000));
                     if let Some(v) = interior {
                         obj.insert("interiorC".to_string(), serde_json::json!(v));
@@ -1184,33 +1091,12 @@ pub async fn temperature_series(
     }
 }
 
-/// GET /api/drives/{id}/battery-series
-///
-/// Time-series of battery percent across the drive, sourced from
-/// the same `telemetry_samples` table the temperature series uses.
-/// The BLE sampler polls `state charge` every 60s in Active mode,
-/// so a typical 30-min drive has ~30 samples — enough to draw a
-/// smooth line on a playback chart without needing to interpolate
-/// between start/end the way the older code did.
-///
-/// Response shape mirrors `temperature_series`:
-/// ```json
-/// {
-///   "points": [
-///     { "ts": 1716471234000, "batteryPct": 73.0 },
-///     ...
-///   ]
-/// }
-/// ```
-/// `batteryPct` is omitted only when a row in the window has NULL
-/// in that column — which is fine for the chart, gaps just don't
-/// draw.
+/// Returns battery samples within a drive's clip window, omitting null values.
 pub async fn battery_series(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    // Find files + derive window + query — all touch the connection
-    // mutex, so run the whole chain on the blocking pool.
+    // File lookup, window derivation, and query share the connection mutex.
     let store = state.drives.store.clone();
     let id_err = id.clone();
     let result =
@@ -1222,8 +1108,7 @@ pub async fn battery_series(
                 None => return Ok(None),
             };
 
-            // Same window-derivation as temperature_series — min/max of the
-            // clip-file timestamps that make up this drive.
+            // Match the temperature-series clip window.
             let mut start_ts: Option<i64> = None;
             let mut end_ts: Option<i64> = None;
             for f in &files {
@@ -1237,7 +1122,7 @@ pub async fn battery_series(
                 _ => return Ok(Some(serde_json::json!({ "points": [] }))),
             };
 
-            let points = store.with_locked_conn(|conn| {
+            let points = store.with_read_conn(|conn| {
                 let mut stmt = conn.prepare(
                     "SELECT ts, battery_pct \
                      FROM telemetry_samples \
@@ -1280,37 +1165,25 @@ pub async fn battery_series(
 
 #[derive(Deserialize, Default)]
 pub struct TireHistoryQuery {
-    /// Window size in days. Clamped to [1, 365] to keep the down-sample
-    /// query bounded. Defaults to 30 to match the dashboard card spec.
+    /// Window size in days, clamped to 1–365 and defaulting to 30.
     #[serde(default)]
     pub days: Option<u32>,
 }
 
-/// GET /api/telemetry/tire-history
-///
-/// Per-tire pressure samples for the last `days` days (default 30).
-/// Rendered as the Dashboard's TirePressureCard.
-///
-/// No down-sampling: TPMS sensors only broadcast while the car is
-/// driving, so even with the 5-minute sampler cadence
-/// (`TIRES_INTERVAL` in the telemetry crate) a typical 30-day window
-/// stays well under a thousand points — small enough to ship raw and
-/// render smoothly in recharts.
-///
-/// Response shape:
-/// ```json
-/// {
-///   "points": [
-///     { "ts": 1716471234000, "fl": 41.7, "fr": 41.5, "rl": 42.4, "rr": 41.3 },
-///     ...
-///   ],
-///   "days": 30
-/// }
-/// ```
+/// Returns cached per-tire pressure history for the requested 1–365 day window.
+/// Cached JSON is shared by `Arc` to avoid cloning large result sets.
+static TIRE_HISTORY_CACHE: crate::ttl_cache::StaleWhileRevalidate<u32, std::sync::Arc<String>> =
+    crate::ttl_cache::StaleWhileRevalidate::new(std::time::Duration::from_secs(60));
+
+/// Even-stride cap for slowly varying pressure history.
+const TIRE_HISTORY_MAX_POINTS: usize = 2_000;
+
 pub async fn tire_history(
     State(state): State<AppState>,
     Query(q): Query<TireHistoryQuery>,
-) -> (StatusCode, Json<serde_json::Value>) {
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+
     let days = q.days.unwrap_or(30).clamp(1, 365);
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1319,60 +1192,70 @@ pub async fn tire_history(
     let cutoff = now - (days as i64) * 86_400;
 
     let store = state.drives.store.clone();
-    let result = tokio::task::spawn_blocking(move || {
-        store.with_locked_conn(|conn| {
-            let mut stmt = conn.prepare(
-                "SELECT ts, tire_fl_psi, tire_fr_psi, tire_rl_psi, tire_rr_psi \
-                 FROM telemetry_samples \
-                 WHERE ts >= ?1 \
-                   AND (tire_fl_psi IS NOT NULL OR tire_fr_psi IS NOT NULL \
-                        OR tire_rl_psi IS NOT NULL OR tire_rr_psi IS NOT NULL) \
-                 ORDER BY ts ASC",
-            )?;
-            let rows = stmt.query_map(rusqlite::params![cutoff], |r| {
-                Ok((
-                    r.get::<_, i64>(0)?,
-                    r.get::<_, Option<f64>>(1)?,
-                    r.get::<_, Option<f64>>(2)?,
-                    r.get::<_, Option<f64>>(3)?,
-                    r.get::<_, Option<f64>>(4)?,
-                ))
-            })?;
-            let mut out: Vec<serde_json::Value> = Vec::new();
-            for row in rows {
-                let (ts, fl, fr, rl, rr) = row?;
+    let body = TIRE_HISTORY_CACHE
+        .get(days, move || {
+            // Build JSON once; cache hits clone only the `Arc`.
+            let rows: Vec<(i64, Option<f32>, Option<f32>, Option<f32>, Option<f32>)> = store
+                .with_read_conn(|conn| {
+                    let mut stmt = conn.prepare(
+                        "SELECT ts, tire_fl_psi, tire_fr_psi, tire_rl_psi, tire_rr_psi \
+                         FROM telemetry_samples \
+                         WHERE ts >= ?1 \
+                           AND (tire_fl_psi IS NOT NULL OR tire_fr_psi IS NOT NULL \
+                                OR tire_rl_psi IS NOT NULL OR tire_rr_psi IS NOT NULL) \
+                         ORDER BY ts ASC",
+                    )?;
+                    let mapped = stmt.query_map(rusqlite::params![cutoff], |r| {
+                        Ok((
+                            r.get::<_, i64>(0)?,
+                            r.get::<_, Option<f32>>(1)?,
+                            r.get::<_, Option<f32>>(2)?,
+                            r.get::<_, Option<f32>>(3)?,
+                            r.get::<_, Option<f32>>(4)?,
+                        ))
+                    })?;
+                    let mut out = Vec::new();
+                    for row in mapped {
+                        out.push(row?);
+                    }
+                    Ok::<_, anyhow::Error>(out)
+                })
+                // Preserve stale cache data when refresh fails.
+                .ok()?;
+
+            let stride = (rows.len() / TIRE_HISTORY_MAX_POINTS).max(1);
+            let mut points = Vec::with_capacity(rows.len().min(TIRE_HISTORY_MAX_POINTS) + 1);
+            for (i, (ts, fl, fr, rl, rr)) in rows.iter().enumerate() {
+                // Always retain the newest sample.
+                if i % stride != 0 && i + 1 != rows.len() {
+                    continue;
+                }
                 let mut obj = serde_json::Map::new();
                 obj.insert("ts".to_string(), serde_json::json!(ts * 1000));
-                if let Some(v) = fl {
-                    obj.insert("fl".to_string(), serde_json::json!(v));
+                for (name, v) in [("fl", fl), ("fr", fr), ("rl", rl), ("rr", rr)] {
+                    if let Some(v) = v {
+                        obj.insert(name.to_string(), serde_json::json!(v));
+                    }
                 }
-                if let Some(v) = fr {
-                    obj.insert("fr".to_string(), serde_json::json!(v));
-                }
-                if let Some(v) = rl {
-                    obj.insert("rl".to_string(), serde_json::json!(v));
-                }
-                if let Some(v) = rr {
-                    obj.insert("rr".to_string(), serde_json::json!(v));
-                }
-                out.push(serde_json::Value::Object(obj));
+                points.push(serde_json::Value::Object(obj));
             }
-            Ok::<_, anyhow::Error>(out)
-        })
-    })
-    .await;
 
-    match result {
-        Ok(Ok(points)) => (
+            let doc = serde_json::json!({ "points": points, "days": days });
+            Some(std::sync::Arc::new(doc.to_string()))
+        })
+        .await;
+
+    match body {
+        Some(json) => (
             StatusCode::OK,
-            Json(serde_json::json!({
-                "points": points,
-                "days": days,
-            })),
-        ),
-        Ok(Err(e)) => crate::json_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
-        Err(e) => {
-            crate::json_error(StatusCode::INTERNAL_SERVER_ERROR, &format!("tire-history task: {}", e))
-        }
+            [(axum::http::header::CONTENT_TYPE, "application/json")],
+            json.as_str().to_owned(),
+        )
+            .into_response(),
+        None => crate::json_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "tire-history query failed",
+        )
+        .into_response(),
     }
 }

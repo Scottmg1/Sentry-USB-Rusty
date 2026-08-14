@@ -24,13 +24,13 @@ Then open `http://sentryusb.local` and the [Setup Wizard](Setup-Wizard-Guide) ta
 
 | Tier | Boards | Notes |
 |------|--------|-------|
-| **Recommended** | Raspberry Pi 4B, Raspberry Pi 5 | USB 2.0 OTG — fastest archiving, smoothest UI |
+| **Recommended** | Raspberry Pi 4B, Raspberry Pi 5 | 1 GB RAM is sufficient. USB 2.0 OTG — fastest archiving, smoothest UI |
 | **Tested** | Raspberry Pi Zero 2 W, Raspberry Pi 3A+ | USB 2.0 OTG — works fine, slower archive speeds. Pi 3A+ needs a USB-A-to-USB-A cable |
 | **Community** | Radxa Rock 4C+, Radxa Zero 3W | USB 3.0 OTG — reported working, not officially supported |
 | **Not supported** | Raspberry Pi 3B/3B+, Pi 2, Pi Zero W (v1), Pi 1 | 3B/3B+/2/1: USB goes through a hub chip — host-only, can never appear as a drive to the car. Zero W v1: too slow, build retired |
 
 Plus:
-- MicroSD card, **256 GB or larger** recommended
+- A high-quality MicroSD card sized for the USB-drive layout and snapshot retention you choose
 - A **USB 3.0 data cable** (not charge-only) — Pi to your Tesla.
   Use a 3.0 cable even on boards that only support USB 2.0 OTG: 3.0 cables
   deliver more power, which keeps lower-end boards stable.

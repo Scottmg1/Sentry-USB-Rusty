@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react"
-import { Tag, X, Plus } from "lucide-react"
+import { AddIcon, CloseIcon, SellIcon } from "@/components/icons"
 import { cn } from "@/lib/utils"
 import { fetchAllTagNames } from "@/api/tags"
 
@@ -24,9 +24,7 @@ export function TagPopover({ tags, onChange }: TagPopoverProps) {
     return () => document.removeEventListener("mousedown", onDoc)
   }, [open])
 
-  // Pull every tag already used on other drives/charges when the popover
-  // opens, so the user can pick one instead of retyping it. The server
-  // list is SELECT DISTINCT, so a tag drops off once nothing uses it.
+  // Load tags currently used by another drive or charge.
   useEffect(() => {
     if (!open) return
     let cancelled = false
@@ -90,7 +88,6 @@ export function TagPopover({ tags, onChange }: TagPopoverProps) {
   const displayTag = hasTags ? tags[0] : null
   const extraCount = hasTags ? tags.length - 1 : 0
 
-  // Existing tags not already on this item, narrowed by what's typed.
   const query = draft.trim().toLowerCase()
   const available = suggestions.filter(
     (s) => !tags.includes(s) && (!query || s.toLowerCase().includes(query)),
@@ -113,7 +110,7 @@ export function TagPopover({ tags, onChange }: TagPopoverProps) {
             : "h-7 w-7 justify-center text-slate-500 hover:bg-white/5 hover:text-slate-300",
         )}
       >
-        <Tag className={hasTags ? "h-3 w-3" : "h-4 w-4"} />
+        <SellIcon className={hasTags ? "h-3 w-3" : "h-4 w-4"} />
         {displayTag && <span>{displayTag}</span>}
         {extraCount > 0 && (
           <span className="text-emerald-300/80">+{extraCount}</span>
@@ -139,7 +136,7 @@ export function TagPopover({ tags, onChange }: TagPopoverProps) {
                     onClick={() => removeTag(t)}
                     className="text-emerald-300/70 hover:text-emerald-100 disabled:opacity-50"
                   >
-                    <X className="h-3 w-3" />
+                    <CloseIcon className="h-3 w-3" />
                   </button>
                 </span>
               ))}
@@ -183,7 +180,7 @@ export function TagPopover({ tags, onChange }: TagPopoverProps) {
                     onClick={() => selectSuggestion(s)}
                     className="inline-flex items-center gap-1 rounded-full border border-white/10 bg-white/5 px-2 py-0.5 text-xs text-slate-300 transition-colors hover:border-emerald-400/40 hover:bg-emerald-400/10 hover:text-emerald-200 disabled:opacity-50"
                   >
-                    <Plus className="h-3 w-3" />
+                    <AddIcon className="h-3 w-3" />
                     {s}
                   </button>
                 ))}

@@ -1,5 +1,6 @@
 pub mod auth;
 pub mod ble;
+pub mod degraded;
 pub mod ble_debug;
 pub mod router;
 pub mod drives_handler;
@@ -22,6 +23,7 @@ pub mod community;
 pub mod healthcheck;
 pub mod clips;
 pub mod preferences;
+pub mod ttl_cache;
 pub mod memory;
 pub mod logs;
 pub mod devices;
@@ -30,6 +32,7 @@ pub mod snapshots;
 pub mod keep_accessory;
 pub mod charging;
 pub mod storage_repair;
+pub mod profile;
 
 pub use auth::{AuthState, init_auth};
 pub use router::build_router;
@@ -53,11 +56,8 @@ pub fn json_ok() -> (StatusCode, Json<serde_json::Value>) {
     (StatusCode::OK, Json(serde_json::json!({"success": true})))
 }
 
-/// Canonical longitude in [-180, 180). The web map (Leaflet) allows panning
-/// into repeated world copies, so clients can submit values like -221.4 for
-/// 138.6°E; wrap on write AND on read so legacy stored values never rehydrate
-/// out-of-range in the UI. Haversine tolerates ±360, so this is storage/display
-/// hygiene, not geofence correctness. Matches the web's `normalizeLon`.
+/// Canonicalize longitudes to [-180, 180) for map world copies and storage.
+/// Geofence calculations tolerate ±360; this keeps displayed values consistent.
 pub fn normalize_lon(lon: f64) -> f64 {
     (lon + 180.0).rem_euclid(360.0) - 180.0
 }
@@ -65,14 +65,8 @@ pub fn normalize_lon(lon: f64) -> f64 {
 /// Process-wide shared `reqwest` client for the outbound community /
 /// notification proxies.
 ///
-/// Previously every proxied request built its own `reqwest::Client`,
-/// spinning up a fresh rustls/TLS stack and connection pool with no
-/// keep-alive reuse. One shared client pools connections to the two
-/// upstreams across requests. It carries **no** request-level timeout —
-/// the per-endpoint values (10s / 15s / 30s …) are preserved by each
-/// call site via `.timeout(..)` on the request builder, which overrides
-/// the client default. The 120s builder timeout is only a backstop so a
-/// site that forgets one can't hang a connection forever.
+/// Call sites set request-specific timeouts; the client timeout is only a
+/// backstop. Sharing preserves connection pooling across requests.
 pub fn http_client() -> &'static reqwest::Client {
     use std::sync::OnceLock;
     static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
@@ -90,7 +84,6 @@ mod tests {
 
     #[test]
     fn normalize_lon_wraps_world_copies() {
-        // The issue-#159 case: Japan clicked on the previous world copy.
         assert!((normalize_lon(-221.5) - 138.5).abs() < 1e-9);
         assert!((normalize_lon(538.5) - 178.5).abs() < 1e-9);
         assert!((normalize_lon(-540.0) - (-180.0)).abs() < 1e-9);
@@ -99,7 +92,6 @@ mod tests {
 
     #[test]
     fn normalize_lon_half_open_range() {
-        // Convention: [-180, 180) — exact +180 canonicalizes to -180.
         assert!((normalize_lon(180.0) - (-180.0)).abs() < 1e-9);
         assert!((normalize_lon(-180.0) - (-180.0)).abs() < 1e-9);
     }

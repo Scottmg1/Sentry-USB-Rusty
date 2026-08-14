@@ -1,15 +1,7 @@
 //! User preferences (key-value store).
 //!
-//! Concurrency: the load→modify→save flow used by [`set_preference`] is
-//! racy without a lock — two concurrent PUTs would both read the same
-//! baseline, each insert their own key, and the second write would
-//! silently clobber the first. Go guarded this with `prefsMu.RWMutex`;
-//! we do the same here with a process-wide `Mutex<()>` held for the
-//! duration of the RMW.
-//!
-//! Durability: saves go through tmp+rename so a power cut mid-write
-//! can't leave the preferences file half-formed (parseable as empty,
-//! losing every stored flag).
+//! Load/modify/save operations share a process-wide lock, and writes use an
+//! atomic temporary-file rename.
 
 use std::sync::Mutex;
 
@@ -20,8 +12,7 @@ use serde::Deserialize;
 
 use crate::router::AppState;
 
-/// Preferences store path (`/mutable` on the Pi; honors the
-/// `SENTRYUSB_MUTABLE_DIR` dev override for off-Pi runs).
+/// Preferences path beneath the configured mutable directory.
 pub(crate) fn prefs_file() -> String {
     format!("{}/.sentryusb_preferences.json", sentryusb_config::mutable_dir())
 }
@@ -30,12 +21,11 @@ fn legacy_prefs_file() -> String {
     format!("{}/sentryusb-prefs.json", sentryusb_config::mutable_dir())
 }
 
-/// Serializes concurrent preference reads + writes. Held around the
-/// RMW in `set_preference` so interleaved PUTs can't lose updates.
+/// Serializes preference read/modify/write operations.
 static PREFS_LOCK: Mutex<()> = Mutex::new(());
 
 pub(crate) fn load_prefs() -> serde_json::Map<String, serde_json::Value> {
-    // Primary path first, legacy path as fallback.
+    // Preserve the previous filename as a read-only migration fallback.
     if let Ok(d) = std::fs::read_to_string(prefs_file()) {
         if let Ok(v) = serde_json::from_str(&d) {
             return v;
@@ -47,19 +37,42 @@ pub(crate) fn load_prefs() -> serde_json::Map<String, serde_json::Value> {
         .unwrap_or_default()
 }
 
+/// Load → modify → save under [`PREFS_LOCK`], propagating write failures.
+/// `f` returns whether it changed anything; nothing is written if it didn't.
+/// Use over `save_prefs` (which only logs) when the caller must know the
+/// write landed.
+pub(crate) fn update_prefs<F>(f: F) -> anyhow::Result<bool>
+where
+    F: FnOnce(&mut serde_json::Map<String, serde_json::Value>) -> anyhow::Result<bool>,
+{
+    let _guard = PREFS_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let mut prefs = load_prefs();
+    if !f(&mut prefs)? {
+        return Ok(false);
+    }
+    save_prefs_checked(&prefs)?;
+    Ok(true)
+}
+
+/// Same write as [`save_prefs`] but the caller sees the failure.
+fn save_prefs_checked(prefs: &serde_json::Map<String, serde_json::Value>) -> anyhow::Result<()> {
+    let data = serde_json::to_string_pretty(prefs)?;
+    let prefs_path = prefs_file();
+    if let Some(parent) = std::path::Path::new(&prefs_path).parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let tmp = format!("{}.tmp", prefs_path);
+    std::fs::write(&tmp, &data)?;
+    if let Err(e) = std::fs::rename(&tmp, &prefs_path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e.into());
+    }
+    Ok(())
+}
+
 pub(crate) fn save_prefs(prefs: &serde_json::Map<String, serde_json::Value>) {
-    // Atomic tmp+rename — a direct `fs::write` leaves the file in an
-    // intermediate zero-length state if the kernel panics mid-write,
-    // which on next boot would silently reset every toggle (away-mode
-    // notifications, update channel, etc.) to its default.
-    //
-    // On a fresh first install the wizard saves prefs (e.g. the new
-    // community wraps/chimes flags) BEFORE the /mutable partition has
-    // been created and mounted — at that point the parent directory
-    // doesn't exist yet and the write fails with ENOENT, leaving a
-    // noisy warning in journalctl. Pre-create the parent so the write
-    // succeeds onto rootfs as a placeholder; once /mutable is mounted
-    // any subsequent save lands on the persistent partition.
+    // Create the parent for early setup writes and rename atomically so a
+    // partial write cannot reset every preference.
     let data = serde_json::to_string_pretty(prefs).unwrap_or_default();
     let prefs_path = prefs_file();
     if let Some(parent) = std::path::Path::new(&prefs_path).parent() {
@@ -113,20 +126,15 @@ pub async fn set_preference(
     let key = req.key.clone();
 
     {
-        // Hold the lock across the entire load→modify→save so two concurrent
-        // PUTs serialize rather than racing on the same baseline snapshot.
-        // Poisoned-guard recovery: treat `into_inner` as "lock was dropped
-        // while held" — safe because we always restore the file from a
-        // complete in-memory map on every save.
+        // Recover a poisoned lock because each save replaces the complete map.
         let _guard = PREFS_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let mut prefs = load_prefs();
         prefs.insert(req.key, req.value);
         save_prefs(&prefs);
     }
 
-    // Rate-config keys feed cloud sync: queue the document for push
-    // and wake the sweep loop. Pull-applied configs bypass this handler
-    // (the sync engine writes prefs directly), so there's no echo loop.
+    // API edits mark rate configuration dirty; pull-applied values bypass this
+    // handler and therefore cannot echo back.
     if RATE_CONFIG_KEYS.contains(&key.as_str()) {
         if let Err(e) = s.drives.store.mark_rate_config_dirty() {
             tracing::warn!("[preferences] mark_rate_config_dirty failed: {}", e);
@@ -142,9 +150,7 @@ pub async fn set_preference(
 pub const RATE_CONFIG_KEYS: &[&str] =
     &["charging_currency", "charging_default_rate", "charging_tag_rates"];
 
-/// `RateConfigAccess` over the local preferences store — wired into the
-/// cloud uploader at spawn (main.rs). Reads/writes only the
-/// RATE_CONFIG_KEYS subset, under the same PREFS_LOCK as the API.
+/// Cloud rate-config access restricted to [`RATE_CONFIG_KEYS`].
 pub struct PrefsRateConfig;
 
 impl sentryusb_cloud_uploader::RateConfigAccess for PrefsRateConfig {

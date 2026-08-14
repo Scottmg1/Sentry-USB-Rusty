@@ -1,4 +1,4 @@
-import { Download, Tag, Trash2 } from "lucide-react"
+import { DeleteIcon, DownloadIcon, SellIcon } from "@/components/icons"
 
 interface SelectModeBarProps {
   selectedCount: number
@@ -26,11 +26,11 @@ export function SelectModeBar({
         {selectedCount} of {totalCount} selected
       </span>
       <Outlined onClick={onTag} disabled={!hasSelection}>
-        <Tag className="h-3.5 w-3.5" />
+        <SellIcon className="h-3.5 w-3.5" />
         Tag
       </Outlined>
       <Outlined onClick={onExport} disabled={!hasSelection}>
-        <Download className="h-3.5 w-3.5" />
+        <DownloadIcon className="h-3.5 w-3.5" />
         Export
       </Outlined>
       <button
@@ -39,7 +39,7 @@ export function SelectModeBar({
         onClick={onDelete}
         className="inline-flex items-center gap-1.5 rounded-full bg-rose-500/95 px-3 py-1 text-xs font-medium text-white transition-colors hover:bg-rose-400 disabled:opacity-50"
       >
-        <Trash2 className="h-3.5 w-3.5" />
+        <DeleteIcon className="h-3.5 w-3.5" />
         Delete
       </button>
       <Outlined onClick={onSelectAll}>Select all</Outlined>

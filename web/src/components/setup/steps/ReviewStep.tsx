@@ -1,4 +1,4 @@
-import { CheckCircle } from "lucide-react"
+import { CheckCircleIcon } from "@/components/icons"
 import type { StepProps } from "../SetupWizard"
 
 const sections = [
@@ -14,7 +14,7 @@ const sections = [
     title: "Archive",
     fields: [
       "ARCHIVE_SYSTEM", "ARCHIVE_SERVER", "SHARE_NAME", "SHARE_USER", "SHARE_PASSWORD",
-      "RSYNC_SERVER", "RSYNC_USER", "RSYNC_PATH",
+      "RSYNC_SERVER", "RSYNC_USER", "RSYNC_PATH", "RSYNC_SSH_PORT",
       "RCLONE_DRIVE", "RCLONE_PATH",
       "ARCHIVE_SAVEDCLIPS", "ARCHIVE_SENTRYCLIPS", "ARCHIVE_RECENTCLIPS",
     ],
@@ -87,7 +87,7 @@ export function ReviewStep({ data, setupAlreadyFinished }: StepProps) {
   return (
     <div className="space-y-5">
       <div className="flex items-center gap-3">
-        <CheckCircle className="h-5 w-5 text-emerald-400" />
+        <CheckCircleIcon className="h-5 w-5 text-emerald-400" />
         <div>
           <h3 className="text-lg font-semibold text-slate-100">Review Configuration</h3>
           <p className="text-xs text-slate-500">

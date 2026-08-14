@@ -27,7 +27,6 @@ export default function RadialProgress({
   return (
     <div className={`relative inline-flex items-center justify-center ${className}`} style={{ width: size, height: size }}>
       <svg width={size} height={size} className="-rotate-90">
-        {/* Track */}
         <circle
           cx={center}
           cy={center}
@@ -36,7 +35,6 @@ export default function RadialProgress({
           stroke={trackColor}
           strokeWidth={strokeWidth}
         />
-        {/* Progress */}
         <circle
           cx={center}
           cy={center}
@@ -50,7 +48,6 @@ export default function RadialProgress({
           className="transition-[stroke-dashoffset] duration-700 ease-out"
         />
       </svg>
-      {/* Center content */}
       {children && (
         <div className="absolute inset-0 flex items-center justify-center">
           {children}

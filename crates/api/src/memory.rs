@@ -9,16 +9,20 @@ use crate::router::AppState;
 pub async fn memory_stats(State(_s): State<AppState>) -> (StatusCode, Json<serde_json::Value>) {
     let mut stats = serde_json::Map::new();
 
-    // Read RSS from /proc/self/statm on Linux
-    if let Ok(statm) = std::fs::read_to_string("/proc/self/statm") {
-        let parts: Vec<&str> = statm.split_whitespace().collect();
-        if parts.len() >= 2 {
-            let page_size = 4096u64; // typical page size
-            if let Ok(pages) = parts[1].parse::<u64>() {
-                stats.insert("rss_mb".into(), serde_json::json!((pages * page_size) as f64 / 1024.0 / 1024.0));
-            }
-            if let Ok(pages) = parts[0].parse::<u64>() {
-                stats.insert("vsz_mb".into(), serde_json::json!((pages * page_size) as f64 / 1024.0 / 1024.0));
+    // `/proc/self/status` avoids assumptions about kernel page size.
+    if let Ok(status) = std::fs::read_to_string("/proc/self/status") {
+        for line in status.lines() {
+            let (key, target) = match line.split_once(':') {
+                Some(("VmRSS", rest)) => (rest, "rss_mb"),
+                Some(("VmSize", rest)) => (rest, "vsz_mb"),
+                _ => continue,
+            };
+            if let Some(kb) = key
+                .trim()
+                .strip_suffix("kB")
+                .and_then(|v| v.trim().parse::<u64>().ok())
+            {
+                stats.insert(target.into(), serde_json::json!(kb as f64 / 1024.0));
             }
         }
     }

@@ -29,6 +29,15 @@ else
   RSYNC_EXTRA=(--partial)
 fi
 
+# Optional non-standard SSH port (RSYNC_SSH_PORT in sentryusb.conf). It has
+# to go through rsync's remote-shell override: `rsync -p` means "preserve
+# permissions", not "port". Unset adds nothing, so the command line is
+# unchanged for servers on the default port.
+RSYNC_SSH_ARGS=()
+if [ -n "${RSYNC_SSH_PORT:-}" ]; then
+  RSYNC_SSH_ARGS=(-e "ssh -p ${RSYNC_SSH_PORT}")
+fi
+
 function connectionmonitor {
   while true
   do
@@ -67,7 +76,7 @@ do
   # default-priority writes winning while guaranteeing the archive makes
   # progress. Needs the bfq scheduler to have effect (udev rule ships it).
   if ! (ionice -c2 -n7 nice -n19 rsync -avhRL --timeout=600 --remove-source-files --no-perms --omit-dir-times \
-        ${RSYNC_EXTRA[@]+"${RSYNC_EXTRA[@]}"} \
+        ${RSYNC_EXTRA[@]+"${RSYNC_EXTRA[@]}"} ${RSYNC_SSH_ARGS[@]+"${RSYNC_SSH_ARGS[@]}"} \
         --stats --log-file=/tmp/archive-rsync-cmd.log --ignore-missing-args \
         --files-from="$2" "$1" "$RSYNC_USER@$RSYNC_SERVER:$RSYNC_PATH" &> /tmp/rsynclog || [[ "$?" = "24" ]] )
   then

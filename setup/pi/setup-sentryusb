@@ -520,6 +520,10 @@ Conflicts=nginx.service
 
 [Service]
 Type=simple
+# Two malloc arenas instead of one per core: glibc otherwise keeps
+# per-arena free lists that hold RSS after burst workloads like clip
+# ingest. Pairs with the periodic malloc_trim in main.rs.
+Environment=MALLOC_ARENA_MAX=2
 ExecStartPre=-/bin/systemctl stop nginx
 ExecStartPre=-/bin/systemctl disable nginx
 ExecStart=/opt/sentryusb/sentryusb --port 80

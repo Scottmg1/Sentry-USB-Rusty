@@ -1,4 +1,4 @@
-import { Wifi, EthernetPort } from "lucide-react"
+import { LanIcon, WifiIcon } from "@/components/icons"
 import { PrefCard } from "@/components/settings/PrefCard"
 import { SectionErrorBoundary } from "@/components/ErrorBoundary"
 import { Row } from "@/components/ui/StatusTile"
@@ -31,7 +31,7 @@ export function NetworkTab({ status, onOpenWizard }: Props) {
     <div className="grid grid-cols-1 gap-2.5 lg:grid-cols-2">
       {/* Network interfaces */}
       <PrefCard
-        icon={<Wifi className="h-3.5 w-3.5" />}
+        icon={<WifiIcon className="h-3.5 w-3.5" />}
         halo={wifiConnected ? "accent" : "slate"}
         title="WiFi"
         badge={wifiConnected ? <Pill kind="accent">Connected</Pill> : null}
@@ -55,7 +55,7 @@ export function NetworkTab({ status, onOpenWizard }: Props) {
       </PrefCard>
 
       <PrefCard
-        icon={<EthernetPort className="h-3.5 w-3.5" />}
+        icon={<LanIcon className="h-3.5 w-3.5" />}
         halo={ethConnected ? "accent" : "slate"}
         title="Ethernet"
         badge={

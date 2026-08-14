@@ -3,10 +3,10 @@ import L from "leaflet"
 import "leaflet/dist/leaflet.css"
 import { normalizeLon } from "@/lib/geo"
 
-const TILES = "https://{s}.basemaps.cartocdn.com/dark_nolabels/{z}/{x}/{y}{r}.png"
+// Labeled tiles make precise manual placement possible.
+const TILES = "https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png"
 
-// Simple CSS pin (a divIcon) — avoids Leaflet's default-marker image URLs,
-// which break under bundlers. Draggable.
+// A CSS divIcon avoids bundled default-marker image URLs.
 const HOME_ICON = L.divIcon({
   className: "",
   html: '<div style="width:16px;height:16px;border-radius:50%;background:#3b82f6;border:2px solid #fff;box-shadow:0 0 0 3px rgba(59,130,246,.35)"></div>',
@@ -14,16 +14,11 @@ const HOME_ICON = L.divIcon({
   iconAnchor: [8, 8],
 })
 
-/**
- * Interactive home-geofence map. Shows the home pin + the radius as an actual
- * circle so the abstract "120 m" becomes something you can see. Tap the map or
- * drag the pin to set home — works with no GPS/BLE (key for new users still in
- * setup). The radius circle resizes live as the parent changes `radiusM`.
- */
+/** Interactive home pin and radius editor that works without GPS or BLE. */
 export function KeepAccessoryMap({
-  lat,
+  lat: rawLat,
   lon: rawLon,
-  radiusM,
+  radiusM: rawRadiusM,
   onPlace,
 }: {
   lat: number | null
@@ -31,27 +26,28 @@ export function KeepAccessoryMap({
   radiusM: number
   onPlace: (lat: number, lon: number) => void
 }) {
-  // Legacy configs may hold a world-copy longitude (e.g. -221 for 139°E);
-  // wrap so the pin and the readout agree with what gets stored.
-  const lon = rawLon != null ? normalizeLon(rawLon) : null
+  // Reject NaN config values before they reach Leaflet.
+  const lat = Number.isFinite(rawLat) ? (rawLat as number) : null
+  // Canonicalize longitudes from repeated Leaflet world copies.
+  const lon = Number.isFinite(rawLon) ? normalizeLon(rawLon as number) : null
+  // Leaflet rejects NaN radii; 120 m is the shared default.
+  const radiusM = Number.isFinite(rawRadiusM) ? rawRadiusM : 120
   const containerRef = useRef<HTMLDivElement>(null)
   const mapRef = useRef<L.Map | null>(null)
   const markerRef = useRef<L.Marker | null>(null)
   const circleRef = useRef<L.Circle | null>(null)
-  // Latest-callback pattern: map click handlers read this at event time.
+  // Map handlers read the latest callback without rebuilding the map.
   const onPlaceRef = useRef(onPlace)
   useEffect(() => {
     onPlaceRef.current = onPlace
   }, [onPlace])
-  // Capture the initial home so the init effect (run once) can center without
-  // needing lat/lon in its deps. Subsequent changes are handled below.
+  // Capture initial center separately from live-value updates.
   const initRef = useRef<{ lat: number | null; lon: number | null; r: number }>({
     lat,
     lon,
     r: radiusM,
   })
 
-  // Init the map exactly once.
   useEffect(() => {
     const el = containerRef.current
     if (!el || mapRef.current) return
@@ -59,8 +55,7 @@ export function KeepAccessoryMap({
     const hasHome = la != null && lo != null
     const center: L.LatLngExpression = hasHome ? [la as number, lo as number] : [39.5, -98.35]
 
-    // worldCopyJump keeps the pin on the primary world copy while panning
-    // across the antimeridian (e.g. from the US default to Japan).
+    // Keep the pin on the primary world copy across the antimeridian.
     const map = L.map(el, { attributionControl: false, zoomControl: true, worldCopyJump: true })
     mapRef.current = map
     L.tileLayer(TILES, { maxZoom: 19, minZoom: 2 }).addTo(map)
@@ -81,8 +76,7 @@ export function KeepAccessoryMap({
     circleRef.current = circle
     if (hasHome) map.fitBounds(circle.getBounds(), { padding: [24, 24], maxZoom: 17 })
 
-    // Wrap lng: panning into an adjacent world copy yields values like
-    // -221.4 for 138.6°E, which would otherwise display and persist as-is.
+    // Panning may return a longitude from an adjacent world copy.
     marker.on("dragend", () => {
       const p = marker.getLatLng()
       onPlaceRef.current(p.lat, normalizeLon(p.lng))
@@ -91,8 +85,7 @@ export function KeepAccessoryMap({
       onPlaceRef.current(e.latlng.lat, normalizeLon(e.latlng.lng))
     })
 
-    // Leaflet mis-sizes if the container wasn't fully laid out at init
-    // (cards/tabs). Nudge it once the next frame settles.
+    // Recalculate after card/tab layout settles.
     const t = window.setTimeout(() => map.invalidateSize(), 120)
 
     return () => {
@@ -102,10 +95,9 @@ export function KeepAccessoryMap({
       markerRef.current = null
       circleRef.current = null
     }
-    // Init-once: deliberately no deps. Live updates handled by the effect below.
+    // Live values are handled by the following effect.
   }, [])
 
-  // Keep the pin + circle in sync with the live values.
   useEffect(() => {
     const map = mapRef.current
     const marker = markerRef.current
@@ -118,8 +110,7 @@ export function KeepAccessoryMap({
       circle.setLatLng(ll)
       circle.setRadius(radiusM)
       circle.setStyle({ opacity: 0.9, fillOpacity: 0.12 })
-      // Always frame the whole circle so the radius is fully visible no
-      // matter how big it's set (your "zoom out to show the whole circle").
+      // Frame the entire radius after a live update.
       map.fitBounds(circle.getBounds(), { padding: [24, 24], maxZoom: 17 })
     } else {
       marker.setOpacity(0)

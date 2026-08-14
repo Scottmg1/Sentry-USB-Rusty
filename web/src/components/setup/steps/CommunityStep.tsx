@@ -1,5 +1,5 @@
 import { useEffect } from "react"
-import { Users, Paintbrush, Volume2, Info } from "lucide-react"
+import { BrushIcon, GroupIcon, InfoIcon, VolumeUpIcon } from "@/components/icons"
 import type { StepProps } from "../SetupWizard"
 
 function isWrapsEnabled(data: StepProps["data"]): boolean {
@@ -53,7 +53,7 @@ export function CommunityStep({ data, onChange, onBatchChange }: StepProps) {
   return (
     <div className="space-y-6">
       <div className="flex items-center gap-2">
-        <Users className="h-4 w-4 text-blue-400" />
+        <GroupIcon className="h-4 w-4 text-blue-400" />
         <h3 className="text-sm font-semibold uppercase tracking-wider text-slate-400">
           Community Features
         </h3>
@@ -75,7 +75,7 @@ export function CommunityStep({ data, onChange, onBatchChange }: StepProps) {
             />
             <div className="flex-1">
               <div className="flex items-center gap-2">
-                <Paintbrush className="h-4 w-4 text-blue-400" />
+                <BrushIcon className="h-4 w-4 text-blue-400" />
                 <span className="text-sm font-medium text-slate-200">Wraps &amp; License Plates</span>
               </div>
               <p className="mt-1 text-xs text-slate-500">
@@ -96,7 +96,7 @@ export function CommunityStep({ data, onChange, onBatchChange }: StepProps) {
             />
             <div className="flex-1">
               <div className="flex items-center gap-2">
-                <Volume2 className="h-4 w-4 text-blue-400" />
+                <VolumeUpIcon className="h-4 w-4 text-blue-400" />
                 <span className="text-sm font-medium text-slate-200">Lock Chimes</span>
               </div>
               <p className="mt-1 text-xs text-slate-500">
@@ -109,7 +109,7 @@ export function CommunityStep({ data, onChange, onBatchChange }: StepProps) {
 
       {noneSelected && (
         <div className="flex items-start gap-2 rounded-lg border border-blue-500/20 bg-blue-500/5 px-3 py-2">
-          <Info className="mt-0.5 h-3.5 w-3.5 shrink-0 text-blue-400" />
+          <InfoIcon className="mt-0.5 h-3.5 w-3.5 shrink-0 text-blue-400" />
           <p className="text-xs text-blue-300">
             Both features disabled. The Community tab will be hidden — you can re-enable either feature later from Settings.
           </p>

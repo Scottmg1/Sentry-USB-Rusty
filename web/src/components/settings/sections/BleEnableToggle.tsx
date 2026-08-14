@@ -1,25 +1,17 @@
 import { useState, useEffect } from "react"
-import { ShieldCheck, ShieldAlert } from "lucide-react"
+import { GppMaybeIcon, VerifiedUserIcon } from "@/components/icons"
 import { PrefCard } from "@/components/settings/PrefCard"
 import { Toggle } from "@/components/ui/Toggle"
 import { Pill } from "@/components/ui/Pill"
 
 /**
- * Two independent BLE feature toggles for Pi → car:
- *   - Telemetry (battery, temps, TPMS, location, odometer)
- *   - Keep-awake nudge (prevents USB power-off during archive cycles)
- *
- * Both share the same paired BLE key and VIN; they just decide whether
- * each feature does anything. Turning everything off is the kill
- * switch — the iOS-app GATT peripheral is unaffected by either toggle.
+ * Independent car-facing telemetry and keep-awake switches. They share the
+ * paired key and VIN but do not affect the iOS-facing GATT peripheral.
  */
 export function BleEnableToggle() {
   const [telemetry, setTelemetry] = useState<boolean | null>(null)
   const [keepAwake, setKeepAwake] = useState<boolean | null>(null)
-  // Name of another keep-awake provider (Tessie/TeslaFi/Webhook) that's
-  // already configured, or null. When set, BLE keep-awake can't be turned
-  // on here — only one provider may be active, and switching belongs in
-  // the wizard. Telemetry is unaffected (it can coexist with any provider).
+  // BLE telemetry can coexist with another keep-awake provider; BLE keep-awake cannot.
   const [blockedBy, setBlockedBy] = useState<string | null>(null)
   const [busy, setBusy] = useState(false)
   const [err, setErr] = useState<string | null>(null)
@@ -73,13 +65,12 @@ export function BleEnableToggle() {
 
   const anyOn = telemetry === true || keepAwake === true
   const loaded = telemetry !== null && keepAwake !== null
-  // Block turning BLE keep-awake ON when another provider owns it. If it's
-  // somehow already on, leave the toggle enabled so it can be turned off.
+  // An existing conflict may still be disabled from this control.
   const keepAwakeBlocked = blockedBy !== null && keepAwake !== true
   const icon = anyOn ? (
-    <ShieldCheck className="h-3.5 w-3.5" />
+    <VerifiedUserIcon className="h-3.5 w-3.5" />
   ) : (
-    <ShieldAlert className="h-3.5 w-3.5" />
+    <GppMaybeIcon className="h-3.5 w-3.5" />
   )
 
   return (

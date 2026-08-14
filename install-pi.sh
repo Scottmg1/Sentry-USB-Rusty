@@ -513,17 +513,9 @@ DTS
         warn "BCM4345C0 .hcd not found — 'apt install --reinstall armbian-firmware', then"
         warn "symlink BCM4345C0.radxa,rock-4c-plus.hcd → the generic BCM4345C0 .hcd."
     fi
-    if [ -e "$BRCM/nvram_ap6256.txt" ]; then
-        ln -sf nvram_ap6256.txt "$BRCM/brcmfmac43455-sdio.radxa,rock-4c-plus.txt"
-        [ -e "$BRCM/brcmfmac43455-sdio.bin" ] && \
-            ln -sf brcmfmac43455-sdio.bin "$BRCM/brcmfmac43455-sdio.radxa,rock-4c-plus.bin"
-        [ -e "$BRCM/brcmfmac43455-sdio.clm_blob" ] && \
-            ln -sf brcmfmac43455-sdio.clm_blob "$BRCM/brcmfmac43455-sdio.radxa,rock-4c-plus.clm_blob"
-        ok "WiFi nvram → nvram_ap6256.txt (AP6256 calibration) — WiFi now survives BT"
-        NEEDS_REBOOT=1
-    else
-        warn "nvram_ap6256.txt not found — WiFi may be unstable with BT (generic calibration)."
-    fi
+    # No WiFi NVRAM relink: nvram_ap6256.txt collapses 4C+ TX to ~6 Mbit/s
+    # (sole TX-power source, no txcap_blob). Driver falls back to the generic
+    # brcmfmac43455-sdio.txt. BT coexistence is the .hcd patch above, not this.
 
     # 4. (Recommended) OpenSSH instead of Dropbear — Dropbear ships no SFTP
     #    subsystem, so scp/sftp to the Pi fail.
@@ -555,46 +547,51 @@ fi
 # "GATT 147 bond=BOND_NONE" symptom they can opt in with:
 #     sudo touch /mutable/force-ble-adv-helper
 # That sentinel forces install regardless of chip detection.
-is_known_broken_ble_chip() {
-    [ -f /mutable/force-ble-adv-helper ] && return 0   # operator override
-    local chips="BCM4345C0\|BCM43430B0\|BCM43438"
-    dmesg 2>/dev/null | grep -qE "hci0: ($chips)" && return 0
-    grep -qai 'rock-4c-plus\|rockpi4c-plus\|ROCK 4C+\|Raspberry Pi Zero 2 W\|Raspberry Pi 3 Model B\|Raspberry Pi Zero W' \
-        /proc/device-tree/model 2>/dev/null && return 0
-    return 1
-}
-if is_known_broken_ble_chip; then
-    info "Known-affected BLE chip detected — installing raw-HCI advertising helper..."
-    BLE_ADV_BASE_URL="https://raw.githubusercontent.com/${REPO}/main/setup/pi"
-    LOCAL_PI_DIR="$(dirname "${1:-/dev/null}")/setup/pi"
-    fetch_file() {
-        # $1 = filename, $2 = destination. Tries local repo first, then URL.
-        if [ -f "$LOCAL_PI_DIR/$1" ]; then
-            install -m 644 "$LOCAL_PI_DIR/$1" "$2"
-        elif curl -fsSL --max-time 15 "$BLE_ADV_BASE_URL/$1" -o "$2" 2>/dev/null; then
-            :
-        else
-            warn "Failed to fetch $1 — BLE LE advertising may not work"
-            return 1
-        fi
-        return 0
-    }
-    if fetch_file sentryusb-ble-adv.sh /usr/local/bin/sentryusb-ble-adv.sh; then
-        chmod +x /usr/local/bin/sentryusb-ble-adv.sh
-        fetch_file sentryusb-ble-adv.service /etc/systemd/system/sentryusb-ble-adv.service
-        fetch_file 99-sentryusb-ble-hci.rules /etc/udev/rules.d/99-sentryusb-ble-hci.rules
-        mkdir -p /etc/systemd/system/sentryusb-ble.service.d
-        fetch_file sentryusb-ble-wants-bluetooth.conf /etc/systemd/system/sentryusb-ble.service.d/wants-bluetooth.conf
-        # Retire any older single-purpose unit from earlier installs.
-        systemctl disable --now sentryusb-ble-le.service 2>/dev/null || true
-        rm -f /etc/systemd/system/sentryusb-ble-le.service 2>/dev/null
-        rm -rf /etc/systemd/system/sentryusb-ble-le.service.d 2>/dev/null
-        systemctl enable bluetooth.service >/dev/null 2>&1 || true
-        systemctl daemon-reload 2>/dev/null || true
-        udevadm control --reload-rules 2>/dev/null || true
-        systemctl enable sentryusb-ble-adv.service >/dev/null 2>&1 || true
-        ok "BLE legacy-advertising helper installed (script + service + hci0 udev rule)"
+# Install the BLE advertising selector + helper on EVERY board. No chip gate:
+# which advertiser runs is decided at boot by the mode marker
+# (select-ble-adv-mode.sh vs ble-native-manifest), never by chip. The old gate
+# force-installed the helper on the working Pi 5 and could not distinguish the
+# natively-working r03 from the 4C+ (identical bluetoothd binary). Staging is
+# inert — the helper self-stands-down on boards the manifest qualifies native.
+info "Installing BLE advertising selector + helper..."
+BLE_ADV_BASE_URL="https://raw.githubusercontent.com/${REPO}/main/setup/pi"
+LOCAL_PI_DIR="$(dirname "${1:-/dev/null}")/setup/pi"
+fetch_file() {
+    # $1 = filename, $2 = destination, $3 = mode (default 644). Local repo first, then URL.
+    local mode="${3:-644}"
+    # Create the parent dir first: some destinations (e.g.
+    # /usr/local/share/sentryusb/) don't exist yet, and `curl -o` to a missing
+    # directory fails (exit 23) — which under `set -eu` would abort the whole
+    # installer. `install -D` handles the local path, mkdir handles the curl one.
+    mkdir -p "$(dirname "$2")" 2>/dev/null || true
+    if [ -f "$LOCAL_PI_DIR/$1" ]; then
+        install -D -m "$mode" "$LOCAL_PI_DIR/$1" "$2"
+    elif curl -fsSL --max-time 15 "$BLE_ADV_BASE_URL/$1" -o "$2" 2>/dev/null; then
+        chmod "$mode" "$2" 2>/dev/null || true
+    else
+        warn "Failed to fetch $1 — BLE LE advertising may not work"
+        return 1
     fi
+    return 0
+}
+if fetch_file select-ble-adv-mode.sh /usr/local/bin/select-ble-adv-mode.sh 755 \
+   && fetch_file sentryusb-ble-adv.sh /usr/local/bin/sentryusb-ble-adv.sh 755; then
+    fetch_file ble-native-manifest /usr/local/share/sentryusb/ble-native-manifest 644
+    fetch_file sentryusb-ble-mode.service /etc/systemd/system/sentryusb-ble-mode.service 644
+    fetch_file sentryusb-ble-adv.service /etc/systemd/system/sentryusb-ble-adv.service 644
+    fetch_file 99-sentryusb-ble-hci.rules /etc/udev/rules.d/99-sentryusb-ble-hci.rules 644
+    mkdir -p /etc/systemd/system/sentryusb-ble.service.d
+    fetch_file sentryusb-ble-wants-bluetooth.conf /etc/systemd/system/sentryusb-ble.service.d/wants-bluetooth.conf 644
+    # Retire any older single-purpose unit from earlier installs.
+    systemctl disable --now sentryusb-ble-le.service 2>/dev/null || true
+    rm -f /etc/systemd/system/sentryusb-ble-le.service 2>/dev/null
+    rm -rf /etc/systemd/system/sentryusb-ble-le.service.d 2>/dev/null
+    systemctl enable bluetooth.service >/dev/null 2>&1 || true
+    systemctl daemon-reload 2>/dev/null || true
+    udevadm control --reload-rules 2>/dev/null || true
+    systemctl enable sentryusb-ble-mode.service >/dev/null 2>&1 || true
+    systemctl enable sentryusb-ble-adv.service >/dev/null 2>&1 || true
+    ok "BLE advertising selector + helper installed (mode gate + advertiser + hci0 udev rule)"
 fi
 
 # ── Step 4: Sample Config ───────────────────────────────────────────

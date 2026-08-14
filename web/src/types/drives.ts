@@ -49,6 +49,15 @@ export interface DriveSummary {
   source?: string
   externalSignature?: string
   tessieAutopilotPercent?: number
+  /** Detected Summon / Smart Summon drive — present only when true. */
+  summon?: boolean
+  /** Per-drive Safety Score (0–100); absent when the drive is too
+   *  short, imported, a summon session, or carries no SEI safety data. */
+  safetyScore?: number
+  safetyHardBrakeEvents?: number
+  safetyAggrTurnEvents?: number
+  safetySpeedingMs?: number
+  safetyNightMi?: number
 }
 
 export interface FsdEvent {

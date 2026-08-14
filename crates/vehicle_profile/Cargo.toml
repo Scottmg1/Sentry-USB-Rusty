@@ -1,0 +1,18 @@
+[package]
+name = "sentryusb-vehicle-profile"
+version = "0.1.0"
+edition = "2021"
+license-file.workspace = true
+
+[lib]
+name = "sentryusb_vehicle_profile"
+path = "src/lib.rs"
+
+[dependencies]
+sentryusb-config = { path = "../config", package = "sentryusb-config" }
+anyhow = { workspace = true }
+serde = { workspace = true }
+chrono = { workspace = true }
+tracing = { workspace = true }
+regex = "1"
+toml = "1.1"

@@ -1,5 +1,12 @@
 import { useEffect, useMemo, useState } from "react"
-import { Cloud, CloudOff, Loader2, RotateCw, Trash2, Upload } from "lucide-react"
+import {
+  CloudIcon,
+  CloudOffIcon,
+  DeleteIcon,
+  ProgressActivityIcon,
+  RotateRightIcon,
+  UploadIcon,
+} from "@/components/icons"
 import { cn } from "@/lib/utils"
 import { wsClient } from "@/lib/ws"
 
@@ -32,8 +39,7 @@ export default function CloudPairingSection({ compact = false }: Props) {
   const [confirmUnpair, setConfirmUnpair] = useState(false)
   const [retrying, setRetrying] = useState(false)
 
-  // Baseline of the current upload session (drives the progress bar) —
-  // state, not a ref, since it feeds rendering.
+  // Baseline used by the rendered session progress bar.
   const [sessionStart, setSessionStart] = useState<{ pending: number; uploaded: number } | null>(null)
 
   useEffect(() => {
@@ -66,11 +72,12 @@ export default function CloudPairingSection({ compact = false }: Props) {
 
     function scheduleNext(data: CloudStatus | null) {
       if (timer) clearTimeout(timer)
-      const fast =
+      // Pairing polls each second; long-running upload backlogs use three seconds.
+      const pairing =
         data?.pairingState === "handshaking" ||
-        data?.pairingState === "polling" ||
-        (data?.paired && data.pendingRouteCount > 0)
-      timer = setTimeout(refetch, fast ? 1000 : 30000)
+        data?.pairingState === "polling"
+      const uploading = data?.paired && data.pendingRouteCount > 0
+      timer = setTimeout(refetch, pairing ? 1000 : uploading ? 3000 : 30000)
     }
 
     refetch()
@@ -116,16 +123,11 @@ export default function CloudPairingSection({ compact = false }: Props) {
     try {
       await fetch("/api/cloud/pair/cancel", { method: "POST" })
     } catch {
-      // fire-and-forget; pairing UI resets regardless
+      // Cancellation is best effort; local pairing state still resets.
     }
   }
 
-  // Nudge the uploader to retry immediately. Used when `lastUploadError`
-  // is showing — the uploader is event-driven (fires at the end of each
-  // archive cycle), so a transient failure (server reload, network blip)
-  // can leave the queue stuck until the next clip finishes archiving.
-  // This button just calls `nudge()` on the uploader; the queued routes
-  // get another shot and the error string clears on success.
+  // Uploads normally retry after an archive; nudge retries a transient failure now.
   async function retryUpload() {
     if (retrying) return
     setRetrying(true)
@@ -136,9 +138,7 @@ export default function CloudPairingSection({ compact = false }: Props) {
     } catch (err) {
       setError(err instanceof Error ? err.message : "retry failed")
     } finally {
-      // Brief delay so the user sees the spinner — the actual upload
-      // completes async and the cloud_upload WS event will refetch
-      // status when it lands.
+      // Completion arrives asynchronously through the cloud_upload event.
       setTimeout(() => setRetrying(false), 800)
     }
   }
@@ -157,9 +157,7 @@ export default function CloudPairingSection({ compact = false }: Props) {
   const pairingState = status?.pairingState ?? "idle"
   const inFlight =
     pairingState === "handshaking" || pairingState === "polling"
-  // Compact "Mon DD, HH:MM" — the previous toLocaleString() ran ~23 chars
-  // (full date + seconds + AM/PM) which truncated to "…" in the 1/4-width
-  // stat box. Same precision a user needs (date + minute), no overflow.
+  // Keep timestamps to date-and-minute precision so they fit the stat box.
   const lastUploadDisplay = status?.lastUploadAt
     ? new Date(status.lastUploadAt).toLocaleString(undefined, {
         month: "short",
@@ -191,9 +189,9 @@ export default function CloudPairingSection({ compact = false }: Props) {
           )}
         >
           {paired ? (
-            <Cloud className="h-4 w-4 text-emerald-400" />
+            <CloudIcon className="h-4 w-4 text-emerald-400" />
           ) : (
-            <CloudOff className="h-4 w-4 text-sky-400" />
+            <CloudOffIcon className="h-4 w-4 text-sky-400" />
           )}
         </div>
         <h3 className="text-sm font-semibold text-slate-200">SentryCloud</h3>
@@ -230,7 +228,7 @@ export default function CloudPairingSection({ compact = false }: Props) {
                 disabled={submitting || code.length !== 6}
                 className="flex items-center justify-center gap-2 rounded-lg bg-sky-500 px-5 py-3 text-sm font-semibold text-white shadow-sm transition-colors hover:bg-sky-400 disabled:cursor-not-allowed disabled:opacity-40"
               >
-                {submitting ? <Loader2 className="h-4 w-4 animate-spin" /> : <Cloud className="h-4 w-4" />}
+                {submitting ? <ProgressActivityIcon className="h-4 w-4 animate-spin" /> : <CloudIcon className="h-4 w-4" />}
                 {submitting ? "Pairing…" : "Pair"}
               </button>
             </div>
@@ -243,7 +241,7 @@ export default function CloudPairingSection({ compact = false }: Props) {
         {!paired && inFlight && (
           <div className="flex items-center justify-between gap-3 rounded-lg border border-sky-500/20 bg-sky-500/5 px-3 py-2.5">
             <div className="flex items-center gap-2">
-              <Loader2 className="h-4 w-4 animate-spin text-sky-400" />
+              <ProgressActivityIcon className="h-4 w-4 animate-spin text-sky-400" />
               <p className="text-xs text-slate-300">
                 {pairingState === "handshaking"
                   ? "Connecting to cloud…"
@@ -271,7 +269,7 @@ export default function CloudPairingSection({ compact = false }: Props) {
               <div className="rounded-lg border border-sky-500/20 bg-sky-500/5 px-3 py-2.5">
                 <div className="mb-2 flex items-center justify-between gap-2 text-[11px]">
                   <div className="flex items-center gap-1.5 text-sky-300">
-                    <Upload className="h-3.5 w-3.5 animate-pulse" />
+                    <UploadIcon className="h-3.5 w-3.5 animate-pulse" />
                     <span className="font-medium">Uploading</span>
                   </div>
                   <span className="text-slate-400">
@@ -309,9 +307,9 @@ export default function CloudPairingSection({ compact = false }: Props) {
                   title="Retry queued uploads now"
                 >
                   {retrying ? (
-                    <Loader2 className="h-3 w-3 animate-spin" />
+                    <ProgressActivityIcon className="h-3 w-3 animate-spin" />
                   ) : (
-                    <RotateCw className="h-3 w-3" />
+                    <RotateRightIcon className="h-3 w-3" />
                   )}
                   Retry
                 </button>
@@ -343,7 +341,7 @@ export default function CloudPairingSection({ compact = false }: Props) {
                 onClick={() => setConfirmUnpair(true)}
                 className="flex items-center gap-1.5 rounded-md border border-white/10 bg-white/5 px-2.5 py-1.5 text-[11px] font-medium text-slate-300 transition-colors hover:border-red-500/30 hover:bg-red-500/10 hover:text-red-300"
               >
-                <Trash2 className="h-3 w-3" />
+                <DeleteIcon className="h-3 w-3" />
                 Unpair this Pi
               </button>
             )}

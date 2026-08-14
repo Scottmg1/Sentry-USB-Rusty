@@ -1,6 +1,4 @@
-// Display formatters for charge-session values. Each tolerates
-// null/undefined and renders an em dash so the UI never shows "NaN" or
-// "null" when a sample column was empty.
+// Missing charge values render as an em dash rather than NaN or null.
 
 export function fmtEnergy(kwh: number | null | undefined): string {
   if (kwh == null) return "—"
@@ -15,6 +13,28 @@ export function fmtSoc(pct: number | null | undefined): string {
 export function fmtPower(kw: number | null | undefined): string {
   if (kw == null) return "—"
   return `${Math.round(kw)} kW`
+}
+
+export function fmtCurrent(amps: number | null | undefined): string {
+  if (amps == null) return "—"
+  return `${Math.round(amps)} A`
+}
+
+export function fmtVoltage(volts: number | null | undefined): string {
+  if (volts == null) return "—"
+  return `${Math.round(volts)} V`
+}
+
+// Charging rate in the configured distance unit per hour. Input is mph
+// because Tesla reports miles regardless of the dashboard preference.
+export function fmtChargeRateUnit(
+  mph: number | null | undefined,
+  metric: boolean,
+): string {
+  if (mph == null) return "—"
+  return metric
+    ? `${Math.round(mph * 1.609344)} km/h`
+    : `${Math.round(mph)} mph`
 }
 
 // Range in the configured distance unit. Input is miles (the car's

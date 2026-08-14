@@ -1,10 +1,24 @@
 import { useState, useEffect, useRef, useCallback } from "react"
-import { Bluetooth, Check, CheckCircle, AlertCircle, Loader2, Wifi, WifiOff, ChevronDown, ChevronUp, Eye, EyeOff, Usb, Cpu } from "lucide-react"
+import {
+  BluetoothIcon,
+  CheckCircleIcon,
+  CheckIcon,
+  ErrorIcon,
+  ExpandLessIcon,
+  ExpandMoreIcon,
+  MemoryIcon,
+  ProgressActivityIcon,
+  UsbIcon,
+  VisibilityIcon,
+  VisibilityOffIcon,
+  WifiOffIcon,
+} from "@/components/icons"
 import { cn } from "@/lib/utils"
 import { wsClient } from "@/lib/ws"
 import { PrefCard } from "@/components/settings/PrefCard"
 import { Pill, LiveDot } from "@/components/ui/Pill"
 import { useUnits } from "@/lib/units"
+import { presentBleHealth, type BleHealth } from "@/lib/bleHealth"
 
 // Telemetry reports TPMS in PSI; bar is a display conversion (PRESSURE_UNIT).
 const PSI_TO_BAR = 0.0689476
@@ -23,7 +37,7 @@ type BleState =
   | "error"
 
 interface BleStatusResp {
-  status: "not_paired" | "keys_generated" | "paired"
+  status: "not_paired" | "keys_generated" | "paired" | "repair_required"
   vin?: string
   binaries_installed?: boolean
   note?: string
@@ -37,35 +51,30 @@ interface BleConnectedResp {
   last_success_ts: number
   seconds_ago: number | null
   sample_count_10min: number
-  /** "keep_awake" while archiveloop's nudge holds the radio,
-   *  "telemetry" while our own sampler is mid-call, null when the
-   *  radio is free. Lets the UI explain a stale pill as "paused"
-   *  rather than "disconnected". */
+  /** Current radio owner, or null when free. */
   radio_owner: string | null
-  /** True when archiveloop reports phase=="archiving" — the most
-   *  common reason `radio_owner === "keep_awake"`. */
+  /** Whether the archive loop currently owns an active cycle. */
   archiving: boolean
+  health?: BleHealth
 }
 
 interface ClockStatusResp {
   synced: boolean
   has_rtc: boolean
   ntp_synced: boolean
-  /** True only when the clock is bad AND there's no RTC battery —
-   *  the only case where the user needs to do something (connect to
-   *  WiFi to let NTP catch up). RTC users always see false. */
+  /** True when a bad clock without RTC requires network synchronization. */
   show_warning: boolean
 }
 
 interface BleAdapter {
-  id: string                          // "hci0", "hci1", ...
-  source: "onboard" | "external"     // hci0 = onboard, hci1+ = external
-  address: string | null              // BD address (best-effort)
+  id: string                          // hci0, hci1, ...
+  source: "onboard" | "external"
+  address: string | null
 }
 
 interface BleAdaptersResp {
-  current: string                     // currently configured adapter id
-  default: string                     // default if BLE_ADAPTER unset
+  current: string
+  default: string
   available: BleAdapter[]
 }
 
@@ -82,21 +91,14 @@ interface BleLatestSample {
   tire_rr_psi?: number | null
   odometer_mi?: number | null
   location_name?: string | null
-  /** Live gate inputs (not the DB). "unknown"/"absent" = not read. */
+  /** Live gate inputs; "unknown" and "absent" mean unread. */
   sentry_mode?: string | null
   charging_state?: string | null
   shift_state?: string | null
   source?: string
-  /** Age (seconds) of the most recent body-controller poll, or null
-   *  if the sampler has never done one. Body-controller polls run
-   *  on a 30-second cadence while the car is in Quiet mode (parked,
-   *  sleeping). Fresh body-controller + stale state = car is asleep
-   *  by design, not a failure mode. */
+  /** Fresh body-controller with stale state indicates intentional Quiet mode. */
   body_controller_seconds_ago?: number | null
-  /** Per-field age (seconds) of the shown value. A field can be far
-   *  older than `seconds_ago` when its poll is failing while other polls
-   *  keep the envelope fresh — that's what made a stale temp read as
-   *  "updated 8 seconds ago". Used to flag the value inline. */
+  /** Field age may exceed envelope age when only one poll source fails. */
   field_secs_ago?: {
     battery_pct?: number | null
     interior_temp_c?: number | null
@@ -106,17 +108,8 @@ interface BleLatestSample {
 }
 
 /**
- * BLE pair card with inline VIN entry, lazy binary install, and a
- * live "connected" indicator. Always rendered in the Device tab —
- * gating is now via the master `BleEnableToggle` card next door.
- *
- * Pairing flow on click:
- *   1. Validate VIN locally (17 alphanumeric chars).
- *   2. If VIN differs from saved → POST /api/system/ble-vin.
- *   3. If binaries missing → POST /api/system/ble-install, wait for
- *      `ble_install_status` WebSocket "done" event.
- *   4. POST /api/system/ble-pair, follow ble_status WebSocket events
- *      and polling fallback.
+ * BLE pairing with VIN validation and lazy binary installation. Pairing starts
+ * after the install-complete event and follows WebSocket status with polling fallback.
  */
 export function BlePairButton() {
   const [bleState, setBleState] = useState<BleState>("loading")
@@ -129,6 +122,7 @@ export function BlePairButton() {
   const [sampleCount10min, setSampleCount10min] = useState<number>(0)
   const [radioOwner, setRadioOwner] = useState<string | null>(null)
   const [archiving, setArchiving] = useState<boolean>(false)
+  const [bleHealth, setBleHealth] = useState<BleHealth | null>(null)
   const [nowTs, setNowTs] = useState<number>(Math.floor(Date.now() / 1000))
   const [outputOpen, setOutputOpen] = useState(false)
   const [latestSample, setLatestSample] = useState<BleLatestSample | null>(null)
@@ -145,9 +139,6 @@ export function BlePairButton() {
   const tickRef = useRef<ReturnType<typeof setInterval> | null>(null)
   const samplePollRef = useRef<ReturnType<typeof setInterval> | null>(null)
 
-  // ---------------------------------------------------------------------------
-  // Initial state load
-  // ---------------------------------------------------------------------------
   const reloadStatus = useCallback(async () => {
     try {
       const [enabledRes, statusRes] = await Promise.all([
@@ -164,6 +155,22 @@ export function BlePairButton() {
       if (!en) {
         setBleState("disabled")
         setBleMsg("BLE is disabled. Enable it in the toggle above to pair.")
+        return
+      }
+      if (statusRes?.status === "repair_required") {
+        setBleState("paired")
+        setBleHealth({
+          severity: "red",
+          code: "repair_required",
+          since_ts: null,
+          label: "Re-pair required",
+          guidance:
+            "Open Settings, select Re-pair, then tap your key card on the center console.",
+        })
+        setBleMsg(
+          statusRes.note ||
+            "The car rejected this SentryUSB key. Re-pair, then tap the key card on the center console.",
+        )
         return
       }
       if (statusRes?.status === "paired") {
@@ -194,22 +201,13 @@ export function BlePairButton() {
     reloadStatus()
   }, [reloadStatus])
 
-  // ---------------------------------------------------------------------------
-  // ble_status (pairing) WebSocket subscription
-  // ---------------------------------------------------------------------------
   useEffect(() => {
     const unsub = wsClient.subscribe("ble_status", (data: unknown) => {
       const d = data as {
         status: string
         error?: string
         output?: string
-        /** Set by the pair handler when add-key-request returned
-         *  exit 0 but the post-pair session-info probe couldn't
-         *  reach the car — meaning the BLE adapter is silently
-         *  dropping writes (a known firmware/kernel quirk on some
-         *  Broadcom chips). Distinct from a generic "tesla-control
-         *  errored out" failure so we can render hardware-specific
-         *  guidance. */
+        /** Successful key request followed by failed session probe, indicating dropped writes. */
         verify_failed?: boolean
       }
       if (d.status === "pairing") {
@@ -219,10 +217,7 @@ export function BlePairButton() {
         setBleState("error")
         const errMsg = d.error || "Unknown error"
         if (d.verify_failed) {
-          // Backend has already composed a detailed message; just
-          // surface it. The car never showed a card prompt because
-          // the adapter never actually delivered the request — no
-          // amount of clicking "tap card" will help here.
+          // Surface the backend's hardware-specific write failure.
           setBleMsg(errMsg)
         } else if (errMsg.includes("maximum number of BLE")) {
           setBleMsg("Too many BLE devices active. Turn off Bluetooth on nearby phone keys and try again.")
@@ -245,9 +240,6 @@ export function BlePairButton() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
-  // ---------------------------------------------------------------------------
-  // ble_install_status WebSocket subscription
-  // ---------------------------------------------------------------------------
   useEffect(() => {
     const unsub = wsClient.subscribe("ble_install_status", (data: unknown) => {
       const d = data as { status: string; message?: string; error?: string }
@@ -258,7 +250,7 @@ export function BlePairButton() {
         setBleState("installing")
         if (d.message) setBleMsg(d.message)
       } else if (d.status === "done") {
-        // Install completed — refresh status, then continue to pair.
+        // Refresh installed state before continuing the deferred pair flow.
         setBinariesInstalled(true)
         runPairAfterInstall()
       } else if (d.status === "error") {
@@ -269,15 +261,7 @@ export function BlePairButton() {
     return () => unsub()
   }, [])
 
-  // ---------------------------------------------------------------------------
-  // Live connection indicator: poll /api/system/ble-connected every 10s
-  // and tick the "Xs ago" label every second. The backend's
-  // last_success_ts merges the webui process's own probe successes with
-  // the sampler daemon's MAX(ts) from telemetry_samples, so this
-  // indicator reflects both pairing-flow activity and the autonomous
-  // sampler — without it the pill would say "Disconnected" while the
-  // sampler was happily writing rows in another process.
-  // ---------------------------------------------------------------------------
+  // Poll authenticated connection health every ten seconds; update age labels locally.
   useEffect(() => {
     let cancelled = false
     async function fetchConn() {
@@ -289,6 +273,8 @@ export function BlePairButton() {
           setSampleCount10min(d?.sample_count_10min ?? 0)
           setRadioOwner(d?.radio_owner ?? null)
           setArchiving(Boolean(d?.archiving))
+          setBleHealth(d?.health ?? null)
+          if (d?.health?.code === "repair_required") setOutputOpen(false)
         }
       } catch {
         /* ignore */
@@ -304,11 +290,7 @@ export function BlePairButton() {
     }
   }, [])
 
-  // ---------------------------------------------------------------------------
-  // "Show output" panel — polls the latest sample every 5s while open
-  // so the user can watch values change in real time as a verification
-  // step before driving off.
-  // ---------------------------------------------------------------------------
+  // Poll the latest sample every five seconds while output is visible.
   const fetchLatestSample = useCallback(async () => {
     setSampleLoading(true)
     try {
@@ -339,20 +321,13 @@ export function BlePairButton() {
     }
   }, [outputOpen, fetchLatestSample])
 
-  // ---------------------------------------------------------------------------
-  // BLE adapter detection + switch. Polls /api/system/ble-adapters
-  // every 5s so that plugging in an external USB BLE dongle is
-  // detected near-instantly without a page refresh. The "switch to
-  // external" button only appears when MORE than one adapter is
-  // detected — single-adapter users see no UI change at all.
-  // ---------------------------------------------------------------------------
+  // Poll adapters every five seconds so hot-plugged radios appear without refresh.
   const fetchAdapters = useCallback(async () => {
     try {
       const res = await fetch("/api/system/ble-adapters")
       if (res.ok) {
         const d = (await res.json()) as BleAdaptersResp
-        // Render code maps over `available` unconditionally — a 200 with an
-        // unexpected JSON shape must not put crashing data into state.
+        // Validate the array before render maps over it.
         if (Array.isArray(d?.available)) setAdapters(d)
       }
     } catch {
@@ -366,10 +341,7 @@ export function BlePairButton() {
     return () => clearInterval(iv)
   }, [fetchAdapters])
 
-  // Clock-sync status — polled until synced, then stops. The
-  // sampler pauses while the system clock is bogus (avoids stranded
-  // samples that would never match a drive window later). RTC users
-  // never see this warning because their clock is sane from boot.
+  // Stop polling after sync; the sampler pauses while timestamps cannot match drives.
   useEffect(() => {
     let stopped = false
     let iv: ReturnType<typeof setInterval> | null = null
@@ -380,7 +352,6 @@ export function BlePairButton() {
         const d = (await res.json()) as ClockStatusResp
         if (stopped) return
         setClockStatus(d)
-        // Once synced, no need to keep polling.
         if (d.synced && iv) {
           clearInterval(iv)
           iv = null
@@ -410,12 +381,9 @@ export function BlePairButton() {
         const err = await res.json().catch(() => null)
         setAdapterError(err?.error || `Switch failed (${res.status})`)
       } else {
-        // Optimistically reflect the change; the next 5s poll will
-        // also confirm by re-reading current from the API.
+        // The next adapter poll confirms the optimistic selection.
         setAdapters((prev) => prev ? { ...prev, current: id } : prev)
-        // Both BLE services restart server-side — give them a moment
-        // then refresh the connection pill and adapter list so the
-        // UI catches up to the new state.
+        // Refresh after both BLE services restart.
         setTimeout(() => {
           fetchAdapters()
         }, 2_000)
@@ -429,9 +397,6 @@ export function BlePairButton() {
     }
   }, [fetchAdapters])
 
-  // ---------------------------------------------------------------------------
-  // Helpers
-  // ---------------------------------------------------------------------------
   function cleanup() {
     if (pollRef.current) {
       clearInterval(pollRef.current)
@@ -454,6 +419,7 @@ export function BlePairButton() {
           const data = (await res.json()) as BleStatusResp
           if (data.status === "paired") {
             setBleState("paired")
+            setBleHealth(null)
             setBleMsg("Successfully paired with car!")
             cleanup()
             return
@@ -484,8 +450,7 @@ export function BlePairButton() {
     return trimmed.length === 17 && /^[A-Z0-9]+$/.test(trimmed)
   }
 
-  // Triggered by the install-done WebSocket event. The pair flow can't
-  // start synchronously from handlePair because install is async.
+  // Installation completion resumes the deferred pair flow.
   async function runPairAfterInstall() {
     setBleState("initiating")
     setBleMsg("Install complete. Sending pairing request...")
@@ -513,7 +478,7 @@ export function BlePairButton() {
       return
     }
 
-    // 1. Persist VIN if changed.
+    // Persist a changed VIN before installing or pairing.
     if (vinUpper !== savedVin) {
       try {
         const res = await fetch("/api/system/ble-vin", {
@@ -534,9 +499,7 @@ export function BlePairButton() {
       }
     }
 
-    // 2. Lazy install if needed. Pair handshake kicks off from the
-    //    install-done WebSocket handler so we don't race the binary
-    //    install.
+    // Defer pairing until an asynchronous installation completes.
     if (!binariesInstalled) {
       setBleState("installing")
       setBleMsg("Installing BLE support...")
@@ -548,8 +511,7 @@ export function BlePairButton() {
         }
         const data = (await res.json()) as { already_installed: boolean }
         if (data.already_installed) {
-          // Install endpoint reports it was already installed — just
-          // proceed straight to pair without waiting for WebSocket.
+          // An already-installed response needs no completion event.
           setBinariesInstalled(true)
           runPairAfterInstall()
         }
@@ -560,7 +522,7 @@ export function BlePairButton() {
       return
     }
 
-    // 3. Already installed — start pair immediately.
+    // Pair immediately when dependencies are present.
     runPairAfterInstall()
   }
 
@@ -569,94 +531,85 @@ export function BlePairButton() {
     reloadStatus()
   }
 
-  // ---------------------------------------------------------------------------
-  // Rendering helpers
-  // ---------------------------------------------------------------------------
   const isActive =
     bleState === "initiating" ||
     bleState === "waiting" ||
     bleState === "polling" ||
     bleState === "installing"
 
+  const secondsAgo = lastSuccessTs > 0 ? Math.max(0, nowTs - lastSuccessTs) : null
+  const showLive = bleState === "paired"
+  const healthPresentation = presentBleHealth(bleHealth, secondsAgo)
+  const repairRequired = showLive && healthPresentation.repairRequired
+  const degraded = showLive && healthPresentation.severity === "yellow"
+
   const halo: "accent" | "red" | "amber" | "blue" | "slate" =
     bleState === "disabled"
       ? "slate"
-      : bleState === "paired"
-        ? "accent"
-        : bleState === "error"
-          ? "red"
-          : isActive
-            ? "amber"
-            : "blue"
+      : repairRequired
+        ? "red"
+        : degraded
+          ? "amber"
+          : bleState === "paired"
+            ? "accent"
+            : bleState === "error"
+              ? "red"
+              : isActive
+                ? "amber"
+                : "blue"
 
   const icon =
     bleState === "loading" ? (
-      <Loader2 className="h-3.5 w-3.5 animate-spin" />
+      <ProgressActivityIcon className="h-3.5 w-3.5 animate-spin" />
     ) : isActive ? (
-      <Loader2 className="h-3.5 w-3.5 animate-spin" />
+      <ProgressActivityIcon className="h-3.5 w-3.5 animate-spin" />
+    ) : repairRequired ? (
+      <ErrorIcon className="h-3.5 w-3.5" />
+    ) : degraded ? (
+      <WifiOffIcon className="h-3.5 w-3.5" />
     ) : bleState === "paired" ? (
-      <CheckCircle className="h-3.5 w-3.5" />
+      <CheckCircleIcon className="h-3.5 w-3.5" />
     ) : bleState === "error" ? (
-      <AlertCircle className="h-3.5 w-3.5" />
+      <ErrorIcon className="h-3.5 w-3.5" />
     ) : (
-      <Bluetooth className="h-3.5 w-3.5" />
+      <BluetoothIcon className="h-3.5 w-3.5" />
     )
 
-  // ── Live connection indicator ──────────────────────────────────────────────
-  // Shown for paired devices. Reads `last_success_ts` from the backend
-  // and renders one of three states based on freshness.
-  //   < 60s   → "Connected" (green, with live dot)
-  //   < 600s  → "Last seen Ns ago" (sky)
-  //   else    → "Disconnected" (slate)
-  const secondsAgo = lastSuccessTs > 0 ? Math.max(0, nowTs - lastSuccessTs) : null
-  const showLive = bleState === "paired"
-  // "Paused" reason: the keep-awake nudge owns the radio (typically
-  // because archiveloop is mid-archive). Show that as the pill state
-  // when fresh data has stopped landing — avoids the user thinking
-  // pairing broke when really the sampler is just waiting its turn.
-  const radioBusyForOther = radioOwner === "keep_awake"
-  const showPaused =
-    showLive &&
-    radioBusyForOther &&
-    (secondsAgo === null || secondsAgo >= 60)
-  const pauseLabel = archiving ? "Paused — archiving" : "Paused — keep-awake"
-
-  const liveLabel = showPaused
-    ? pauseLabel
-    : secondsAgo === null
-      ? "Idle"
-      : secondsAgo < 60
-        ? "Connected"
-        : secondsAgo < 600
-          ? `Last seen ${formatAgo(secondsAgo)} ago`
-          : "Disconnected"
-  const liveKind: "accent" | "sky" | "slate" | "amber" = showPaused
-    ? "amber"
-    : secondsAgo !== null && secondsAgo < 60
-      ? "accent"
-      : secondsAgo !== null && secondsAgo < 600
-        ? "sky"
-        : "slate"
-  const liveIcon = showPaused ? (
-    <Loader2 className="h-3 w-3 animate-spin" />
-  ) : secondsAgo !== null && secondsAgo < 60 ? (
+  // Authenticated telemetry outranks raw adapter connectivity.
+  const liveKind = healthPresentation.severity === "green"
+    ? "accent"
+    : healthPresentation.severity === "red"
+      ? "rose"
+      : "amber"
+  const liveIcon = healthPresentation.severity === "green" ? (
     <LiveDot />
-  ) : secondsAgo !== null && secondsAgo < 600 ? (
-    <Wifi className="h-3 w-3" />
+  ) : healthPresentation.code === "paused_archiving" ||
+      healthPresentation.code === "paused_keep_awake" ||
+      healthPresentation.code === "reconnecting" ? (
+    <ProgressActivityIcon className="h-3 w-3 animate-spin" />
+  ) : healthPresentation.severity === "red" ? (
+    <ErrorIcon className="h-3 w-3" />
   ) : (
-    <WifiOff className="h-3 w-3" />
+    <WifiOffIcon className="h-3 w-3" />
   )
 
-  // ── Top-right badge: shows pair status + live connection ───────────────────
   const badge = (() => {
     if (bleState === "paired") {
+      if (repairRequired) {
+        return (
+          <Pill kind="rose" className="flex items-center gap-1">
+            <ErrorIcon className="h-3 w-3" />
+            {healthPresentation.label}
+          </Pill>
+        )
+      }
       return (
         <span className="flex items-center gap-1.5">
           <Pill kind="accent">Paired</Pill>
           {showLive && (
             <Pill kind={liveKind} className="flex items-center gap-1">
               {liveIcon}
-              {liveLabel}
+              {healthPresentation.label}
             </Pill>
           )}
         </span>
@@ -668,7 +621,6 @@ export function BlePairButton() {
     return null
   })()
 
-  // ── Button label + handler ─────────────────────────────────────────────────
   const buttonLabel = (() => {
     if (bleState === "disabled") return "Disabled"
     if (bleState === "loading") return "Loading..."
@@ -689,6 +641,9 @@ export function BlePairButton() {
     !validVin(vin)
 
   const buttonHandler = bleState === "error" ? handleReset : handlePair
+  const statusMessage = showLive && healthPresentation.severity !== "green"
+    ? healthPresentation.guidance
+    : bleMsg || "Initiate Bluetooth Low Energy pairing with your car."
 
   return (
     <PrefCard icon={icon} halo={halo} title="BLE Pairing" badge={badge}>
@@ -734,7 +689,7 @@ export function BlePairButton() {
               aria-label={vinRevealed ? "Hide VIN" : "Reveal VIN"}
               className="absolute right-1.5 top-1/2 -translate-y-1/2 rounded p-1 text-slate-500 transition-colors hover:bg-white/5 hover:text-slate-300 disabled:opacity-50"
             >
-              {vinRevealed ? <EyeOff className="h-3.5 w-3.5" /> : <Eye className="h-3.5 w-3.5" />}
+              {vinRevealed ? <VisibilityOffIcon className="h-3.5 w-3.5" /> : <VisibilityIcon className="h-3.5 w-3.5" />}
             </button>
           )}
         </div>
@@ -743,16 +698,20 @@ export function BlePairButton() {
       <p
         className={cn(
           "text-xs",
-          bleState === "paired"
-            ? "text-emerald-400"
-            : bleState === "error"
-              ? "text-red-400"
-              : bleState === "waiting"
-                ? "font-medium text-amber-400"
-                : "text-slate-500",
+          repairRequired
+            ? "text-red-400"
+            : degraded
+              ? "text-amber-400"
+              : bleState === "paired"
+                ? "text-emerald-400"
+                : bleState === "error"
+                  ? "text-red-400"
+                  : bleState === "waiting"
+                    ? "font-medium text-amber-400"
+                    : "text-slate-500",
         )}
       >
-        {bleMsg || "Initiate Bluetooth Low Energy pairing with your car."}
+        {statusMessage}
       </p>
 
       <div className="flex flex-wrap items-center gap-2">
@@ -761,11 +720,13 @@ export function BlePairButton() {
           disabled={buttonDisabled}
           className={cn(
             "self-start rounded-lg px-3 py-1.5 text-xs font-medium transition-colors disabled:opacity-50",
-            bleState === "paired"
-              ? "bg-white/5 text-slate-300 hover:bg-white/10"
-              : bleState === "error"
-                ? "bg-red-500/15 text-red-400 hover:bg-red-500/25"
-                : "bg-blue-500/15 text-blue-400 hover:bg-blue-500/25",
+            repairRequired
+              ? "bg-red-500/15 text-red-400 hover:bg-red-500/25"
+              : bleState === "paired"
+                ? "bg-white/5 text-slate-300 hover:bg-white/10"
+                : bleState === "error"
+                  ? "bg-red-500/15 text-red-400 hover:bg-red-500/25"
+                  : "bg-blue-500/15 text-blue-400 hover:bg-blue-500/25",
           )}
         >
           {buttonLabel}
@@ -773,13 +734,13 @@ export function BlePairButton() {
         {/* "Show output" is only useful when there's actually data
             to show — gate on a recent successful round-trip OR a
             non-zero sample count in the last 10 min. */}
-        {bleState === "paired" &&
+        {bleState === "paired" && !repairRequired &&
           ((secondsAgo !== null && secondsAgo < 600) || sampleCount10min > 0) && (
             <button
               onClick={() => setOutputOpen((v) => !v)}
               className="inline-flex items-center gap-1 self-start rounded-lg bg-white/5 px-3 py-1.5 text-xs font-medium text-slate-300 transition-colors hover:bg-white/10"
             >
-              {outputOpen ? <ChevronUp className="h-3 w-3" /> : <ChevronDown className="h-3 w-3" />}
+              {outputOpen ? <ExpandLessIcon className="h-3 w-3" /> : <ExpandMoreIcon className="h-3 w-3" />}
               {outputOpen ? "Hide output" : "Show output"}
             </button>
           )}
@@ -799,7 +760,7 @@ export function BlePairButton() {
       {clockStatus?.show_warning && (
         <div className="rounded-lg border border-blue-500/20 bg-blue-500/[0.04] p-3 text-xs">
           <div className="flex items-start gap-2">
-            <AlertCircle className="mt-0.5 h-4 w-4 shrink-0 text-blue-400" />
+            <ErrorIcon className="mt-0.5 h-4 w-4 shrink-0 text-blue-400" />
             <div>
               <p className="font-semibold text-blue-300">
                 Setting Pi clock from car
@@ -835,6 +796,8 @@ export function BlePairButton() {
               setSampleCount10min(d?.sample_count_10min ?? 0)
               setRadioOwner(d?.radio_owner ?? null)
               setArchiving(Boolean(d?.archiving))
+              setBleHealth(d?.health ?? null)
+              if (d?.health?.code === "repair_required") setOutputOpen(false)
             } catch { /* ignore */ }
           }}
           radioOwner={radioOwner}
@@ -882,7 +845,7 @@ function AdapterPicker({
   return (
     <div className="rounded-lg border border-blue-500/20 bg-blue-500/[0.04] p-3 text-xs">
       <div className="mb-2 flex items-center gap-2">
-        <Usb className="h-3.5 w-3.5 text-blue-400" />
+        <UsbIcon className="h-3.5 w-3.5 text-blue-400" />
         <span className="font-semibold text-slate-200">Bluetooth adapter</span>
       </div>
       <p className="mb-2 text-[11px] leading-relaxed text-slate-400">
@@ -909,9 +872,9 @@ function AdapterPicker({
             >
               <span className="flex items-center gap-2">
                 {a.source === "external" ? (
-                  <Usb className="h-3 w-3 text-blue-400" />
+                  <UsbIcon className="h-3 w-3 text-blue-400" />
                 ) : (
-                  <Cpu className="h-3 w-3 text-slate-400" />
+                  <MemoryIcon className="h-3 w-3 text-slate-400" />
                 )}
                 <span className="font-medium text-slate-200">
                   {a.source === "external" ? "USB Bluetooth dongle" : "Pi built-in Bluetooth"}
@@ -922,7 +885,7 @@ function AdapterPicker({
               </span>
               {isCurrent && (
                 <span className="inline-flex items-center gap-1 text-[10px] font-semibold text-blue-400">
-                  <Check className="h-3 w-3" /> In use
+                  <CheckIcon className="h-3 w-3" /> In use
                 </span>
               )}
             </button>
@@ -942,7 +905,7 @@ function AdapterPicker({
       )}
       {switching && (
         <p className="mt-1.5 inline-flex items-center gap-1 text-[10px] text-slate-400">
-          <Loader2 className="h-3 w-3 animate-spin" /> Switching Bluetooth adapter…
+          <ProgressActivityIcon className="h-3 w-3 animate-spin" /> Switching Bluetooth adapter…
         </p>
       )}
       {error && (
@@ -1030,7 +993,7 @@ function TelemetryOutputPanel({
             title="Ask the Pi to read your car's data right now"
             className="inline-flex items-center gap-1 rounded bg-blue-500/15 px-2 py-0.5 text-[10px] font-medium text-blue-400 hover:bg-blue-500/25 disabled:opacity-50"
           >
-            {polling ? <Loader2 className="h-3 w-3 animate-spin" /> : null}
+            {polling ? <ProgressActivityIcon className="h-3 w-3 animate-spin" /> : null}
             Poll now
           </button>
           <button
@@ -1039,7 +1002,7 @@ function TelemetryOutputPanel({
             title="Reload the values from the Pi's database"
             className="inline-flex items-center gap-1 rounded bg-white/5 px-2 py-0.5 text-[10px] text-slate-400 hover:bg-white/10 disabled:opacity-50"
           >
-            {loading ? <Loader2 className="h-3 w-3 animate-spin" /> : null}
+            {loading ? <ProgressActivityIcon className="h-3 w-3 animate-spin" /> : null}
             Refresh
           </button>
         </div>

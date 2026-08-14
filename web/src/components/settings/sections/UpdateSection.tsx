@@ -1,10 +1,5 @@
 import { useState, useEffect } from "react"
-import {
-  Download,
-  Loader2,
-  CheckCircle,
-  AlertCircle,
-} from "lucide-react"
+import { CheckCircleIcon, DownloadIcon, ErrorIcon, ProgressActivityIcon } from "@/components/icons"
 import { cn } from "@/lib/utils"
 import { wsClient } from "@/lib/ws"
 import { useVersion } from "@/hooks/useVersion"
@@ -48,24 +43,20 @@ export function UpdateSection({ onInstallStart }: Props) {
   const [revertStable, setRevertStable] = useState<ReleaseInfo | null>(null)
   const [autoUpdateEnabled, setAutoUpdateEnabled] = useState(true)
   const [includePrerelease, setIncludePrerelease] = useState(false)
-  const [showRestartModal, setShowRestartModal] = useState(false)
+  const [showUpdateModal, setShowUpdateModal] = useState(false)
+  const [downloadPercent, setDownloadPercent] = useState<number | null>(null)
 
   useEffect(() => {
-    if (updateStatus === "restarting" || updateStatus === "reconnecting") {
-      setShowRestartModal(true)
-    }
-  }, [updateStatus])
-
-  useEffect(() => {
-    if (!showRestartModal) return
+    if (!showUpdateModal) return
     if (updateStatus === "done") {
-      const t = setTimeout(() => setShowRestartModal(false), 3000)
+      const t = setTimeout(() => setShowUpdateModal(false), 3000)
       return () => clearTimeout(t)
     }
+    // Close on failure so the card's inline error remains visible.
     if (updateStatus === "idle" || updateStatus === "error") {
-      setShowRestartModal(false)
+      setShowUpdateModal(false)
     }
-  }, [showRestartModal, updateStatus])
+  }, [showUpdateModal, updateStatus])
 
   useEffect(() => {
     fetch("/api/system/update-status")
@@ -179,16 +170,38 @@ export function UpdateSection({ onInstallStart }: Props) {
     setUpdateStatus("checking_internet")
     setUpdateError(null)
     setUpdateMessage("Checking internet connection...")
-    // Track the version we're installing so the success modal and message
-    // can show it without trusting /api/system/version — the OLD daemon
-    // answers that endpoint until reboot fires and can return a stale tag.
+    setShowUpdateModal(true)
+    setDownloadPercent(null)
+    // Retain the target version while the pre-reboot daemon serves the old one.
     const preUpdateVersion = version
     let newVersion: string | null = targetVersion ?? null
     setInstalledVersion(newVersion)
 
+    // Version files change before reboot, so require a new kernel boot_id.
+    // Missing boot IDs never prove success; the watchdog handles that case.
+    let preBootId: string | null = null
+    try {
+      const r = await fetch("/api/system/version", { cache: "no-store" })
+      if (r.ok) preBootId = (await r.json()).boot_id || null
+    } catch {
+      /* gate refuses success without a baseline */
+    }
+
+    let sawRestartPending = false
+    let enteredReconnect = false
+    let reconnected = false
+    let fallbackTimer: ReturnType<typeof setTimeout> | null = null
+
     const unsubscribe = wsClient.subscribe("update_status", (data: unknown) => {
-      const msg = data as { status?: string; message?: string; error?: string; output?: string }
+      const msg = data as {
+        status?: string
+        message?: string
+        error?: string
+        output?: string
+        percent?: number | null
+      }
       if (msg.error) {
+        cleanup()
         setUpdateStatus("error")
         setUpdateError(msg.error)
         setUpdateMessage(null)
@@ -206,26 +219,100 @@ export function UpdateSection({ onInstallStart }: Props) {
         }
         setUpdateStatus(statusMap[msg.status] || "installing")
       }
-      if (msg.status === "complete" && msg.output) {
-        const m = msg.output.match(/Updated to (\S+?)\.?\s*$/)
-        if (m) {
-          newVersion = m[1]
-          setInstalledVersion(newVersion)
+      setDownloadPercent(
+        msg.status === "downloading" && typeof msg.percent === "number"
+          ? msg.percent
+          : null
+      )
+      if (msg.status === "complete") {
+        sawRestartPending = true
+        if (msg.output) {
+          const m = msg.output.match(/Updated to (\S+?)\.?\s*$/)
+          if (m) {
+            newVersion = m[1]
+            setInstalledVersion(newVersion)
+          }
         }
+      }
+      if (msg.status === "restarting") {
+        sawRestartPending = true
+        // The boot-id gate rejects polls that arrive before reboot.
+        setTimeout(enterReconnect, 3000)
       }
       if (msg.message) {
         setUpdateMessage(msg.message)
       }
     })
 
+    // A socket drop after restart begins is evidence to enter reconnect mode.
+    const unsubStatus = wsClient.onStatusChange((connected) => {
+      if (!connected && sawRestartPending) enterReconnect()
+    })
+
+    function cleanup() {
+      unsubscribe()
+      unsubStatus()
+      if (fallbackTimer) clearTimeout(fallbackTimer)
+    }
+
+    function enterReconnect() {
+      if (enteredReconnect) return
+      enteredReconnect = true
+      cleanup()
+      setUpdateStatus("reconnecting")
+      setUpdateMessage("Waiting for device to come back online...")
+
+      const pollInterval = setInterval(async () => {
+        try {
+          const r = await fetch("/api/system/version", { cache: "no-store" })
+          if (!r.ok) return
+          const data = await r.json()
+          const polled = (data.version || "").trim()
+          const bootId = data.boot_id || null
+          // Require both a proven reboot and the expected version.
+          if (!preBootId || !bootId || bootId === preBootId) return
+          const norm = (s: string) => s.replace(/^v/, "")
+          const versionOk = newVersion
+            ? norm(polled) === norm(newVersion)
+            : Boolean(polled) && polled !== preUpdateVersion
+          if (!versionOk) return
+          reconnected = true
+          clearInterval(pollInterval)
+          setStableUpdate(null)
+          setPrereleaseUpdate(null)
+          setRevertStable(null)
+          setUpdateStatus("done")
+          setUpdateMessage(`Update complete — now running ${newVersion || polled || "latest"}`)
+          setTimeout(() => {
+            setUpdateStatus("idle")
+            setUpdateMessage(null)
+            setInstalledVersion(null)
+            // Reload cached chunks and hooks against the installed backend.
+            window.location.reload()
+          }, 6000)
+        } catch {
+          /* Still restarting */
+        }
+      }, 3000)
+      setTimeout(() => {
+        if (!reconnected) {
+          clearInterval(pollInterval)
+          setUpdateStatus("idle")
+          setUpdateMessage(null)
+          setInstalledVersion(null)
+          setUpdateError("Update may still be in progress. Refresh the page in a moment.")
+        }
+      }, 180000)
+    }
+
     try {
       const checkRes = await fetch("/api/system/check-internet")
       const checkData = await checkRes.json()
       if (!checkData.connected) {
+        cleanup()
         setUpdateStatus("error")
         setUpdateError("No internet connection. Connect to WiFi first.")
         setUpdateMessage(null)
-        unsubscribe()
         return
       }
 
@@ -236,59 +323,10 @@ export function UpdateSection({ onInstallStart }: Props) {
       })
       if (!res.ok) throw new Error("Failed to start update")
 
-      let reconnected = false
-      setTimeout(() => {
-        unsubscribe()
-        setUpdateStatus("reconnecting")
-        setUpdateMessage("Waiting for device to come back online...")
-
-        const pollInterval = setInterval(async () => {
-          try {
-            const r = await fetch("/api/system/version")
-            if (r.ok) {
-              const data = await r.json()
-              // Reject stale responses from the OLD daemon — it stays
-              // responsive until `reboot` fires and may answer before
-              // /opt/sentryusb/version has been rewritten with the new
-              // tag. Wait for either the expected new version or any
-              // version distinct from the pre-update one.
-              const polled = (data.version || "").trim()
-              const matchesNew = newVersion && polled === newVersion
-              const differsFromOld = preUpdateVersion && polled && polled !== preUpdateVersion
-              if (!matchesNew && !differsFromOld) return
-              reconnected = true
-              clearInterval(pollInterval)
-              setStableUpdate(null)
-              setPrereleaseUpdate(null)
-              setRevertStable(null)
-              setUpdateStatus("done")
-              setUpdateMessage(`Update complete — now running ${newVersion || polled || "latest"}`)
-              setTimeout(() => {
-                setUpdateStatus("idle")
-                setUpdateMessage(null)
-                setInstalledVersion(null)
-                // Hard reload so every cached chunk and hook (useVersion,
-                // feature-gated UI) picks up against the freshly installed
-                // backend instead of holding the pre-update snapshot.
-                window.location.reload()
-              }, 6000)
-            }
-          } catch {
-            /* Still restarting */
-          }
-        }, 3000)
-        setTimeout(() => {
-          if (!reconnected) {
-            clearInterval(pollInterval)
-            setUpdateStatus("idle")
-            setUpdateMessage(null)
-            setInstalledVersion(null)
-            setUpdateError("Update may still be in progress. Refresh the page in a moment.")
-          }
-        }, 180000)
-      }, 20000)
+      // Fallback when no progress or restart event arrives over WebSocket.
+      fallbackTimer = setTimeout(enterReconnect, 120000)
     } catch (err) {
-      unsubscribe()
+      cleanup()
       setUpdateStatus("error")
       setUpdateError(err instanceof Error ? err.message : "Update failed")
       setUpdateMessage(null)
@@ -304,13 +342,13 @@ export function UpdateSection({ onInstallStart }: Props) {
 
   const headerIcon =
     updateStatus === "error" ? (
-      <AlertCircle className="h-3.5 w-3.5" />
+      <ErrorIcon className="h-3.5 w-3.5" />
     ) : updateStatus === "done" ? (
-      <CheckCircle className="h-3.5 w-3.5" />
+      <CheckCircleIcon className="h-3.5 w-3.5" />
     ) : installInProgress ? (
-      <Loader2 className="h-3.5 w-3.5 animate-spin" />
+      <ProgressActivityIcon className="h-3.5 w-3.5 animate-spin" />
     ) : (
-      <Download className="h-3.5 w-3.5" />
+      <DownloadIcon className="h-3.5 w-3.5" />
     )
 
   const headerHalo =
@@ -329,10 +367,7 @@ export function UpdateSection({ onInstallStart }: Props) {
         halo={headerHalo}
         title="Software Updates"
         badge={
-          // Always show the *current* installed version here. The available
-          // update's version is shown in the "Stable:"/"Pre-release:" card
-          // below; surfacing it in the badge made it look like the pending
-          // release was already installed. Accent just flags that one is waiting.
+          // Badge text stays on the installed version; accent signals availability.
           <Pill kind={stableUpdate || prereleaseUpdate ? "accent" : "slate"}>
             {version ?? "…"}
           </Pill>
@@ -450,7 +485,7 @@ export function UpdateSection({ onInstallStart }: Props) {
         >
           {isCheckingUpdate ? (
             <span className="inline-flex items-center gap-1.5">
-              <Loader2 className="h-3.5 w-3.5 animate-spin" /> Checking
+              <ProgressActivityIcon className="h-3.5 w-3.5 animate-spin" /> Checking
             </span>
           ) : (
             "Check for Updates"
@@ -459,7 +494,7 @@ export function UpdateSection({ onInstallStart }: Props) {
       </PrefCard>
 
       <PrefCard
-        icon={<Download className="h-3.5 w-3.5" />}
+        icon={<DownloadIcon className="h-3.5 w-3.5" />}
         halo="slate"
         title="Update Preferences"
       >
@@ -497,32 +532,57 @@ export function UpdateSection({ onInstallStart }: Props) {
         />
       </PrefCard>
 
-      {showRestartModal && (
+      {showUpdateModal && (
         <Modal
-          title="Restarting"
-          onClose={() => setShowRestartModal(false)}
+          title={updateStatus === "done" ? "Update Complete" : "Installing Update"}
+          onClose={() => setShowUpdateModal(false)}
           dismissable={false}
           size="sm"
         >
           <div className="flex flex-col items-center gap-3 py-6 text-center">
             {updateStatus === "done" ? (
-              <CheckCircle className="h-12 w-12 text-emerald-400" />
+              <CheckCircleIcon className="h-12 w-12 text-emerald-400" />
             ) : (
-              <Loader2 className="h-12 w-12 animate-spin text-blue-400" />
+              <ProgressActivityIcon className="h-12 w-12 animate-spin text-blue-400" />
             )}
             <h2 className="text-lg font-semibold text-slate-100">
+              {updateStatus === "checking_internet" && "Checking connection"}
+              {updateStatus === "checking" && "Checking release"}
+              {updateStatus === "downloading" && "Downloading update"}
+              {updateStatus === "installing" && "Installing update"}
+              {updateStatus === "updating_scripts" && "Updating scripts"}
               {updateStatus === "restarting" && "Restarting Pi"}
               {updateStatus === "reconnecting" && "Waiting for Pi to come back online"}
               {updateStatus === "done" && "Update complete"}
             </h2>
+            {updateStatus === "downloading" && (
+              <div className="w-full px-4">
+                <div className="h-2 w-full overflow-hidden rounded-full bg-slate-700/50">
+                  <div
+                    className={cn(
+                      "h-full rounded-full bg-blue-400 transition-[width] duration-300",
+                      downloadPercent === null && "animate-pulse"
+                    )}
+                    style={{ width: `${downloadPercent ?? 100}%` }}
+                  />
+                </div>
+                {downloadPercent !== null && (
+                  <p className="mt-1.5 text-xs text-slate-400">{downloadPercent}%</p>
+                )}
+              </div>
+            )}
             <p className="text-sm text-slate-400">
               {updateStatus === "restarting" &&
                 "Applying update — this takes about 30 seconds."}
               {updateStatus === "reconnecting" && "Don't close this tab."}
-              {updateStatus === "done" && (
+              {updateStatus === "done" ? (
                 <>
                   Now running <span className="font-mono text-slate-200">{installedVersion ?? version}</span>.
                 </>
+              ) : (
+                updateStatus !== "restarting" &&
+                updateStatus !== "reconnecting" &&
+                (updateMessage || "Don't close this tab.")
               )}
             </p>
           </div>

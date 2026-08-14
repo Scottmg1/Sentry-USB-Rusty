@@ -3,28 +3,23 @@ import { createContext, useCallback, useContext, useEffect, useRef, useState } f
 export type AwayModeKind = "manual" | "auto"
 
 interface AwayModeStatus {
-    /** Automation mode (backend source of truth). Undefined until the
-     *  first status poll resolves (or an older backend). */
+    /** Backend automation mode; undefined until the first compatible response. */
     mode?: AwayModeKind
     state: "idle" | "active"
     has_rtc?: boolean
-    /** False when no AP profile exists (AP unchecked/removed in setup).
-     *  Undefined until the first status poll resolves. */
+    /** False when no AP profile exists; undefined until the first response. */
     ap_configured?: boolean
     ap_ssid?: string
     ap_ip?: string
-    // Manual timer
     expires_at?: string
     remaining_sec?: number
     enabled_at?: string
-    // Automatic geofence
     /** Committed home/away decision: true=home, false=away, null=undecided. */
     is_home?: boolean | null
-    /** Whether the AP is currently commanded on (auto mode). */
+    /** Whether automatic mode currently commands the AP on. */
     ap_on?: boolean
-    /** Whether a home geofence center is set. */
     geofence_configured?: boolean
-    /** Whether BLE telemetry (the GPS source) is enabled. */
+    /** Whether the BLE GPS source is enabled. */
     ble_ready?: boolean
     /** Last GPS fix is missing or too old to act on. */
     gps_stale?: boolean
@@ -48,7 +43,7 @@ interface AwayModeContextValue {
     setMode: (mode: AwayModeKind) => Promise<void>
     config: AwayGeofenceValues
     updateConfig: (patch: Partial<AwayGeofenceValues>) => void
-    /** Last geofence-save failure, or null. Cleared on the next successful save. */
+    /** Last geofence-save failure, cleared after a successful save. */
     saveError: string | null
     useCurrentLocation: () => Promise<{ lat: number; lon: number } | null>
 }
@@ -104,7 +99,6 @@ export function AwayModeProvider({ children }: { children: React.ReactNode }) {
         } catch { /* ignore — connection may be lost due to Away Mode */ }
     }, [])
 
-    // Poll status.
     useEffect(() => {
         let mounted = true
         const tick = () => { if (mounted) refresh() }
@@ -113,7 +107,6 @@ export function AwayModeProvider({ children }: { children: React.ReactNode }) {
         return () => { mounted = false; clearInterval(iv) }
     }, [refresh])
 
-    // Load the geofence config once on mount.
     useEffect(() => {
         let alive = true
         fetch("/api/away-mode/config")
@@ -130,7 +123,6 @@ export function AwayModeProvider({ children }: { children: React.ReactNode }) {
         return () => { alive = false }
     }, [])
 
-    // Clear the pending debounced config PUT on unmount.
     useEffect(() => () => {
         if (saveTimer.current) clearTimeout(saveTimer.current)
     }, [])
@@ -145,8 +137,7 @@ export function AwayModeProvider({ children }: { children: React.ReactNode }) {
             })
             const data: AwayModeStatus = await res.json()
             setStatus(data)
-            // Store in localStorage so the connection banner can reference it
-            // even after the API becomes unreachable.
+            // Preserve the deadline for the offline connection banner.
             localStorage.setItem(AWAY_MODE_LS_KEY, JSON.stringify({
                 enabled_at: data.enabled_at ?? new Date().toISOString(),
                 ap_ssid: data.ap_ssid ?? "",
@@ -174,12 +165,8 @@ export function AwayModeProvider({ children }: { children: React.ReactNode }) {
                 body: JSON.stringify({ mode }),
             })
         } catch { /* ignore */ }
-        // Pull fresh full status (the /mode response omits the ap_ssid/ap_ip
-        // the status endpoint adds). refresh() starts after this mutation's
-        // timestamp, so its own response still applies — but we must NOT
-        // reset the guard to 0: doing so let a status poll that was already
-        // in flight before the switch land afterward and revert the
-        // optimistic mode, flickering the picker back for one cycle.
+        // Keep the mutation timestamp so an older in-flight poll cannot revert
+        // the optimistic mode; the full refresh also supplies AP metadata.
         refresh()
     }, [refresh])
 
@@ -187,8 +174,7 @@ export function AwayModeProvider({ children }: { children: React.ReactNode }) {
         setConfig((prev) => {
             const next = { ...prev, ...patch }
             if (saveTimer.current) clearTimeout(saveTimer.current)
-            // Debounce — a PUT triggers a RO-root remount on the Pi, so we
-            // don't want one per keystroke (mirrors useKeepAccessory).
+            // Each PUT remounts the read-only root, so debounce field edits.
             saveTimer.current = window.setTimeout(() => {
                 fetch("/api/away-mode/config", {
                     method: "PUT",

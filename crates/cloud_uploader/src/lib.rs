@@ -1,3 +1,4 @@
+pub mod charge_deletes;
 pub mod charges;
 pub mod client;
 pub mod credentials_store;
@@ -18,6 +19,11 @@ use sentryusb_drives::DriveStore;
 use sentryusb_ws::Hub;
 
 pub use crate::state::{CloudStatus, CloudStateInner, PairingState, RateConfigAccess};
+
+/// Cloud charge ID for a local session start.
+pub fn charge_id_for_session(start_ts: i64) -> String {
+    crypto::ids::charge_id_from_start_ts(start_ts)
+}
 
 pub const DEFAULT_CLOUD_BASE_URL: &str = "https://sentryusb.com";
 
@@ -84,11 +90,7 @@ impl CloudUploader {
         db_ext::pending_queue(&self.inner.store, limit)
     }
 
-    /// One-shot backfill: reset `cloud_uploaded_at` on already-uploaded
-    /// routes whose BLE rollup is non-NULL so the next sweep re-uploads
-    /// them with the BLE fields baked into the encrypted blob. Returns
-    /// the number of routes queued for re-upload. Caller should `nudge()`
-    /// after this lands rows.
+    /// Queues previously uploaded routes for a BLE-field backfill.
     pub fn backfill_ble_reupload(&self) -> anyhow::Result<i64> {
         db_ext::backfill_ble_reupload(&self.inner.store)
     }
@@ -97,8 +99,7 @@ impl CloudUploader {
 pub struct SpawnOptions {
     pub cloud_base_url: String,
     pub credentials_path: String,
-    /// Preferences hook for rate-config sync. None disables
-    /// rate-config sync (tests).
+    /// Preferences hook; `None` disables rate-config sync in tests.
     pub rate_config: Option<Arc<dyn state::RateConfigAccess>>,
 }
 

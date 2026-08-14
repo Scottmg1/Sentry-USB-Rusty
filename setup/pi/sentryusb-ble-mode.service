@@ -1,0 +1,23 @@
+[Unit]
+Description=SentryUSB: select BLE advertising mode (native vs helper)
+# Reads only /proc/device-tree/model + uname; touches neither bluetoothd nor
+# the controller, so it needs nothing from bluetooth.service and can run early.
+# Must complete before either BLE service so the mode marker exists when they
+# start. The marker lives on /run (tmpfs) and is rebuilt every boot.
+DefaultDependencies=no
+After=local-fs.target
+Before=sentryusb-ble.service sentryusb-ble-adv.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/bin/select-ble-adv-mode.sh
+# Never block boot on a selector fault — absence of the marker means "helper",
+# which is the safe default, so a failure here still yields a discoverable Pi.
+SuccessExitStatus=0 1
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=sentryusb-ble-gate
+
+[Install]
+WantedBy=multi-user.target

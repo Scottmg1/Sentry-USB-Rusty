@@ -1,10 +1,25 @@
 import { useState, useEffect, useRef, useCallback, useMemo, lazy, Suspense } from "react"
 import {
-  Video, Play, Pause, SkipBack, SkipForward, Loader2,
-  Maximize, Minimize, Trash2,
-  Download, ChevronLeft, ChevronRight, AlertTriangle,
-  Zap, Eye, Car, Hand, ExternalLink, X,
-} from "lucide-react"
+  BackHandIcon,
+  BoltIcon,
+  ChevronLeftIcon,
+  ChevronRightIcon,
+  CloseIcon,
+  DeleteIcon,
+  DirectionsCarIcon,
+  DownloadIcon,
+  FullscreenExitIcon,
+  FullscreenIcon,
+  OpenInNewIcon,
+  PauseIcon,
+  PlayArrowIcon,
+  ProgressActivityIcon,
+  SkipNextIcon,
+  SkipPreviousIcon,
+  VideocamIcon,
+  VisibilityIcon,
+  WarningIcon,
+} from "@/components/icons"
 import { cn } from "@/lib/utils"
 import type { ClipEntry, ClipGroup, EventMeta } from "@/lib/api"
 import { useTelemetry } from "@/hooks/useTelemetry"
@@ -43,24 +58,24 @@ const CAMERA_SHORT: Record<string, string> = {
 
 const SPEED_OPTIONS = [0.5, 1, 1.5, 2, 4]
 
-const EVENT_REASONS: Record<string, { label: string; icon: typeof Zap }> = {
-  sentry_aware_object_detection: { label: "Object Detected", icon: Eye },
-  vehicle_auto_emergency_braking: { label: "Emergency Braking", icon: AlertTriangle },
-  user_interaction_dashcam_icon_tapped: { label: "Manual Save", icon: Hand },
-  user_interaction_dashcam_panel_save: { label: "Manual Save", icon: Hand },
-  user_interaction_dashcam_launcher_action_tapped: { label: "Manual Save", icon: Hand },
-  user_interaction_honk: { label: "Honk", icon: Zap },
-  sentry_aware_accel: { label: "Acceleration", icon: Zap },
-  collision: { label: "Collision", icon: AlertTriangle },
-  user_interaction_dashcam: { label: "Manual Save", icon: Hand },
+const EVENT_REASONS: Record<string, { label: string; icon: typeof BoltIcon }> = {
+  sentry_aware_object_detection: { label: "Object Detected", icon: VisibilityIcon },
+  vehicle_auto_emergency_braking: { label: "Emergency Braking", icon: WarningIcon },
+  user_interaction_dashcam_icon_tapped: { label: "Manual Save", icon: BackHandIcon },
+  user_interaction_dashcam_panel_save: { label: "Manual Save", icon: BackHandIcon },
+  user_interaction_dashcam_launcher_action_tapped: { label: "Manual Save", icon: BackHandIcon },
+  user_interaction_honk: { label: "Honk", icon: BoltIcon },
+  sentry_aware_accel: { label: "Acceleration", icon: BoltIcon },
+  collision: { label: "Collision", icon: WarningIcon },
+  user_interaction_dashcam: { label: "Manual Save", icon: BackHandIcon },
 }
 
-function formatEventReason(reason: string): { label: string; Icon: typeof Zap } {
+function formatEventReason(reason: string): { label: string; Icon: typeof BoltIcon } {
   const mapped = EVENT_REASONS[reason]
   if (mapped) return { label: mapped.label, Icon: mapped.icon }
   return {
     label: reason.replace(/_/g, " ").replace(/\b\w/g, (c) => c.toUpperCase()),
-    Icon: Zap,
+    Icon: BoltIcon,
   }
 }
 
@@ -703,7 +718,7 @@ export default function Viewer() {
           className="ml-auto rounded-lg p-1.5 text-slate-500 transition-colors hover:bg-white/5 hover:text-slate-300"
           title={sidebarCollapsed ? "Show clip browser" : "Hide clip browser"}
         >
-          {sidebarCollapsed ? <ChevronRight className="h-4 w-4" /> : <ChevronLeft className="h-4 w-4" />}
+          {sidebarCollapsed ? <ChevronRightIcon className="h-4 w-4" /> : <ChevronLeftIcon className="h-4 w-4" />}
         </button>
       </div>
 
@@ -722,7 +737,7 @@ export default function Viewer() {
             <div className="flex-1 overflow-y-auto p-1.5">
               {loading ? (
                 <div className="flex items-center justify-center p-8">
-                  <Loader2 className="h-5 w-5 animate-spin text-slate-500" />
+                  <ProgressActivityIcon className="h-5 w-5 animate-spin text-slate-500" />
                 </div>
               ) : activeGroup && activeGroup.clips.length > 0 ? (
                 activeGroup.clips.map((clip) => {
@@ -773,7 +788,7 @@ export default function Viewer() {
                             className="absolute right-1 top-1 hidden rounded p-0.5 text-slate-600 transition-colors hover:bg-red-500/15 hover:text-red-400 group-hover:block"
                             title="Delete clip"
                           >
-                            <Trash2 className="h-3 w-3" />
+                            <DeleteIcon className="h-3 w-3" />
                           </button>
                           {deleteConfirm === clip.date && (
                             <div className="mx-1 mb-1 flex items-center gap-1 rounded-md bg-red-500/10 px-2 py-1.5">
@@ -799,7 +814,7 @@ export default function Viewer() {
                 })
               ) : (
                 <div className="flex flex-col items-center justify-center py-8 text-center">
-                  <Video className="mb-2 h-8 w-8 text-slate-500" />
+                  <VideocamIcon className="mb-2 h-8 w-8 text-slate-500" />
                   <p className="text-xs text-slate-600">No {categoryLabels[activeCategory]?.toLowerCase()} clips</p>
                 </div>
               )}
@@ -811,7 +826,7 @@ export default function Viewer() {
                 >
                   {loadingMore ? (
                     <span className="flex items-center justify-center gap-1.5">
-                      <Loader2 className="h-3 w-3 animate-spin" /> Loading…
+                      <ProgressActivityIcon className="h-3 w-3 animate-spin" /> Loading…
                     </span>
                   ) : "Load more clips"}
                 </button>
@@ -826,10 +841,10 @@ export default function Viewer() {
                     onClick={() => setShowPromo(false)}
                     className="absolute right-1 top-1 rounded p-0.5 text-slate-600 hover:text-slate-400"
                   >
-                    <X className="h-3 w-3" />
+                    <CloseIcon className="h-3 w-3" />
                   </button>
                   <div className="flex items-start gap-2">
-                    <Car className="mt-0.5 h-4 w-4 shrink-0 text-blue-400" />
+                    <DirectionsCarIcon className="mt-0.5 h-4 w-4 shrink-0 text-blue-400" />
                     <div>
                       <p className="text-[11px] font-medium text-slate-300">
                         Looking for more? Try Sentry Studio
@@ -843,7 +858,7 @@ export default function Viewer() {
                         rel="noopener noreferrer"
                         className="mt-1.5 inline-flex items-center gap-1 rounded-md bg-blue-500/10 px-2 py-1 text-[10px] font-medium text-blue-400 transition-colors hover:bg-blue-500/20 hover:text-blue-300"
                       >
-                        View on GitHub <ExternalLink className="h-2.5 w-2.5" />
+                        View on GitHub <OpenInNewIcon className="h-2.5 w-2.5" />
                       </a>
                     </div>
                   </div>
@@ -922,12 +937,12 @@ export default function Viewer() {
                         />
                       ) : currentSet.cameras[cam] && !isCamActive ? (
                         <div className="flex h-full flex-col items-center justify-center gap-1.5 bg-slate-900/80">
-                          <Play className="h-5 w-5 text-slate-500" />
+                          <PlayArrowIcon className="h-5 w-5 text-slate-500" />
                           <span className="text-[10px] text-slate-500">Click to stream</span>
                         </div>
                       ) : (
                         <div className="flex h-full items-center justify-center">
-                          <Video className="h-6 w-6 text-slate-500" />
+                          <VideocamIcon className="h-6 w-6 text-slate-500" />
                         </div>
                       )}
                       {/* Camera label */}
@@ -1023,7 +1038,7 @@ export default function Viewer() {
                     className="rounded-lg p-1.5 text-slate-400 transition-colors hover:bg-white/5 hover:text-slate-200"
                     title="Back 5s (← or Shift+← for 15s)"
                   >
-                    <SkipBack className="h-3.5 w-3.5" />
+                    <SkipPreviousIcon className="h-3.5 w-3.5" />
                   </button>
 
                   {/* Play/Pause */}
@@ -1032,7 +1047,7 @@ export default function Viewer() {
                     className="flex h-8 w-8 items-center justify-center rounded-full bg-blue-500/20 text-blue-400 transition-colors hover:bg-blue-500/30"
                     title="Play/Pause (Space)"
                   >
-                    {playing ? <Pause className="h-4 w-4" /> : <Play className="h-4 w-4 translate-x-px" />}
+                    {playing ? <PauseIcon className="h-4 w-4" /> : <PlayArrowIcon className="h-4 w-4 translate-x-px" />}
                   </button>
 
                   {/* Skip forward */}
@@ -1041,7 +1056,7 @@ export default function Viewer() {
                     className="rounded-lg p-1.5 text-slate-400 transition-colors hover:bg-white/5 hover:text-slate-200"
                     title="Forward 5s (→ or Shift+→ for 15s)"
                   >
-                    <SkipForward className="h-3.5 w-3.5" />
+                    <SkipNextIcon className="h-3.5 w-3.5" />
                   </button>
 
                   <div className="flex-1" />
@@ -1072,7 +1087,7 @@ export default function Viewer() {
                       className="rounded-lg p-1.5 text-slate-500 transition-colors hover:bg-white/5 hover:text-slate-300"
                       title="Download clip folder"
                     >
-                      <Download className="h-3.5 w-3.5" />
+                      <DownloadIcon className="h-3.5 w-3.5" />
                     </button>
                   )}
 
@@ -1082,7 +1097,7 @@ export default function Viewer() {
                     className="rounded-lg p-1.5 text-slate-500 transition-colors hover:bg-white/5 hover:text-slate-300"
                     title="Fullscreen (F)"
                   >
-                    {isFullscreen ? <Minimize className="h-3.5 w-3.5" /> : <Maximize className="h-3.5 w-3.5" />}
+                    {isFullscreen ? <FullscreenExitIcon className="h-3.5 w-3.5" /> : <FullscreenIcon className="h-3.5 w-3.5" />}
                   </button>
                 </div>
               </div>
@@ -1090,7 +1105,7 @@ export default function Viewer() {
           ) : (
             <div className="glass-card flex flex-1 items-center justify-center">
               <div className="max-w-xs text-center">
-                <Video className="mx-auto mb-3 h-16 w-16 text-slate-500" />
+                <VideocamIcon className="mx-auto mb-3 h-16 w-16 text-slate-500" />
                 <p className="text-sm font-medium text-slate-400">
                   {selectedClip ? "No video files found" : "Select a clip to begin playback"}
                 </p>
@@ -1108,7 +1123,7 @@ export default function Viewer() {
                     rel="noopener noreferrer"
                     className="mt-2 inline-flex items-center gap-1 text-[10px] font-medium text-blue-400 transition-colors hover:text-blue-300"
                   >
-                    Check out Sentry Studio <ExternalLink className="h-2.5 w-2.5" />
+                    Check out Sentry Studio <OpenInNewIcon className="h-2.5 w-2.5" />
                   </a>
                 </div>
               </div>

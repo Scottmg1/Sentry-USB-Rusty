@@ -1,4 +1,4 @@
-import { ChevronFirst, ChevronLast, ChevronLeft, ChevronRight } from "lucide-react"
+import { ChevronLeftIcon, ChevronRightIcon, FirstPageIcon, LastPageIcon } from "@/components/icons"
 import { cn } from "@/lib/utils"
 
 interface PaginationProps {
@@ -17,19 +17,19 @@ export function Pagination({ page, pageCount, pageStart, pageEnd, total, onChang
   return (
     <div className="flex items-center gap-2 text-sm text-slate-400">
       <Btn label="First page" disabled={atStart} onClick={() => onChange(1)}>
-        <ChevronFirst className="h-4 w-4" />
+        <FirstPageIcon className="h-4 w-4" />
       </Btn>
       <Btn label="Previous page" disabled={atStart} onClick={() => onChange(page - 1)}>
-        <ChevronLeft className="h-4 w-4" />
+        <ChevronLeftIcon className="h-4 w-4" />
       </Btn>
       <span className="px-1 tabular-nums text-slate-300">
         {total === 0 ? "0 of 0" : `${pageStart}–${pageEnd} of ${total}`}
       </span>
       <Btn label="Next page" disabled={atEnd} onClick={() => onChange(page + 1)}>
-        <ChevronRight className="h-4 w-4" />
+        <ChevronRightIcon className="h-4 w-4" />
       </Btn>
       <Btn label="Last page" disabled={atEnd} onClick={() => onChange(pageCount)}>
-        <ChevronLast className="h-4 w-4" />
+        <LastPageIcon className="h-4 w-4" />
       </Btn>
     </div>
   )

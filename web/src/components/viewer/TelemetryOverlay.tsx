@@ -34,21 +34,17 @@ export default memo(function TelemetryOverlay({ frame, metric = false }: Telemet
       {...dragProps}
       className="z-10 flex items-center gap-3 rounded-xl border border-white/10 bg-black/60 px-4 py-2 backdrop-blur-md select-none"
     >
-      {/* Speed */}
       <div className="text-center">
         <span className="text-2xl font-bold tabular-nums text-white">{speed}</span>
         <span className="ml-1 text-[10px] text-slate-400">{unit}</span>
       </div>
 
-      {/* Divider */}
       <div className="h-6 w-px bg-white/10" />
 
-      {/* Gear pill */}
       <span className={`rounded-md px-2 py-0.5 text-xs font-bold ${gear.color}`}>
         {gear.text}
       </span>
 
-      {/* Autopilot mode indicator */}
       {isAssisted && (
         <>
           <div className="h-6 w-px bg-white/10" />
@@ -59,7 +55,6 @@ export default memo(function TelemetryOverlay({ frame, metric = false }: Telemet
         </>
       )}
 
-      {/* Accel bar */}
       {accelPct > 0 && (
         <>
           <div className="h-6 w-px bg-white/10" />

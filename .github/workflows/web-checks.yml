@@ -1,0 +1,44 @@
+name: web-checks
+
+# Run the release workflow's web checks for direct frontend pushes. PRs already
+# receive the same checks from build.yml.
+
+on:
+  push:
+    branches: [main, main-dev]
+    paths:
+      - 'web/**'
+      - '.github/workflows/web-checks.yml'
+  workflow_dispatch:
+
+jobs:
+  lint-web:
+    name: Lint web
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - name: Lint
+        # Match build.yml and do not increase eslint.config.js's warning budget.
+        run: |
+          cd web
+          npm ci
+          npx eslint . --max-warnings 30
+      - name: Production build
+        # Direct pushes otherwise receive no production bundle check.
+        run: |
+          cd web
+          npm run build
+          if [ ! -s "dist/index.html" ]; then
+            echo "::error::web/dist/index.html missing or empty after npm run build"
+            exit 1
+          fi
+      - name: Icons up to date
+        # Verify generated icons against symbols.mjs; generation uses jsDelivr.
+        run: |
+          cd web
+          npm run icons -- --check

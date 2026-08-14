@@ -46,9 +46,7 @@ pub async fn run_sweep_loop(state: Arc<CloudStateInner>) {
             }
         }
 
-        // Charge sessions ride the same wake/timer cadence. A charge
-        // failure must not block route uploads (and vice versa), so each
-        // sweep reports independently.
+        // Route and charge failures are reported independently.
         match crate::charges::sweep_once(state.clone()).await {
             Ok(uploaded) if uploaded > 0 => {
                 info!("cloud charge sweep complete: {} sessions uploaded", uploaded);
@@ -61,11 +59,30 @@ pub async fn run_sweep_loop(state: Arc<CloudStateInner>) {
             }
         }
 
-        // Two-way mutable sync (tags / cost overrides / rate config).
+        // Drain deletions after uploads to retire mid-sweep races immediately.
+        match crate::charge_deletes::sweep_once(state.clone()).await {
+            Ok(n) if n > 0 => {
+                info!("cloud charge delete sweep: {} sessions retired", n);
+            }
+            Ok(_) => {}
+            Err(e) => {
+                warn!("cloud charge delete error: {}", e);
+                let mut last_err = state.last_upload_error.lock().await;
+                *last_err = Some(format!("{:#}", e));
+            }
+        }
+
         if let Err(e) = crate::sync::run_once(state.clone()).await {
             warn!("cloud sync error: {}", e);
         }
     }
+}
+
+/// Prepared upload batch with source-file data for acknowledgement handling.
+struct PreparedBatch {
+    pending: Vec<db_ext::PendingRoute>,
+    wire_routes: Vec<UploadRoute>,
+    wrapped_by_file: std::collections::HashMap<String, String>,
 }
 
 async fn sweep_once(state: Arc<CloudStateInner>) -> Result<u32> {
@@ -98,74 +115,87 @@ async fn sweep_once(state: Arc<CloudStateInner>) -> Result<u32> {
     let mut total_stored: u32 = 0;
     loop {
 
-        let mut pending = db_ext::select_pending(&state.store, BATCH_LIMIT)
-            .context("select pending routes")?;
-        if pending.is_empty() {
-            break;
-        }
-
-        let mut wire_routes: Vec<UploadRoute> = Vec::with_capacity(pending.len());
-        // file -> wrappedRouteKey b64, cached locally on ack so tag sync
-        // can rewrap without a cloud round-trip.
-        let mut wrapped_by_file: std::collections::HashMap<String, String> = std::collections::HashMap::new();
-        let mut estimated_body_bytes: usize = 64;
-        for p in &mut pending {
-            // Attach the clip's temperature samples so the cloud can
-            // chart the drive's temperature series — the telemetry DB
-            // never leaves the Pi otherwise.
-            p.route.temp_samples = db_ext::temp_samples_for_route(&state.store, &p.file);
-            let encrypted = encrypt::encrypt_route(
-                &p.route,
-                &unlocked.pi_key,
-                &creds_snapshot.user_id,
-                &creds_snapshot.pi_id,
-                p.cloud_route_id.as_deref(),
-            )
-            .with_context(|| format!("encrypt {}", p.file))?;
-
-            if p.cloud_route_id.is_none() {
-                if let Err(e) = db_ext::cache_route_id(&state.store, &p.file, &encrypted.route_id) {
-                    warn!("cache_route_id failed for {}: {}", p.file, e);
+        // Route decoding and encryption are synchronous; keep them off async workers.
+        let prep = {
+            let store = state.store.clone();
+            let pi_key = unlocked.pi_key;
+            let user_id = creds_snapshot.user_id.clone();
+            let pi_id = creds_snapshot.pi_id.clone();
+            tokio::task::spawn_blocking(move || -> Result<Option<PreparedBatch>> {
+                let mut pending = db_ext::select_pending(&store, BATCH_LIMIT)
+                    .context("select pending routes")?;
+                if pending.is_empty() {
+                    return Ok(None);
                 }
-            }
 
-            if encrypted.route_blob_b64.len() > MAX_ROUTE_BLOB_B64_LEN {
-                warn!(
-                    "cloud upload: skipping {} (blob {} bytes > {} limit)",
-                    p.file,
-                    encrypted.route_blob_b64.len(),
-                    MAX_ROUTE_BLOB_B64_LEN,
-                );
-                if let Err(e) = db_ext::mark_permanent_skip(&state.store, &p.file) {
-                    warn!("mark_permanent_skip failed for {}: {}", p.file, e);
+                let mut wire_routes: Vec<UploadRoute> = Vec::with_capacity(pending.len());
+                // Cache wrapped route keys on acknowledgement for tag sync.
+                let mut wrapped_by_file: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+                let mut estimated_body_bytes: usize = 64;
+                for p in &mut pending {
+                    // Embed temperature samples because the telemetry DB remains local.
+                    p.route.temp_samples = db_ext::temp_samples_for_route(&store, &p.file);
+                    let encrypted = encrypt::encrypt_route(
+                        &p.route,
+                        &pi_key,
+                        &user_id,
+                        &pi_id,
+                        p.cloud_route_id.as_deref(),
+                    )
+                    .with_context(|| format!("encrypt {}", p.file))?;
+
+                    if p.cloud_route_id.is_none() {
+                        if let Err(e) = db_ext::cache_route_id(&store, &p.file, &encrypted.route_id) {
+                            warn!("cache_route_id failed for {}: {}", p.file, e);
+                        }
+                    }
+
+                    if encrypted.route_blob_b64.len() > MAX_ROUTE_BLOB_B64_LEN {
+                        warn!(
+                            "cloud upload: skipping {} (blob {} bytes > {} limit)",
+                            p.file,
+                            encrypted.route_blob_b64.len(),
+                            MAX_ROUTE_BLOB_B64_LEN,
+                        );
+                        if let Err(e) = db_ext::mark_permanent_skip(&store, &p.file) {
+                            warn!("mark_permanent_skip failed for {}: {}", p.file, e);
+                        }
+                        continue;
+                    }
+
+                    let route_json_size = encrypted.route_blob_b64.len()
+                        + encrypted.wrapped_route_key_b64.len()
+                        + encrypted.route_id.len()
+                        + 96;
+                    if !wire_routes.is_empty()
+                        && estimated_body_bytes + route_json_size > MAX_BATCH_BODY_BYTES
+                    {
+                        debug!(
+                            "cloud upload: capping batch at {} routes (est {} bytes)",
+                            wire_routes.len(),
+                            estimated_body_bytes,
+                        );
+                        break;
+                    }
+                    estimated_body_bytes += route_json_size;
+
+                    wrapped_by_file.insert(p.file.clone(), encrypted.wrapped_route_key_b64.clone());
+                    wire_routes.push(UploadRoute {
+                        route_id: encrypted.route_id,
+                        route_blob: encrypted.route_blob_b64,
+                        wrapped_route_key: encrypted.wrapped_route_key_b64,
+                        summary_ciphertext: encrypted.summary_ciphertext_b64,
+                    });
                 }
-                continue;
-            }
-
-            let route_json_size = encrypted.route_blob_b64.len()
-                + encrypted.wrapped_route_key_b64.len()
-                + encrypted.route_id.len()
-                + 96;
-            if !wire_routes.is_empty()
-                && estimated_body_bytes + route_json_size > MAX_BATCH_BODY_BYTES
-            {
-                debug!(
-                    "cloud upload: capping batch at {} routes (est {} bytes)",
-                    wire_routes.len(),
-                    estimated_body_bytes,
-                );
-                break;
-            }
-            estimated_body_bytes += route_json_size;
-
-            wrapped_by_file.insert(p.file.clone(), encrypted.wrapped_route_key_b64.clone());
-            wire_routes.push(UploadRoute {
-                route_id: encrypted.route_id,
-                route_blob: encrypted.route_blob_b64,
-                wrapped_route_key: encrypted.wrapped_route_key_b64,
-                summary_ciphertext: encrypted.summary_ciphertext_b64,
-            });
-        }
+                Ok(Some(PreparedBatch { pending, wire_routes, wrapped_by_file }))
+            })
+            .await
+            .map_err(|e| anyhow!("upload prep task: {}", e))??
+        };
+        let PreparedBatch { pending, wire_routes, wrapped_by_file } = match prep {
+            Some(v) => v,
+            None => break,
+        };
 
         if wire_routes.is_empty() {
             break;
@@ -341,9 +371,7 @@ struct UploadRoute {
     route_blob: String,
     #[serde(rename = "wrappedRouteKey")]
     wrapped_route_key: String,
-    // Compact summary computed at upload time, so new rows arrive in
-    // the cloud summary-complete and the browser never has to fetch and
-    // decrypt the full blob just to render the drive list.
+    // Allows list rendering without fetching and decrypting the full route blob.
     #[serde(rename = "summaryCiphertext")]
     summary_ciphertext: String,
 }

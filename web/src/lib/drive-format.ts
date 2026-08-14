@@ -6,12 +6,7 @@ export function formatDuration(ms: number): string {
   return `${h}h ${m}m`
 }
 
-// HVAC seconds come from per-clip BLE samples whose windows can extend
-// slightly past the drive's true end_time (e.g. HVAC was still on after
-// motion stopped, or pre-conditioning before motion started). Clamping
-// to the drive duration when supplied avoids the surprising "19m drive
-// / 20m HVAC" display. Both sides round to the nearest minute so they
-// agree at the minute boundary.
+// BLE sample windows can outlive the drive; clamp HVAC time to its duration.
 export function formatHvacRuntime(seconds: number, drivenMs?: number): string {
   let secs = Math.max(0, seconds)
   if (typeof drivenMs === "number" && drivenMs > 0) {
@@ -33,8 +28,7 @@ export function formatDistance(mi: number, km: number, metric: boolean): string 
   })} ${unit}`
 }
 
-/** Format an odometer / distance value (in miles) with thousands separators
- *  and the requested decimal precision. 31676.9 -> "31,676.9 mi". */
+/** Format miles with grouping and the requested precision. */
 export function formatMiles(mi: number, decimals = 1): string {
   return `${mi.toLocaleString(undefined, {
     minimumFractionDigits: decimals,
@@ -42,8 +36,7 @@ export function formatMiles(mi: number, decimals = 1): string {
   })} mi`
 }
 
-/** Format an odometer reading (raw value in miles) honouring the user's
- *  metric/imperial preference. metric=true converts to km. */
+/** Format a mile-based odometer in the preferred distance unit. */
 export function formatOdometer(mi: number, metric: boolean, decimals = 1): string {
   const value = metric ? mi * 1.609344 : mi
   const unit = metric ? "km" : "mi"
@@ -86,9 +79,7 @@ export function formatRelativeTime(iso: string, now: Date = new Date()): string 
   return `${t.toLocaleDateString([], { month: "short", day: "numeric" })} ${time}`
 }
 
-// Telemetry reports TPMS in PSI; bar is a display conversion driven by the
-// Display & Units "Tire pressure" toggle (PRESSURE_UNIT). Same constant and
-// precision as TirePressureCard so both readouts agree.
+// Tesla reports PSI; use the shared conversion so TPMS displays agree.
 const PSI_TO_BAR = 0.0689476
 
 export function formatPsi(psi: number | undefined, bar: boolean): string {
@@ -97,11 +88,7 @@ export function formatPsi(psi: number | undefined, bar: boolean): string {
   return `${psi.toFixed(1)} psi`
 }
 
-/**
- * Format a percentage with up to 2 decimal places, trailing zeros trimmed.
- * Examples: 99.4567 → "99.46", 99.5 → "99.5", 100 → "100", 0 → "0".
- * Preserves the raw value's precision without showing more than 2 decimals.
- */
+/** Format a percentage to at most two decimal places without trailing zeros. */
 export function formatPercent(n: number): string {
   if (!Number.isFinite(n)) return "0"
   return parseFloat(n.toFixed(2)).toString()

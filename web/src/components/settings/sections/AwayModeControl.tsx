@@ -1,5 +1,12 @@
 import { useState, useRef, useEffect } from "react"
-import { AlertTriangle, Clock, Wifi, MapPin, Loader2, Plane } from "lucide-react"
+import {
+  LocationOnIcon,
+  ProgressActivityIcon,
+  ScheduleIcon,
+  TravelIcon,
+  WarningIcon,
+  WifiIcon,
+} from "@/components/icons"
 import { cn } from "@/lib/utils"
 import { useAwayMode } from "@/hooks/useAwayMode"
 import type { AwayModeKind } from "@/hooks/useAwayMode"
@@ -30,8 +37,7 @@ interface Props {
 
 export function AwayModeControl({ onOpenWizard }: Props = {}) {
   const { status, enable, disable, setMode, config, updateConfig, saveError, useCurrentLocation } = useAwayMode()
-  // Undefined means the first status poll hasn't resolved (or an older
-  // backend) — assume configured/manual so the card doesn't flash.
+  // Avoid a disabled-state flash before the first compatible response.
   const apConfigured = status.ap_configured !== false
   const mode: AwayModeKind = status.mode ?? "manual"
   const [selectedDuration, setSelectedDuration] = useState(240)
@@ -41,18 +47,17 @@ export function AwayModeControl({ onOpenWizard }: Props = {}) {
   const [enabling, setEnabling] = useState(false)
   const [confirmOpen, setConfirmOpen] = useState(false)
   const [enablingBle, setEnablingBle] = useState(false)
-  // Secret menu: 5 taps on the card icon opens the Travel Mode dialog.
+  // Five icon taps open Travel Mode.
   const [secretOpen, setSecretOpen] = useState(false)
   const [travelOn, setTravelOn] = useState(false)
   const tapCount = useRef(0)
   const tapTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
 
-  // Reflect Travel Mode in the card badge even before the dialog is opened.
+  // Fetch Travel Mode for the card badge.
   useEffect(() => {
     api.getTravelMode().then((r) => setTravelOn(r.enabled)).catch(() => {})
   }, [])
 
-  // Clear the pending 5-tap reset timer on unmount.
   useEffect(
     () => () => {
       if (tapTimer.current) clearTimeout(tapTimer.current)
@@ -74,7 +79,7 @@ export function AwayModeControl({ onOpenWizard }: Props = {}) {
   }
 
   const isActive = status.state === "active"
-  // The AP is up when a manual timer is running, or auto mode says "away".
+  // The AP is up during a manual timer or an automatic away decision.
   const apUp = mode === "auto" ? status.ap_on === true : isActive
 
   function getCustomMinutes() {
@@ -109,8 +114,7 @@ export function AwayModeControl({ onOpenWizard }: Props = {}) {
   }
 
   function getProgress() {
-    // `== null` (not `!`) on remaining_sec: 0 is a real value (timer just
-    // hit zero → full bar), not "missing" — `!0` would snap the bar to empty.
+    // Zero remaining is a real timer value, not missing data.
     if (!status.enabled_at || !status.expires_at || status.remaining_sec == null) return 0
     const total =
       (new Date(status.expires_at).getTime() - new Date(status.enabled_at).getTime()) / 1000
@@ -149,7 +153,7 @@ export function AwayModeControl({ onOpenWizard }: Props = {}) {
     }
     return (
       <div className="flex items-center gap-2 text-xs">
-        <MapPin className="h-3 w-3 text-blue-400" />
+        <LocationOnIcon className="h-3 w-3 text-blue-400" />
         <span className="text-slate-300">
           Currently <span className="font-medium">{status.is_home ? "home" : "away"}</span> —
           access point{" "}
@@ -165,7 +169,7 @@ export function AwayModeControl({ onOpenWizard }: Props = {}) {
     <PrefCard
       icon={
         <span onClick={handleSecretTap} className="cursor-default select-none" role="presentation">
-          <Wifi className="h-3.5 w-3.5" />
+          <WifiIcon className="h-3.5 w-3.5" />
         </span>
       }
       halo="blue"
@@ -175,7 +179,7 @@ export function AwayModeControl({ onOpenWizard }: Props = {}) {
           <span className="flex items-center gap-1.5">
             {travelOn && (
               <Pill kind="accent">
-                <Plane className="h-3 w-3" /> Travel
+                <TravelIcon className="h-3 w-3" /> Travel
               </Pill>
             )}
             {apUp && (
@@ -211,11 +215,10 @@ export function AwayModeControl({ onOpenWizard }: Props = {}) {
             returns (so the Pi rejoins your home WiFi). Uses the car’s location over BLE.
           </p>
 
-          {/* BLE telemetry is the GPS source — Automatic can't see location
-              without it. Mirrors the keep-accessory dependency warning. */}
+          {/* Automatic mode requires the BLE GPS source. */}
           {status.ble_ready === false && (
             <div className="flex items-start gap-2 rounded-lg border border-amber-500/30 bg-amber-500/10 p-3">
-              <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-amber-400" />
+              <WarningIcon className="mt-0.5 h-4 w-4 shrink-0 text-amber-400" />
               <div className="space-y-2">
                 <p className="text-xs text-amber-200/90">
                   <span className="font-medium">Automatic needs BLE telemetry.</span> The car’s
@@ -228,7 +231,7 @@ export function AwayModeControl({ onOpenWizard }: Props = {}) {
                   disabled={enablingBle}
                   className="inline-flex items-center gap-1.5 rounded-md border border-amber-500/40 bg-amber-500/15 px-2.5 py-1 text-xs font-medium text-amber-100 transition-colors hover:bg-amber-500/25 disabled:opacity-50"
                 >
-                  {enablingBle && <Loader2 className="h-3 w-3 animate-spin" />}
+                  {enablingBle && <ProgressActivityIcon className="h-3 w-3 animate-spin" />}
                   Turn on BLE telemetry
                 </button>
               </div>
@@ -256,7 +259,7 @@ export function AwayModeControl({ onOpenWizard }: Props = {}) {
         <>
           {status.has_rtc === false && (
             <div className="flex gap-2 rounded-lg border border-amber-500/20 bg-amber-500/5 p-2 text-[10px] text-amber-400/80">
-              <AlertTriangle className="mt-0.5 h-3 w-3 shrink-0" />
+              <WarningIcon className="mt-0.5 h-3 w-3 shrink-0" />
               <p>No RTC detected — timer saved every 30s, may lose accuracy on reboot.</p>
             </div>
           )}
@@ -265,7 +268,7 @@ export function AwayModeControl({ onOpenWizard }: Props = {}) {
             <>
               <div className="flex items-center justify-between">
                 <div className="flex items-center gap-2 text-xs text-blue-400">
-                  <Clock className="h-3 w-3" />
+                  <ScheduleIcon className="h-3 w-3" />
                   <span className="font-medium">{formatRemaining(status.remaining_sec ?? 0)}</span>
                 </div>
                 <button
@@ -352,7 +355,7 @@ export function AwayModeControl({ onOpenWizard }: Props = {}) {
               {confirmOpen && (
                 <div className="space-y-3 rounded-xl border border-amber-500/30 bg-amber-500/5 p-4">
                   <div className="flex items-start gap-2">
-                    <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-amber-400" />
+                    <WarningIcon className="mt-0.5 h-4 w-4 shrink-0 text-amber-400" />
                     <div className="space-y-1 text-xs text-amber-300/90">
                       <p className="font-semibold">You may lose connection to this page</p>
                       <p className="text-amber-400/70">
@@ -399,10 +402,6 @@ export function AwayModeControl({ onOpenWizard }: Props = {}) {
         </>
       )}
 
-      {/* AP details — folded into the Away Mode card so users see the
-          control and the access-point address together. While the AP is
-          down, this is a one-line placeholder; while up, it shows the SSID
-          and IP to join from inside the car. */}
       <div className="space-y-1.5 border-t border-white/5 pt-3">
         <p className="text-xs font-medium text-slate-400">Access point</p>
         {apUp ? (

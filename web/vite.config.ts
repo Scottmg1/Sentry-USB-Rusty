@@ -13,30 +13,18 @@ export default defineConfig({
   build: {
     rollupOptions: {
       output: {
-        // Named vendor chunks so an OTA update that only changes app
-        // code doesn't bust the cache for libraries that haven't moved.
-        // Each library lives in its own content-hashed file. Standard
-        // Rollup `manualChunks` function form — the prior `codeSplitting`
-        // key is a rolldown-vite-only API, but this build runs plain
-        // vite@8, so it failed to build. Same vendor groups, working syntax.
+      // Stable vendor chunks preserve library caches across app-only updates.
         manualChunks(id: string) {
           if (/[\\/]node_modules[\\/](react|react-dom|react-router|react-router-dom)[\\/]/.test(id)) return 'vendor-react'
           if (/[\\/]node_modules[\\/]recharts[\\/]/.test(id)) return 'vendor-charts'
           if (/[\\/]node_modules[\\/]leaflet[\\/]/.test(id)) return 'vendor-maps'
           if (/[\\/]node_modules[\\/]@xterm[\\/]/.test(id)) return 'vendor-term'
-          if (/[\\/]node_modules[\\/]lucide-react[\\/]/.test(id)) return 'vendor-icons'
+        // Vendored icons change independently from the views that use them.
+          if (/[\\/]src[\\/]components[\\/]icons\.tsx$/.test(id)) return 'vendor-icons'
         },
       },
     },
-    // Vite's default modulepreload walks every transitively-reachable
-    // async chunk and bakes a <link rel="modulepreload"> for each.
-    // That defeats lazy-loading for heavy vendors: leaflet/xterm/
-    // recharts get preloaded on every page just because *some* lazy
-    // route eventually pulls them in. Strip those from the initial
-    // preload list — they'll still be fetched on-demand when the
-    // lazy chunk that needs them is loaded (one extra RTT at
-    // navigation time, but only for users who actually visit that
-    // chunk's route).
+    // Do not preload heavy vendors that are reachable only through lazy routes.
     modulePreload: {
       resolveDependencies: (_filename, deps) =>
         deps.filter(
@@ -50,9 +38,7 @@ export default defineConfig({
   server: {
     allowedHosts: true,
     proxy: {
-      // Backend API target. Defaults to the local Rust server on :8788;
-      // set SENTRYUSB_API (e.g. http://sentryusb.local) to develop the
-      // UI against a live Pi without running the backend locally.
+      // SENTRYUSB_API can point development at a remote backend.
       '/api': process.env.SENTRYUSB_API || 'http://localhost:8788',
       '/TeslaCam': process.env.SENTRYUSB_API || 'http://localhost:8788',
     },

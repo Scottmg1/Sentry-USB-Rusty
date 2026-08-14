@@ -21,12 +21,30 @@ pub struct AppState {
     pub net_sampler: NetSampler,
 }
 
+// Substates let full and degraded routers share focused handlers.
+impl axum::extract::FromRef<AppState> for AuthState {
+    fn from_ref(s: &AppState) -> Self {
+        s.auth.clone()
+    }
+}
+
+impl axum::extract::FromRef<AppState> for sentryusb_ws::Hub {
+    fn from_ref(s: &AppState) -> Self {
+        s.hub.clone()
+    }
+}
+
 /// Build the complete Axum router with all API routes.
 pub fn build_router(state: AppState) -> Router {
     let api = Router::new()
         // Status & config
         .route("/api/status", get(crate::status::get_status))
+        .route(
+            "/api/dashboard-snapshot",
+            get(crate::status::dashboard_snapshot),
+        )
         .route("/api/status/storage", get(crate::status::get_storage_breakdown))
+        .route("/api/profile", get(crate::profile::get_profile))
         .route("/api/config", get(crate::status::get_config))
         .route("/api/wifi", get(crate::status::get_wifi_config))
         // Auth
@@ -40,8 +58,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/setup/phases", get(crate::setup::get_setup_phases))
         .route("/api/setup/test-archive", post(crate::setup::test_archive))
         .route("/api/setup/preflight", post(crate::setup::preflight))
-        // Snapshot management — list / delete archived dashcam
-        // snapshots, plus a free-space query for the UI's gauge.
+        // Snapshots
         .route("/api/snapshots", get(crate::snapshots::list_snapshots))
         .route("/api/snapshots/{id}", delete(crate::snapshots::delete_snapshot))
         .route("/api/backingfiles/free-space", get(crate::snapshots::get_free_space))
@@ -60,13 +77,12 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/files/download-zip", get(crate::files::download_zip))
         .route("/api/files/download-zip-multi", post(crate::files::download_zip_multi))
         // Logs
-        // Bundle endpoint must come BEFORE the /{name} catch-all,
-        // otherwise axum would treat "bluetooth/bundle" as `name=bluetooth/bundle`
-        // and the path validator (which rejects '/' in name) would 400.
+        // Register the bundle route before the `{name}` catch-all.
         .route(
             "/api/logs/bluetooth/bundle",
             get(crate::ble_debug::get_ble_bundle),
         )
+        .route("/api/logs/{name}/page", get(crate::logs::get_log_page))
         .route("/api/logs/{name}", get(crate::logs::get_log))
         // Diagnostics & health
         .route("/api/diagnostics/refresh", post(crate::healthcheck::refresh_diagnostics))
@@ -113,7 +129,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/system/check-update", post(crate::update::check_for_update))
         .route("/api/system/update-status", get(crate::update::get_update_status))
         .route("/api/system/block-devices", get(crate::devices::list_block_devices))
-        // Storage repair — guided XFS backingfiles recovery (see storage_repair.rs)
+        // Storage repair
         .route("/api/storage/health", get(crate::storage_repair::storage_health))
         .route("/api/storage/repair", post(crate::storage_repair::storage_repair))
         // Preferences
@@ -128,21 +144,34 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/notifications/history", get(crate::notification_center::get_history).post(crate::notification_center::append_history).delete(crate::notification_center::clear_history))
         .route("/api/notifications/history/{id}", delete(crate::notification_center::delete_history_item))
         .route("/api/notifications/settings/check", get(crate::notification_center::check_notification_type))
-        // Support
-        .route("/api/support/check", get(crate::support::check_available))
-        .route("/api/support/ticket", post(crate::support::create_ticket))
-        .route("/api/support/ticket/{id}/message", post(crate::support::send_message))
-        .route("/api/support/ticket/{id}/media", post(crate::support::upload_media))
-        .route("/api/support/ticket/{id}/messages", get(crate::support::fetch_messages))
-        .route("/api/support/ticket/{id}/close", post(crate::support::close_ticket))
-        .route("/api/support/ticket/{id}/mark-read", post(crate::support::mark_read))
-        .route("/api/support/ticket/{id}/register-device", post(crate::support::register_device))
-        .route("/api/support/ticket/{id}/unregister-device", post(crate::support::unregister_device))
+        // AI Support receives product context but no Pi login credential.
+        .route(
+            "/api/support/ai/conversations",
+            post(crate::support::create_ai_conversation),
+        )
+        .route(
+            "/api/support/ai/conversations/{id}",
+            delete(crate::support::delete_ai_conversation),
+        )
+        .route(
+            "/api/support/ai/conversations/{id}/messages",
+            get(crate::support::fetch_ai_messages).post(crate::support::send_ai_message),
+        )
+        .route(
+            "/api/support/ai/conversations/{id}/file-decisions",
+            post(crate::support::decide_ai_file_request),
+        )
+        .route(
+            "/api/support/ai/conversations/{id}/files",
+            post(crate::support::upload_ai_file).layer(DefaultBodyLimit::max(3 * 1024 * 1024)),
+        )
         // Lock chime
         .route("/api/lockchime/list", get(crate::lock_chime::list))
         .route("/api/lockchime/upload", post(crate::lock_chime::upload))
         .route("/api/lockchime/activate/{filename}", post(crate::lock_chime::activate))
+        .route("/api/lockchime/activate-ass/{filename}", post(crate::lock_chime::activate_ass))
         .route("/api/lockchime/clear-active", post(crate::lock_chime::clear_active))
+        .route("/api/lockchime/clear-ass-active", post(crate::lock_chime::clear_ass_active))
         .route("/api/lockchime/{filename}", delete(crate::lock_chime::delete_chime))
         .route("/api/lockchime/volume/{filename}", put(crate::lock_chime::set_volume))
         .route("/api/lockchime/random-config", get(crate::lock_chime::get_random_config).put(crate::lock_chime::save_random_config))
@@ -179,6 +208,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/drives/tags", get(crate::drives_handler::list_tags))
         .route("/api/drives/process", get(crate::drives_handler::processing_status).post(crate::drives_handler::process_files))
         .route("/api/drives/reprocess", post(crate::drives_handler::reprocess_all))
+        .route("/api/drives/check-summon", post(crate::drives_handler::check_summon))
         .route("/api/drives/status", get(crate::drives_handler::processing_status))
         .route("/api/drives/data/download", get(crate::drives_handler::download_data))
         .route("/api/drives/data/upload", post(crate::drives_handler::upload_data))
@@ -188,6 +218,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/drives/data/export-for-sync", post(crate::drives_handler::export_for_sync))
         .route("/api/drives/stats", get(crate::drives_handler::drive_stats))
         .route("/api/drives/fsd-analytics", get(crate::drives_handler::fsd_analytics))
+        .route("/api/drives/safety-analytics", get(crate::drives_handler::safety_analytics))
         .route("/api/drives/migration-status", get(crate::drives_handler::migration_status))
         .route("/api/drives/{id}/tags", put(crate::drives_handler::set_drive_tags))
         .route(
@@ -199,17 +230,20 @@ pub fn build_router(state: AppState) -> Router {
             get(crate::drives_handler::temperature_series),
         )
         .route("/api/drives/{id}", get(crate::drives_handler::single_drive))
-        // Telemetry — global rollups over telemetry_samples, not scoped
-        // to one drive. Powers the Dashboard's TirePressureCard.
+        // Global telemetry rollups
         .route(
             "/api/telemetry/tire-history",
             get(crate::drives_handler::tire_history),
         )
-        // Charging — sessions derived on-demand from the per-sample
-        // charge columns. Empty unless the experimental flag is on.
+        // Charging sessions derived from samples
         .route("/api/charging", get(crate::charging::list_charging))
         .route("/api/charging/current", get(crate::charging::current_charging))
+        .route("/api/charging/action", post(crate::charging::charging_action))
         .route("/api/charging/tags", get(crate::charging::list_charge_tags))
+        .route(
+            "/api/charging/home-sessions",
+            get(crate::charging::home_session_count),
+        )
         .route(
             "/api/charging/bulk-delete",
             post(crate::charging::bulk_delete_charges),
@@ -226,30 +260,23 @@ pub fn build_router(state: AppState) -> Router {
         // Keep-awake
         .route("/api/keep-awake/start", post(crate::keep_awake::start))
         .route("/api/keep-awake/stop", post(crate::keep_awake::stop))
-        // Frontend (useKeepAwake.tsx:123, 152) disables Keep Awake via
-        // `DELETE /api/keep-awake`. Route to the same `stop` handler so
-        // both shapes work — matches the `DELETE /api/away-mode` pattern.
+        // Support both explicit stop and DELETE forms.
         .route("/api/keep-awake", axum::routing::delete(crate::keep_awake::stop))
         .route("/api/keep-awake/status", get(crate::keep_awake::status))
         .route("/api/keep-awake/heartbeat", post(crate::keep_awake::heartbeat))
         // Away mode
         .route("/api/away-mode/enable", post(crate::away_mode::enable))
         .route("/api/away-mode/disable", post(crate::away_mode::disable))
-        // Frontend calls `DELETE /api/away-mode` to turn Away Mode off —
-        // keep the more specific POST handlers above and alias the bare
-        // path here so both shapes work.
+        // Support both explicit disable and DELETE forms.
         .route("/api/away-mode", delete(crate::away_mode::disable))
         .route("/api/away-mode/status", get(crate::away_mode::status))
-        // Away mode — Automatic (geofence) mode: switch modes + the home
-        // geofence (center shared with keep-accessory, radius its own).
+        // Away Mode shares its geofence center with keep-accessory.
         .route("/api/away-mode/mode", post(crate::away_mode::set_mode))
         .route(
             "/api/away-mode/config",
             get(crate::away_mode::config_get).put(crate::away_mode::config_set),
         )
-        // Travel Mode — secret-menu toggle: keep the USB gadget presented to
-        // the car at all times so recording stays continuous while archiving
-        // on the road (read fresh by archiveloop's travel_mode_active).
+        // Travel Mode keeps the gadget presented while archiving.
         .route("/api/travel-mode/status", get(crate::travel_mode::status))
         .route("/api/travel-mode", post(crate::travel_mode::set))
         // Terminal WebSocket
@@ -258,12 +285,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/ws", get(ws_handler))
         // Memory HTML page
         .route("/memory", get(crate::memory::memory_page))
-        // Cloud upload pipeline (paired-Pi cloud sync). Production uploads
-        // are automatic at the tail of the archive lifecycle. `upload-now`
-        // nudges the uploader manually — wired to the Retry button in the
-        // cloud-pairing UI when `lastUploadError` is showing (uploader is
-        // event-driven, so a transient failure can leave the queue stuck
-        // until the next clip archives).
+        // Paired-device cloud uploads and manual queue retry.
         .route("/api/cloud/status", get(crate::cloud::get_status))
         .route("/api/cloud/queue", get(crate::cloud::get_queue))
         .route("/api/cloud/pair/begin", post(crate::cloud::pair_begin))
@@ -275,12 +297,38 @@ pub fn build_router(state: AppState) -> Router {
     api.with_state(state)
 }
 
-/// WebSocket handler.
-async fn ws_handler(
+/// Journal requests slower than 500 ms with archive and database-backup state.
+/// Backup begins after the archive status file is removed, so both flags matter.
+pub async fn slow_request_log(
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let method = req.method().clone();
+    let path = req.uri().path().to_string();
+    let t0 = std::time::Instant::now();
+    let resp = next.run(req).await;
+    let ms = t0.elapsed().as_millis();
+    if ms >= 500 {
+        tracing::warn!(
+            "slow_request method={} path={} status={} duration_ms={} archiving={} db_backup={}",
+            method,
+            path,
+            resp.status().as_u16(),
+            ms,
+            crate::drives_handler::is_archiving(),
+            crate::backup::DB_BACKUP_IN_FLIGHT.load(std::sync::atomic::Ordering::Acquire),
+        );
+    }
+    resp
+}
+
+/// WebSocket handler. Takes only the hub so the degraded router can
+/// mount it too (storage-repair progress streams over it).
+pub(crate) async fn ws_handler(
     ws: axum::extract::WebSocketUpgrade,
-    axum::extract::State(state): axum::extract::State<AppState>,
+    axum::extract::State(hub): axum::extract::State<sentryusb_ws::Hub>,
 ) -> impl axum::response::IntoResponse {
-    ws.on_upgrade(move |socket| handle_ws(socket, state.hub))
+    ws.on_upgrade(move |socket| handle_ws(socket, hub))
 }
 
 async fn handle_ws(socket: axum::extract::ws::WebSocket, hub: sentryusb_ws::Hub) {
@@ -294,7 +342,7 @@ async fn handle_ws(socket: axum::extract::ws::WebSocket, hub: sentryusb_ws::Hub)
 
     let hub_clone = hub.clone();
 
-    // Writer task: forward broadcasts + periodic pings
+    // Forward broadcasts and periodic pings.
     let mut send_task = tokio::spawn(async move {
         let mut ping_interval = interval(Duration::from_secs(30));
         loop {
@@ -320,11 +368,7 @@ async fn handle_ws(socket: axum::extract::ws::WebSocket, hub: sentryusb_ws::Hub)
         }
     });
 
-    // Reader task: any message (including pong) resets the 60-second read
-    // deadline. Two missed pings (30s each) tears down the socket — matches
-    // Go's `SetReadDeadline(60s)` in hub.go and means a JS tab that's been
-    // paused by the browser stops holding a server-side goroutine within a
-    // minute, instead of however long it takes the TCP send buffer to fill.
+    // Any message resets the deadline; two missed pings close the connection.
     let mut recv_task = tokio::spawn(async move {
         loop {
             match tokio::time::timeout(Duration::from_secs(60), receiver.next()).await {
@@ -335,7 +379,6 @@ async fn handle_ws(socket: axum::extract::ws::WebSocket, hub: sentryusb_ws::Hub)
         }
     });
 
-    // Wait for either task to finish
     tokio::select! {
         _ = &mut send_task => { recv_task.abort(); }
         _ = &mut recv_task => { send_task.abort(); }

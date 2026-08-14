@@ -1,18 +1,22 @@
 import { useEffect, useRef, useState } from "react"
 import {
-  ChevronDown,
-  Download,
-  Loader2,
-  Play,
-  RefreshCw,
-  Trash2,
-  Upload,
-} from "lucide-react"
+  CachedIcon,
+  DeleteIcon,
+  DownloadIcon,
+  ExpandMoreIcon,
+  PlayArrowIcon,
+  ProgressActivityIcon,
+  SettingsRemoteIcon,
+  UploadIcon,
+} from "@/components/icons"
 import { cn } from "@/lib/utils"
+import { api } from "@/lib/api"
+import { wsClient } from "@/lib/ws"
 import {
   deleteAllDrives,
   triggerProcessNew,
   triggerReprocessAll,
+  triggerSummonCheck,
   uploadDriveData,
 } from "@/api/drives"
 
@@ -23,6 +27,7 @@ interface DrivesActionsBarProps {
 export function DrivesActionsBar({ onChanged }: DrivesActionsBarProps) {
   const [processMenuOpen, setProcessMenuOpen] = useState(false)
   const [processing, setProcessing] = useState(false)
+  const [backendProcessing, setBackendProcessing] = useState(false)
   const [importing, setImporting] = useState(false)
   const [deleting, setDeleting] = useState(false)
   const [confirmingDelete, setConfirmingDelete] = useState(false)
@@ -30,6 +35,52 @@ export function DrivesActionsBar({ onChanged }: DrivesActionsBarProps) {
 
   const menuRef = useRef<HTMLDivElement>(null)
   const fileInputRef = useRef<HTMLInputElement>(null)
+
+  // Keep inline parent callbacks from restarting the status subscription.
+  const onChangedRef = useRef(onChanged)
+  useEffect(() => {
+    onChangedRef.current = onChanged
+  })
+
+  // Jobs outlive the trigger request and may start elsewhere. WebSocket events
+  // drive status, with visible-page polling as a dropped-event fallback.
+  useEffect(() => {
+    let mounted = true
+    const check = () =>
+      api
+        .getDriveStatus()
+        .then((s) => {
+          if (mounted) setBackendProcessing(s.running)
+        })
+        .catch(() => {})
+    check()
+    const unsubProcess = wsClient.subscribe("drive_process", (data) => {
+      if (!mounted) return
+      const msg = data as { status: string }
+      if (msg.status === "started" || msg.status === "progress") {
+        setBackendProcessing(true)
+      } else if (msg.status === "complete" || msg.status === "error") {
+        setBackendProcessing(false)
+        onChangedRef.current()
+      }
+    })
+    const unsubSummon = wsClient.subscribe("summon_check", (data) => {
+      if (!mounted) return
+      if ((data as { status: string }).status === "complete") {
+        setBackendProcessing(false)
+        onChangedRef.current()
+      }
+    })
+    const interval = setInterval(() => {
+      if (!document.hidden) check()
+    }, 5000)
+    return () => {
+      mounted = false
+      clearInterval(interval)
+      unsubProcess()
+      unsubSummon()
+    }
+  }, [])
 
   useEffect(() => {
     if (!processMenuOpen) return
@@ -40,15 +91,17 @@ export function DrivesActionsBar({ onChanged }: DrivesActionsBarProps) {
     return () => document.removeEventListener("mousedown", onDoc)
   }, [processMenuOpen])
 
-  const runProcess = async (mode: "new" | "all") => {
+  const runProcess = async (mode: "new" | "all" | "summon") => {
     setProcessMenuOpen(false)
     setProcessing(true)
     setError(null)
     try {
       if (mode === "new") await triggerProcessNew()
+      else if (mode === "summon") await triggerSummonCheck()
       else await triggerReprocessAll()
-      // Backend runs the job async; surface a soft hint, then refresh
-      // the list so newly extracted drives appear when the user comes back.
+      // Reflect accepted asynchronous work immediately.
+      setBackendProcessing(true)
+      // Refresh results when the user returns.
       window.setTimeout(onChanged, 2000)
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e))
@@ -91,31 +144,39 @@ export function DrivesActionsBar({ onChanged }: DrivesActionsBarProps) {
         <div ref={menuRef} className="relative">
           <button
             type="button"
-            disabled={processing}
+            disabled={processing || backendProcessing}
             onClick={() => setProcessMenuOpen((o) => !o)}
             className="inline-flex items-center gap-1.5 rounded-lg border border-white/10 bg-white/[0.03] px-3 py-1.5 text-xs font-medium text-slate-200 transition-colors hover:bg-white/[0.06] disabled:opacity-50"
           >
-            {processing ? (
-              <Loader2 className="h-3.5 w-3.5 animate-spin" />
+            {processing || backendProcessing ? (
+              <ProgressActivityIcon className="h-3.5 w-3.5 animate-spin" />
             ) : (
-              <RefreshCw className="h-3.5 w-3.5" />
+              <CachedIcon className="h-3.5 w-3.5" />
             )}
-            Process
-            <ChevronDown className="h-3 w-3" />
+            {processing || backendProcessing ? "Processing" : "Process"}
+            {!(processing || backendProcessing) && (
+              <ExpandMoreIcon className="h-3 w-3" />
+            )}
           </button>
-          {processMenuOpen && !processing && (
+          {processMenuOpen && !(processing || backendProcessing) && (
             <div className="absolute right-0 z-50 mt-1 w-60 rounded-lg border border-white/10 bg-slate-950/95 py-1 shadow-2xl backdrop-blur">
               <MenuItem
-                icon={<Play className="h-3.5 w-3.5 text-emerald-400" />}
+                icon={<PlayArrowIcon className="h-3.5 w-3.5 text-emerald-400" />}
                 title="Process new drives"
                 hint="Extract GPS from unprocessed clips"
                 onClick={() => runProcess("new")}
               />
               <MenuItem
-                icon={<RefreshCw className="h-3.5 w-3.5 text-amber-400" />}
+                icon={<CachedIcon className="h-3.5 w-3.5 text-amber-400" />}
                 title="Reprocess all drives"
                 hint="Re-extract every existing clip on disk"
                 onClick={() => runProcess("all")}
+              />
+              <MenuItem
+                icon={<SettingsRemoteIcon className="h-3.5 w-3.5 text-violet-400" />}
+                title="Scan for Summon drives"
+                hint="Re-read slow clips for summon evidence"
+                onClick={() => runProcess("summon")}
               />
             </div>
           )}
@@ -125,7 +186,7 @@ export function DrivesActionsBar({ onChanged }: DrivesActionsBarProps) {
           href="/api/drives/data/download"
           className="inline-flex items-center gap-1.5 rounded-lg border border-white/10 bg-white/[0.03] px-3 py-1.5 text-xs font-medium text-slate-200 transition-colors hover:bg-white/[0.06]"
         >
-          <Download className="h-3.5 w-3.5" /> Export
+          <DownloadIcon className="h-3.5 w-3.5" /> Export
         </a>
 
         <button
@@ -135,9 +196,9 @@ export function DrivesActionsBar({ onChanged }: DrivesActionsBarProps) {
           className="inline-flex items-center gap-1.5 rounded-lg border border-white/10 bg-white/[0.03] px-3 py-1.5 text-xs font-medium text-slate-200 transition-colors hover:bg-white/[0.06] disabled:opacity-50"
         >
           {importing ? (
-            <Loader2 className="h-3.5 w-3.5 animate-spin" />
+            <ProgressActivityIcon className="h-3.5 w-3.5 animate-spin" />
           ) : (
-            <Upload className="h-3.5 w-3.5" />
+            <UploadIcon className="h-3.5 w-3.5" />
           )}
           {importing ? "Importing…" : "Import"}
         </button>
@@ -158,7 +219,7 @@ export function DrivesActionsBar({ onChanged }: DrivesActionsBarProps) {
           onClick={() => setConfirmingDelete(true)}
           className="inline-flex items-center gap-1.5 rounded-lg border border-rose-400/30 bg-rose-500/10 px-3 py-1.5 text-xs font-medium text-rose-200 transition-colors hover:bg-rose-500/20 disabled:opacity-50"
         >
-          <Trash2 className="h-3.5 w-3.5" /> Delete all
+          <DeleteIcon className="h-3.5 w-3.5" /> Delete all
         </button>
       </div>
 
@@ -197,9 +258,9 @@ export function DrivesActionsBar({ onChanged }: DrivesActionsBarProps) {
                 )}
               >
                 {deleting ? (
-                  <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                  <ProgressActivityIcon className="h-3.5 w-3.5 animate-spin" />
                 ) : (
-                  <Trash2 className="h-3.5 w-3.5" />
+                  <DeleteIcon className="h-3.5 w-3.5" />
                 )}
                 {deleting ? "Deleting…" : "Delete everything"}
               </button>

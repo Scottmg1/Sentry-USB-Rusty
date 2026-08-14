@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react"
-import { AlertTriangle } from "lucide-react"
+import { WarningIcon } from "@/components/icons"
 import type { StepProps } from "./SetupWizard"
 
 type Unit = "G" | "M"
@@ -115,7 +115,7 @@ export function SizeInput({
       <p className="mt-1 text-xs text-slate-600">{hint}</p>
       {!disabled && warning && numericVal && unit === "G" && (
         <div className="mt-2 flex items-start gap-2 rounded-lg border border-amber-500/20 bg-amber-500/5 px-3 py-2">
-          <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0 text-amber-400" />
+          <WarningIcon className="mt-0.5 h-3.5 w-3.5 shrink-0 text-amber-400" />
           <p className="text-xs text-amber-300">{warning}</p>
         </div>
       )}

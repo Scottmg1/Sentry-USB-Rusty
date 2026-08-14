@@ -1,11 +1,8 @@
-import { Activity, Clock, Gauge, Sparkles } from "lucide-react"
+import { DangerousIcon, Robot2Icon, ScheduleIcon, SpeedIcon, VitalSignsIcon } from "@/components/icons"
 import { formatDuration, formatPercent } from "@/lib/drive-format"
 import type { DrivesFilteredStats } from "@/hooks/useDrivesList"
 
-/** Aggregate distance with thousands separators + 1 decimal, honouring
- *  the user's metric preference. Distinct from formatDistance() which
- *  uses 2 decimals — at scale (e.g. 1,234.5 mi over a month) one
- *  decimal reads cleaner. */
+/** Aggregate distance with grouping and one decimal in the preferred unit. */
 function formatAggregateDistance(
   mi: number,
   km: number,
@@ -25,28 +22,13 @@ interface DrivesSummaryStripProps {
   metric: boolean
 }
 
-/**
- * Compact lifetime-of-current-selection stats strip — rendered inline
- * inside DrivesToolbar between the Filter button and the Select
- * button. Numbers recompute live against the current filter set so
- * switching the date preset (or applying a tag/min-distance filter)
- * updates them immediately.
- *
- * Deliberately *does not* render a "drives count" cell — that number
- * is already shown by the pagination row ("1–10 of 26") and a date
- * badge — the active date pill in the toolbar already communicates
- * the active selection. Keeps the strip tight enough to fit on one
- * line next to the filter chrome.
- */
+/** Aggregate statistics for the current filter selection. */
 export function DrivesSummaryStrip({
   stats,
   loading,
   metric,
 }: DrivesSummaryStripProps) {
-  // While the initial fetch is in flight render a skeleton so the
-  // toolbar row keeps its height. On subsequent refreshes (post
-  // process / import) we keep showing the previous numbers rather
-  // than flashing back to a skeleton.
+  // Preserve prior values during refreshes; only cold loads need a skeleton.
   if (loading && stats.count === 0) {
     return (
       <div className="flex flex-wrap items-center gap-x-5 gap-y-2">
@@ -60,7 +42,7 @@ export function DrivesSummaryStrip({
   return (
     <div className="flex flex-wrap items-center gap-x-5 gap-y-2">
       <StatCell
-        icon={<Gauge className="h-3.5 w-3.5" />}
+        icon={<SpeedIcon className="h-3.5 w-3.5" />}
         label="Distance"
         value={formatAggregateDistance(
           stats.totalDistanceMi,
@@ -70,7 +52,7 @@ export function DrivesSummaryStrip({
       />
       <Divider />
       <StatCell
-        icon={<Clock className="h-3.5 w-3.5" />}
+        icon={<ScheduleIcon className="h-3.5 w-3.5" />}
         label="Time"
         value={formatDuration(stats.totalDurationMs)}
       />
@@ -78,7 +60,7 @@ export function DrivesSummaryStrip({
         <>
           <Divider />
           <StatCell
-            icon={<Sparkles className="h-3.5 w-3.5 text-emerald-300" />}
+            icon={<Robot2Icon className="h-3.5 w-3.5 text-emerald-300" />}
             label="FSD"
             value={`${formatPercent(stats.fsdPercent)}%`}
             highlight={stats.fsdPercent >= 99}
@@ -89,7 +71,7 @@ export function DrivesSummaryStrip({
         <>
           <Divider />
           <StatCell
-            icon={<Activity className="h-3.5 w-3.5" />}
+            icon={<VitalSignsIcon className="h-3.5 w-3.5" />}
             label="Autopilot"
             value={`${formatPercent(stats.autopilotPercent)}%`}
           />
@@ -99,7 +81,7 @@ export function DrivesSummaryStrip({
         <>
           <Divider />
           <StatCell
-            icon={<Sparkles className="h-3.5 w-3.5 text-rose-300" />}
+            icon={<DangerousIcon className="h-3.5 w-3.5 text-rose-300" />}
             label="Disengagements"
             value={stats.fsdDisengagements.toLocaleString()}
           />
@@ -109,7 +91,7 @@ export function DrivesSummaryStrip({
         <>
           <Divider />
           <StatCell
-            icon={<Sparkles className="h-3.5 w-3.5 text-violet-300" />}
+            icon={<Robot2Icon className="h-3.5 w-3.5 text-violet-300" />}
             label="Tessie"
             value={stats.tessieCount.toLocaleString()}
           />

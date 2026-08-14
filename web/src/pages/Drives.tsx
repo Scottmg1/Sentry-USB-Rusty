@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useState } from "react"
-import { Loader2, Trash2 } from "lucide-react"
+import { DeleteIcon, ProgressActivityIcon } from "@/components/icons"
 import { bulkDeleteDrives, setDriveTags } from "@/api/drives"
 import { cn } from "@/lib/utils"
 import { DriveRow } from "@/components/drives/DriveRow"
@@ -175,7 +175,7 @@ export default function Drives() {
       <div className="mt-3 flex flex-col gap-3">
         {list.loading && (
           <div className="flex items-center justify-center gap-2 rounded-2xl border border-white/[0.06] bg-white/[0.025] p-10 text-sm text-slate-400">
-            <Loader2 className="h-4 w-4 animate-spin" />
+            <ProgressActivityIcon className="h-4 w-4 animate-spin" />
             Loading drives…
           </div>
         )}
@@ -252,9 +252,9 @@ export default function Drives() {
                 )}
               >
                 {deletingBulk ? (
-                  <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                  <ProgressActivityIcon className="h-3.5 w-3.5 animate-spin" />
                 ) : (
-                  <Trash2 className="h-3.5 w-3.5" />
+                  <DeleteIcon className="h-3.5 w-3.5" />
                 )}
                 {deletingBulk
                   ? "Deleting…"

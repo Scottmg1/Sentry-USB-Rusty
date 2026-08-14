@@ -35,6 +35,8 @@ export SHARE_PASSWORD='password'
 #export RSYNC_USER=username
 #export RSYNC_SERVER=hostname_or_ip
 #export RSYNC_PATH=path_on_server
+# Only needed if your server's SSH daemon does not listen on port 22.
+#export RSYNC_SSH_PORT=2222
 
 # Variables for rclone archiving
 # If you are using rclone to archive to a local (non-cloud) server,
@@ -161,6 +163,14 @@ export CAM_SIZE=40G
 # starting the archiving of recorded clips. Uncomment this to change
 # the duration of that delay
 # export ARCHIVE_DELAY=20
+
+# CIFS/NFS archiving aborts a transfer when the archive server stops
+# answering connection probes AND no file has completed for this many
+# seconds (30-240; 60 by default, 180 in Travel Mode). Raise it if your
+# Pi parks at the edge of wifi range and archives die on brief signal
+# dropouts that the transfer itself would survive. Probes failing for a
+# full 300s always abort, regardless of this setting.
+# export ARCHIVE_STALL_GRACE_SECONDS=60
 
 # Uncomment if you want to override the default hostname of "sentryusb"
 # export SENTRYUSB_HOSTNAME=sentryusb-Model3

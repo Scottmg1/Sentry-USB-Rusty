@@ -19,14 +19,32 @@ export async function fetchChargeSession(
   return res.json()
 }
 
-/// Live "is the car charging right now" for the dashboard banner.
+// Current charging state for the dashboard banner.
 export async function fetchCurrentCharge(): Promise<CurrentCharge> {
   const res = await fetch("/api/charging/current")
   if (!res.ok) throw new Error(`charging/current: ${res.status}`)
   return res.json()
 }
 
-/// Every charge tag in use (for the filter + per-tag rate editor).
+export type ChargingActionRequest =
+  | { action: "start" | "stop" }
+  | { action: "setAmps" | "setLimit"; value: number }
+
+export async function sendChargingAction(
+  request: ChargingActionRequest,
+): Promise<void> {
+  const res = await fetch("/api/charging/action", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(request),
+  })
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({}))
+    throw new Error(body.error || `charging action: ${res.status}`)
+  }
+}
+
+// Tags used by charging filters and rate plans.
 export async function fetchChargeTags(): Promise<string[]> {
   const res = await fetch("/api/charging/tags")
   if (!res.ok) throw new Error(`charging tags: ${res.status}`)
@@ -34,7 +52,7 @@ export async function fetchChargeTags(): Promise<string[]> {
   return Array.isArray(data) ? data : []
 }
 
-/// Replace the tags for a charge session (id == its start timestamp).
+// Replace the tags for a session identified by its start timestamp.
 export async function setChargeTags(
   id: string | number,
   tags: string[],
@@ -47,9 +65,7 @@ export async function setChargeTags(
   if (!res.ok) throw new Error(`set charge tags ${id}: ${res.status}`)
 }
 
-/// Set or clear the manual per-charge cost override (id == its start
-/// timestamp). Pass `null` to clear and revert to the rate-derived cost.
-/// The amount is stored in the user's configured currency server-side.
+// Pass `null` to clear the manual cost and resume rate-based calculation.
 export async function setChargeCost(
   id: string | number,
   amount: number | null,
@@ -67,8 +83,7 @@ export interface BulkDeleteChargesResult {
   sessions: number
 }
 
-/// Delete charge sessions by id (their start timestamps). The backend
-/// removes each session's charge-bearing telemetry samples + tags.
+// Session IDs are start timestamps; deletion also removes their samples and tags.
 export async function bulkDeleteCharges(
   ids: Array<string | number>,
 ): Promise<BulkDeleteChargesResult> {

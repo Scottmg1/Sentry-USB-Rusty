@@ -1,12 +1,12 @@
 import { useState, useEffect } from "react"
 import {
-  Save,
-  RotateCcw,
-  Loader2,
-  CheckCircle,
-  AlertCircle,
-  AlertTriangle,
-} from "lucide-react"
+  CheckCircleIcon,
+  ErrorIcon,
+  ProgressActivityIcon,
+  RotateLeftIcon,
+  SaveIcon,
+  WarningIcon,
+} from "@/components/icons"
 import { cn } from "@/lib/utils"
 import { PrefCard } from "@/components/settings/PrefCard"
 
@@ -76,7 +76,6 @@ export function ConfigBackupSection() {
       if (!res.ok) throw new Error("Backup failed")
       const result = await res.json()
       setLastBackup({ date: result.date, timestamp: new Date().toISOString() })
-      // Refresh list
       try {
         const list = await fetch("/api/system/backups").then((r) => r.json())
         setBackups(list || [])
@@ -122,11 +121,10 @@ export function ConfigBackupSection() {
 
   return (
     <PrefCard
-      icon={<Save className="h-3.5 w-3.5" />}
+      icon={<SaveIcon className="h-3.5 w-3.5" />}
       halo="blue"
       title="Config Backup"
     >
-      {/* Location + backup trigger */}
       <div className="flex flex-wrap items-center gap-2">
         <span className="text-[10px] text-slate-500">Location:</span>
         <button
@@ -184,11 +182,10 @@ export function ConfigBackupSection() {
         </div>
       </div>
 
-      {/* Confirm / Result */}
       {restoreState === "success" && restoreResult && (
         <div className="rounded-xl border border-emerald-500/20 bg-emerald-500/5 p-4">
           <div className="flex items-start gap-3">
-            <CheckCircle className="mt-0.5 h-5 w-5 shrink-0 text-emerald-400" />
+            <CheckCircleIcon className="mt-0.5 h-5 w-5 shrink-0 text-emerald-400" />
             <div>
               <p className="text-sm font-medium text-emerald-300">Config Restored</p>
               <p className="mt-1 text-xs text-slate-400">
@@ -214,7 +211,7 @@ export function ConfigBackupSection() {
       {restoreState === "confirm" && selectedBackup && (
         <div className="rounded-xl border border-amber-500/20 bg-amber-500/5 p-4">
           <div className="flex items-start gap-3">
-            <AlertTriangle className="mt-0.5 h-5 w-5 shrink-0 text-amber-400" />
+            <WarningIcon className="mt-0.5 h-5 w-5 shrink-0 text-amber-400" />
             <div>
               <p className="text-sm font-medium text-amber-300">Confirm Restore</p>
               <p className="mt-1 text-xs text-slate-400">
@@ -254,12 +251,11 @@ export function ConfigBackupSection() {
 
       {restoreState === "error" && (
         <div className="flex items-center gap-2 rounded-lg bg-red-500/10 px-3 py-2 text-xs text-red-400">
-          <AlertCircle className="h-3.5 w-3.5 shrink-0" />
+          <ErrorIcon className="h-3.5 w-3.5 shrink-0" />
           Restore failed. Please try again.
         </div>
       )}
 
-      {/* Backups list */}
       {loaded && backups.length === 0 && restoreState === "idle" && (
         <p className="py-2 text-center text-xs text-slate-500">
           No backups yet. Backups are created automatically after each archive.
@@ -300,9 +296,9 @@ export function ConfigBackupSection() {
                 </p>
               </div>
               {restoreState === "restoring" && selectedBackup?.date === b.date ? (
-                <Loader2 className="h-4 w-4 animate-spin text-blue-400" />
+                <ProgressActivityIcon className="h-4 w-4 animate-spin text-blue-400" />
               ) : (
-                <RotateCcw className="h-3.5 w-3.5 text-slate-500" />
+                <RotateLeftIcon className="h-3.5 w-3.5 text-slate-500" />
               )}
             </button>
           ))}

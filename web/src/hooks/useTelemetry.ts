@@ -37,7 +37,6 @@ export function useTelemetry(clipPath: string | null, frontFile: string | null) 
     return () => { cancelled = true }
   }, [clipPath, frontFile])
 
-  // Binary search for nearest frame at a given time
   const frameAtTime = useCallback((seconds: number): TelemetryFrame | null => {
     if (!telemetry || !telemetry.frames.length) return null
     const frames = telemetry.frames
@@ -51,7 +50,6 @@ export function useTelemetry(clipPath: string | null, frontFile: string | null) 
       if (frames[mid].t <= seconds) lo = mid
       else hi = mid
     }
-    // Return whichever is closer
     return (seconds - frames[lo].t) <= (frames[hi].t - seconds) ? frames[lo] : frames[hi]
   }, [telemetry])
 

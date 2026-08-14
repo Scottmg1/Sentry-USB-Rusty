@@ -1,4 +1,4 @@
-import { Clock, Gauge, Sparkles } from "lucide-react"
+import { Robot2Icon, ScheduleIcon, SettingsRemoteIcon, SpeedIcon, VerifiedUserIcon } from "@/components/icons"
 import { useNavigate } from "react-router-dom"
 import { cn } from "@/lib/utils"
 import { formatDistance, formatDuration, formatPercent } from "@/lib/drive-format"
@@ -101,22 +101,45 @@ export function DriveRow({
       <div className="flex flex-col items-end justify-between gap-2">
         <div className="flex flex-wrap items-center justify-end gap-1.5">
           <Chip>
-            <Gauge className="h-3.5 w-3.5" />
+            <SpeedIcon className="h-3.5 w-3.5" />
             {formatDistance(drive.distanceMi, drive.distanceKm, metric)}
           </Chip>
           <Chip>
-            <Clock className="h-3.5 w-3.5" />
+            <ScheduleIcon className="h-3.5 w-3.5" />
             {formatDuration(drive.durationMs)}
           </Chip>
-          <Chip emphasis>
-            <Sparkles className="h-3.5 w-3.5" />
-            FSD {fsdDisplay}%
-            {fsdFull && (
-              <span className="ml-0.5 text-amber-300" aria-hidden>
-                ★
-              </span>
-            )}
-          </Chip>
+          {drive.summon ? (
+            <Chip summon>
+              <SettingsRemoteIcon className="h-3.5 w-3.5" />
+              Summon
+            </Chip>
+          ) : (
+            <Chip emphasis>
+              <Robot2Icon className="h-3.5 w-3.5" />
+              FSD {fsdDisplay}%
+              {fsdFull && (
+                <span className="ml-0.5 text-amber-300" aria-hidden>
+                  ★
+                </span>
+              )}
+            </Chip>
+          )}
+          {typeof drive.safetyScore === "number" && (
+            <Chip
+              className={
+                drive.safetyScore >= 90
+                  ? "bg-emerald-400/15 text-emerald-200 ring-emerald-400/20"
+                  : drive.safetyScore >= 70
+                    ? "bg-blue-400/15 text-blue-200 ring-blue-400/20"
+                    : drive.safetyScore >= 40
+                      ? "bg-amber-400/15 text-amber-200 ring-amber-400/20"
+                      : "bg-red-400/15 text-red-200 ring-red-400/20"
+              }
+            >
+              <VerifiedUserIcon className="h-3.5 w-3.5" />
+              {Math.round(drive.safetyScore)}
+            </Chip>
+          )}
         </div>
         <div className="flex items-end gap-2">
           <div
@@ -138,16 +161,22 @@ export function DriveRow({
 interface ChipProps {
   children: React.ReactNode
   emphasis?: boolean
+  summon?: boolean
+  /** Explicit color classes (bg/text/ring); overrides the variant flags. */
+  className?: string
 }
 
-function Chip({ children, emphasis }: ChipProps) {
+function Chip({ children, emphasis, summon, className }: ChipProps) {
   return (
     <span
       className={cn(
-        "inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-xs font-medium tabular-nums",
-        emphasis
-          ? "bg-emerald-400/15 text-emerald-200 ring-1 ring-inset ring-emerald-400/20"
-          : "bg-white/5 text-slate-300 ring-1 ring-inset ring-white/10",
+        "inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-xs font-medium tabular-nums ring-1 ring-inset",
+        className ??
+          (summon
+            ? "bg-violet-400/15 text-violet-200 ring-violet-400/20"
+            : emphasis
+              ? "bg-emerald-400/15 text-emerald-200 ring-emerald-400/20"
+              : "bg-white/5 text-slate-300 ring-white/10"),
       )}
     >
       {children}

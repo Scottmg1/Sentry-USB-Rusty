@@ -81,7 +81,45 @@ use rusqlite::{params, Connection, OptionalExtension};
 /// v14 -> v15: add clip-boundary state columns to `routes`
 /// (V15_ROUTE_BOUNDARY_COLUMNS) so FSD disengagements and accel pushes
 /// resolve across clip seams in the drive grouper.
-pub const CURRENT_SCHEMA_VERSION: i32 = 15;
+///
+/// v15 -> v16: add `flag_runs_blob` (per-frame SEI blinker/brake/accel
+/// flag RLE in RAW frame space, each run carrying its max |SEI speed| —
+/// the summon detector's evidence, frame-accurate for the speed gate)
+/// and `sei_speed_abs_max` (max |SEI speed| per clip; the locked
+/// `max_speed_mps` drops negative Reverse samples, so a reverse-only
+/// summon crawl would read 0 — feeds the detector's legacy fallback) to
+/// `routes`. Both nullable — rows written before flag extraction stay
+/// NULL, which the summon detector reads as "unverifiable, not summon".
+/// No backfill: flags and per-run speeds can only come from
+/// re-extracting the MP4's SEI stream, not from stored deduped arrays.
+///
+/// v16 -> v17: persist the charge-port-open flag plus the selected and
+/// maximum charging current. These nullable fields gate and bound the
+/// dashboard's BLE charging controls using a fresh authenticated sample.
+///
+/// v17 -> v18: add per-clip Safety Score scalars to `routes`
+/// (V18_ROUTE_SAFETY_COLUMNS, see `safety.rs`): hard-braking /
+/// aggressive-turning / speeding / moving-time metrics computed by
+/// `compute_clip_safety` inside `compute_route_aggregates`. All
+/// nullable; the AGGREGATE_FORMULA_VERSION bump recomputes them from
+/// stored blobs for every existing row (clips without an SEI speed
+/// channel land on 0 — "no safety data").
+///
+/// v18 -> v19: add conditional-ratio denominator columns to `routes`
+/// (V19_ROUTE_SAFETY_DENOM_COLUMNS): manual time decelerating above
+/// 0.1g / turning above 0.2g, so hard-braking and aggressive-turning
+/// become Tesla-style conditional proportions (harsh time ÷ braking/
+/// turning time) instead of shares of all driving time. Recomputed for
+/// existing rows by the same formula-version backfill as v18.
+///
+/// v19 -> v20: add `accel_x_blob` / `accel_y_blob` to `routes` — the SEI
+/// stream's IMU linear acceleration (proto fields 14/15, lateral /
+/// longitudinal m/s² per deduped point, peak-preserved through GPS
+/// dedup). MEASURED G-force for the Safety Score; rows without the
+/// blobs (pre-v20 extractions, firmware without the fields) fall back
+/// to the speed/GPS-derived estimates. No backfill: like flag_runs,
+/// the channel only exists by re-extracting the MP4's SEI stream.
+pub const CURRENT_SCHEMA_VERSION: i32 = 20;
 
 /// v1 DDL. Each statement is idempotent (`IF NOT EXISTS`) so `migrate()`
 /// is safe on every startup. Column shapes and names match Go exactly â€”
@@ -182,6 +220,54 @@ pub const V3_ROUTE_CLOUD_COLUMNS: &[(&str, &str)] = &[
 const V3_CLOUD_PENDING_INDEX: &str =
     "CREATE INDEX IF NOT EXISTS idx_routes_cloud_pending \
      ON routes(cloud_uploaded_at) WHERE cloud_uploaded_at IS NULL";
+
+/// Positive counterpart: `upload_summary`'s COUNT/MAX over uploaded rows
+/// was a full-table scan once the table outgrew its design size (a user
+/// DB measured 29.8k routes).
+const CLOUD_UPLOADED_INDEX: &str =
+    "CREATE INDEX IF NOT EXISTS idx_routes_cloud_uploaded \
+     ON routes(cloud_uploaded_at) WHERE cloud_uploaded_at > 0";
+
+/// Charge-signal rows are a small fraction of `telemetry_samples` (48k of
+/// 308k on the same measured DB), but `current_charging` reverse-scans and
+/// `load_charge_rows` filters the whole table without this. The predicate
+/// must match those queries verbatim for SQLite to use the partial index.
+const TELEMETRY_CHARGE_INDEX: &str =
+    "CREATE INDEX IF NOT EXISTS idx_telemetry_charge_ts \
+     ON telemetry_samples(ts) \
+     WHERE charging_state IS NOT NULL \
+        OR charger_power_kw IS NOT NULL \
+        OR charge_rate_mph IS NOT NULL";
+
+/// Meta key: ts the next cloud charge sweep may scan from. Only ever a
+/// session's FIRST row ts — identity IS that ts, so starting mid-session
+/// would mint a different session. Cleared on JSON import, which inserts
+/// telemetry below the cursor.
+pub const CHARGE_SWEEP_CURSOR_KEY: &str = "charge_sweep_cursor";
+
+/// Meta key: UTC date of the last full (`from = 0`) charge sweep. One
+/// sweep a day ignores the cursor, so a restore or clock rollback that
+/// lands rows below it still gets seen without instrumenting every writer.
+pub const CHARGE_SWEEP_FULL_DATE_KEY: &str = "charge_sweep_full_date";
+
+/// `route_sync_info_by_cloud_id` reverse lookup (cloud sync pull).
+const CLOUD_ROUTE_ID_INDEX: &str =
+    "CREATE INDEX IF NOT EXISTS idx_routes_cloud_route_id \
+     ON routes(cloud_route_id) WHERE cloud_route_id IS NOT NULL";
+
+/// TPMS rows are ~5% of `telemetry_samples` (7,977 of a 30-day window on
+/// a measured device), but `/api/telemetry/tire-history` had to walk the
+/// whole window to find them — 5.2s during an archive, holding one of
+/// the two read connections and queueing every other telemetry poll
+/// behind it. Covering: the value columns ride along so the chart is
+/// answered from the index without touching the table.
+const TELEMETRY_TIRE_INDEX: &str =
+    "CREATE INDEX IF NOT EXISTS idx_telemetry_tire_ts \
+     ON telemetry_samples(ts, tire_fl_psi, tire_fr_psi, tire_rl_psi, tire_rr_psi) \
+     WHERE tire_fl_psi IS NOT NULL \
+        OR tire_fr_psi IS NOT NULL \
+        OR tire_rl_psi IS NOT NULL \
+        OR tire_rr_psi IS NOT NULL";
 
 /// v4 Tessie provenance columns. Preserves `source`, `externalSignature`,
 /// and `tessieAutopilotPercent` through SQLite on import/export so a
@@ -320,6 +406,14 @@ pub const V14_TELEMETRY_CHARGE_PHASE_COLUMN: &[(&str, &str)] = &[
     ("charging_state", "TEXT"),
 ];
 
+/// v17 charging-control telemetry. `charge_port_door_open` is stored as
+/// SQLite 0/1; all three stay NULL when the vehicle omits the signal.
+pub const V17_TELEMETRY_CHARGING_CONTROL_COLUMNS: &[(&str, &str)] = &[
+    ("charging_amps_set", "INTEGER"),
+    ("charge_current_request_max", "INTEGER"),
+    ("charge_port_door_open", "INTEGER"),
+];
+
 /// v10 per-clip location-name rollups on `routes`. Populated by
 /// the aggregator from the first / last non-null sample in the
 /// clip's 60s window.
@@ -338,6 +432,40 @@ pub const V15_ROUTE_BOUNDARY_COLUMNS: &[(&str, &str)] = &[
     ("fsd_at_end", "INTEGER"),
     ("fsd_accel_pushes_early", "INTEGER"),
     ("ap_at_start", "INTEGER"),
+];
+
+/// v16 summon-evidence columns on `routes` (see `CURRENT_SCHEMA_VERSION`
+/// docs). `flag_runs_blob` extends the `gear_runs_blob` wire shape with
+/// a per-run speed max (1-byte flags + LE i32 frames + LE f32 max |SEI
+/// speed| per run; NaN = max unknown).
+pub const V16_ROUTE_FLAG_COLUMNS: &[(&str, &str)] = &[
+    ("flag_runs_blob", "BLOB"),
+    ("sei_speed_abs_max", "REAL"),
+];
+
+/// v18 per-clip Safety Score scalars on `routes` (see `safety.rs`).
+/// Recomputable from stored blobs — included in the
+/// AGGREGATE_FORMULA_VERSION NULL-and-backfill list in db.rs.
+pub const V18_ROUTE_SAFETY_COLUMNS: &[(&str, &str)] = &[
+    ("safety_hard_brake_ms", "INTEGER"),
+    ("safety_hard_brake_events", "INTEGER"),
+    ("safety_aggr_turn_ms", "INTEGER"),
+    ("safety_aggr_turn_events", "INTEGER"),
+    ("safety_speeding_ms", "INTEGER"),
+    ("safety_moving_ms", "INTEGER"),
+    ("safety_manual_moving_ms", "INTEGER"),
+];
+
+/// v19 conditional-ratio denominators on `routes` (see `safety.rs`).
+pub const V19_ROUTE_SAFETY_DENOM_COLUMNS: &[(&str, &str)] = &[
+    ("safety_brake_any_ms", "INTEGER"),
+    ("safety_turn_any_ms", "INTEGER"),
+];
+
+/// v20 IMU accel channels on `routes` (see `CURRENT_SCHEMA_VERSION`).
+pub const V20_ROUTE_IMU_COLUMNS: &[(&str, &str)] = &[
+    ("accel_x_blob", "BLOB"),
+    ("accel_y_blob", "BLOB"),
 ];
 
 /// v9 rollups on `routes`. Odometer start/end let the UI show a
@@ -401,6 +529,22 @@ pub const CHARGE_UPLOADS_TABLE: &[&str] = &[
      ON charge_uploads(cloud_charge_id)",
 ];
 
+/// Durable outbox for propagating local charge deletions to the cloud
+/// (ENCRYPTION.md §11.7 in the cloud repo). A row per deleted session
+/// still awaiting the cloud's terminal ack. `acked_at` NULL = pending;
+/// set = settled, kept for one extra sweep round (a final delete is
+/// issued) to close the late-committing-upload race, then removed —
+/// after that a re-imported session may legitimately re-upload.
+/// Standalone idempotent table — no CURRENT_SCHEMA_VERSION bump needed.
+pub const CHARGE_DELETE_OUTBOX_TABLE: &[&str] = &[
+    "CREATE TABLE IF NOT EXISTS charge_delete_outbox (
+        session_ts      INTEGER PRIMARY KEY,
+        cloud_charge_id TEXT NOT NULL,
+        queued_at       INTEGER NOT NULL,
+        acked_at        INTEGER
+    ) WITHOUT ROWID",
+];
+
 /// Dirty queue for two-way cloud sync. A row per locally-changed
 /// mutable item awaiting push to the cloud:
 ///   kind 'drive'  — key = drive_tags.drive_key (start_time string)
@@ -422,10 +566,84 @@ pub const MUTABLE_DIRTY_TABLE: &[&str] = &[
 
 /// Bring the DB up to `CURRENT_SCHEMA_VERSION`. Safe on every open â€”
 /// idempotent by construction.
+/// True for `CREATE [UNIQUE] INDEX ...` — performance DDL that
+/// [`try_create_index`] may skip on an operational failure. Everything
+/// else (tables, columns, data migrations) is correctness and stays
+/// fail-hard.
+fn is_index_ddl(stmt: &str) -> bool {
+    let s = stmt.trim_start();
+    let up = s.get(..20).unwrap_or(s).to_ascii_uppercase();
+    up.starts_with("CREATE INDEX") || up.starts_with("CREATE UNIQUE INDEX")
+}
+
+/// Create a PERFORMANCE index, tolerating operational failures.
+///
+/// Index DDL used to propagate, which aborts `migrate()`, which fails
+/// `DriveStore::open()`, at which point the daemon falls back to an empty
+/// in-memory store: the user's entire drive history looks gone and that
+/// boot's ingest is discarded on reboot. The likeliest trigger is
+/// `SQLITE_FULL` on a nearly-full disk — precisely the condition
+/// free-space management exists to resolve — so "the disk is filling up"
+/// could present as "all my drives vanished".
+///
+/// Indexes are pure performance: without one, queries stay CORRECT and
+/// only get slower, so a resource failure must not cost the store. But
+/// this is deliberately NOT a catch-all: a corrupt database or a
+/// malformed statement is a real defect and must still abort migration
+/// rather than let the daemon limp along on a damaged file.
+fn try_create_index(conn: &Connection, stmt: &str, name: &str) -> Result<()> {
+    use rusqlite::ErrorCode;
+    match conn.execute(stmt, []) {
+        Ok(_) => Ok(()),
+        Err(e) => {
+            let code = match &e {
+                rusqlite::Error::SqliteFailure(err, _) => Some(err.code),
+                _ => None,
+            };
+            // Operational/resource conditions: transient or
+            // environmental, and recoverable on a later boot.
+            // SystemIoFailure is deliberately NOT here: SQLITE_IOERR
+            // carries corruption-bearing extended codes (IOERR_DATA is a
+            // page-checksum failure, IOERR_CORRUPTFS a corrupt
+            // filesystem), and both collapse to this one primary code. A
+            // full disk already reports SQLITE_FULL, so nothing we
+            // actually need to survive requires accepting IOERR.
+            let operational = matches!(
+                code,
+                Some(
+                    ErrorCode::DiskFull
+                        | ErrorCode::DatabaseBusy
+                        | ErrorCode::DatabaseLocked
+                        | ErrorCode::ReadOnly
+                        | ErrorCode::OutOfMemory
+                )
+            );
+            if operational {
+                tracing::error!(
+                    "schema: could not create {} ({e}); continuing without it — \
+                     queries stay correct, just slower. This usually means the \
+                     disk is full or busy; the index is retried on the next boot.",
+                    name
+                );
+                Ok(())
+            } else {
+                // DatabaseCorrupt, NotADatabase, malformed SQL, etc.
+                Err(e).with_context(|| format!("migrate: creating {}", name))
+            }
+        }
+    }
+}
+
 pub fn migrate(conn: &Connection) -> Result<()> {
     for stmt in V1_SCHEMA {
-        conn.execute(stmt, [])
-            .with_context(|| format!("migrate: applying DDL {:?}", truncate(stmt, 60)))?;
+        if is_index_ddl(stmt) {
+            // Performance index: an operational failure (full disk, busy)
+            // must not cost the whole store — see try_create_index.
+            try_create_index(conn, stmt, &truncate(stmt, 60))?;
+        } else {
+            conn.execute(stmt, [])
+                .with_context(|| format!("migrate: applying DDL {:?}", truncate(stmt, 60)))?;
+        }
     }
 
     // Drop the legacy `idx_routes_start_ts` index that every V1_SCHEMA
@@ -437,13 +655,20 @@ pub fn migrate(conn: &Connection) -> Result<()> {
     // ships the CREATE), and every upgraded DB (pre-v6 / v6 / v7 / v8
     // / v9 â€” all inherited the index from the old V1_SCHEMA). The
     // `routes.start_ts` column itself stays.
-    conn.execute("DROP INDEX IF EXISTS idx_routes_start_ts", [])?;
+    // Performance-only cleanup: never fail the open over it.
+    if let Err(e) = conn.execute("DROP INDEX IF EXISTS idx_routes_start_ts", []) {
+        tracing::error!("schema: could not drop legacy idx_routes_start_ts ({e}); continuing");
+    }
 
     // v6 standalone tables. Idempotent (`IF NOT EXISTS`) so safe on
     // every open and on first-run alongside V1_SCHEMA.
     for stmt in V6_NEW_TABLES {
-        conn.execute(stmt, [])
-            .with_context(|| format!("migrate: applying v6 DDL {:?}", truncate(stmt, 60)))?;
+        if is_index_ddl(stmt) {
+            try_create_index(conn, stmt, &truncate(stmt, 60))?;
+        } else {
+            conn.execute(stmt, [])
+                .with_context(|| format!("migrate: applying v6 DDL {:?}", truncate(stmt, 60)))?;
+        }
     }
 
     // Charging-session tags. Idempotent standalone table; see the
@@ -465,7 +690,11 @@ pub fn migrate(conn: &Connection) -> Result<()> {
 
     // Cloud charge-upload bookkeeping + mutable-sync dirty queue. Same
     // idempotent standalone-table treatment; see the const docs.
-    for stmt in CHARGE_UPLOADS_TABLE.iter().chain(MUTABLE_DIRTY_TABLE.iter()) {
+    for stmt in CHARGE_UPLOADS_TABLE
+        .iter()
+        .chain(MUTABLE_DIRTY_TABLE.iter())
+        .chain(CHARGE_DELETE_OUTBOX_TABLE.iter())
+    {
         conn.execute(stmt, []).with_context(|| {
             format!("migrate: applying cloud-sync DDL {:?}", truncate(stmt, 60))
         })?;
@@ -484,6 +713,10 @@ pub fn migrate(conn: &Connection) -> Result<()> {
         .chain(V9_ROUTE_COLUMNS.iter())
         .chain(V10_ROUTE_COLUMNS.iter())
         .chain(V15_ROUTE_BOUNDARY_COLUMNS.iter())
+        .chain(V16_ROUTE_FLAG_COLUMNS.iter())
+        .chain(V18_ROUTE_SAFETY_COLUMNS.iter())
+        .chain(V19_ROUTE_SAFETY_DENOM_COLUMNS.iter())
+        .chain(V20_ROUTE_IMU_COLUMNS.iter())
     {
         if existing.contains(*name) {
             continue;
@@ -505,6 +738,7 @@ pub fn migrate(conn: &Connection) -> Result<()> {
         .chain(V12_TELEMETRY_GPS_COLUMNS.iter())
         .chain(V13_TELEMETRY_MINUTES_COLUMN.iter())
         .chain(V14_TELEMETRY_CHARGE_PHASE_COLUMN.iter())
+        .chain(V17_TELEMETRY_CHARGING_CONTROL_COLUMNS.iter())
     {
         if existing_tele.contains(*name) {
             continue;
@@ -514,9 +748,35 @@ pub fn migrate(conn: &Connection) -> Result<()> {
             .with_context(|| format!("migrate: adding telemetry_samples.{}", name))?;
     }
 
-    // v3 partial index. Idempotent.
-    conn.execute(V3_CLOUD_PENDING_INDEX, [])
-        .context("migrate: creating idx_routes_cloud_pending")?;
+    // v3 partial index. Idempotent, and best-effort — see
+    // `try_create_index`.
+    try_create_index(conn, V3_CLOUD_PENDING_INDEX, "idx_routes_cloud_pending")?;
+
+    // Partial indexes for cloud-status counts and charge queries.
+    // Idempotent, but the FIRST build on a grown DB (hundreds of MB)
+    // can take tens of seconds — log so a slow upgrade boot explains
+    // itself in the journal.
+    for (stmt, name) in [
+        (CLOUD_UPLOADED_INDEX, "idx_routes_cloud_uploaded"),
+        (TELEMETRY_CHARGE_INDEX, "idx_telemetry_charge_ts"),
+        (CLOUD_ROUTE_ID_INDEX, "idx_routes_cloud_route_id"),
+        (TELEMETRY_TIRE_INDEX, "idx_telemetry_tire_ts"),
+    ] {
+        // Existence probe is for LOGGING only — never fail migration on
+        // it. Treat an unreadable catalog as "unknown" and carry on; the
+        // CREATE below is idempotent either way.
+        let exists: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE type='index' AND name=?1",
+                [name],
+                |r| r.get(0),
+            )
+            .unwrap_or(1);
+        if exists == 0 {
+            tracing::info!("schema: building {} (one-time, may take a while on a large DB)", name);
+        }
+        try_create_index(conn, stmt, name)?;
+    }
 
     // v5 data cleanup: purge SavedClips/SentryClips routes that pre-v5
     // scans wrote. Gated on the stored schema_version so we only pay the
@@ -644,6 +904,12 @@ pub fn meta_set(conn: &Connection, key: &str, value: &str) -> Result<()> {
     Ok(())
 }
 
+/// Remove a `meta` key. No-op when it isn't set.
+pub fn meta_del(conn: &Connection, key: &str) -> Result<()> {
+    conn.execute("DELETE FROM meta WHERE key = ?1", params![key])?;
+    Ok(())
+}
+
 /// True when the string-encoded schema_version is numerically less than
 /// `target`. Non-numeric values (corrupted meta) are treated as "older"
 /// so migrate() gets a chance to heal them.
@@ -682,7 +948,7 @@ mod tests {
         migrate(&conn).unwrap();
         assert_eq!(
             meta_get(&conn, "schema_version").unwrap().as_deref(),
-            Some("15"),
+            Some("20"),
         );
         assert!(meta_get(&conn, "created_at").unwrap().is_some());
     }
@@ -720,7 +986,7 @@ mod tests {
         }
         assert_eq!(
             meta_get(&conn, "schema_version").unwrap().as_deref(),
-            Some("15")
+            Some("20")
         );
     }
 
@@ -752,7 +1018,7 @@ mod tests {
         }
         assert_eq!(
             meta_get(&conn, "schema_version").unwrap().as_deref(),
-            Some("15")
+            Some("20")
         );
     }
 
@@ -786,7 +1052,7 @@ mod tests {
         }
         assert_eq!(
             meta_get(&conn, "schema_version").unwrap().as_deref(),
-            Some("15")
+            Some("20")
         );
     }
 
@@ -893,7 +1159,7 @@ mod tests {
         assert!(surviving_processed.starts_with("RecentClips/"));
         assert_eq!(
             meta_get(&conn, "schema_version").unwrap().as_deref(),
-            Some("15")
+            Some("20")
         );
     }
 
@@ -944,7 +1210,7 @@ mod tests {
         assert_eq!(count_routes(&conn), 1, "fresh-DB seed must not run v5 cleanup");
         assert_eq!(
             meta_get(&conn, "schema_version").unwrap().as_deref(),
-            Some("15")
+            Some("20")
         );
     }
 
@@ -997,7 +1263,7 @@ mod tests {
         assert_eq!(table_exists, 1, "v6 must create telemetry_samples");
         assert_eq!(
             meta_get(&conn, "schema_version").unwrap().as_deref(),
-            Some("15")
+            Some("20")
         );
     }
 
@@ -1034,7 +1300,260 @@ mod tests {
         }
         assert_eq!(
             meta_get(&conn, "schema_version").unwrap().as_deref(),
-            Some("15")
+            Some("20")
+        );
+    }
+
+    #[test]
+    fn migrate_from_v15_adds_v16_flag_columns() {
+        // Stand up a v15 DB (everything but the v16 flag columns) and
+        // confirm migrate adds them.
+        let conn = open();
+        for stmt in V1_SCHEMA {
+            conn.execute(stmt, []).unwrap();
+        }
+        for stmt in V6_NEW_TABLES {
+            conn.execute(stmt, []).unwrap();
+        }
+        for (name, typ) in V2_ROUTE_AGGREGATE_COLUMNS
+            .iter()
+            .chain(V3_ROUTE_CLOUD_COLUMNS.iter())
+            .chain(V4_ROUTE_TESSIE_COLUMNS.iter())
+            .chain(V6_ROUTE_TELEMETRY_COLUMNS.iter())
+            .chain(V7_ROUTE_TPMS_COLUMNS.iter())
+            .chain(V9_ROUTE_COLUMNS.iter())
+            .chain(V10_ROUTE_COLUMNS.iter())
+            .chain(V15_ROUTE_BOUNDARY_COLUMNS.iter())
+        {
+            conn.execute(&format!("ALTER TABLE routes ADD COLUMN {} {}", name, typ), [])
+                .unwrap();
+        }
+        meta_set(&conn, "schema_version", "15").unwrap();
+
+        migrate(&conn).unwrap();
+
+        let cols = list_route_columns(&conn).unwrap();
+        for (name, _) in V16_ROUTE_FLAG_COLUMNS {
+            assert!(cols.contains(*name), "routes.{} missing after v16", name);
+        }
+        assert_eq!(
+            meta_get(&conn, "schema_version").unwrap().as_deref(),
+            Some("20")
+        );
+    }
+
+    #[test]
+    fn migrate_adds_v17_charging_control_columns() {
+        let conn = open();
+        migrate(&conn).unwrap();
+
+        let cols = list_telemetry_columns(&conn).unwrap();
+        for name in [
+            "charging_amps_set",
+            "charge_current_request_max",
+            "charge_port_door_open",
+        ] {
+            assert!(
+                cols.contains(name),
+                "telemetry_samples.{name} missing after v17",
+            );
+        }
+        assert_eq!(
+            meta_get(&conn, "schema_version").unwrap().as_deref(),
+            Some("20")
+        );
+    }
+
+    #[test]
+    fn migrate_from_v16_adds_v17_columns_without_losing_telemetry() {
+        // Recreate the shape an existing v16 install has: all route columns
+        // through v16 and all telemetry columns through v14, but none of the
+        // new charging-control fields.
+        let conn = open();
+        for stmt in V1_SCHEMA {
+            conn.execute(stmt, []).unwrap();
+        }
+        for stmt in V6_NEW_TABLES {
+            conn.execute(stmt, []).unwrap();
+        }
+        for (name, typ) in V2_ROUTE_AGGREGATE_COLUMNS
+            .iter()
+            .chain(V3_ROUTE_CLOUD_COLUMNS.iter())
+            .chain(V4_ROUTE_TESSIE_COLUMNS.iter())
+            .chain(V6_ROUTE_TELEMETRY_COLUMNS.iter())
+            .chain(V7_ROUTE_TPMS_COLUMNS.iter())
+            .chain(V9_ROUTE_COLUMNS.iter())
+            .chain(V10_ROUTE_COLUMNS.iter())
+            .chain(V15_ROUTE_BOUNDARY_COLUMNS.iter())
+            .chain(V16_ROUTE_FLAG_COLUMNS.iter())
+        {
+            conn.execute(&format!("ALTER TABLE routes ADD COLUMN {} {}", name, typ), [])
+                .unwrap();
+        }
+        for (name, typ) in V7_TELEMETRY_TPMS_COLUMNS
+            .iter()
+            .chain(V9_TELEMETRY_COLUMNS.iter())
+            .chain(V10_TELEMETRY_COLUMNS.iter())
+            .chain(V11_TELEMETRY_CHARGE_COLUMNS.iter())
+            .chain(V12_TELEMETRY_GPS_COLUMNS.iter())
+            .chain(V13_TELEMETRY_MINUTES_COLUMN.iter())
+            .chain(V14_TELEMETRY_CHARGE_PHASE_COLUMN.iter())
+        {
+            conn.execute(
+                &format!("ALTER TABLE telemetry_samples ADD COLUMN {} {}", name, typ),
+                [],
+            )
+            .unwrap();
+        }
+        conn.execute(
+            "INSERT INTO telemetry_samples (ts, source, battery_pct) VALUES (?1, ?2, ?3)",
+            params![1_700_000_000_i64, "state", 73.0_f64],
+        )
+        .unwrap();
+        meta_set(&conn, "schema_version", "16").unwrap();
+
+        migrate(&conn).unwrap();
+
+        let cols = list_telemetry_columns(&conn).unwrap();
+        for (name, _) in V17_TELEMETRY_CHARGING_CONTROL_COLUMNS {
+            assert!(
+                cols.contains(*name),
+                "telemetry_samples.{name} missing after v17",
+            );
+        }
+        let retained: (f64, Option<i64>, Option<i64>, Option<i64>) = conn
+            .query_row(
+                "SELECT battery_pct, charging_amps_set, charge_current_request_max, \
+                        charge_port_door_open \
+                 FROM telemetry_samples WHERE ts = ?1",
+                [1_700_000_000_i64],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(retained, (73.0, None, None, None));
+        assert_eq!(
+            meta_get(&conn, "schema_version").unwrap().as_deref(),
+            Some("20")
+        );
+    }
+
+    #[test]
+    fn migrate_from_v17_adds_v18_safety_columns() {
+        // Stand up a v17 DB (everything but the v18 safety columns) and
+        // confirm migrate adds them.
+        let conn = open();
+        for stmt in V1_SCHEMA {
+            conn.execute(stmt, []).unwrap();
+        }
+        for stmt in V6_NEW_TABLES {
+            conn.execute(stmt, []).unwrap();
+        }
+        for (name, typ) in V2_ROUTE_AGGREGATE_COLUMNS
+            .iter()
+            .chain(V3_ROUTE_CLOUD_COLUMNS.iter())
+            .chain(V4_ROUTE_TESSIE_COLUMNS.iter())
+            .chain(V6_ROUTE_TELEMETRY_COLUMNS.iter())
+            .chain(V7_ROUTE_TPMS_COLUMNS.iter())
+            .chain(V9_ROUTE_COLUMNS.iter())
+            .chain(V10_ROUTE_COLUMNS.iter())
+            .chain(V15_ROUTE_BOUNDARY_COLUMNS.iter())
+            .chain(V16_ROUTE_FLAG_COLUMNS.iter())
+        {
+            conn.execute(&format!("ALTER TABLE routes ADD COLUMN {} {}", name, typ), [])
+                .unwrap();
+        }
+        meta_set(&conn, "schema_version", "17").unwrap();
+
+        migrate(&conn).unwrap();
+
+        let cols = list_route_columns(&conn).unwrap();
+        for (name, _) in V18_ROUTE_SAFETY_COLUMNS {
+            assert!(cols.contains(*name), "routes.{} missing after v18", name);
+        }
+        assert_eq!(
+            meta_get(&conn, "schema_version").unwrap().as_deref(),
+            Some("20")
+        );
+    }
+
+    #[test]
+    fn migrate_from_v18_adds_v19_denom_columns() {
+        // Stand up a v18 DB (everything but the v19 denominator columns)
+        // and confirm migrate adds them.
+        let conn = open();
+        for stmt in V1_SCHEMA {
+            conn.execute(stmt, []).unwrap();
+        }
+        for stmt in V6_NEW_TABLES {
+            conn.execute(stmt, []).unwrap();
+        }
+        for (name, typ) in V2_ROUTE_AGGREGATE_COLUMNS
+            .iter()
+            .chain(V3_ROUTE_CLOUD_COLUMNS.iter())
+            .chain(V4_ROUTE_TESSIE_COLUMNS.iter())
+            .chain(V6_ROUTE_TELEMETRY_COLUMNS.iter())
+            .chain(V7_ROUTE_TPMS_COLUMNS.iter())
+            .chain(V9_ROUTE_COLUMNS.iter())
+            .chain(V10_ROUTE_COLUMNS.iter())
+            .chain(V15_ROUTE_BOUNDARY_COLUMNS.iter())
+            .chain(V16_ROUTE_FLAG_COLUMNS.iter())
+            .chain(V18_ROUTE_SAFETY_COLUMNS.iter())
+        {
+            conn.execute(&format!("ALTER TABLE routes ADD COLUMN {} {}", name, typ), [])
+                .unwrap();
+        }
+        meta_set(&conn, "schema_version", "18").unwrap();
+
+        migrate(&conn).unwrap();
+
+        let cols = list_route_columns(&conn).unwrap();
+        for (name, _) in V19_ROUTE_SAFETY_DENOM_COLUMNS {
+            assert!(cols.contains(*name), "routes.{} missing after v19", name);
+        }
+        assert_eq!(
+            meta_get(&conn, "schema_version").unwrap().as_deref(),
+            Some("20")
+        );
+    }
+
+    #[test]
+    fn migrate_from_v19_adds_v20_imu_columns() {
+        // Stand up a v19 DB (everything but the IMU blobs) and confirm
+        // migrate adds them.
+        let conn = open();
+        for stmt in V1_SCHEMA {
+            conn.execute(stmt, []).unwrap();
+        }
+        for stmt in V6_NEW_TABLES {
+            conn.execute(stmt, []).unwrap();
+        }
+        for (name, typ) in V2_ROUTE_AGGREGATE_COLUMNS
+            .iter()
+            .chain(V3_ROUTE_CLOUD_COLUMNS.iter())
+            .chain(V4_ROUTE_TESSIE_COLUMNS.iter())
+            .chain(V6_ROUTE_TELEMETRY_COLUMNS.iter())
+            .chain(V7_ROUTE_TPMS_COLUMNS.iter())
+            .chain(V9_ROUTE_COLUMNS.iter())
+            .chain(V10_ROUTE_COLUMNS.iter())
+            .chain(V15_ROUTE_BOUNDARY_COLUMNS.iter())
+            .chain(V16_ROUTE_FLAG_COLUMNS.iter())
+            .chain(V18_ROUTE_SAFETY_COLUMNS.iter())
+            .chain(V19_ROUTE_SAFETY_DENOM_COLUMNS.iter())
+        {
+            conn.execute(&format!("ALTER TABLE routes ADD COLUMN {} {}", name, typ), [])
+                .unwrap();
+        }
+        meta_set(&conn, "schema_version", "19").unwrap();
+
+        migrate(&conn).unwrap();
+
+        let cols = list_route_columns(&conn).unwrap();
+        for (name, _) in V20_ROUTE_IMU_COLUMNS {
+            assert!(cols.contains(*name), "routes.{} missing after v20", name);
+        }
+        assert_eq!(
+            meta_get(&conn, "schema_version").unwrap().as_deref(),
+            Some("20")
         );
     }
 
@@ -1077,7 +1596,7 @@ mod tests {
         }
         assert_eq!(
             meta_get(&conn, "schema_version").unwrap().as_deref(),
-            Some("15")
+            Some("20")
         );
     }
 

@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react"
-import { Gauge, Loader2 } from "lucide-react"
+import { ProgressActivityIcon, SpeedIcon } from "@/components/icons"
 import { Modal } from "@/components/ui/Modal"
 
 export function SpeedTestModal({ onClose }: { onClose: () => void }) {
@@ -68,7 +68,6 @@ export function SpeedTestModal({ onClose }: { onClose: () => void }) {
     }
   }
 
-  // Auto-start when modal opens; stop if user closes mid-run.
   useEffect(() => {
     void startTest()
     return () => stopTest()
@@ -79,7 +78,7 @@ export function SpeedTestModal({ onClose }: { onClose: () => void }) {
     <Modal
       title={
         <span className="flex items-center gap-2">
-          <Gauge className="h-4 w-4 text-blue-400" />
+          <SpeedIcon className="h-4 w-4 text-blue-400" />
           <span>Speed Test</span>
         </span>
       }
@@ -102,7 +101,7 @@ export function SpeedTestModal({ onClose }: { onClose: () => void }) {
       <div className="flex flex-col items-center justify-center gap-3 py-6">
         {running && !mbps ? (
           <>
-            <Loader2 className="h-8 w-8 animate-spin text-blue-400" />
+            <ProgressActivityIcon className="h-8 w-8 animate-spin text-blue-400" />
             <p className="text-xs text-slate-500">Measuring throughput…</p>
           </>
         ) : mbps ? (

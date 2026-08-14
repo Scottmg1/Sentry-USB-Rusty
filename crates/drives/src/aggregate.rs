@@ -46,7 +46,13 @@ pub fn compute_route_aggregates(r: &Route) -> RouteAggregates {
     let has_ap = r.autopilot_states.len() == n;
     let has_gears = r.gear_states.len() == n;
     let has_accel = r.accel_positions.len() == n;
-    let has_sei_speeds = r.speeds.len() == n && r.speeds.iter().any(|&sp| sp > 0.0);
+    // Channel presence vs usefulness: `has_speeds_channel` = the clip
+    // carries an SEI speed array at all (feeds `sei_speed_abs_max`, which
+    // is NULL without the channel); `has_sei_speeds` additionally requires
+    // a positive sample — the locked stats fall back to GPS-derived speed
+    // when SEI reads all-zero/negative, and that behavior must not shift.
+    let has_speeds_channel = r.speeds.len() == n;
+    let has_sei_speeds = has_speeds_channel && r.speeds.iter().any(|&sp| sp > 0.0);
 
     // Start/End points: first and last non-null-island Points. Tracked
     // independently of the pair loop so single-point clips still report
@@ -147,6 +153,7 @@ pub fn compute_route_aggregates(r: &Route) -> RouteAggregates {
     }
 
     let mut speed_sum = 0.0f64;
+    let mut sei_abs_max = 0.0f64;
 
     for i in 1..n {
         let prev = r.points[i - 1];
@@ -163,6 +170,17 @@ pub fn compute_route_aggregates(r: &Route) -> RouteAggregates {
         }
 
         agg.distance_m += d;
+
+        // v16 summon evidence: max |SEI speed| regardless of sign. SEI
+        // speed is SIGNED (negative in Reverse); the locked stats below
+        // drop negative samples, but the summon detector must see a
+        // reverse-only crawl as movement. Same 100 m/s sanity cap.
+        if has_speeds_channel {
+            let abs_speed = (r.speeds[i] as f64).abs();
+            if abs_speed < 100.0 && abs_speed > sei_abs_max {
+                sei_abs_max = abs_speed;
+            }
+        }
 
         // Speed accounting.
         if has_sei_speeds {
@@ -289,6 +307,28 @@ pub fn compute_route_aggregates(r: &Route) -> RouteAggregates {
     if agg.speed_sample_count > 0 {
         agg.avg_speed_mps = speed_sum / agg.speed_sample_count as f64;
     }
+
+    // Some(0.0) means "the clip HAS an SEI speed channel but never moved";
+    // None means "no channel at all" — the summon detector treats both as
+    // not-SEI-verified movement, but the distinction keeps the column
+    // honest for future consumers.
+    if has_speeds_channel {
+        agg.sei_speed_abs_max = Some(sei_abs_max);
+    }
+
+    // v18 Safety Score scalars. Always Some once computed — a clip
+    // without SEI speeds stores zeros ("no safety data"), while NULL
+    // columns mean "row predates v18, not yet backfilled".
+    let cs = crate::safety::compute_clip_safety(r);
+    agg.safety_hard_brake_ms = Some(cs.hard_brake_ms);
+    agg.safety_hard_brake_events = Some(cs.hard_brake_events as i64);
+    agg.safety_aggr_turn_ms = Some(cs.aggr_turn_ms);
+    agg.safety_aggr_turn_events = Some(cs.aggr_turn_events as i64);
+    agg.safety_speeding_ms = Some(cs.speeding_ms);
+    agg.safety_moving_ms = Some(cs.moving_ms);
+    agg.safety_manual_moving_ms = Some(cs.manual_moving_ms);
+    agg.safety_brake_any_ms = Some(cs.brake_any_ms);
+    agg.safety_turn_any_ms = Some(cs.turn_any_ms);
 
     agg
 }
@@ -528,6 +568,41 @@ mod tests {
         assert_eq!(agg.ap_at_start, Some(AUTOPILOT_FSD as i32));
         let agg2 = compute_route_aggregates(&boundary_route(vec![], vec![4; 61], vec![]));
         assert_eq!(agg2.ap_at_start, None, "no AP data → no start mode");
+    }
+
+    #[test]
+    fn sei_speed_abs_max_sees_reverse_and_channel_absence() {
+        // Reverse-only crawl: SEI speeds all negative. The locked
+        // max_speed_mps drops them (stays 0), but the summon-evidence
+        // column must carry the magnitude.
+        let mut r = route_with(
+            (0..10)
+                .map(|i| [37.7749 + i as f64 * 0.00001, -122.4194])
+                .collect(),
+        );
+        r.speeds = vec![-1.5; 10];
+        let agg = compute_route_aggregates(&r);
+        // Locked stats drop the negative SEI samples and fall back to
+        // GPS-derived speed (~0.17 m/s for these points) — the 1.5 m/s
+        // SEI magnitude must never leak into max_speed_mps.
+        assert!(
+            agg.max_speed_mps < 1.0,
+            "locked column must stay GPS-derived, got {}",
+            agg.max_speed_mps
+        );
+        let abs_max = agg.sei_speed_abs_max.expect("channel present");
+        assert!((abs_max - 1.5).abs() < 1e-9, "got {abs_max}");
+
+        // No SEI speed channel at all → None, not Some(0.0).
+        let r2 = route_with(vec![[37.7749, -122.4194], [37.7750, -122.4194]]);
+        let agg2 = compute_route_aggregates(&r2);
+        assert!(agg2.sei_speed_abs_max.is_none());
+
+        // Channel present but the car never moved → Some(0.0).
+        let mut r3 = route_with(vec![[37.7749, -122.4194], [37.7750, -122.4194]]);
+        r3.speeds = vec![0.0; 2];
+        let agg3 = compute_route_aggregates(&r3);
+        assert_eq!(agg3.sei_speed_abs_max, Some(0.0));
     }
 
     #[test]

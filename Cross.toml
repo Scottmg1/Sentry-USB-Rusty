@@ -1,7 +1,4 @@
-# Cross-compilation config for the BLE crates (tesla_ble / tesla_telemetry).
-# btleplug pulls libdbus-sys, which links the system libdbus and probes it via
-# pkg-config. The stock cross image lacks the arm64 dbus dev lib, so install it
-# (+ pkg-config) into the build container and allow cross pkg-config.
+# btleplug/libdbus-sys needs target libdbus headers and cross pkg-config.
 [target.aarch64-unknown-linux-gnu]
 pre-build = [
     "dpkg --add-architecture arm64",

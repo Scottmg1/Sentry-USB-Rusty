@@ -1,8 +1,7 @@
 //! Web-UI keep-awake manager.
 //!
-//! Keep-awake API: manual/auto modes, busy-queuing,
-//! expiration watcher, and re-arm when archiveloop finishes (archiveloop's
-//! own `awake_stop` kills our nudge, so we relaunch when we notice busy→idle).
+//! Supports manual and automatic modes, busy-state queuing, expiration, and
+//! rearming after archiveloop stops the shared nudge.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -74,7 +73,6 @@ impl KeepAwakeManager {
     pub async fn start(self: &Arc<Self>, mode: String, duration: Duration) {
         let mut inner = self.inner.lock().await;
 
-        // Already active/pending: just update expiry/duration.
         if inner.state == KaState::Active {
             inner.expires_at = Some(SystemTime::now() + duration);
             inner.mode = mode;
@@ -86,7 +84,6 @@ impl KeepAwakeManager {
             return;
         }
 
-        // Fresh start.
         let new_epoch = inner.epoch.fetch_add(1, Ordering::SeqCst) + 1;
         inner.mode = mode.clone();
         inner.pending_duration = duration;
@@ -94,9 +91,7 @@ impl KeepAwakeManager {
 
         if (self.is_busy)() {
             inner.state = KaState::Pending;
-            // Record intent immediately so awake_stop's handoff guard knows
-            // the webui session will need the nudge as soon as the busy
-            // owner releases.
+            // Register intent before the busy owner releases its nudge.
             crate::drives_handler::register_keep_awake_want("webui");
             keep_awake_log(&format!(
                 "Queued (mode: {}, duration: {}s) — waiting for archive/processing to finish",
@@ -130,12 +125,8 @@ impl KeepAwakeManager {
 
     /// Auto-mode heartbeat: extend by AUTO_TIMEOUT, start if idle.
     ///
-    /// Manual-mode sessions are NOT extended — the user picked an explicit
-    /// duration that the heartbeat must not silently shorten. Previously the
-    /// `Active` arm unconditionally set `expires_at = now + AUTO_TIMEOUT`,
-    /// which meant the web UI's periodic heartbeat clobbered a 2-hour manual
-    /// session down to a rolling 10-minute window — manual timers visibly
-    /// reset themselves to 10 min after the first heartbeat tick.
+    /// Manual sessions retain their explicit duration; only automatic sessions
+    /// are extended by heartbeats.
     pub async fn heartbeat(self: &Arc<Self>) -> KaState {
         {
             let mut inner = self.inner.lock().await;
@@ -177,9 +168,7 @@ impl KeepAwakeManager {
         }
 
         if was_active {
-            // Don't kill the shared nudge if archive/processor still owns it.
-            // Web-UI clears its own state; the active owner issues its own
-            // awake_stop on completion.
+            // A busy archive or processor still owns the shared nudge.
             if (self.is_busy)() {
                 keep_awake_log(
                     "Stopped by user — system still busy (archive/processor); leaving nudge to current owner",
@@ -224,7 +213,6 @@ impl KeepAwakeManager {
                 _ = notify.notified() => return,
                 _ = tokio::time::sleep(POLL_INTERVAL) => {}
             }
-            // Stale if another start/stop happened.
             {
                 let inner = self.inner.lock().await;
                 if inner.epoch.load(Ordering::SeqCst) != epoch || inner.state != KaState::Pending {
@@ -296,7 +284,7 @@ impl KeepAwakeManager {
 
                     crate::drives_handler::release_keep_awake_want("webui");
 
-                    // Don't kill the shared nudge mid-archive/processing.
+                    // Preserve a nudge still owned by busy work.
                     if (self.is_busy)() {
                         keep_awake_log(
                             "Expired — system still busy; leaving nudge to current owner",
@@ -313,8 +301,7 @@ impl KeepAwakeManager {
                 return;
             }
 
-            // Re-arm if archive just finished: archiveloop's awake_stop killed
-            // our nudge, so relaunch it with the same expiry.
+            // Archiveloop stops the nudge on completion; rearm the active session.
             let now_busy = (self.is_busy)();
             if was_busy && !now_busy {
                 keep_awake_log(&format!(
@@ -365,8 +352,6 @@ fn keep_awake_log(msg: &str) {
         let _ = writeln!(f, "{}: [keep-awake-webui] {}", ts, msg);
     }
 }
-
-// --- HTTP handlers ---
 
 #[derive(Deserialize)]
 struct StartRequest {

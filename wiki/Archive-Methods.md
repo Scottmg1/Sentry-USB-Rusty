@@ -33,11 +33,15 @@ For Linux/Unix servers. Faster and more reliable than CIFS over the open interne
 | Server | `archive.example.com` |
 | Username | `tesla` |
 | Remote Path | `/home/tesla/dashcam` |
+| SSH Port | leave blank unless your server's SSH daemon listens on a port other than 22 |
 
 **After the wizard finishes**, you need to copy the Pi's SSH public key to the server. SSH into the Pi:
 
 ```bash
 ssh-copy-id <username>@<server>
+
+# if your server uses a custom SSH port:
+ssh-copy-id -p <port> <username>@<server>
 ```
 
 You'll only have to do this once.

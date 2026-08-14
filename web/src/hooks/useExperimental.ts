@@ -1,14 +1,7 @@
 import { useEffect, useState } from "react"
 
-// Reads the master experimental opt-in (SENTRYUSB_EXPERIMENTAL) from
-// the same /api/setup/config the rest of the app uses. Returns null
-// while the fetch is in flight so callers can distinguish "not yet
-// known" from a definite false and avoid flashing experimental UI on
-// during the initial load. Mirrors the config-entry shape Drives.tsx
-// already consumes ({ value, active } | string).
-//
-// Module-scope cache so every consumer (sidebar, mobile nav, pages)
-// shares one fetch instead of each issuing its own round trip on mount.
+// Null represents an unresolved opt-in and prevents experimental UI flashing.
+// A module cache shares the config request across consumers.
 let cached: boolean | null = null
 let inflight: Promise<boolean> | null = null
 

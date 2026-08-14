@@ -1,19 +1,7 @@
 import { useCallback, useEffect, useState } from "react"
 
-// Electricity rates used to cost charge sessions. Persisted in the
-// generic preference store (/api/config/preference) under the keys the
-// backend reads in crates/api/src/charging.rs (RateConfig):
-//   charging_currency      — symbol string, default "$"
-//   charging_default_rate  — flat price per kWh for untagged sessions
-//   charging_tag_rates     — { tag: plan } overrides, where each plan is
-//                            { flat, schedules } (a flat per-tag rate plus
-//                            optional time-of-use schedules). A legacy
-//                            value that is a bare number is read as a flat
-//                            rate with no schedules, so older configs keep
-//                            working.
-// Time-of-use is per-tag: a schedule carries a time window, days-of-week,
-// and a month range. The session cost itself is computed server-side and
-// returned on each session; this hook only reads/writes the inputs.
+// Rate inputs live in the generic preference store; costs are calculated by
+// the backend. Bare numeric tag rates remain valid as flat-rate plans.
 
 export interface RateSchedule {
   label: string
@@ -25,9 +13,7 @@ export interface RateSchedule {
   rate: number
 }
 
-// Pricing for one tag: an optional flat fallback rate plus any number of
-// time-of-use schedules. An interval is priced at the first schedule that
-// covers it, else `flat`, else the global default rate.
+// The first matching schedule wins, followed by the tag and global flat rates.
 export interface TagRate {
   flat: number | null
   schedules: RateSchedule[]
@@ -67,8 +53,7 @@ async function putPref(key: string, value: unknown): Promise<void> {
   })
 }
 
-// Prefs can come back as a number or a numeric string; normalise to a
-// finite, non-negative number or null.
+// Preference values may be numbers or numeric strings.
 function toRate(v: unknown): number | null {
   const n =
     typeof v === "number"
@@ -81,8 +66,7 @@ function toRate(v: unknown): number | null {
 
 const TIME_RE = /^\d{1,2}:\d{2}$/
 
-// Parse a days array (0=Sun..6=Sat) into a sorted, deduped, in-range list.
-// Anything else → empty (which the backend treats as "every day").
+// Empty means every day; discard duplicates and out-of-range values.
 function parseDays(raw: unknown): number[] {
   if (!Array.isArray(raw)) return []
   const out: number[] = []
@@ -94,8 +78,7 @@ function parseDays(raw: unknown): number[] {
   return out.sort((a, b) => a - b)
 }
 
-// Parse a month (1=Jan..12=Dec) from a number or numeric string, falling
-// back when absent or out of range.
+// Accept numeric strings and enforce the 1–12 month range.
 function parseMonth(raw: unknown, fallback: number): number {
   const n =
     typeof raw === "number" ? raw : typeof raw === "string" ? parseInt(raw, 10) : NaN
@@ -120,8 +103,7 @@ function parseSchedule(raw: unknown): RateSchedule | null {
   }
 }
 
-// Parse one tag's plan, accepting both the legacy bare-number shape (a
-// flat rate, no schedules) and the new { flat, schedules } object.
+// Accept both bare flat rates and structured plans.
 function parseTagRate(raw: unknown): TagRate {
   if (raw && typeof raw === "object" && !Array.isArray(raw)) {
     const o = raw as Record<string, unknown>
@@ -134,7 +116,6 @@ function parseTagRate(raw: unknown): TagRate {
     }
     return { flat: toRate(o.flat), schedules }
   }
-  // Legacy: the value itself is the flat rate.
   return { flat: toRate(raw), schedules: [] }
 }
 
@@ -157,7 +138,7 @@ export function useChargingRates() {
       if (tagRatesRaw && typeof tagRatesRaw === "object") {
         for (const [k, v] of Object.entries(tagRatesRaw)) {
           const plan = parseTagRate(v)
-          // Keep only configured plans (a flat rate or ≥1 schedule).
+          // Omit empty plans from persisted preferences.
           if (plan.flat != null || plan.schedules.length > 0) tags[k] = plan
         }
       }

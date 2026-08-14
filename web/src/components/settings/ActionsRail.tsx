@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react"
 import type { ReactNode, ComponentType } from "react"
-import { Loader2, CheckCircle, AlertCircle } from "lucide-react"
+import { CheckCircleIcon, ErrorIcon, ProgressActivityIcon } from "@/components/icons"
 import { cn } from "@/lib/utils"
 
 type IconType = ComponentType<{ className?: string }>
@@ -14,14 +14,7 @@ export interface ActionChipProps {
   /** Renders to the right of the label (e.g. status pill). Hidden during feedback states. */
   trailing?: ReactNode
   disabled?: boolean
-  /**
-   * Click handler. Return:
-   *   - `void` → show default success feedback after the promise resolves
-   *   - a `string` → show that string as the feedback message
-   *   - the literal `"confirm"` → suppress success feedback (used for two-step
-   *     "arm then confirm" patterns where the parent owns the label transition)
-   *   - throw → show error feedback (using the error message, or `errorMessage`)
-   */
+  /** Return text for custom feedback, "confirm" to suppress it, or throw on failure. */
   onClick: () => void | string | Promise<void | string>
   /** Message shown on success when handler doesn't return its own string. Default: "Done". */
   successMessage?: string
@@ -43,7 +36,6 @@ function ActionChip({
   const [feedbackMsg, setFeedbackMsg] = useState<string | null>(null)
   const timeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null)
 
-  // Cancel any pending revert on unmount so we don't setState after teardown.
   useEffect(
     () => () => {
       if (timeoutRef.current) clearTimeout(timeoutRef.current)
@@ -67,7 +59,7 @@ function ActionChip({
     try {
       const result = await onClick()
       if (result === "confirm") {
-        // Two-step pattern — caller owns its own label change; stay quiet.
+        // The caller owns feedback for two-step confirmation.
         setState("idle")
         return
       }
@@ -83,11 +75,11 @@ function ActionChip({
 
   const ActiveIcon =
     state === "loading"
-      ? Loader2
+      ? ProgressActivityIcon
       : state === "success"
-      ? CheckCircle
+      ? CheckCircleIcon
       : state === "error"
-      ? AlertCircle
+      ? ErrorIcon
       : Icon
 
   return (
@@ -97,8 +89,7 @@ function ActionChip({
       onClick={handleClick}
       className={cn(
         "action-chip",
-        // State colours win over variant during feedback so "Restart Pi" doesn't
-        // stay red while showing a success/loading state.
+        // Feedback colors override the action variant.
         state === "idle" && variant === "danger" && "action-chip--danger",
         state === "idle" && variant === "accent" && "action-chip--accent",
         state === "loading" && "text-blue-400",

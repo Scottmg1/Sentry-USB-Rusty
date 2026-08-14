@@ -1,15 +1,15 @@
-import { Bluetooth, Webhook, Zap } from "lucide-react"
+import { BluetoothIcon, BoltIcon, WebhookIcon } from "@/components/icons"
 import type { StepProps } from "../SetupWizard"
 import { SecretInput } from "../SecretInput"
 import { cn } from "@/lib/utils"
 import { KeepAccessoryConfig } from "@/components/settings/KeepAccessoryConfig"
 
 const methods = [
-  { id: "ble", label: "Bluetooth LE", icon: Bluetooth, desc: "Direct connection, unlimited. Requires initial pairing." },
-  { id: "teslafi", label: "TeslaFi", icon: Zap, desc: "Cloud API via TeslaFi service. Requires paid subscription." },
-  { id: "tessie", label: "Tessie", icon: Zap, desc: "Cloud API via Tessie service. Requires paid subscription." },
-  { id: "webhook", label: "Webhook", icon: Webhook, desc: "Send webhook to external service (e.g. Home Assistant)." },
-  { id: "none", label: "None", icon: Zap, desc: "No keep-awake. Use Sentry/Camp mode manually." },
+  { id: "ble", label: "Bluetooth LE", icon: BluetoothIcon, desc: "Direct connection, unlimited. Requires initial pairing." },
+  { id: "teslafi", label: "TeslaFi", icon: BoltIcon, desc: "Cloud API via TeslaFi service. Requires paid subscription." },
+  { id: "tessie", label: "Tessie", icon: BoltIcon, desc: "Cloud API via Tessie service. Requires paid subscription." },
+  { id: "webhook", label: "Webhook", icon: WebhookIcon, desc: "Send webhook to external service (e.g. Home Assistant)." },
+  { id: "none", label: "None", icon: BoltIcon, desc: "No keep-awake. Use Sentry/Camp mode manually." },
 ]
 
 const sentryCases = [

@@ -1,5 +1,11 @@
 import { useState, useEffect, useRef, useCallback } from "react"
-import { Terminal as TerminalIcon, Loader2, LogIn, Power, AlertCircle } from "lucide-react"
+import {
+  ErrorIcon,
+  LoginIcon,
+  PowerSettingsNewIcon,
+  ProgressActivityIcon,
+  Terminal2Icon,
+} from "@/components/icons"
 import { Terminal as XTerm } from "@xterm/xterm"
 import { FitAddon } from "@xterm/addon-fit"
 import "@xterm/xterm/css/xterm.css"
@@ -214,7 +220,7 @@ export default function TerminalPage() {
                 <div className="glass-card w-full max-w-sm p-6">
                     <div className="mb-6 flex flex-col items-center">
                         <div className="mb-3 flex h-14 w-14 items-center justify-center rounded-full bg-blue-500/15">
-                            <TerminalIcon className="h-7 w-7 text-blue-400" />
+                            <Terminal2Icon className="h-7 w-7 text-blue-400" />
                         </div>
                         <h1 className="text-lg font-semibold text-slate-100">Terminal</h1>
                         <p className="mt-1 text-center text-sm text-slate-500">
@@ -229,7 +235,7 @@ export default function TerminalPage() {
 
                     {(state === "error" && errorMsg) && (
                         <div className="mb-4 flex items-center gap-2 rounded-lg bg-red-500/10 px-3 py-2 text-sm text-red-400">
-                            <AlertCircle className="h-4 w-4 shrink-0" />
+                            <ErrorIcon className="h-4 w-4 shrink-0" />
                             {errorMsg}
                         </div>
                     )}
@@ -269,12 +275,12 @@ export default function TerminalPage() {
                         >
                             {state === "connecting" ? (
                                 <>
-                                    <Loader2 className="h-4 w-4 animate-spin" />
+                                    <ProgressActivityIcon className="h-4 w-4 animate-spin" />
                                     Connecting...
                                 </>
                             ) : (
                                 <>
-                                    <LogIn className="h-4 w-4" />
+                                    <LoginIcon className="h-4 w-4" />
                                     Connect
                                 </>
                             )}
@@ -304,7 +310,7 @@ export default function TerminalPage() {
                     onClick={disconnect}
                     className="flex items-center gap-1.5 rounded-lg border border-white/10 px-3 py-1.5 text-xs font-medium text-slate-400 transition-colors hover:bg-red-500/10 hover:text-red-400"
                 >
-                    <Power className="h-3.5 w-3.5" />
+                    <PowerSettingsNewIcon className="h-3.5 w-3.5" />
                     Disconnect
                 </button>
             </div>

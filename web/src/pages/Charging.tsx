@@ -1,14 +1,17 @@
 import { useCallback, useEffect, useMemo, useState } from "react"
 import { useNavigate } from "react-router-dom"
 import {
-  BatteryCharging,
-  CheckSquare,
-  ChevronRight,
-  Loader2,
-  MapPin,
-  Trash2,
-  Zap,
-} from "lucide-react"
+  BatteryAndroidFrameBoltIcon,
+  BoltIcon,
+  CheckBoxIcon,
+  ChevronRightIcon,
+  DeleteIcon,
+  ElectricalServicesIcon,
+  EvStationIcon,
+  HomeIcon,
+  LocationOnIcon,
+  ProgressActivityIcon,
+} from "@/components/icons"
 import {
   bulkDeleteCharges,
   fetchChargeSessions,
@@ -20,6 +23,7 @@ import type { ChargeSessionSummary, CurrentCharge } from "@/types/charging"
 import { cn } from "@/lib/utils"
 import { DatePopover } from "@/components/drives/DatePopover"
 import { TagPopover } from "@/components/drives/TagPopover"
+import { HomeLocationSection } from "@/components/charging/HomeLocationSection"
 import {
   ChargingSummaryStrip,
   type ChargingStats,
@@ -36,6 +40,34 @@ import { fmtDuration, fmtEnergy, fmtMoney, fmtSoc } from "@/lib/charge-format"
 const POLL_MS = 30_000
 
 export default function Charging() {
+  const [homeSeed, setHomeSeed] = useState<{ lat: number | null; lon: number | null } | null>(null)
+  // Whether a home geofence exists at all. Without one NOTHING can be tagged
+  // Home, so the answer is a single prompt — not a "set as home" button on
+  // every row, which is what per-session affordances degrade into when the
+  // feature is entirely unconfigured.
+  const [homeConfigured, setHomeConfigured] = useState<boolean | null>(null)
+  // Escape closes the editor. Nothing is written until the user confirms, so
+  // backing out is always safe and should not need a mouse.
+  useEffect(() => {
+    if (!homeSeed) return
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") setHomeSeed(null)
+    }
+    document.addEventListener("keydown", onKey)
+    return () => document.removeEventListener("keydown", onKey)
+  }, [homeSeed])
+  useEffect(() => {
+    let alive = true
+    fetch("/api/system/keep-accessory-config")
+      .then((r) => (r.ok ? r.json() : null))
+      .then((d) => {
+        if (alive) setHomeConfigured(d ? d.home_lat != null && d.home_lon != null : null)
+      })
+      .catch(() => {})
+    return () => {
+      alive = false
+    }
+  }, [])
   const [sessions, setSessions] = useState<ChargeSessionSummary[]>([])
   const [tags, setTags] = useState<string[]>([])
   const [selectedTags, setSelectedTags] = useState<string[]>([])
@@ -116,6 +148,23 @@ export default function Charging() {
 
   const onTagsChange = useCallback(
     async (id: number, next: string[]) => {
+      // Tagging a charge "Home" is the user saying "this is home" — so treat it
+      // as a request to MOVE the geofence, not a tag write. The tag is derived
+      // and the store strips it anyway, so storing it would silently do
+      // nothing; this turns a dead action into the one they meant. The change
+      // still has to be confirmed in the dialog, because it re-tags history.
+      const isHome = (t: string) => t.trim().toLowerCase() === "home"
+      const sess = sessions.find((x) => x.id === id)
+      // "Home" is never in a session's stored tags (it is derived into `atHome`,
+      // and the store strips it), so its presence here means the user just typed
+      // or picked it. Unrelated edits carry it in neither list and never open the
+      // dialog. Still filtered out below rather than trusted to that.
+      const asksHome = next.some(isHome) && !(sess?.tags ?? []).some(isHome)
+      if (asksHome && sess?.locationLat != null && sess?.locationLon != null) {
+        setHomeSeed({ lat: sess.locationLat, lon: sess.locationLon })
+      }
+      // Strip it either way: it is derived, and the store discards it on write.
+      next = next.filter((t) => !isHome(t))
       // Optimistic: show the new tags immediately, then resync (cost is
       // recomputed server-side from the tags).
       setSessions((prev) =>
@@ -127,7 +176,7 @@ export default function Charging() {
         await reload()
       }
     },
-    [reload],
+    [reload, sessions],
   )
 
   const toggleSelectMode = () => {
@@ -156,14 +205,32 @@ export default function Charging() {
       const t = new Date(s.startMs)
       if (from && t < from) return false
       if (to && t >= to) return false
-      if (
-        selectedTags.length > 0 &&
-        !s.tags.some((tag) => selectedTags.includes(tag))
-      )
-        return false
+      if (selectedTags.length > 0) {
+        // "Home" and "Fast charging" are derived filters (not stored tags) —
+        // match them via atHome / fastCharging; everything else is a real tag.
+        const sel = selectedTags.map((t) => t.toLowerCase())
+        const tagMatch =
+          s.tags.some((tag) => selectedTags.includes(tag)) ||
+          (s.atHome && sel.includes("home")) ||
+          (s.fastCharging && sel.includes("fast charging"))
+        if (!tagMatch) return false
+      }
       return true
     })
   }, [sessions, range, selectedTags])
+
+  // Tags-dropdown options = real tags (incl. the API-surfaced "Home") plus the
+  // derived "Fast charging" filter when any session qualifies — so it lives in
+  // the Tags dropdown alongside Home, not as a separate pill.
+  const filterTags = useMemo(() => {
+    if (
+      sessions.some((s) => s.fastCharging) &&
+      !tags.some((t) => t.toLowerCase() === "fast charging")
+    ) {
+      return [...tags, "Fast charging"]
+    }
+    return tags
+  }, [tags, sessions])
 
   const onSelectAll = useCallback(() => {
     setSelected(new Set(visible.map((s) => s.id)))
@@ -222,7 +289,7 @@ export default function Charging() {
       <div className="flex flex-wrap items-center gap-x-3 gap-y-2">
         <DatePopover range={range} onChange={setRange} />
         <ChargingTagFilter
-          tags={tags}
+          tags={filterTags}
           selected={selectedTags}
           onChange={setSelectedTags}
         />
@@ -247,17 +314,43 @@ export default function Charging() {
               onClick={toggleSelectMode}
               className="inline-flex items-center gap-2 rounded-full border border-white/10 bg-white/[0.03] px-3.5 py-1.5 text-sm font-medium text-slate-200 transition-colors hover:bg-white/[0.06]"
             >
-              <CheckSquare className="h-4 w-4" />
+              <CheckBoxIcon className="h-4 w-4" />
               Select
             </button>
           )}
         </div>
       </div>
 
+      {homeConfigured === false && sessions.some((x) => x.locationLat != null) && (
+        <div className="mb-3 flex flex-wrap items-center gap-3 rounded-lg border border-white/10 bg-white/[0.02] px-3 py-2.5">
+          <HomeIcon className="h-4 w-4 shrink-0 text-slate-400" />
+          <p className="min-w-0 flex-1 text-xs text-slate-400">
+            No home location set, so none of these charges can be tagged{" "}
+            <span className="text-slate-300">Home</span> or priced with a home rate.
+          </p>
+          <button
+            type="button"
+            onClick={() => {
+              // Seed from the most recent charge that has coordinates — for most
+              // people that is home, and it beats opening a world map. They can
+              // drag the pin if it guessed wrong.
+              const withFix = sessions.find((x) => x.locationLat != null && x.locationLon != null)
+              setHomeSeed({
+                lat: withFix?.locationLat ?? null,
+                lon: withFix?.locationLon ?? null,
+              })
+            }}
+            className="shrink-0 rounded-md border border-white/10 bg-white/[0.04] px-3 py-1.5 text-xs font-medium text-slate-200 hover:bg-white/[0.08]"
+          >
+            Set home location
+          </button>
+        </div>
+      )}
+
       <div className="mt-4 flex flex-col gap-3">
         {loading && (
           <div className="flex items-center justify-center gap-2 rounded-2xl border border-white/[0.06] bg-white/[0.025] p-10 text-sm text-slate-400">
-            <Loader2 className="h-4 w-4 animate-spin" />
+            <ProgressActivityIcon className="h-4 w-4 animate-spin" />
             Loading charging history…
           </div>
         )}
@@ -268,7 +361,7 @@ export default function Charging() {
         )}
         {!loading && !error && visible.length === 0 && (
           <div className="rounded-2xl border border-white/[0.06] bg-white/[0.025] p-10 text-center text-sm text-slate-400">
-            <BatteryCharging className="mx-auto mb-3 h-8 w-8 text-slate-600" />
+            <BatteryAndroidFrameBoltIcon className="mx-auto mb-3 h-8 w-8 text-slate-600" />
             {sessions.length === 0
               ? "No charging sessions recorded yet. Sessions appear here once the car charges while the Pi is sampling."
               : "No charging sessions match these filters."}
@@ -286,9 +379,49 @@ export default function Charging() {
               selected={selected.has(s.id)}
               onToggleSelected={onToggleSelected}
               onTagsChange={onTagsChange}
+              onOpenHomeLocation={(lat, lon) => setHomeSeed({ lat, lon })}
             />
           ))}
       </div>
+
+      {homeSeed && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4"
+          onClick={() => setHomeSeed(null)}
+        >
+          <div
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="home-location-title"
+            className="max-h-[85vh] w-full max-w-md overflow-y-auto rounded-xl border border-white/10 bg-slate-950 p-4"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="mb-3 flex items-center justify-between">
+              <div>
+                <h2 id="home-location-title" className="text-sm font-medium text-slate-200">
+                  Home location
+                </h2>
+              </div>
+              <button
+                type="button"
+                onClick={() => setHomeSeed(null)}
+                className="rounded-md border border-white/10 bg-white/[0.04] px-3 py-1 text-xs font-medium text-slate-200 hover:bg-white/[0.08]"
+              >
+                Done
+              </button>
+            </div>
+            <HomeLocationSection
+              onSaved={() => {
+                setHomeConfigured(true) // kill the banner without a page reload
+                reload()
+              }}
+              onDone={() => setHomeSeed(null)}
+              seedLat={homeSeed.lat}
+              seedLon={homeSeed.lon}
+            />
+          </div>
+        </div>
+      )}
 
       {confirmingBulkDelete && (
         <div className="fixed inset-0 z-[2000] flex items-center justify-center bg-black/60 backdrop-blur-sm">
@@ -322,9 +455,9 @@ export default function Charging() {
                 className="inline-flex items-center gap-1.5 rounded-lg bg-rose-600 px-4 py-1.5 text-xs font-medium text-white transition-colors hover:bg-rose-500 disabled:opacity-50"
               >
                 {deletingBulk ? (
-                  <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                  <ProgressActivityIcon className="h-3.5 w-3.5 animate-spin" />
                 ) : (
-                  <Trash2 className="h-3.5 w-3.5" />
+                  <DeleteIcon className="h-3.5 w-3.5" />
                 )}
                 {deletingBulk
                   ? "Deleting…"
@@ -365,7 +498,7 @@ function ChargingSelectBar({
         onClick={onDelete}
         className="inline-flex items-center gap-1.5 rounded-full bg-rose-500/95 px-3 py-1 text-xs font-medium text-white transition-colors hover:bg-rose-400 disabled:opacity-50"
       >
-        <Trash2 className="h-3.5 w-3.5" />
+        <DeleteIcon className="h-3.5 w-3.5" />
         Delete
       </button>
       <button
@@ -395,6 +528,7 @@ function ChargeRow({
   selected,
   onToggleSelected,
   onTagsChange,
+  onOpenHomeLocation,
 }: {
   session: ChargeSessionSummary
   metric: boolean
@@ -404,6 +538,7 @@ function ChargeRow({
   selected: boolean
   onToggleSelected: (id: number) => void
   onTagsChange: (id: number, tags: string[]) => Promise<void> | void
+  onOpenHomeLocation: (lat: number | null, lon: number | null) => void
 }) {
   const navigate = useNavigate()
   const start = new Date(session.startMs)
@@ -479,7 +614,11 @@ function ChargeRow({
       )}
 
       <span className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-emerald-500/10 text-emerald-300 ring-1 ring-inset ring-emerald-500/20">
-        <BatteryCharging className={"h-5 w-5" + (active ? " animate-pulse" : "")} />
+        {session.fastCharging ? (
+          <EvStationIcon className={"h-5 w-5" + (active ? " animate-pulse" : "")} />
+        ) : (
+          <ElectricalServicesIcon className={"h-5 w-5" + (active ? " animate-pulse" : "")} />
+        )}
       </span>
 
       <div className="min-w-0 flex-1">
@@ -495,13 +634,13 @@ function ChargeRow({
               title="DC fast charging (Supercharger / CCS) — peak power over 22 kW"
               className="inline-flex shrink-0 items-center gap-1 rounded-full bg-amber-500/15 px-1.5 py-0.5 text-[10px] font-medium text-amber-300 ring-1 ring-inset ring-amber-400/20"
             >
-              <Zap className="h-2.5 w-2.5 fill-amber-300" />
+              <BoltIcon className="h-2.5 w-2.5 fill-amber-300" />
               Fast
             </span>
           )}
           {session.location ? (
             <>
-              <MapPin className="h-3.5 w-3.5 shrink-0 text-emerald-300/80" />
+              <LocationOnIcon className="h-3.5 w-3.5 shrink-0 text-emerald-300/80" />
               <span className="truncate">{session.location}</span>
             </>
           ) : (
@@ -525,7 +664,7 @@ function ChargeRow({
             title gets the full row width instead of being squeezed. */}
         <div className="mt-1.5 flex items-center gap-2.5 tabular-nums sm:hidden">
           <span className="inline-flex items-center gap-1 text-sm font-semibold text-emerald-300">
-            <Zap className="h-3.5 w-3.5" />
+            <BoltIcon className="h-3.5 w-3.5" />
             {fmtEnergy(session.energyAddedKwh)}
           </span>
           <span className="text-xs text-slate-500">{socShort}</span>
@@ -540,7 +679,7 @@ function ChargeRow({
       {/* Desktop: energy + SoC + cost as a right-aligned column. */}
       <div className="hidden shrink-0 text-right sm:block">
         <div className="flex items-center justify-end gap-1 text-sm font-semibold text-emerald-300 tabular-nums">
-          <Zap className="h-3.5 w-3.5" />
+          <BoltIcon className="h-3.5 w-3.5" />
           {fmtEnergy(session.energyAddedKwh)}
         </div>
         <div className="mt-0.5 text-xs text-slate-500 tabular-nums">{socFull}</div>
@@ -551,7 +690,27 @@ function ChargeRow({
         )}
       </div>
 
-      <div onClick={(e) => e.stopPropagation()}>
+      <div
+        onClick={(e) => e.stopPropagation()}
+        className="flex items-center gap-1.5"
+      >
+        {session.atHome && (
+          // Tappable on purpose. The Home chip is derived from the geofence, so
+          // "how does it know?" is the obvious next question — answer it where
+          // the question is asked instead of burying the setting in a menu.
+          <button
+            type="button"
+            title="Charged at home — tap to see or change your home location"
+            onClick={(e) => {
+              e.stopPropagation() // the whole row navigates to the detail page
+              onOpenHomeLocation(null, null) // edit the saved home, don't propose a move
+            }}
+            className="inline-flex items-center gap-1 rounded-md border border-emerald-400/30 bg-emerald-400/10 px-2 py-1 text-xs font-medium text-emerald-200 transition-colors hover:bg-emerald-400/20"
+          >
+            <HomeIcon className="h-3 w-3" />
+            Home
+          </button>
+        )}
         <TagPopover
           tags={session.tags}
           onChange={(t) => onTagsChange(session.id, t)}
@@ -566,7 +725,7 @@ function ChargeRow({
         />
       )}
 
-      <ChevronRight className="h-4 w-4 shrink-0 text-slate-600 transition-colors group-hover:text-slate-400" />
+      <ChevronRightIcon className="h-4 w-4 shrink-0 text-slate-600 transition-colors group-hover:text-slate-400" />
     </div>
   )
 }

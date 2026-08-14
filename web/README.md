@@ -7,7 +7,7 @@ The Sentry USB web interface — a React single-page application with a dark gla
 - **React 19** + TypeScript
 - **Vite** — build tooling and dev server
 - **TailwindCSS** — utility-first styling
-- **Lucide React** — icons
+- **Material Symbols** — icons, vendored as inline SVG in `src/components/icons.tsx`
 - **Leaflet** — drive map visualization
 
 ## Development
@@ -23,6 +23,24 @@ The dev server proxies `/api/*` requests to the Go backend at `localhost:8788`. 
 cd ../server
 make dev        # Starts Go API on :8788
 ```
+
+## Icons
+
+Icons are Google Material Symbols, vendored as inline SVG in
+`src/components/icons.tsx` so the app ships no icon font and makes no external
+request. That file is generated — don't edit it by hand.
+
+To add or remove one, put its name (exactly as shown on
+[fonts.google.com/icons](https://fonts.google.com/icons)) in
+`scripts/icons/symbols.mjs`, then regenerate:
+
+```bash
+npm run icons             # rewrites src/components/icons.tsx
+npm run icons -- --check  # CI: fails if the committed file is stale
+```
+
+Each symbol becomes a component named after it (`delete` → `DeleteIcon`), taking
+the same props as any `<svg>`, so Tailwind sizing (`h-4 w-4`) works as usual.
 
 ## Production Build
 

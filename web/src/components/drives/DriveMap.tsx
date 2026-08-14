@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react"
 import L from "leaflet"
 import "leaflet/dist/leaflet.css"
-import { Layers } from "lucide-react"
+import { LayersIcon } from "@/components/icons"
 import { useScrubberState } from "@/hooks/useScrubberSync"
 import type { FsdEvent } from "@/types/drives"
 
@@ -11,20 +11,11 @@ interface DriveMapProps {
   fsdEvents?: FsdEvent[]
   showEvents?: boolean
   source?: string
-  // ISO start_time of the drive — needed to convert each point's
-  // relative-ms field into an absolute clock time for the playback
-  // info card. Without it the card would show offsets, not times.
+  // Drive start converts relative point offsets to wall-clock time.
   startTime?: string
-  // True when the user's DRIVE_MAP_UNIT === "km". Controls the speed
-  // unit displayed in the playback card.
+  // Selects the playback card's speed unit.
   metric?: boolean
-  // Per-sample battery time-series from
-  // GET /api/drives/{id}/battery-series. The BLE telemetry sampler
-  // polls every 60s in Active mode, so a 30-min drive has ~30 samples.
-  // For each scrubber tick we look up the most recent sample at or
-  // before the current point's wall-clock time — battery changes in
-  // discrete steps, not smoothly, so step-lookup beats interpolation.
-  // Omit the prop (or pass an empty array) to skip the battery row.
+  // Battery samples use latest-at-or-before lookup rather than interpolation.
   batterySeries?: BatteryPoint[]
 }
 
@@ -40,19 +31,13 @@ const TILES = {
     "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
 } as const
 
-// CartoDB "labels only" overlay — transparent tiles with street + place
-// names, drawn on top of the satellite base so the user can actually
-// read the map. Dark/streets already include labels in their base tile.
+// Satellite imagery needs a transparent labels overlay.
 const SATELLITE_LABELS_URL =
   "https://{s}.basemaps.cartocdn.com/rastertiles/voyager_only_labels/{z}/{x}/{y}{r}.png"
 
 type Style = keyof typeof TILES
 
-// Colors for the route polyline segments.
-// FSD-engaged: emerald accent. Manual: indigo-blue (echo of the old design
-// for instant familiarity). When fsdStates is unavailable, the route falls
-// back to a single emerald polyline OR a violet polyline for Tessie-source
-// drives (matches the existing source badge convention).
+// FSD and manual segments use distinct colors; imported routes use violet.
 const COLOR_FSD = "#34d399"
 const COLOR_MANUAL = "#3b82f6"
 const COLOR_TESSIE = "#a78bfa"
@@ -75,12 +60,7 @@ function endMarkerIcon() {
   })
 }
 
-// Pulse marker — the bot that tracks the scrubber position along
-// the route. Replaced the old green dot with a directional arrow that
-// rotates to point along the current heading, matching how GPS apps
-// indicate "you are here, going that way". The inner `.drive-pulse`
-// wrapper carries the rotation transform; Leaflet's own translate
-// transform lives on the outer marker element so the two don't fight.
+// Rotate the inner marker so Leaflet can retain translation on the outer node.
 function pulseMarkerIcon(bearingDeg: number) {
   return L.divIcon({
     className: "drive-pulse-marker",
@@ -93,9 +73,7 @@ function pulseMarkerIcon(bearingDeg: number) {
   })
 }
 
-// Bearing in degrees-clockwise-from-north between two GPS points.
-// Standard great-circle formula; for adjacent samples a few seconds
-// apart the lat/lng delta is tiny so this is fine without correction.
+// Great-circle bearing in degrees clockwise from north.
 function bearingBetween(
   lat1: number,
   lng1: number,
@@ -113,11 +91,7 @@ function bearingBetween(
   return ((Math.atan2(y, x) * 180) / Math.PI + 360) % 360
 }
 
-// Heading for the arrow at scrubber index `i`. Looks back ~3 samples
-// for stability against GPS jitter at low speeds (a single-sample
-// delta produces a twitchy arrow). For the first few samples we look
-// forward instead so the very first frame still has a sensible
-// direction. Returns 0 when there's no meaningful delta available.
+// Use a three-sample baseline to damp low-speed GPS jitter.
 function headingAt(
   points: [number, number, number, number][],
   i: number,
@@ -127,8 +101,7 @@ function headingAt(
   let from = i - LOOKBACK
   let to = i
   if (from < 0) {
-    // Near start of drive — look forward instead so the arrow still
-    // orients meaningfully on frame 0.
+    // Near the start, derive heading from a forward sample.
     from = i
     to = Math.min(points.length - 1, i + LOOKBACK)
     if (from === to) return 0
@@ -153,25 +126,16 @@ function fsdEventIcon(kind: "disengagement" | "accel_push") {
   })
 }
 
-// Steering-wheel glyph in the playback info card. Uses the project
-// asset (blue circular wheel) served from web/public. The parent
-// `.playback-info__wheel` span carries the FSD/manual visual state
-// via CSS (full opacity for engaged, dim+grey for manual) — the
-// asset itself is a flat coloured PNG.
+// The wrapper styles the static steering-wheel asset by engagement state.
 const WHEEL_HTML =
   '<img src="/autosteer-icon.png" alt="" width="18" height="18" draggable="false" class="playback-info__wheel-img"/>'
 
 const MPS_TO_MPH = 2.23694
 const MPS_TO_KPH = 3.6
 
-// Inline-SVG battery icon. Outer rectangle with a small terminal nub
-// on the right; the inner fill rect's width is set inline at call
-// time from the current battery percentage so the visual gauge tracks
-// the playback. `fill="currentColor"` so the CSS pill colour controls
-// the whole glyph.
+// Inline battery fill follows the current percentage and CSS color.
 function batterySVG(pct: number): string {
-  // Inner fill spans x=3..x=18 (15 units wide max) and is proportional
-  // to pct. clamp so out-of-range readings can't blow past the bounds.
+  // Clamp the 15-unit fill span to valid percentages.
   const fillW = Math.max(0, Math.min(15, (pct / 100) * 15))
   return (
     '<svg viewBox="0 0 22 12" width="18" height="10" fill="none" stroke="currentColor" stroke-width="1.2">' +
@@ -182,9 +146,7 @@ function batterySVG(pct: number): string {
   )
 }
 
-// Build the HTML body of the playback tooltip for the given scrubber
-// index. Returns a string so Leaflet's `tooltip.setContent` can swap
-// it on every tick without paying React-reconciliation cost.
+// Leaflet updates this HTML directly on each scrubber tick.
 function renderPlaybackHTML(
   pt: [number, number, number, number] | undefined,
   fsd: number | undefined,
@@ -213,9 +175,6 @@ function renderPlaybackHTML(
       ? `<span class="playback-info__battery" aria-label="Battery ${Math.round(battery)}%">` +
         `${batterySVG(battery)}${Math.round(battery)}%</span>`
       : ""
-  // Layout: time on top, then speed + wheel row, then battery on its
-  // own row below — matches the GPS-app convention the user requested
-  // (battery is reference info, not part of the primary speed/state).
   return (
     `<div class="playback-info__time">${time}</div>` +
     `<div class="playback-info__row">` +
@@ -228,29 +187,18 @@ function renderPlaybackHTML(
   )
 }
 
-// Step-lookup of the most recent battery sample at or before
-// `currentMs`. Battery changes in 1% steps and the sampler runs
-// at 60s cadence — linear interpolation would invent values
-// between samples, so we use the latest sample as the canonical
-// reading at the scrubber's wall-clock time. Falls back to the
-// first sample when the scrubber is before any sample (so the card
-// always shows something once the series has loaded). Returns
-// undefined when the series is empty or the value is NULL.
+// Use the latest sample at or before the target; interpolation would invent
+// battery values. Before the first timestamp, use the earliest sample.
 function lookupBatteryAt(
   series: BatteryPoint[] | undefined,
   currentMs: number,
 ): number | undefined {
   if (!series || series.length === 0) return undefined
-  // Series is ASC-ordered by ts (the backend's ORDER BY ts ASC).
-  // Walk backwards to find the latest sample with ts <= currentMs.
-  // A binary search would be theoretically nicer; for ~30 samples
-  // on a typical drive the linear scan is cheaper than the branch.
+  // Series is ascending and small enough for a reverse scan.
   for (let i = series.length - 1; i >= 0; i--) {
     if (series[i].ts <= currentMs) return series[i].batteryPct
   }
-  // currentMs is before every sample (e.g. scrubber at frame 0,
-  // first sample arrived a few seconds in). Show the earliest
-  // reading rather than nothing — battery doesn't jump in 60s.
+  // The first reading is representative before its timestamp.
   return series[0].batteryPct
 }
 
@@ -267,9 +215,7 @@ export function DriveMap({
   const containerRef = useRef<HTMLDivElement>(null)
   const mapRef = useRef<L.Map | null>(null)
   const tileRef = useRef<L.TileLayer | null>(null)
-  // Transparent labels layer drawn on top of satellite imagery so place
-  // and street names remain readable. Only attached in the "satellite"
-  // style; the dark/streets base tiles already include labels.
+  // Only satellite mode needs the transparent labels layer.
   const labelsRef = useRef<L.TileLayer | null>(null)
   const pulseRef = useRef<L.Marker | null>(null)
   const eventsLayerRef = useRef<L.LayerGroup | null>(null)
@@ -280,11 +226,7 @@ export function DriveMap({
     const el = containerRef.current
     if (!el || mapRef.current || points.length === 0) return
 
-    // preferCanvas keeps the polyline(s) on a single 2D canvas, which
-    // re-projects much faster than the default SVG renderer on zoom for
-    // routes with thousands of points. The pulse marker stays as a DOM
-    // divIcon so its scrubber-driven setLatLng() moves via CSS transform
-    // without triggering a canvas redraw.
+    // Canvas handles large routes; the moving pulse remains a DOM marker.
     const map = L.map(el, {
       attributionControl: false,
       zoomControl: true,
@@ -295,18 +237,8 @@ export function DriveMap({
 
     const latLngs = points.map(([lat, lng]) => L.latLng(lat, lng))
 
-    // Segment the polyline by FSD state when fsdStates is parallel to
-    // points. Each contiguous run of the same engagement state becomes
-    // one polyline; adjacent segments overlap by one point so there's
-    // no visible gap at the transition. Falls back to a single-color
-    // polyline (emerald for SEI, violet for Tessie-source) when
-    // fsdStates is missing or length-mismatched.
-    // Break the route wherever consecutive points jump more than GAP_M apart.
-    // Happens on a genuine GPS dropout (tunnel/signal loss) and at the seam left
-    // when an overlapping/duplicate RecentClips segment is dropped upstream —
-    // without the break the polyline slashes a straight line across the map
-    // between the two. (The data layer's monotonic-time filter removes the bulk
-    // of any overlap; this catches the residual seam.)
+    // Segment index-aligned FSD states and overlap transition points. Break
+    // jumps over GAP_M so GPS dropouts do not draw across the map.
     const GAP_M = 300
 
     const hasFsdSegments =
@@ -328,8 +260,7 @@ export function DriveMap({
               smoothFactor: 1.2,
             }).addTo(map)
           }
-          // Gap → start fresh at i (don't bridge). State change → share the
-          // boundary point so the colors meet seamlessly.
+          // Gaps restart at the current point; state changes share a boundary.
           segStart = gap ? i : Math.max(i - 1, 0)
         }
       }
@@ -354,15 +285,10 @@ export function DriveMap({
       }
     }
 
-    // Start / end / pulse all use DOM markers (divIcon) so the pulse
-    // marker can move on every scrubber tick without redrawing the
-    // canvas-rendered polylines.
+    // DOM markers move independently from canvas-rendered routes.
     L.marker(latLngs[0], { icon: startMarkerIcon(), interactive: false }).addTo(map)
     L.marker(latLngs[latLngs.length - 1], { icon: endMarkerIcon(), interactive: false }).addTo(map)
-    // The pulse marker MUST be interactive so the bound tooltip can
-    // open via openTooltip() — Leaflet refuses to open tooltips on
-    // non-interactive markers. We still set keyboard:false so it
-    // doesn't capture tab focus.
+    // Leaflet requires an interactive marker for openTooltip; exclude it from tab order.
     pulseRef.current = L.marker(latLngs[0], {
       icon: pulseMarkerIcon(headingAt(points, 0)),
       interactive: true,
@@ -370,11 +296,7 @@ export function DriveMap({
       zIndexOffset: 1000,
     }).addTo(map)
 
-    // Playback info card — permanent tooltip floating next to the
-    // pulse marker. Bound once here, content swapped on each scrubber
-    // tick by the dedicated effect below. Position "right" so the
-    // card sits beside the pulse rather than covering it; Leaflet
-    // auto-flips when it would go off the map edge.
+    // Bind once and update tooltip content from the playback effect.
     const baseMs = startTime ? new Date(startTime).getTime() : NaN
     const firstPointMs = Number.isFinite(baseMs) ? baseMs + points[0][2] : NaN
     const initialBattery = lookupBatteryAt(batterySeries, firstPointMs)
@@ -406,9 +328,7 @@ export function DriveMap({
       pulseRef.current = null
       eventsLayerRef.current = null
     }
-    // batterySeries/metric/startTime only seed the initial tooltip; adding
-    // them would tear down and recreate the whole Leaflet map. Live tooltip
-    // updates are handled by the playback effect below.
+    // Tooltip inputs update separately so they do not rebuild the Leaflet map.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [points, fsdStates, source])
 
@@ -417,9 +337,7 @@ export function DriveMap({
     if (!map || !tileRef.current) return
     map.removeLayer(tileRef.current)
     tileRef.current = L.tileLayer(TILES[style], { maxZoom: 19 }).addTo(map)
-    // Manage the satellite labels overlay: attach on switch-to-satellite,
-    // remove on switch-away. Pane "shadowPane" keeps it above the
-    // base tiles but below polylines and markers.
+    // shadowPane keeps satellite labels below routes and markers.
     if (labelsRef.current) {
       map.removeLayer(labelsRef.current)
       labelsRef.current = null
@@ -454,10 +372,7 @@ export function DriveMap({
     if (!pulse || points.length === 0) return
     const i = Math.min(points.length - 1, Math.max(0, currentIndex))
     pulse.setLatLng(L.latLng(points[i][0], points[i][1]))
-    // Rotate the arrow to match current heading. Direct DOM mutation
-    // of the inner div avoids setIcon's full element rebuild on every
-    // scrubber tick — Leaflet's own translate transform stays on the
-    // outer marker element, our rotate sits on the inner wrapper.
+    // Rotate the inner node directly to avoid rebuilding the marker.
     const el = pulse.getElement()
     if (el) {
       const arrow = el.querySelector(".drive-pulse") as HTMLElement | null
@@ -466,9 +381,7 @@ export function DriveMap({
         arrow.style.transform = `rotate(${bearing}deg)`
       }
     }
-    // Refresh the playback info card to match the new position.
-    // setContent on an attached Leaflet tooltip patches its innerHTML
-    // in place — no React render, no marker rebind, no map redraw.
+    // setContent updates the attached tooltip without a React render.
     const tooltip = pulse.getTooltip()
     if (tooltip) {
       const baseMs = startTime ? new Date(startTime).getTime() : NaN
@@ -495,7 +408,7 @@ export function DriveMap({
       <div ref={containerRef} className="absolute inset-0 bg-slate-900" />
       <div className="absolute right-2 top-2 z-[400] flex flex-col gap-1">
         <ControlBtn label={`Map style: ${style}`} onClick={cycleStyle}>
-          <Layers className="h-4 w-4" />
+          <LayersIcon className="h-4 w-4" />
         </ControlBtn>
       </div>
     </div>

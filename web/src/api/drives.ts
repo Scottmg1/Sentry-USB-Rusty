@@ -43,6 +43,16 @@ export async function triggerReprocessAll(): Promise<void> {
   }
 }
 
+/** Targeted summon evidence re-read (backend runs it async — poll the
+ *  drives list afterwards; summon pills appear once the scan finishes). */
+export async function triggerSummonCheck(): Promise<void> {
+  const res = await fetch("/api/drives/check-summon", { method: "POST" })
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({}))
+    throw new Error(body.error || `check-summon: ${res.status}`)
+  }
+}
+
 export async function uploadDriveData(file: File): Promise<{ imported: number }> {
   const res = await fetch("/api/drives/data/upload", {
     method: "POST",

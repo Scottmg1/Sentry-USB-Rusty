@@ -1,13 +1,11 @@
 //! Notification center: history and type settings.
 //!
-//! Notification center API:
 //! - History events carry id, unix-ts, type, title, message, providers,
 //!   per-provider results.
 //! - Newest-first ordering, max 500 entries.
 //! - Query params: `limit`, `offset`, `type` (filter).
 //! - Settings are stored in the user-preferences map with `notify_<type>` keys.
-//! - Read fallback: primary `/mutable/sentryusb-notifications.json`, legacy
-//!   `/mutable/.notification_history.json` (older Rust port wrote there).
+//! - The previous history filename remains a read-only migration fallback.
 
 use std::collections::HashMap;
 use std::sync::RwLock;
@@ -58,8 +56,6 @@ fn save_history_locked(events: &[NotificationEvent]) -> std::io::Result<()> {
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
     std::fs::write(HISTORY_PATH, data)
 }
-
-// --- Settings: toggle flags stored in preferences ---
 
 #[derive(Serialize, Deserialize, Clone, Copy)]
 pub struct NotificationSettings {
@@ -168,8 +164,6 @@ pub async fn update_settings(
     crate::json_ok()
 }
 
-// --- History ---
-
 #[derive(Deserialize)]
 pub struct HistoryQuery {
     #[serde(rename = "type")]
@@ -259,8 +253,7 @@ pub(crate) fn record_event(
 }
 
 /// Evaluate the notification-type gate for a given type.
-/// `None` or empty → always allowed (matches bash behavior of skipping
-/// the gate when no type is provided).
+/// `None` or empty is always allowed.
 pub(crate) fn is_type_enabled(notification_type: Option<&str>) -> bool {
     let Some(ntype) = notification_type else { return true };
     if ntype.is_empty() {
@@ -279,7 +272,6 @@ pub(crate) fn is_type_enabled(notification_type: Option<&str>) -> bool {
         "music_sync" => s.music_sync,
         "keep_accessory" => s.keep_accessory,
         "storage_repair" => s.storage_repair,
-        // Unknown types default to allowed.
         _ => true,
     }
 }
@@ -324,9 +316,7 @@ pub struct CheckParams {
 
 /// GET /api/notifications/settings/check?type=archive_start
 ///
-/// Go returns `{type, enabled}` reflecting the user's toggle state. We match
-/// that contract (the prior Rust impl returned `{configured}` based on config
-/// keys, which is a different question).
+/// Return `{type, enabled}` for the user's notification toggle.
 pub async fn check_notification_type(
     State(_s): State<AppState>,
     Query(params): Query<CheckParams>,
@@ -373,8 +363,7 @@ mod tests {
 
     #[test]
     fn settings_deserialize_defaults_storage_repair_on() {
-        // A PUT from an older UI won't include storage_repair — it must
-        // default to enabled rather than failing deserialization.
+        // Omitted storage-repair settings remain enabled.
         let json = r#"{
             "archive_start": true, "archive_complete": true,
             "archive_error": true, "temperature": true,

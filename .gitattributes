@@ -3,6 +3,6 @@ pi-gen-sources/** linguist-vendored
 run/** linguist-vendored
 setup/** linguist-vendored
 tools/** linguist-vendored
-tests/** linguist-vendored
+test/** linguist-vendored
 server/** linguist-vendored
 crates/sentryusb/static/** linguist-generated

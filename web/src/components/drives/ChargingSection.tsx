@@ -1,4 +1,4 @@
-import { BatteryCharging, Gauge, Plug, Zap } from "lucide-react"
+import { BatteryAndroidFrameBoltIcon, BoltIcon, PowerIcon, SpeedIcon } from "@/components/icons"
 
 import { SectionHeading, StatTile } from "@/components/drives/StatTile"
 
@@ -29,42 +29,42 @@ export function ChargingSection({ charge }: { charge: ChargeDetail }) {
         <StatTile
           label="Power"
           value={fmt(charge.powerKw, " kW")}
-          icon={<Zap className="h-4 w-4" />}
+          icon={<BoltIcon className="h-4 w-4" />}
           info="Power the charger is delivering."
         />
         <StatTile
           label="Current"
           value={fmt(charge.currentA, " A")}
-          icon={<Plug className="h-4 w-4" />}
+          icon={<PowerIcon className="h-4 w-4" />}
           info="Actual current the charger is supplying."
         />
         <StatTile
           label="Voltage"
           value={fmt(charge.voltageV, " V")}
-          icon={<Zap className="h-4 w-4" />}
+          icon={<BoltIcon className="h-4 w-4" />}
         />
         <StatTile
           label="Charge rate"
           value={fmt(charge.rateMph, " mi/hr")}
-          icon={<Gauge className="h-4 w-4" />}
+          icon={<SpeedIcon className="h-4 w-4" />}
           info="Range added per hour at the current rate."
         />
         <StatTile
           label="Energy added"
           value={fmt(charge.energyAddedKwh, " kWh", 1)}
-          icon={<BatteryCharging className="h-4 w-4" />}
+          icon={<BatteryAndroidFrameBoltIcon className="h-4 w-4" />}
           info="Energy added this charging session."
         />
         <StatTile
           label="Charge limit"
           value={fmt(charge.limitSoc, "%")}
-          icon={<BatteryCharging className="h-4 w-4" />}
+          icon={<BatteryAndroidFrameBoltIcon className="h-4 w-4" />}
           info="Target state of charge."
         />
         <StatTile
           label="Range"
           value={fmt(charge.rangeMi, " mi")}
-          icon={<Gauge className="h-4 w-4" />}
+          icon={<SpeedIcon className="h-4 w-4" />}
           info="Estimated rated range."
         />
       </div>

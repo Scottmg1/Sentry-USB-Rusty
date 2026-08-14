@@ -1,26 +1,26 @@
 import { useEffect, useRef, useState } from "react"
 import { Link } from "react-router-dom"
 import {
-  Thermometer,
-  HardDrive,
-  Wifi,
-  WifiOff,
-  Clock,
-  Camera,
-  Activity,
-  EthernetPort,
-  HeartPulse,
-  Timer,
-  Zap,
-  ChevronRight,
-  Download,
-  AlertTriangle,
-  Wind,
-  Info,
-  Film,
-  MapPin,
-  Route,
-} from "lucide-react"
+  AirIcon,
+  BoltIcon,
+  CardiologyIcon,
+  ChevronRightIcon,
+  ConversionPathIcon,
+  DeviceThermostatIcon,
+  DownloadIcon,
+  HardDriveIcon,
+  InfoIcon,
+  LanIcon,
+  LocationOnIcon,
+  MovieIcon,
+  PhotoCameraIcon,
+  ScheduleIcon,
+  TimerIcon,
+  VitalSignsIcon,
+  WarningIcon,
+  WifiIcon,
+  WifiOffIcon,
+} from "@/components/icons"
 import { api } from "@/lib/api"
 import { useKeepAwake } from "@/hooks/useKeepAwake"
 import { useAwayMode } from "@/hooks/useAwayMode"
@@ -41,6 +41,7 @@ import { BannerStack, type BannerItem } from "@/components/ui/Banner"
 import { Pill, LiveDot } from "@/components/ui/Pill"
 import type { Halo } from "@/components/ui/StatusTile"
 import type { TireHistoryResponse } from "@/components/dashboard/TirePressureCard"
+import type { BleHealth } from "@/lib/bleHealth"
 
 function getTempHalo(milliC: number): Halo {
   if (milliC <= 0) return "blue"
@@ -146,6 +147,8 @@ export default function Dashboard() {
   // Polled at 30s — the BLE sampler itself runs once a minute while
   // parked + awake, so anything faster on the UI side is wasted.
   const [carStatusSample, setCarStatusSample] = useState<CarStatusSample | null>(null)
+  const [bleHealth, setBleHealth] = useState<BleHealth | null>(null)
+  const [bleHealthConfigured, setBleHealthConfigured] = useState(false)
   // Live charge status for the CarStatusCard battery chip.
   const [currentCharge, setCurrentCharge] = useState<CurrentCharge | null>(null)
   // ISO end-time of the latest drive on record — used to derive the
@@ -247,12 +250,34 @@ export default function Dashboard() {
     // overview tile; the user can still pair BLE from Settings.
     async function fetchCarStatusSample() {
       try {
-        const res = await fetch("/api/system/ble-latest-sample")
-        if (!res.ok) return
-        const d = (await res.json()) as CarStatusSample
-        if (mounted) setCarStatusSample(d)
+        const [sampleRes, healthRes] = await Promise.all([
+          fetch("/api/system/ble-latest-sample"),
+          fetch("/api/system/ble-connected"),
+        ])
+        if (!mounted) return
+        if (healthRes.ok) {
+          const d = (await healthRes.json()) as {
+            configured?: boolean
+            health?: BleHealth
+          }
+          if (mounted) setBleHealthConfigured(Boolean(d.configured))
+          if (mounted) setBleHealth(d.health ?? null)
+        } else if (mounted) {
+          setBleHealthConfigured(false)
+          setBleHealth(null)
+        }
+        if (sampleRes.ok) {
+          const d = (await sampleRes.json()) as CarStatusSample
+          if (mounted) setCarStatusSample(d)
+        } else if (mounted) {
+          setCarStatusSample(null)
+        }
       } catch {
-        /* non-critical */
+        if (mounted) {
+          setBleHealthConfigured(false)
+          setBleHealth(null)
+          setCarStatusSample(null)
+        }
       }
     }
 
@@ -309,7 +334,7 @@ export default function Dashboard() {
         const c = await fetchCurrentCharge()
         if (mounted) setCurrentCharge(c)
       } catch {
-        /* non-critical */
+        if (mounted) setCurrentCharge(null)
       }
     }
 
@@ -421,7 +446,7 @@ export default function Dashboard() {
   if (error) {
     return (
       <div className="flex flex-col items-center justify-center py-20">
-        <Activity className="mb-4 h-12 w-12 text-slate-600" />
+        <VitalSignsIcon className="mb-4 h-12 w-12 text-slate-600" />
         <p className="text-lg font-medium text-slate-400">{error}</p>
         <p className="mt-1 text-sm text-slate-600">
           Make sure the Sentry USB API server is running
@@ -449,7 +474,7 @@ export default function Dashboard() {
     banners.push({
       id: "rtc",
       kind: "warn",
-      icon: <AlertTriangle className="h-4 w-4" />,
+      icon: <WarningIcon className="h-4 w-4" />,
       title: "RTC Battery Warning",
       sub: rtcWarning,
     })
@@ -458,7 +483,7 @@ export default function Dashboard() {
     banners.push({
       id: "update",
       kind: "update",
-      icon: <Download className="h-4 w-4" />,
+      icon: <DownloadIcon className="h-4 w-4" />,
       title: `Update Available${
         updateInfo.latestVersion ? `: ${updateInfo.latestVersion}` : ""
       }`,
@@ -468,7 +493,7 @@ export default function Dashboard() {
           to="/settings?tab=Device"
           className="action-chip action-chip--accent shrink-0"
         >
-          Install <ChevronRight className="h-3.5 w-3.5" />
+          Install <ChevronRightIcon className="h-3.5 w-3.5" />
         </Link>
       ),
     })
@@ -519,9 +544,12 @@ export default function Dashboard() {
           full content width so its flex-1 chips line up under the status
           tiles above; the page-level max-width keeps it from over-stretching
           on ultrawide. */}
-      {(carStatusSample?.ts != null || currentCharge?.soc != null) && (
+      {(carStatusSample?.ts != null ||
+        currentCharge?.soc != null ||
+        (bleHealthConfigured && bleHealth != null)) && (
         <CarStatusCard
           sample={carStatusSample}
+          bleHealth={bleHealth}
           latestDriveEnd={latestDriveEnd}
           tireHistory={tireHistory ?? undefined}
           useFahrenheit={useFahrenheit}
@@ -550,24 +578,24 @@ function SystemTile({
   const cpuTemp = parseInt(status.cpu_temp)
   return (
     <StatusTile
-      icon={<Activity className="h-4 w-4" />}
+      icon={<VitalSignsIcon className="h-4 w-4" />}
       halo={getTempHalo(cpuTemp)}
       title="System"
     >
       <Row
-        icon={<Clock className="h-3.5 w-3.5" />}
+        icon={<ScheduleIcon className="h-3.5 w-3.5" />}
         label="Uptime"
         value={formatUptime(uptime)}
       />
       <Row
-        icon={<Thermometer className="h-3.5 w-3.5" />}
+        icon={<DeviceThermostatIcon className="h-3.5 w-3.5" />}
         label="CPU"
         value={cpuTemp > 0 ? formatTemp(cpuTemp, useFahrenheit) : "N/A"}
         valueColor={cpuTemp > 0 ? getTempColor(cpuTemp) : undefined}
       />
       {status.fan_speed && (
         <Row
-          icon={<Wind className="h-3.5 w-3.5" />}
+          icon={<AirIcon className="h-3.5 w-3.5" />}
           label="Fan"
           value={`${status.fan_speed} RPM`}
         />
@@ -579,7 +607,7 @@ function SystemTile({
           backends; treat absent as link-unknown and keep the old view.
           Label and color derive from ONE state value so they can't drift. */}
       <Row
-        icon={<HardDrive className="h-3.5 w-3.5" />}
+        icon={<HardDriveIcon className="h-3.5 w-3.5" />}
         label="USB Drives"
         {...(() => {
           const drivesState =
@@ -598,7 +626,7 @@ function SystemTile({
       />
       {keepAwakeIdle && (
         <Row
-          icon={<HeartPulse className="h-3.5 w-3.5" />}
+          icon={<CardiologyIcon className="h-3.5 w-3.5" />}
           label="Keep Awake"
           value={
             <Link
@@ -621,7 +649,7 @@ function NetworkTile({ status }: { status: PiStatus }) {
 
   return (
     <StatusTile
-      icon={haveWifi || haveEth ? <Wifi className="h-4 w-4" /> : <WifiOff className="h-4 w-4" />}
+      icon={haveWifi || haveEth ? <WifiIcon className="h-4 w-4" /> : <WifiOffIcon className="h-4 w-4" />}
       halo={halo}
       title="Network"
     >
@@ -629,7 +657,7 @@ function NetworkTile({ status }: { status: PiStatus }) {
         <>
           <div className="tile-row">
             <span className="inline-flex text-slate-500">
-              <Wifi className="h-3.5 w-3.5" />
+              <WifiIcon className="h-3.5 w-3.5" />
             </span>
             <span className="text-xs font-medium text-slate-200">
               {status.wifi_ssid}
@@ -658,7 +686,7 @@ function NetworkTile({ status }: { status: PiStatus }) {
         </>
       ) : (
         <Row
-          icon={<WifiOff className="h-3.5 w-3.5" />}
+          icon={<WifiOffIcon className="h-3.5 w-3.5" />}
           label="WiFi"
           sub="Not connected"
         />
@@ -668,7 +696,7 @@ function NetworkTile({ status }: { status: PiStatus }) {
         <>
           <div className="tile-row">
             <span className="inline-flex text-slate-500">
-              <EthernetPort className="h-3.5 w-3.5" />
+              <LanIcon className="h-3.5 w-3.5" />
             </span>
             <span className="text-xs font-medium text-slate-200">
               {status.ether_speed}
@@ -697,7 +725,7 @@ function NetworkTile({ status }: { status: PiStatus }) {
         // disconnected state without taking the tile's halo over.
         <div className="tile-row">
           <span className="inline-flex text-slate-600">
-            <EthernetPort className="h-3.5 w-3.5" />
+            <LanIcon className="h-3.5 w-3.5" />
           </span>
           <span className="text-xs text-slate-600">Ethernet</span>
           <span className="ml-auto text-[10px] text-slate-600">Not connected</span>
@@ -733,7 +761,7 @@ function StorageTile({
 
   return (
     <StatusTile
-      icon={<HardDrive className="h-4 w-4" />}
+      icon={<HardDriveIcon className="h-4 w-4" />}
       halo={getStorageHalo(usedPct)}
       title="Storage"
     >
@@ -752,7 +780,7 @@ function StorageTile({
             the card body rather than overflowing off the right
             edge on narrow grid columns. */}
         <span className="group relative inline-flex items-center self-center">
-          <Info
+          <InfoIcon
             aria-label="About storage management"
             className="h-3 w-3 cursor-help text-slate-600 transition-colors hover:text-slate-400"
           />
@@ -812,10 +840,12 @@ function StorageTile({
       )}
       <TileDivider />
       <Row
-        icon={<Camera className="h-3.5 w-3.5" />}
+        icon={<PhotoCameraIcon className="h-3.5 w-3.5" />}
         label={`${snaps.toLocaleString()} snapshots`}
         sub={
-          snaps > 0
+          snaps > 0 &&
+          Number.isFinite(parseInt(status.snapshot_oldest)) &&
+          Number.isFinite(parseInt(status.snapshot_newest))
             ? `${new Date(
                 parseInt(status.snapshot_oldest) * 1000
               ).toLocaleDateString()} → ${new Date(
@@ -883,7 +913,7 @@ function ActivityTile({
         </div>
       )}
       <StatusTile
-        icon={<Zap className="h-4 w-4" />}
+        icon={<BoltIcon className="h-4 w-4" />}
         halo="violet"
         title="Activity"
         className="flex-1"
@@ -896,17 +926,17 @@ function ActivityTile({
         ) : (
           <>
             <Row
-              icon={<Film className="h-3.5 w-3.5" />}
+              icon={<MovieIcon className="h-3.5 w-3.5" />}
               label="Clips"
               value={driveStats.processed_count.toLocaleString()}
             />
             <Row
-              icon={<MapPin className="h-3.5 w-3.5" />}
+              icon={<LocationOnIcon className="h-3.5 w-3.5" />}
               label="Drives"
               value={driveStats.drives_count.toLocaleString()}
             />
             <Row
-              icon={<Route className="h-3.5 w-3.5" />}
+              icon={<ConversionPathIcon className="h-3.5 w-3.5" />}
               label="Distance"
               value={`${
                 metric
@@ -916,7 +946,7 @@ function ActivityTile({
             />
             {driveStats.fsd_engaged_ms > 0 && (
               <Row
-                icon={<Zap className="h-3.5 w-3.5" />}
+                icon={<BoltIcon className="h-3.5 w-3.5" />}
                 label="FSD"
                 value={
                   <Link to="/fsd" className="text-emerald-400 hover:text-emerald-300">
@@ -1096,11 +1126,11 @@ function KeepAwakeInline({ keepAwake }: { keepAwake: ReturnType<typeof useKeepAw
       <div className="flex items-center gap-2">
         <span className={`inline-flex ${iconColor}`}>
           {isActive ? (
-            <HeartPulse className="h-3.5 w-3.5 animate-pulse" />
+            <CardiologyIcon className="h-3.5 w-3.5 animate-pulse" />
           ) : isPending ? (
-            <Timer className="h-3.5 w-3.5 animate-pulse" />
+            <TimerIcon className="h-3.5 w-3.5 animate-pulse" />
           ) : (
-            <HeartPulse className="h-3.5 w-3.5" />
+            <CardiologyIcon className="h-3.5 w-3.5" />
           )}
         </span>
         <span className="text-[10px] font-semibold uppercase tracking-wider text-slate-500">
@@ -1133,7 +1163,7 @@ function AwayModeTile() {
 
   return (
     <StatusTile
-      icon={<Wifi className="h-4 w-4" />}
+      icon={<WifiIcon className="h-4 w-4" />}
       halo="blue"
       title="Away Mode"
       badge={

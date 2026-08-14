@@ -1,14 +1,14 @@
 import { useEffect, useState } from "react"
 import {
-  Download,
-  Settings as SettingsIcon,
-  Wand2,
-  ShieldCheck,
-  Check,
-  X,
-  Loader2,
-  FileText,
-} from "lucide-react"
+  CheckIcon,
+  CloseIcon,
+  DescriptionIcon,
+  DownloadIcon,
+  ProgressActivityIcon,
+  SettingsIcon,
+  VerifiedUserIcon,
+  WandStarsIcon,
+} from "@/components/icons"
 import { PrefCard, PrefGrid } from "@/components/settings/PrefCard"
 import { ConfigBackupSection } from "@/components/settings/sections/ConfigBackupSection"
 import { StorageRepairCard } from "@/components/settings/sections/StorageRepairCard"
@@ -135,7 +135,7 @@ export function SystemTab({ onOpenRawConfig, onOpenWizard, version, hostname }: 
               onClick={exportConfig}
               className="rounded-lg border border-white/10 bg-white/5 px-3 py-1.5 text-xs font-medium text-slate-300 transition-colors hover:bg-white/10"
             >
-              <Download className="mr-1.5 inline h-3.5 w-3.5" />
+              <DownloadIcon className="mr-1.5 inline h-3.5 w-3.5" />
               Download sentryusb.conf
             </button>
           </div>
@@ -147,7 +147,7 @@ export function SystemTab({ onOpenRawConfig, onOpenWizard, version, hostname }: 
 
       {/* --- Setup Wizard + Resources (was: About) --- */}
       <PrefCard
-        icon={<Wand2 className="h-3.5 w-3.5" />}
+        icon={<WandStarsIcon className="h-3.5 w-3.5" />}
         halo="accent"
         title="Setup Wizard"
       >
@@ -189,12 +189,7 @@ export function SystemTab({ onOpenRawConfig, onOpenWizard, version, hostname }: 
   )
 }
 
-/**
- * Settings → System → Privacy. Lets users review the disclosure and flip
- * the analytics opt-in at any time. This is the Art. 21 right-to-object
- * mechanism required for legitimate-interest processing — automated means,
- * no email needed.
- */
+/** Settings → System privacy disclosure and analytics preference. */
 function PrivacyCards() {
   const [choice, setChoice] = useState<boolean | null>(null)
   const [saving, setSaving] = useState(false)
@@ -232,15 +227,18 @@ function PrivacyCards() {
   return (
     <>
       <PrefCard
-        icon={<ShieldCheck className="h-3.5 w-3.5" />}
+        icon={<VerifiedUserIcon className="h-3.5 w-3.5" />}
         halo="accent"
         title="Analytics opt-in"
       >
         <p className="t-xs">
           When opted in, daily update checks include a one-way hashed device
           ID (derived from your board serial) so we can count unique installs
-          without double-counting reinstalls. When opted out, nothing
-          identifying is sent on update checks.
+          without double-counting reinstalls. When opted out, no
+          device-derived identifier is sent on future update checks; normal
+          connection metadata such as the source IP is briefly used for rate
+          limiting. Opting out does not automatically erase a row sent earlier;
+          email privacy@sentry-six.com to request its deletion.
         </p>
 
         <div className="mt-1 flex flex-col gap-2 sm:flex-row">
@@ -256,9 +254,9 @@ function PrivacyCards() {
             )}
           >
             {saving && choice !== true ? (
-              <Loader2 className="h-3.5 w-3.5 animate-spin" />
+              <ProgressActivityIcon className="h-3.5 w-3.5 animate-spin" />
             ) : (
-              <Check className="h-3.5 w-3.5" />
+              <CheckIcon className="h-3.5 w-3.5" />
             )}
             Opted in
           </button>
@@ -274,9 +272,9 @@ function PrivacyCards() {
             )}
           >
             {saving && choice !== false ? (
-              <Loader2 className="h-3.5 w-3.5 animate-spin" />
+              <ProgressActivityIcon className="h-3.5 w-3.5 animate-spin" />
             ) : (
-              <X className="h-3.5 w-3.5" />
+              <CloseIcon className="h-3.5 w-3.5" />
             )}
             Opted out
           </button>
@@ -291,7 +289,7 @@ function PrivacyCards() {
       </PrefCard>
 
       <PrefCard
-        icon={<FileText className="h-3.5 w-3.5" />}
+        icon={<DescriptionIcon className="h-3.5 w-3.5" />}
         halo="slate"
         title="What we send, and when"
       >
@@ -303,13 +301,18 @@ function PrivacyCards() {
           />
           <FlowRow
             when="Once per install"
-            what="Empty ping (no body, no identifier)"
-            note="Anonymous gross-install counter."
+            what="Empty ping with no payload or device identifier"
+            note="The source IP is briefly rate-limited; only a daily aggregate count is stored."
           />
           <FlowRow
             when="Sentry Cloud (if signed in)"
             what="Account credentials + synced files"
             note="Stop using Cloud to stop this."
+          />
+          <FlowRow
+            when="AI Support & Help (when used)"
+            what="Messages, product/software version, the Pi connection's public IP for abuse prevention + diagnostics you explicitly approve"
+            note="Ollama Cloud processes messages. Redacted chats stay on Sentry Six servers up to 90 days after the last activity and may be reviewed; approved diagnostics stay 7 days."
           />
           <FlowRow
             when="Wraps / lock chime submissions"

@@ -1,6 +1,6 @@
 import { useEffect, useState, lazy, Suspense } from "react"
 import { BrowserRouter, Routes, Route } from "react-router-dom"
-import { Loader2, AlertTriangle } from "lucide-react"
+import { ProgressActivityIcon, WarningIcon } from "@/components/icons"
 import { AppShell } from "@/components/layout/AppShell"
 import { SetupWizard } from "@/components/setup/SetupWizard"
 import { SetupProgress } from "@/components/setup/SetupProgress"
@@ -21,10 +21,13 @@ const DriveDetail = lazy(() => import("@/pages/DriveDetail"))
 const Charging = lazy(() => import("@/pages/Charging"))
 const ChargeSessionDetail = lazy(() => import("@/pages/ChargeSessionDetail"))
 // Dev-only mock-data preview of in-progress UI; not routed in production.
-const PreviewCharging = lazy(() => import("@/pages/PreviewCharging"))
+const PreviewCharging = import.meta.env.DEV
+  ? lazy(() => import("@/pages/PreviewCharging"))
+  : null
 const Support = lazy(() => import("@/pages/Support"))
 const Terminal = lazy(() => import("@/pages/Terminal"))
 const FSDAnalytics = lazy(() => import("@/pages/FSDAnalytics"))
+const SafetyScore = lazy(() => import("@/pages/SafetyScore"))
 const Community = lazy(() => import("@/pages/Community"))
 const Notifications = lazy(() => import("@/pages/Notifications"))
 const Snapshots = lazy(() => import("@/pages/Snapshots"))
@@ -163,7 +166,7 @@ function AppContent() {
       <div className="flex min-h-screen items-center justify-center bg-slate-950 p-4">
         <div className="flex w-full max-w-lg flex-col items-center gap-6 rounded-2xl border border-amber-500/20 bg-white/[0.03] p-10 text-center">
           <div className="flex h-16 w-16 items-center justify-center rounded-full bg-amber-500/20">
-            <AlertTriangle className="h-8 w-8 text-amber-400" />
+            <WarningIcon className="h-8 w-8 text-amber-400" />
           </div>
           <div>
             <h2 className="text-xl font-semibold text-slate-100">
@@ -213,7 +216,7 @@ function AppContent() {
       <div className="flex h-screen items-center justify-center bg-slate-950">
         <div className="flex w-full max-w-lg flex-col items-center gap-6 rounded-2xl border border-white/10 bg-white/[0.03] p-10 text-center">
           <div className="flex h-16 w-16 items-center justify-center rounded-full bg-blue-500/20">
-            <Loader2 className="h-8 w-8 animate-spin text-blue-400" />
+            <ProgressActivityIcon className="h-8 w-8 animate-spin text-blue-400" />
           </div>
           <div>
             <h2 className="text-xl font-semibold text-slate-100">Setting Up Sentry USB</h2>
@@ -239,7 +242,7 @@ function AppContent() {
       <div className="flex h-screen items-center justify-center bg-slate-950">
         <div className="flex w-full max-w-lg flex-col items-center gap-6 rounded-2xl border border-white/10 bg-white/[0.03] p-10 text-center">
           <div className="flex h-16 w-16 items-center justify-center rounded-full bg-emerald-500/20">
-            <Loader2 className="h-8 w-8 animate-spin text-emerald-400" />
+            <ProgressActivityIcon className="h-8 w-8 animate-spin text-emerald-400" />
           </div>
           <div>
             <h2 className="text-xl font-semibold text-slate-100">Almost Done!</h2>
@@ -293,6 +296,7 @@ function AppContent() {
             <Route path="/charging" element={<Charging />} />
             <Route path="/charging/:id" element={<ChargeSessionDetail />} />
             <Route path="/fsd" element={<FSDAnalytics />} />
+            <Route path="/safety" element={<SafetyScore />} />
             <Route path="/support" element={<Support />} />
             <Route path="/terminal" element={<Terminal />} />
             <Route path="/community" element={<Community />} />
@@ -300,7 +304,7 @@ function AppContent() {
             <Route path="/snapshots" element={<Snapshots />} />
             <Route path="/settings" element={<Settings />} />
           </Route>
-          {import.meta.env.DEV && (
+          {import.meta.env.DEV && PreviewCharging && (
             <Route path="/preview/charging" element={<PreviewCharging />} />
           )}
         </Routes>
@@ -312,7 +316,7 @@ function AppContent() {
 function RouteFallback() {
   return (
     <div className="flex h-screen items-center justify-center bg-slate-950">
-      <Loader2 className="h-6 w-6 animate-spin text-blue-400" />
+      <ProgressActivityIcon className="h-6 w-6 animate-spin text-blue-400" />
     </div>
   )
 }

@@ -1,24 +1,14 @@
 //! Snapshot management API.
 //!
-//! Snapshots are XFS reflink-backed point-in-time copies of cam_disk
-//! that the runtime archiveloop creates on a schedule (default every
-//! 58 minutes). They live at `/backingfiles/snapshots/snap-<id>/snap.bin`
-//! and consume space on the backingfiles partition.
-//!
-//! Until the wizard's setup re-run was made data-safe, snapshots were
-//! auto-deleted by the runtime's `manage_free_space.sh` and silently
-//! wiped by the disk-image setup phase whenever CAM_SIZE changed. With
-//! that behavior fixed, users need an explicit way to inspect and
-//! delete snapshots when they want to free space (e.g. before growing
-//! a drive image past available capacity). This module provides:
+//! XFS reflink snapshots live at
+//! `/backingfiles/snapshots/snap-<id>/snap.bin`. This module provides:
 //!
 //!   * `GET    /api/snapshots`               — list with size/timestamp
 //!   * `DELETE /api/snapshots/:id`           — delete one snapshot
 //!   * `GET    /api/backingfiles/free-space` — total/used/avail in KB
 //!
-//! The actual delete shells out to `/root/bin/release_snapshot.sh`
-//! (already on disk, used by the runtime free-space manager) so we
-//! don't reimplement the careful umount + symlink cleanup it performs.
+//! Deletion uses `/root/bin/release_snapshot.sh` when available so it shares
+//! the runtime's unmount and symlink-cleanup behavior.
 
 use axum::Json;
 use axum::extract::{Path, State};
@@ -28,17 +18,129 @@ use crate::router::AppState;
 
 const SNAPSHOTS_DIR: &str = "/backingfiles/snapshots";
 const RELEASE_SNAPSHOT_SCRIPT: &str = "/root/bin/release_snapshot.sh";
+/// The live image retains shared extents independently of snapshots.
+const CAM_DISK: &str = "/backingfiles/cam_disk.bin";
 
 /// One snapshot entry in the listing response.
 #[derive(serde::Serialize)]
 struct SnapshotEntry {
     /// `snap-<id>` directory name. Used as the path parameter for delete.
     id: String,
-    /// Bytes consumed by the snapshot directory (recursive).
-    size_bytes: u64,
-    /// Unix epoch seconds — directory mtime. Used by the UI to render a
-    /// human-friendly date and to sort.
+    /// Estimated bytes freed by deleting THIS snapshot **and every older
+    /// one**, not this snapshot alone.
+    ///
+    /// Reflinked blocks are freed only when their final holder is deleted, so
+    /// reclaim is meaningful for an oldest-first prefix rather than one file.
+    /// The final row should equal the independently derived total footprint.
+    ///
+    /// `None` means "not measured yet, or could not be measured" — render
+    /// as pending/unavailable, NEVER as `0 B`. A measured zero is
+    /// legitimate (a run that frees nothing) and does render as `0 B`.
+    cumulative_reclaim_bytes: Option<u64>,
+    /// Number of older snapshots in the reclaim prefix.
+    older_count: usize,
+    /// Unix epoch seconds from `snap.bin` mtime.
     created_unix: i64,
+}
+
+/// How long a measurement stays usable before we re-measure.
+const SIZE_MAX_AGE_SECS: u64 = 15 * 60;
+
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+fn size_cache() -> &'static std::sync::Mutex<sentryusb_gadget::reflink::SizeCache> {
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<sentryusb_gadget::reflink::SizeCache>> =
+        std::sync::OnceLock::new();
+    CACHE.get_or_init(|| std::sync::Mutex::new(sentryusb_gadget::reflink::SizeCache::new()))
+}
+
+static REFRESH_IN_FLIGHT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Clears the in-flight flag even if measurement panics.
+struct RefreshGuard;
+impl Drop for RefreshGuard {
+    fn drop(&mut self) {
+        REFRESH_IN_FLIGHT.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// Measure every snapshot off the request path.
+///
+/// Extent-map walks run off the request path, one refresh at a time.
+/// `ids` must be OLDEST-FIRST: the cumulative figure for a snapshot is
+/// "delete this and everything older", so the prefix order is the meaning.
+fn spawn_size_refresh(ids: Vec<String>, generation: u64) {
+    use std::sync::atomic::Ordering;
+    if REFRESH_IN_FLIGHT.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    tokio::task::spawn_blocking(move || {
+        let _guard = RefreshGuard;
+
+        // One missing extent map invalidates every later cumulative value.
+        let mut maps: Vec<Vec<sentryusb_gadget::reflink::PhysicalRange>> =
+            Vec::with_capacity(ids.len());
+        let mut idents = Vec::with_capacity(ids.len());
+        let mut failed: Option<(String, String)> = None;
+        for id in &ids {
+            let bin = format!("{}/{}/snap.bin", SNAPSHOTS_DIR, id);
+            let p = std::path::Path::new(&bin);
+            match sentryusb_gadget::reflink::extent_map(p)
+                .and_then(|m| Ok((m, sentryusb_gadget::reflink::file_identity(p)?)))
+            {
+                Ok((m, ident)) => {
+                    maps.push(m);
+                    idents.push(ident);
+                }
+                Err(e) => {
+                    failed = Some((id.clone(), e.to_string()));
+                    break;
+                }
+            }
+        }
+
+        // Extents retained by the live image are not reclaimable.
+        let external = if failed.is_none() {
+            match sentryusb_gadget::reflink::extent_map(std::path::Path::new(CAM_DISK)) {
+                Ok(m) => Some(m),
+                Err(e) => {
+                    failed = Some((CAM_DISK.to_string(), e.to_string()));
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        let entries = match (failed, external) {
+            (None, Some(external)) => {
+                let curve = sentryusb_gadget::reflink::cumulative_reclaim(&maps, &external);
+                ids.iter()
+                    .zip(curve)
+                    .zip(idents)
+                    .map(|((id, bytes), ident)| (id.clone(), (bytes, ident)))
+                    .collect()
+            }
+            (failed, _) => {
+                if let Some((id, e)) = failed {
+                    tracing::warn!("cumulative snapshot sizing failed at {}: {}", id, e);
+                }
+                Vec::new()
+            }
+        };
+
+        if let Ok(mut cache) = size_cache().lock() {
+            // Do not republish values invalidated by a concurrent deletion.
+            if !cache.publish(generation, ids, entries, now_secs()) {
+                tracing::debug!("discarded a snapshot-size measurement invalidated mid-flight");
+            }
+        }
+    });
 }
 
 /// GET /api/snapshots
@@ -54,7 +156,6 @@ pub async fn list_snapshots(
     let dir = match std::fs::read_dir(SNAPSHOTS_DIR) {
         Ok(d) => d,
         Err(_) => {
-            // Directory missing entirely is fine — no snapshots yet.
             return (StatusCode::OK, Json(serde_json::json!({
                 "snapshots": entries,
             })));
@@ -71,62 +172,60 @@ pub async fn list_snapshots(
             continue;
         }
 
-        // mtime as the "created" timestamp — matches what
-        // manage_free_space.sh sorts by (alphabetic snap-<id>) closely
-        // enough for UI purposes, and is what users actually see.
-        let created_unix = entry
-            .metadata()
+        // Use `snap.bin` mtime because autofs metadata updates the directory
+        // mtime when an old snapshot is viewed.
+        let created_unix = std::fs::symlink_metadata(path.join("snap.bin"))
+            .or_else(|_| entry.metadata())
             .and_then(|m| m.modified())
             .ok()
             .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
             .map(|d| d.as_secs() as i64)
             .unwrap_or(0);
 
-        // Per-snapshot apparent allocated bytes (st_blocks * 512). This
-        // is NOT reflink-aware: each snap.bin is `cp --reflink=always` of
-        // cam_disk.bin, so every snap.bin's `st_blocks` is the full
-        // cam_disk block count even though those extents are shared with
-        // the live image and the other snapshots. Treat this as an upper
-        // bound, not "what you'd reclaim by deleting just this snapshot."
-        // The aggregate `total_allocated_bytes` below uses df-based math
-        // to recover the reflink-exclusive footprint.
-        let du_out = sentryusb_shell::run(
-            "du", &["-sB1", &path.to_string_lossy()],
-        ).await.unwrap_or_default();
-        let size_bytes: u64 = du_out
-            .split_whitespace()
-            .next()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(0);
-
         entries.push(SnapshotEntry {
             id: name,
-            size_bytes,
+            // Filled from the extent-map cache below.
+            cumulative_reclaim_bytes: None,
+            older_count: 0,
             created_unix,
         });
     }
 
-    // Oldest first by mtime. UI may re-sort, but this default matches
-    // what users actually want (delete the oldest to free space).
+    // Cumulative reclaim values are defined against oldest-first order.
     entries.sort_by_key(|e| e.created_unix);
+    for (i, e) in entries.iter_mut().enumerate() {
+        e.older_count = i;
+    }
 
-    // Reflink-aware aggregate: bytes that would be freed if every snapshot
-    // were deleted. `du` is NOT reflink-aware — it dedupes hard links by
-    // inode, but each snap.bin is a separate inode whose extents are shared
-    // with cam_disk.bin via `cp --reflink=always`. Each snap.bin's
-    // `st_blocks` therefore reports the full cam_disk.bin block count, and
-    // `du -sB1 /backingfiles/snapshots` (even as a single tree walk) sums
-    // those per-file counts — producing N × cam_disk_size, far larger than
-    // the partition.
-    //
-    // Compute the true reflink-exclusive footprint as:
-    //     df_used(/backingfiles)  −  du(--exclude=snapshots /backingfiles/)
-    // i.e. partition-level used bytes (which counts each allocated extent
-    // once, regardless of how many files reference it) minus the apparent
-    // footprint of non-snapshot content. Deleting all snapshots leaves only
-    // the non-snapshot files (chiefly cam_disk.bin), whose blocks XFS
-    // retains, so `df` settles to that du value afterwards — the difference
-    // is what the snapshots collectively hold exclusively.
+    // A stale value may describe a different snapshot set, so omit it and refresh.
+    let now = now_secs();
+    let ids: Vec<String> = entries.iter().map(|e| e.id.clone()).collect();
+    let (current, computed_at, generation) = match size_cache().lock() {
+        Ok(cache) => {
+            let current = cache.is_current_for(&ids, now, SIZE_MAX_AGE_SECS);
+            if current {
+                for e in entries.iter_mut() {
+                    // Verify the file is still the one that was measured.
+                    let bin = format!("{}/{}/snap.bin", SNAPSHOTS_DIR, e.id);
+                    e.cumulative_reclaim_bytes =
+                        sentryusb_gadget::reflink::file_identity(std::path::Path::new(&bin))
+                            .ok()
+                            .and_then(|ident| cache.get_if_same(&e.id, ident));
+                }
+            }
+            (current, cache.computed_at(), cache.generation())
+        }
+        Err(_) => (false, None, 0),
+    };
+    if !current && !ids.is_empty() {
+        spawn_size_refresh(ids, generation);
+    }
+    // Derive pending state from the cache to avoid racing worker publication.
+    // Failed measurements still count as completed attempts.
+    let pending = !current && !entries.is_empty();
+
+    // `du` double-counts reflinked files. Derive the aggregate exclusive
+    // footprint as filesystem-used bytes minus non-snapshot file usage.
     let total_allocated_bytes: u64 = if entries.is_empty() {
         0
     } else {
@@ -152,9 +251,27 @@ pub async fn list_snapshots(
         used_bytes.saturating_sub(non_snap_bytes)
     };
 
+    // Cross-check FIEMAP attribution against the independent df-minus-du total.
+    if let Some(last) = entries.last().and_then(|e| e.cumulative_reclaim_bytes) {
+        let hi = total_allocated_bytes.max(last);
+        let lo = total_allocated_bytes.min(last);
+        // Allow metadata, journal, and in-flight-write noise.
+        if hi > 0 && (hi - lo) * 10 > hi * 3 {
+            tracing::warn!(
+                "snapshot accounting disagreement: cumulative curve ends at {} bytes but \
+                 df-based total is {} — one of these is wrong",
+                last,
+                total_allocated_bytes
+            );
+        }
+    }
+
     (StatusCode::OK, Json(serde_json::json!({
         "snapshots": entries,
         "total_allocated_bytes": total_allocated_bytes,
+        // Distinguish an active measurement from unavailable data.
+        "sizes_computed_at": computed_at,
+        "sizes_pending": pending,
     })))
 }
 
@@ -180,16 +297,9 @@ pub async fn delete_snapshot(
         return crate::json_error(StatusCode::NOT_FOUND, "Snapshot not found");
     }
 
-    // Prefer the on-disk script so we share the runtime's careful
-    // umount + symlink cleanup logic. Fall back to a plain rm only if
-    // the script is missing (possible on a partially-installed system).
-    //
-    // Pass the bare `id`, NOT the full path: the Rust-installed
-    // `release_snapshot.sh` is a thin shim that forwards "$@" to
-    // `sentryusb snapshot release`, which expects a `snap-NNNNNN` name.
-    // The id is already validated above, and `release_snapshot` now also
-    // accepts a full path, so this is robust across both the thin-wrapper
-    // and full-script installs.
+    // Run teardown out of process so its blocking lock wait cannot exhaust API
+    // workers. Pass the validated bare ID expected by the installed script;
+    // partially installed systems fall back to removing the snapshot directory.
     let script_exists = std::path::Path::new(RELEASE_SNAPSHOT_SCRIPT).exists();
     let result = if script_exists {
         sentryusb_shell::run(RELEASE_SNAPSHOT_SCRIPT, &[id.as_str()]).await
@@ -198,7 +308,13 @@ pub async fn delete_snapshot(
     };
 
     match result {
-        Ok(_) => (StatusCode::OK, Json(serde_json::json!({"deleted": id}))),
+        Ok(_) => {
+            // Deleting one holder changes every cumulative reclaim value.
+            if let Ok(mut cache) = size_cache().lock() {
+                cache.invalidate();
+            }
+            (StatusCode::OK, Json(serde_json::json!({"deleted": id})))
+        }
         Err(e) => crate::json_error(
             StatusCode::INTERNAL_SERVER_ERROR,
             &format!("Failed to delete snapshot: {}", e),

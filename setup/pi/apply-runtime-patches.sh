@@ -48,31 +48,34 @@ is_rock_4cplus() {
 # kernel logs on first BT probe (e.g. "Bluetooth: hci0: BCM43430B0 (002.001.012)").
 #
 # Currently:
-#   BCM4345C0 — Rock 4C+ (confirmed broken via field evidence)
+#   BCM4345C0 — Rock 4C+ (confirmed broken via field evidence) AND
+#     Raspberry Pi 4 Model B (confirmed broken via btmon trace 2026-07-25:
+#     "Add Extended Advertising Data (0x0055) → Invalid Parameters (0x0d)";
+#     without the helper only LE Set Advertising Parameters + Enable are
+#     issued — no Set Advertising Data (0x0008) — so the Pi advertises an
+#     EMPTY packet and is undiscoverable by name/UUID). Pi 4B's BT loads
+#     firmware brcm/BCM4345C0.raspberrypi,4-model-b.hcd — same silicon.
 #   BCM43430B0 — Pi Zero 2 W (confirmed broken via btmon trace 2026-06-20)
 #   BCM43438 — Pi 3B/3B+, Pi Zero W (same chip family / same firmware tree)
 #
 # DELIBERATELY EXCLUDED until tested:
-#   BCM43455 / CYW43455 — Pi 4 / Pi 5; their modern bluetoothd path is
-#   reported to work fine, and running our raw-HCI helper there would
-#   override their working ext-adv with legacy adv (regression). If a Pi
-#   4/5 user does hit "GATT 147 bond=BOND_NONE" they can opt in with:
+#   BCM43455 / CYW43455 — Pi 5; its modern bluetoothd path is reported to
+#   work fine, and running our raw-HCI helper there would override its
+#   working ext-adv with legacy adv (regression). (Note: Raspberry Pi 4
+#   Model B was previously excluded here on the assumption it uses
+#   BCM43455 — in the field its BT identifies as BCM4345C0 and rejects
+#   ext-adv, so it is now in the broken list above.) If an excluded board
+#   does hit "GATT 147 bond=BOND_NONE" the operator can opt in with:
 #       sudo touch /mutable/force-ble-adv-helper
 #   That sentinel forces install regardless of chip detection. The next OTA
 #   (or `sudo /usr/local/bin/sentryusb-apply-runtime-patches`) lands it.
-is_known_broken_ble_chip() {
-    # Operator override — for chips we haven't detection-listed yet but
-    # field-confirmed need the helper.
-    [ -f /mutable/force-ble-adv-helper ] && { log "BLE adv: /mutable/force-ble-adv-helper present — forcing install"; return 0; }
-    local chips="BCM4345C0\|BCM43430B0\|BCM43438"
-    dmesg 2>/dev/null | grep -qE "hci0: ($chips)" && return 0
-    # dmesg may not retain that line on a long-running box; also check the
-    # board model as a backstop (4C+'s 4345C0 + Zero 2 W's 43430B0 are
-    # board-specific so model match is unambiguous).
-    grep -qai 'rock-4c-plus\|rockpi4c-plus\|ROCK 4C+\|Raspberry Pi Zero 2 W\|Raspberry Pi 3 Model B\|Raspberry Pi Zero W' \
-        /proc/device-tree/model 2>/dev/null && return 0
-    return 1
-}
+# NOTE: the old is_known_broken_ble_chip() gate was removed here. It keyed on
+# the BT chip (BCM4345C0 et al.), which cannot classify these boards — the
+# working Pi 5, the broken 4C+, and the broken Pi 4B are all BCM4345C0. Whether
+# the helper runs is now decided per-boot by the RF-verified native manifest
+# (select-ble-adv-mode.sh + ble-native-manifest); apply_ble_adv_helper below
+# stages the files on every board and the mode marker gates the advertiser.
+# /mutable/force-ble-adv-helper still works — the selector honors it first.
 
 # ── BLE non-fatal-adv patch (all Broadcom Pi-family chips) ──────────────
 #
@@ -93,6 +96,12 @@ apply_ble_nonfatal_adv() {
 
     if grep -q 'legacy btmgmt advertising' "$f"; then
         log "BLE non-fatal-adv: already patched"
+        return 0
+    fi
+    # Newer ble.py removed register_ad_error_cb entirely (native mode retries
+    # registration itself) — nothing to patch.
+    if ! grep -q 'def register_ad_error_cb' "$f"; then
+        log "BLE non-fatal-adv: obsolete on this build (retry built in)"
         return 0
     fi
 
@@ -195,53 +204,104 @@ apply_eatt_disable() {
 # is only written when missing OR when the on-disk contents differ from the
 # current upstream version.
 #
-# Files installed:
+# Files installed (staged on every board; the mode marker gates the advertiser):
 #   /usr/local/bin/sentryusb-ble-adv.sh
+#   /usr/local/bin/select-ble-adv-mode.sh
+#   /usr/local/share/sentryusb/ble-native-manifest
 #   /etc/systemd/system/sentryusb-ble-adv.service
+#   /etc/systemd/system/sentryusb-ble-mode.service
 #   /etc/udev/rules.d/99-sentryusb-ble-hci.rules
 #   /etc/systemd/system/sentryusb-ble.service.d/wants-bluetooth.conf
+#   /root/bin/sentryusb-ble.py   (re-fetched whole so existing installs converge)
 apply_ble_adv_helper() {
-    # Gate to known-affected chips so Pi 4/5 (where bluetoothd's modern
-    # ext-adv works) don't get the raw-HCI helper overriding their good
-    # advertising. See is_known_broken_ble_chip above for the full list.
-    is_known_broken_ble_chip || { log "BLE adv: chip not in known-broken list — skipping helper install"; return 0; }
+    # No chip gate: stage everything on every board; the boot-time mode marker
+    # (select-ble-adv-mode.sh + ble-native-manifest) picks the advertiser.
     local repo="${REPO:-Sentry-Six/Sentry-USB-Rusty}"
     local base="https://raw.githubusercontent.com/${repo}/main/setup/pi"
-    local changed=0
+    local ble_base="https://raw.githubusercontent.com/${repo}/main/server/ble"
 
-    install_one() {
-        # $1 = source filename, $2 = destination path, $3 = mode
-        local src="$1" dst="$2" mode="$3"
-        local tmp; tmp="$(mktemp)" || { warn "BLE adv: mktemp failed"; return 1; }
-        if ! curl -fsSL --max-time 15 "$base/$src" -o "$tmp" 2>/dev/null; then
-            rm -f "$tmp"
-            warn "BLE adv: failed to fetch $src — leaving any existing copy alone"
-            return 1
-        fi
-        if [ -f "$dst" ] && cmp -s "$tmp" "$dst"; then
-            rm -f "$tmp"
-            return 0  # already up to date
-        fi
-        [ -x /root/bin/remountfs_rw ] && /root/bin/remountfs_rw >/dev/null 2>&1 || true
-        install -m "$mode" "$tmp" "$dst"
-        rm -f "$tmp"
-        changed=1
-        log "BLE adv: installed/refreshed $dst"
-    }
+    # (url, dst, mode) set. ble.py is re-fetched whole (the mode-gating adds
+    # three edit sites the old in-place patcher can't reliably reach; the repo
+    # copy is the source of truth and already carries the non-fatal-adv fix).
+    local specs=(
+        "$base/sentryusb-ble-adv.sh|/usr/local/bin/sentryusb-ble-adv.sh|755"
+        "$base/select-ble-adv-mode.sh|/usr/local/bin/select-ble-adv-mode.sh|755"
+        "$base/ble-native-manifest|/usr/local/share/sentryusb/ble-native-manifest|644"
+        "$base/sentryusb-ble-adv.service|/etc/systemd/system/sentryusb-ble-adv.service|644"
+        "$base/sentryusb-ble-mode.service|/etc/systemd/system/sentryusb-ble-mode.service|644"
+        "$base/99-sentryusb-ble-hci.rules|/etc/udev/rules.d/99-sentryusb-ble-hci.rules|644"
+        "$base/sentryusb-ble-wants-bluetooth.conf|/etc/systemd/system/sentryusb-ble.service.d/wants-bluetooth.conf|644"
+        "$ble_base/sentryusb-ble.py|/root/bin/sentryusb-ble.py|755"
+    )
 
-    install_one sentryusb-ble-adv.sh /usr/local/bin/sentryusb-ble-adv.sh 755 || return 0
-    install_one sentryusb-ble-adv.service /etc/systemd/system/sentryusb-ble-adv.service 644
-    install_one 99-sentryusb-ble-hci.rules /etc/udev/rules.d/99-sentryusb-ble-hci.rules 644
-    mkdir -p /etc/systemd/system/sentryusb-ble.service.d
-    install_one sentryusb-ble-wants-bluetooth.conf \
-                /etc/systemd/system/sentryusb-ble.service.d/wants-bluetooth.conf 644
+    # All-or-nothing: fetch everything to temp first; any fetch failure aborts
+    # untouched (a half-applied set can dark or dual-own the board).
+    local tmpdir; tmpdir="$(mktemp -d)" || { warn "BLE adv: mktemp -d failed"; return 0; }
+    local -a tmps dsts modes
+    local i=0 spec rest dst mode url
+    for spec in "${specs[@]}"; do
+        url="${spec%%|*}"; rest="${spec#*|}"; dst="${rest%%|*}"; mode="${rest##*|}"
+        if ! curl -fsSL --max-time 15 "$url" -o "$tmpdir/$i" 2>/dev/null; then
+            warn "BLE adv: fetch failed for ${url##*/} — aborting BLE update (no partial apply)"
+            rm -rf "$tmpdir"; return 0
+        fi
+        tmps[i]="$tmpdir/$i"; dsts[i]="$dst"; modes[i]="$mode"; i=$((i+1))
+    done
+
+    # Atomic install: back up changed files / track new ones, and on ANY install
+    # failure roll the whole set back (a mixed set would dark/dual-own on reboot).
+    local changed=0 install_failed=0 n=$i
+    [ -x /root/bin/remountfs_rw ] && /root/bin/remountfs_rw >/dev/null 2>&1 || true
+    local -a bak_files new_files
+    for (( i = 0; i < n; i++ )); do
+        [ -f "${dsts[i]}" ] && cmp -s "${tmps[i]}" "${dsts[i]}" && continue
+        if [ -f "${dsts[i]}" ]; then
+            # Back up before changing; if the backup fails, abort before the
+            # install (can't roll back an untracked change).
+            if cp -p "${dsts[i]}" "${dsts[i]}.subak" 2>/dev/null; then
+                bak_files+=("${dsts[i]}")
+            else
+                rm -f "${dsts[i]}.subak" 2>/dev/null
+                install_failed=1
+                warn "BLE adv: could not back up ${dsts[i]} — aborting before install"
+                break
+            fi
+        else
+            new_files+=("${dsts[i]}")
+        fi
+        if install -D -m "${modes[i]}" "${tmps[i]}" "${dsts[i]}"; then
+            changed=1
+            log "BLE adv: installed/refreshed ${dsts[i]}"
+        else
+            install_failed=1
+            warn "BLE adv: install failed for ${dsts[i]}"
+            break
+        fi
+    done
+    rm -rf "$tmpdir"
+
+    if [ "$install_failed" = "1" ]; then
+        warn "BLE adv: install failed — rolling back to the previous consistent set"
+        for f in "${bak_files[@]}"; do mv -f "$f.subak" "$f" 2>/dev/null || true; done
+        for f in "${new_files[@]}"; do rm -f "$f" 2>/dev/null || true; done
+        return 0
+    fi
+    # Success — discard the backups.
+    for f in "${bak_files[@]}"; do rm -f "$f.subak" 2>/dev/null || true; done
 
     if [ "$changed" = "1" ]; then
         systemctl daemon-reload 2>/dev/null || true
         udevadm control --reload-rules 2>/dev/null || true
-        systemctl enable sentryusb-ble-adv.service >/dev/null 2>&1 || true
+        systemctl enable sentryusb-ble-mode.service >/dev/null 2>&1 || true
+        systemctl enable sentryusb-ble-adv.service  >/dev/null 2>&1 || true
+        # ble.py reads the marker once at startup, so restart it on ANY BLE file
+        # change (a manifest/selector-only change can flip the mode).
+        systemctl restart sentryusb-ble-mode.service 2>/dev/null || \
+            /usr/local/bin/select-ble-adv-mode.sh 2>/dev/null || true
+        systemctl reset-failed sentryusb-ble.service 2>/dev/null || true
+        systemctl restart sentryusb-ble.service 2>/dev/null || true
         systemctl restart sentryusb-ble-adv.service 2>/dev/null || true
-        log "BLE adv: service enabled + restarted"
+        log "BLE adv: gate + advertiser refreshed; mode re-selected; daemons restarted"
     else
         log "BLE adv: all files current, nothing to do"
     fi
@@ -254,11 +314,18 @@ apply_ble_adv_helper() {
 # `ionice -c2 -n7` so the car's dashcam writes through the USB gadget
 # always win disk access — but ionice only has effect under the bfq I/O
 # scheduler (mq-deadline, the Pi OS default, ignores I/O priorities).
-# Ship a udev rule so every sd disk gets bfq at hotplug/boot, and apply
+# Ship a udev rule so the backing disk gets bfq at hotplug/boot, and apply
 # it to the live backingfiles disk immediately when that is safe.
+#
+# The pattern covers SD cards (mmcblk*) as well as USB/SATA disks (sd*).
+# Matching only sd* left every install whose /backingfiles sits on the SD
+# card — common on a Zero 2 W — silently back on mq-deadline after each
+# reboot, which makes the archive's ionice a no-op and lets rsync starve
+# the API's disk reads. NVMe is deliberately excluded: bfq's fairness
+# machinery costs more than it returns on a device that fast.
 apply_backingfiles_bfq() {
     local rule=/etc/udev/rules.d/60-sentryusb-bfq.rules
-    local want='ACTION=="add|change", KERNEL=="sd[a-z]", SUBSYSTEM=="block", ATTR{queue/scheduler}="bfq"'
+    local want='ACTION=="add|change", KERNEL=="sd[a-z]|mmcblk[0-9]", SUBSYSTEM=="block", ATTR{queue/scheduler}="bfq"'
 
     modprobe bfq 2>/dev/null || true
 
@@ -290,7 +357,30 @@ apply_backingfiles_bfq() {
     src="$(findmnt -n -o SOURCE /backingfiles 2>/dev/null)" || true
     [ -n "${src:-}" ] || { log "bfq: /backingfiles not mounted — udev rule will cover next boot"; return 0; }
     disk="$(lsblk -n -o PKNAME "$src" 2>/dev/null | head -1)"
-    [ -n "$disk" ] || disk="$(basename "$src" | sed 's/[0-9]*$//')"
+    # Fallback when lsblk can't resolve the parent. mmcblk/nvme name their
+    # partitions <disk>p<N>, so stripping only trailing digits leaves
+    # "mmcblk0p" — a device that does not exist, which then fails the
+    # class gate below and silently skips the live switch. Strip the
+    # partition suffix per naming scheme instead.
+    if [ -z "$disk" ]; then
+        disk="$(basename "$src")"
+        case "$disk" in
+            mmcblk*|nvme*) disk="$(echo "$disk" | sed 's/p[0-9]*$//')" ;;
+            *)             disk="$(echo "$disk" | sed 's/[0-9]*$//')" ;;
+        esac
+    fi
+    # Same device-class gate the udev rule above uses (sd*/mmcblk*).
+    # Without it the LIVE switch would happily set bfq on an NVMe that
+    # the rule deliberately excludes — bfq's fairness machinery costs
+    # more than it returns on a device that fast — leaving the scheduler
+    # inconsistent with the documented policy until the next reboot.
+    case "$disk" in
+        sd[a-z]|mmcblk[0-9]) ;;
+        *)
+            log "bfq: $disk is not sd*/mmcblk* (NVMe?) — excluded by design, leaving its scheduler alone"
+            return 0
+            ;;
+    esac
     sched="/sys/block/$disk/queue/scheduler"
     if [ -w "$sched" ]; then
         if grep -q '\[bfq\]' "$sched"; then
@@ -802,18 +892,646 @@ RCLONEREACH_EOF
     log "rclone-watchdog: archive scripts refreshed (probe ARCHIVE_SERVER, scoped kill)"
 }
 
+# ── CIFS/NFS archive watchdog: dual-signal, scoped kill ─────────────────
+#
+# The shipped cifs/nfs archive-clips.sh killed rsync after five
+# consecutive failed port probes (~35s). A probe only tests whether a NEW
+# TCP connection can be opened; at the edge of WiFi range a loss burst
+# blocks fresh SYNs while the established SMB/NFS session keeps
+# retransmitting and delivering, so healthy transfers were aborted
+# mid-run. The replacement monitor treats "probe up OR file completed" as
+# alive, kills after ARCHIVE_STALL_GRACE_SECONDS of neither (60s default,
+# 300s absolute ceiling), and scopes the kill to this run's rsync.
+# /root/bin scripts are only rewritten at wizard time, so existing
+# installs need this refresh.
+#
+# The heredocs below MUST stay byte-identical to
+# run/mounted-archive-monitor.sh, run/cifs_archive/archive-clips.sh and
+# run/nfs_archive/archive-clips.sh.
+apply_mounted_archive_watchdog() {
+    local clips=/root/bin/archive-clips.sh
+    # Only cifs/nfs installs rsync onto $ARCHIVE_MOUNT; the rsync-ssh
+    # (pushes to $RSYNC_SERVER), rclone and none variants keep their own
+    # archive-clips.sh untouched.
+    if ! grep -q 'ARCHIVE_MOUNT' "$clips" 2>/dev/null \
+       || grep -q 'rclone --config' "$clips" 2>/dev/null \
+       || grep -q 'RSYNC_SERVER' "$clips" 2>/dev/null; then
+        log "mounted-watchdog: not applicable"
+        return 0
+    fi
+    if grep -q 'MOUNTED_ARCHIVE_MONITOR_V1' "$clips" 2>/dev/null \
+       && grep -q 'MOUNTED_ARCHIVE_MONITOR_V1' /root/bin/mounted-archive-monitor.sh 2>/dev/null; then
+        log "mounted-watchdog: already patched"
+        return 0
+    fi
+
+    # NFS keeps --no-o --no-g for root-squashed shares; that flag pair is
+    # the only difference between the two variants and identifies which
+    # one is installed.
+    local variant=cifs
+    grep -q -- '--no-o --no-g' "$clips" 2>/dev/null && variant=nfs
+
+    local ro_before=no
+    findmnt -no OPTIONS / 2>/dev/null | grep -qE '(^|,)ro(,|$)' && ro_before=yes
+    if [ "$ro_before" = yes ]; then
+        [ -x /root/bin/remountfs_rw ] && /root/bin/remountfs_rw >/dev/null 2>&1 \
+            || mount -o remount,rw / 2>/dev/null || true
+    fi
+    _mounted_wd_relock() {
+        [ "$ro_before" = yes ] || return 0
+        sync
+        mount -o remount,ro / 2>/dev/null || true
+    }
+
+    # Staged + atomic rename, monitor first: archive-clips.sh sources it
+    # by absolute path, so the helper must be live before the script that
+    # needs it.
+    cat > /root/bin/mounted-archive-monitor.sh.new <<'MOUNTEDMON_EOF'
+#!/bin/bash -eu
+
+# MOUNTED_ARCHIVE_MONITOR_V1: dual-signal connection monitor for mounted
+# (CIFS/NFS) clip archiving. Sourced by archive-clips.sh.
+#
+# The previous monitor killed rsync after five consecutive failed port
+# probes (~35s). A probe only tests whether a NEW TCP connection can be
+# opened; at the edge of WiFi range a loss burst blocks fresh SYNs while
+# the established SMB/NFS session keeps retransmitting and delivering, so
+# transfers that would have completed were aborted mid-run.
+#
+# Liveness is now either signal:
+#   - a successful reachability probe, or
+#   - a new completed-file record in rsync's --log-file. The rsync
+#     invocation must pass a --log-file-format containing %b: a
+#     transfer-statistic escape makes rsync log at the END of each file's
+#     transfer, where the default format logs before it. Received regular
+#     files itemize as ">f"; pre-transfer names, vanished-file warnings
+#     and directory records never match.
+#
+# Kill when both signals have been absent for ARCHIVE_STALL_GRACE_SECONDS
+# (default 60, 180 under Travel Mode, clamped 30-240), or unconditionally
+# after 300s of continuous probe failure: writes into a dead CIFS mount
+# can complete into page cache for a while, so completed-file records can
+# lag reality — the ceiling bounds a real drive-away so archiveloop gets
+# the gadget back to normal housekeeping.
+#
+# The kill is scoped to this run's rsync via its unique --log-file path;
+# `killall rsync` would also take out an unrelated music or media sync.
+
+MONITOR_RSYNC_LOG=/tmp/archive-rsync-cmd.log
+
+function connectionmonitor {
+  local grace
+  local -r hard_cap=300
+  if [ "${TRAVEL_MODE_ACTIVE:-0}" = "1" ]
+  then
+    grace="${ARCHIVE_STALL_GRACE_SECONDS:-180}"
+  else
+    grace="${ARCHIVE_STALL_GRACE_SECONDS:-60}"
+  fi
+  case "$grace" in
+    ''|*[!0-9]*) grace=60 ;;
+  esac
+  if [ "$grace" -lt 30 ]; then grace=30; fi
+  if [ "$grace" -gt 240 ]; then grace=240; fi
+
+  local now probe_down stalled
+  local probe_failed_since=0
+  local completed prev_completed=0
+  local last_progress
+  last_progress=$(date +%s)
+
+  while true
+  do
+    if timeout 6 /root/bin/archive-is-reachable.sh "$ARCHIVE_SERVER"
+    then
+      probe_failed_since=0
+    elif [ "$probe_failed_since" = 0 ]
+    then
+      probe_failed_since=$(date +%s)
+    fi
+
+    completed=$(grep -c ' >f' "$MONITOR_RSYNC_LOG" 2>/dev/null || true)
+    completed="${completed:-0}"
+    if [ "$completed" != "$prev_completed" ]
+    then
+      # != rather than -gt: archive-clips.sh truncates the log per run, so
+      # a shrinking count is a fresh run, not a stall.
+      prev_completed=$completed
+      last_progress=$(date +%s)
+    fi
+
+    if [ "$probe_failed_since" != 0 ]
+    then
+      now=$(date +%s)
+      probe_down=$(( now - probe_failed_since ))
+      stalled=$(( now - last_progress ))
+      if [ "$probe_down" -ge "$hard_cap" ] || { [ "$probe_down" -ge "$grace" ] && [ "$stalled" -ge "$grace" ]; }
+      then
+        log "connection dead (probes failing ${probe_down}s, no completed file for ${stalled}s), killing archive-clips"
+        # TERM first: rsync may still delete already-archived source files.
+        pkill -f 'rsync .*--log-file=/tmp/archive-rsync-cmd\.log' || true
+        sleep 2
+        pkill -9 -f 'rsync .*--log-file=/tmp/archive-rsync-cmd\.log' || true
+        kill -9 "$1" || true
+        return
+      fi
+    fi
+    sleep 5
+  done
+}
+MOUNTEDMON_EOF
+
+    if [ "$variant" = nfs ]; then
+        cat > "$clips.new" <<'NFSCLIPS_EOF'
+#!/bin/bash -eu
+
+# MOUNTED_ARCHIVE_MONITOR_V1: the connection watchdog lives in
+# mounted-archive-monitor.sh (shared with the CIFS variant) and only kills
+# rsync when probes fail AND no file has completed for a grace window —
+# probe-only monitoring aborted healthy transfers on lossy WiFi links.
+source /root/bin/mounted-archive-monitor.sh
+
+# Truncate before the monitor starts: a stale log from the previous run
+# would seed the monitor's completed-file counter with the old total.
+rm -f /tmp/archive-rsync-cmd.log /tmp/archive-error.log
+
+connectionmonitor $$ &
+
+# rsync's temp files may be left behind if the connection is lost,
+# but rsync doesn't clean these up on subsequent runs. Putting
+# them in a temp dir allows them to be easily cleaned up.
+rsynctmp=".sentryusbtmp"
+rm -rf "$ARCHIVE_MOUNT/${rsynctmp:?}" || true
+mkdir -p "$ARCHIVE_MOUNT/$rsynctmp"
+
+while [ -n "${1+x}" ]
+do
+  # Using --no-o --no-g to prevent permission errors on NFS root squashed shares
+  # Low I/O + CPU priority so the archive reads never starve the car's
+  # dashcam writes on the same disk (see run/rsync_archive/archive-clips.sh
+  # for the full rationale; -c2 -n7 not -c3 so progress is guaranteed).
+  # --log-file-format contains %b so records are written at the END of each
+  # file's transfer — the watchdog counts them as its progress signal.
+  if ! (ionice -c2 -n7 nice -n19 rsync -avhRL --no-o --no-g --remove-source-files --temp-dir="$rsynctmp" --no-perms --omit-dir-times --stats \
+        --log-file=/tmp/archive-rsync-cmd.log --log-file-format='%i %b %n%L' --ignore-missing-args \
+        --files-from="$2" "$1/" "$ARCHIVE_MOUNT" &> /tmp/rsynclog || [[ "$?" = "24" ]] )
+  then
+    cat /tmp/archive-rsync-cmd.log /tmp/rsynclog > /tmp/archive-error.log
+    exit 1
+  fi
+
+  shift 2
+done
+
+rm -rf "$ARCHIVE_MOUNT/${rsynctmp:?}" || true
+
+kill %1 || true
+NFSCLIPS_EOF
+    else
+        cat > "$clips.new" <<'CIFSCLIPS_EOF'
+#!/bin/bash -eu
+
+# MOUNTED_ARCHIVE_MONITOR_V1: the connection watchdog lives in
+# mounted-archive-monitor.sh (shared with the NFS variant) and only kills
+# rsync when probes fail AND no file has completed for a grace window —
+# probe-only monitoring aborted healthy transfers on lossy WiFi links.
+source /root/bin/mounted-archive-monitor.sh
+
+# Truncate before the monitor starts: a stale log from the previous run
+# would seed the monitor's completed-file counter with the old total.
+rm -f /tmp/archive-rsync-cmd.log /tmp/archive-error.log
+
+connectionmonitor $$ &
+
+# rsync's temp files may be left behind if the connection is lost,
+# but rsync doesn't clean these up on subsequent runs. Putting
+# them in a temp dir allows them to be easily cleaned up.
+rsynctmp=".sentryusbtmp"
+rm -rf "$ARCHIVE_MOUNT/${rsynctmp:?}" || true
+mkdir -p "$ARCHIVE_MOUNT/$rsynctmp"
+
+while [ -n "${1+x}" ]
+do
+  # Low I/O + CPU priority so the archive reads never starve the car's
+  # dashcam writes on the same disk (see run/rsync_archive/archive-clips.sh
+  # for the full rationale; -c2 -n7 not -c3 so progress is guaranteed).
+  # --log-file-format contains %b so records are written at the END of each
+  # file's transfer — the watchdog counts them as its progress signal.
+  if ! (ionice -c2 -n7 nice -n19 rsync -avhRL --remove-source-files --temp-dir="$rsynctmp" --no-perms --omit-dir-times --stats \
+        --log-file=/tmp/archive-rsync-cmd.log --log-file-format='%i %b %n%L' --ignore-missing-args \
+        --files-from="$2" "$1/" "$ARCHIVE_MOUNT" &> /tmp/rsynclog || [[ "$?" = "24" ]] )
+  then
+    cat /tmp/archive-rsync-cmd.log /tmp/rsynclog > /tmp/archive-error.log
+    exit 1
+  fi
+
+  shift 2
+done
+
+rm -rf "$ARCHIVE_MOUNT/${rsynctmp:?}" || true
+
+kill %1 || true
+CIFSCLIPS_EOF
+    fi
+
+    chmod 755 /root/bin/mounted-archive-monitor.sh.new "$clips.new" 2>/dev/null || true
+
+    if ! bash -n /root/bin/mounted-archive-monitor.sh.new 2>/dev/null \
+       || ! bash -n "$clips.new" 2>/dev/null \
+       || ! grep -q 'MOUNTED_ARCHIVE_MONITOR_V1' "$clips.new"; then
+        err "mounted-watchdog: staged script failed verification (disk full? truncated write?)"
+        rm -f /root/bin/mounted-archive-monitor.sh.new "$clips.new"
+        _mounted_wd_relock
+        return 1
+    fi
+
+    mv /root/bin/mounted-archive-monitor.sh.new /root/bin/mounted-archive-monitor.sh
+    mv "$clips.new" "$clips"
+    _mounted_wd_relock
+    log "mounted-watchdog: $variant archive-clips.sh refreshed (dual-signal monitor, scoped kill)"
+}
+
+# ── Rock 4C+ WiFi NVRAM: remove the TX-collapsing AP6256 relink ──────────
+# The old 4C+ installer symlinked the board WiFi NVRAM to nvram_ap6256.txt,
+# which collapses TX to ~6 Mbit/s (sole TX-power source, no txcap_blob).
+# Remove it → driver falls back to the generic brcmfmac43455-sdio.txt. Heals
+# existing boxes on OTA (reboots on completion). BT coexistence is the .hcd
+# patch, not this.
+apply_4cplus_wifi_nvram_fix() {
+    is_rock_4cplus || return 0
+    local brcm=/lib/firmware/brcm
+    local link="$brcm/brcmfmac43455-sdio.radxa,rock-4c-plus.txt"
+    # Only our exact relink (symlink -> nvram_ap6256.txt); leave anything else alone.
+    [ -L "$link" ] || { log "4c+ wifi nvram: no board relink — generic in use"; return 0; }
+    if [ "$(basename "$(readlink "$link")")" != "nvram_ap6256.txt" ]; then
+        log "4c+ wifi nvram: board .txt not the AP6256 relink — leaving as-is"
+        return 0
+    fi
+    # Re-lock only if we unlocked (leave root as found).
+    local ro_before=no
+    findmnt -no OPTIONS / 2>/dev/null | grep -qE '(^|,)ro(,|$)' && ro_before=yes
+    [ -x /root/bin/remountfs_rw ] && /root/bin/remountfs_rw >/dev/null 2>&1 || true
+    if rm -f "$link" 2>/dev/null; then
+        log "4c+ wifi nvram: removed AP6256 relink → generic fallback (REBOOT to apply)"
+    else
+        err "4c+ wifi nvram: could not remove $link (read-only fs? check remountfs_rw)"
+    fi
+    if [ "$ro_before" = yes ]; then
+        sync
+        mount -o remount,ro / 2>/dev/null || true
+    fi
+}
+
+
+# ── Snapshot eviction/slot-order fixes (all boards) ─────────────────────
+#
+# Snapshot slot names are NOT time-monotonic in the field: a reflash can
+# leave a stale high-numbered snapshot above a freshly restarted sequence
+# (real device: snap-000414 from Jul 9 sitting over snap-000413 from
+# Aug 8, numbering restarted at snap-000000 beneath it). Two legacy-bash
+# consequences fixed here for installs that still run the FULL scripts:
+#   - manage_free_space.sh picked the "oldest" snapshot by NAME
+#     (`sort | head -1`) and could evict newer footage while sparing the
+#     genuinely oldest snapshot;
+#   - make_snapshot.sh derived its next slot from snap.bin paths, so a
+#     tree with dirs but no snap.bin restarts numbering at 0.
+# Modern installs have thin wrappers calling `sentryusb space manage` /
+# `sentryusb snapshot make`; the Rust binary carries these fixes there,
+# and the wrappers are deliberately left untouched.
+
+apply_snapshot_eviction_by_age() {
+    local f=/root/bin/manage_free_space.sh
+    [ -f "$f" ] || { warn "eviction-by-age: $f missing — skipping"; return 0; }
+    if grep -q 'sentryusb space manage' "$f"; then
+        log "eviction-by-age: thin Rust wrapper — binary carries the fix"
+        return 0
+    fi
+    # Marker must name the CURRENT body, not just "some mtime patch".
+    # The first shipped version of this patch only had the mtime
+    # ordering; a device that received it would match a generic marker
+    # and never get the clock-rollback guard added later — which is the
+    # data-loss fix. Key on text unique to the newest body.
+    if grep -q 'HIGHEST-numbered snapshot' "$f"; then
+        log "eviction-by-age: already patched (current version)"
+        return 0
+    fi
+    # Two accepted inputs: the ORIGINAL legacy body, or the earlier
+    # mtime-only patched body (needs upgrading to add the clock guard).
+    # Both are byte-stable shipped artifacts, so a whole-file replace is
+    # safe; anything else is a local fork and is left alone.
+    if grep -qF "oldest=\$(find /backingfiles/snapshots -maxdepth 1 -name 'snap-*' | sort | head -1)" "$f"; then
+        log "eviction-by-age: upgrading original legacy body"
+    elif grep -q 'oldest by snap.bin mtime' "$f"; then
+        log "eviction-by-age: upgrading earlier mtime-only patch to add the clock-rollback guard"
+    else
+        warn "eviction-by-age: unknown local variant of $f — leaving untouched"
+        return 0
+    fi
+    [ -x /root/bin/remountfs_rw ] && /root/bin/remountfs_rw >/dev/null 2>&1 || true
+
+    # Whole-file staged replace (this script was byte-stable since the
+    # port, so the fingerprint above proves we know exactly what we are
+    # replacing). Atomic rename so archiveloop can never see a torn file.
+    cat > "$f.new" <<'MFS_EOF'
+#!/bin/bash -eu
+
+if [ "${BASH_SOURCE[0]}" != "$0" ]
+then
+  echo "${BASH_SOURCE[0]} must be executed, not sourced"
+  return 1 # shouldn't use exit when sourced
+fi
+
+if [ "${FLOCKED:-}" != "$0" ]
+then
+  mkdir -p /backingfiles/snapshots
+  if FLOCKED="$0" flock -E 99 /backingfiles/snapshots "$0" "$@" || case "$?" in
+  99) echo "failed to lock snapshots dir"
+      exit 99
+      ;;
+  *)  exit $?
+      ;;
+  esac
+  then
+    # success
+    exit 0
+  fi
+fi
+
+# archiveloop exports its own `log` to children (export -f log), so the
+# normal path inherits it. A HAND invocation does not, and every log
+# call would then abort the script under `set -e` — right before the
+# delete, so a troubleshooting operator got `log: command not found` and
+# no cleanup. Define a stdout fallback only when nothing was inherited.
+if ! declare -F log > /dev/null 2>&1
+then
+  function log () {
+    echo "$( date ):" "$@"
+  }
+fi
+
+function manage_free_space {
+  # Try to make free space equal to 10 GB plus three percent of the total
+  # available space. This should be enough to hold the next hour of
+  # recordings without completely filling up the filesystem.
+  # todo: this could be put in a background task and with a lower free
+  # space requirement, to delete old snapshots just before running out
+  # of space and thus make better use of space
+  local reserve="$1"
+  while true
+  do
+    local freespace
+    freespace=$(eval "$(stat --file-system --format="echo \$((%f*%S))" /backingfiles/cam_disk.bin)")
+    if [ "$freespace" -gt "$reserve" ]
+    then
+      exit 0
+    fi
+    # Candidates = snapshot dirs that actually hold a snap.bin, ordered by
+    # the bin's mtime (TRUE age), name as tie-break. Slot numbers are not
+    # time-monotonic in the field — a reflash can leave a stale
+    # high-numbered snapshot above a restarted sequence — and the old
+    # name-order pick (`sort | head -1`) deleted newer footage while
+    # sparing the genuinely oldest snapshot. The same list feeds the
+    # "fewer than two" guard so the count and the pick can't disagree.
+    local candidates
+    # `-regex` (not just snap-*) so a scratch dir like snap-backup/ is
+    # never a deletion candidate — matches the numeric-only rule the
+    # Rust scanners use.
+    candidates=$(
+      LC_ALL=C find /backingfiles/snapshots \
+        -mindepth 2 -maxdepth 2 -type f \
+        -regextype posix-extended -regex '/backingfiles/snapshots/snap-[0-9]+/snap\.bin' \
+        -printf '%T@\t%h\n' 2>/dev/null |
+      LC_ALL=C sort -t $'\t' -k1,1n -k2,2
+    )
+    if [ -z "$candidates" ]
+    then
+      log "Warning: low space for new snapshots, but no snapshots exist."
+      log "Please use a larger storage medium or reduce CAM_SIZE"
+      exit 1
+    fi
+    # if there's only one snapshot then we likely just took it, so don't immediately delete it
+    if [ "$(printf '%s\n' "$candidates" | wc -l)" -lt 2 ]
+    then
+      # there's only one snapshot and yet we're low on space
+      log "Warning: low space for new snapshots, but only one snapshot exists."
+      log "Please use a larger storage medium or reduce CAM_SIZE"
+      exit 1
+    fi
+
+    # Never delete the HIGHEST-numbered snapshot, even if its mtime says
+    # it is the oldest. This board usually has no battery-backed RTC and
+    # archiveloop starts freespacemanager BEFORE timesyncloop, so a boot
+    # can run eviction while the clock still holds a fake-hwclock time in
+    # the past — the snapshot just taken then sorts as oldest and would
+    # be the first deleted. Slot numbers are allocated monotonically, so
+    # the highest number is the most recent creation whatever the clock
+    # said. Mirrors `releasable()` in crates/usb_gadget/src/space.rs.
+    # Withhold BOTH the highest-numbered slot and the newest-by-mtime,
+    # matching releasable() in space.rs. (Protecting only the highest
+    # would still let a long low-space run delete the mtime-newest.)
+    local highest newest
+    highest=$(printf '%s\n' "$candidates" | cut -f2- | sed 's#.*/##' \
+              | grep -E '^snap-[0-9]+$' | LC_ALL=C sort | tail -1)
+    newest=$(printf '%s\n' "$candidates" | tail -1 | cut -f2- | sed 's#.*/##')
+    oldest=$(printf '%s\n' "$candidates" | cut -f2- \
+             | grep -v "/${highest}\$" | grep -v "/${newest}\$" | head -1)
+    if [ -z "$oldest" ]
+    then
+      log "unable to select oldest snapshot (only protected snapshots remain)"
+      exit 1
+    fi
+    log "low space, deleting $oldest (oldest by snap.bin mtime)"
+    /root/bin/release_snapshot.sh "$oldest"
+    rm -rf "$oldest"
+  done
+}
+
+# Normally called by archiveloop's freespacemanager with "10G + 3% of
+# total space". When invoked by hand with no argument, compute the SAME
+# policy rather than falling back to a flat 20G: a size-blind default is
+# harsher than the real policy on small drives and far weaker on
+# multi-TB ones, which is exactly the vintage-dependent divergence this
+# shares with crates/usb_gadget/src/space.rs (default_reserve_bytes).
+reserve="${1:-}"
+if [ -z "$reserve" ]
+then
+  reserve=$(eval "$(stat --file-system --format="echo \$((10737418240 + %b*%S/33))" /backingfiles/cam_disk.bin)")
+fi
+manage_free_space "$reserve"
+MFS_EOF
+    if ! bash -n "$f.new" 2>/dev/null; then
+        err "eviction-by-age: staged replacement failed bash -n — aborting"
+        rm -f "$f.new"
+        return 1
+    fi
+    chmod --reference="$f" "$f.new" 2>/dev/null || chmod 755 "$f.new"
+    if ! mv "$f.new" "$f"; then
+        err "eviction-by-age: rename failed (read-only fs? disk full?) — $f left as-is"
+        rm -f "$f.new"
+        return 1
+    fi
+    log "eviction-by-age: replaced legacy manage_free_space.sh (mtime-ordered eviction)"
+}
+
+apply_snapshot_slot_pick_hardening() {
+    local f=/root/bin/make_snapshot.sh
+    [ -f "$f" ] || { warn "slot-pick: $f missing — skipping"; return 0; }
+    if grep -q 'sentryusb snapshot make' "$f"; then
+        log "slot-pick: thin Rust wrapper — binary carries the fix"
+        return 0
+    fi
+    if grep -q 'slot pick: picker=bash' "$f"; then
+        log "slot-pick: already patched"
+        return 0
+    fi
+    # The picker block is byte-stable since the original port even though
+    # the rest of make_snapshot.sh has drifted across releases; anchor on
+    # its first and last lines and replace just that block.
+    if ! grep -qF 'oldnum=$(find /backingfiles/snapshots/snap-* -maxdepth 1 -name snap.bin | sort | tail -1' "$f"; then
+        warn "slot-pick: unknown local variant of $f — leaving untouched"
+        return 0
+    fi
+    [ -x /root/bin/remountfs_rw ] && /root/bin/remountfs_rw >/dev/null 2>&1 || true
+
+    local result
+    result="$(python3 - "$f" 2>&1 <<'SLOT_PYEOF'
+import sys
+p = sys.argv[1]; s = open(p).read()
+a = s.find("  local oldnum=-1")
+b = s.find("  newsnapdir=/backingfiles/snapshots/snap-", a)
+if a < 0 or b <= a:
+    print("anchor-not-found"); raise SystemExit
+new = """  # Highest slot from snapshot DIRECTORY names, not snap.bin presence
+  # (slot pick hardening — see run/make_snapshot.sh in the repo).
+  local oldnum=-1
+  local newnum=0
+  local maxdir
+  maxdir=$(LC_ALL=C find /backingfiles/snapshots -mindepth 1 -maxdepth 1 \
+             -type d -name 'snap-*' 2>/dev/null |
+           grep -E '/snap-[0-9]+$' | LC_ALL=C sort | tail -1)
+  if [ -n "$maxdir" ]
+  then
+    oldnum=$(basename "$maxdir" | tr -c -d '[:digit:]' | sed 's/^0*//')
+    oldnum=${oldnum:-0}
+    newnum=$((oldnum + 1))
+  fi
+  local oldname
+  local newsnapdir
+  oldname=/backingfiles/snapshots/snap-$(printf "%06d" "$oldnum")/snap.bin
+
+  # check that the previous snapshot is complete (TOC AND bin present)
+  if [ "$oldnum" != "-1" ] && { [ ! -e "${oldname}.toc" ] || [ ! -e "$oldname" ]; }
+  then
+    if grep -q "/backingfiles/snapshots/snap-$(printf "%06d" "$oldnum")/" /proc/mounts 2>/dev/null || \
+       grep -q "/tmp/snapshots/snap-$(printf "%06d" "$oldnum")" /proc/mounts 2>/dev/null
+    then
+      log "previous snapshot snap-$(printf "%06d" "$oldnum") incomplete but mounted — appending instead of reusing"
+      oldnum=$((oldnum - 1))
+      oldname=/backingfiles/snapshots/snap-$(printf "%06d" "$oldnum")/snap.bin
+    else
+      log "previous snapshot was incomplete, deleting"
+      rm -rf "$(dirname "$oldname")"
+      newnum=$((oldnum))
+      oldnum=$((oldnum - 1))
+      oldname=/backingfiles/snapshots/snap-$(printf "%06d" "$oldnum")/snap.bin
+    fi
+  fi
+  log "slot pick: picker=bash max_seen=${maxdir:-none} prev=$oldnum next=$newnum"
+
+"""
+staged = p + ".new"
+open(staged, "w").write(s[:a] + new + s[b:])
+print("staged")
+SLOT_PYEOF
+)" || result="python-error"
+
+    if [ "$result" != "staged" ] || [ ! -f "$f.new" ]; then
+        err "slot-pick: staging failed ($result) — leaving $f untouched"
+        rm -f "$f.new"
+        return 1
+    fi
+    if ! bash -n "$f.new" 2>/dev/null || ! grep -q 'slot pick: picker=bash' "$f.new"; then
+        err "slot-pick: staged file failed verification — aborting"
+        rm -f "$f.new"
+        return 1
+    fi
+    chmod --reference="$f" "$f.new" 2>/dev/null || chmod 755 "$f.new"
+    if ! mv "$f.new" "$f"; then
+        err "slot-pick: rename failed (read-only fs? disk full?) — $f left as-is"
+        rm -f "$f.new"
+        return 1
+    fi
+    log "slot-pick: patched legacy make_snapshot.sh picker (dir-name max + mounted guard)"
+}
+
+# Counts patches that FAILED to apply (as opposed to correctly skipping).
+# The runner deliberately has no `set -e` — one broken patch must not stop
+# the rest from applying — so without an explicit tally a failed write or
+# rename is invisible and the OTA caller records "patches re-applied
+# successfully". Every patch function returns 0 for "applied" AND for
+# "legitimately not applicable" (wrong board, thin wrapper, already
+# patched, file absent); a non-zero return means a REAL failure.
+PATCH_FAILURES=0
+
+# Run one patch function, tallying a hard failure without aborting the
+# rest of the run.
+run_patch() {
+    local fn="$1"
+    if ! "$fn"; then
+        PATCH_FAILURES=$((PATCH_FAILURES + 1))
+        err "$fn: FAILED"
+    fi
+}
+
+# ── MALLOC_ARENA_MAX on the server unit (all boards) ────────────────────
+#
+# main.rs' periodic malloc_trim assumes the unit caps glibc at two malloc
+# arenas; fresh installs get the Environment line from setup-sentryusb,
+# but units written by older setups never had it — glibc then defaults to
+# 8 * cores arenas, whose free lists hold RSS after clip-ingest bursts on
+# exactly the low-RAM boards that can least afford it.
+apply_malloc_arena_cap() {
+    local unit=/etc/systemd/system/sentryusb.service
+    [ -f "$unit" ] || { log "malloc-arena: no server unit — skipping"; return 0; }
+    if grep -q '^Environment=MALLOC_ARENA_MAX=' "$unit"; then
+        log "malloc-arena: already set"
+        return 0
+    fi
+    [ -x /root/bin/remountfs_rw ] && /root/bin/remountfs_rw >/dev/null 2>&1 || true
+    if sed -i '/^\[Service\]/a Environment=MALLOC_ARENA_MAX=2' "$unit"; then
+        systemctl daemon-reload 2>/dev/null || true
+        # Takes effect on the service's next restart — the OTA flow
+        # restarts it right after this script anyway.
+        log "malloc-arena: MALLOC_ARENA_MAX=2 added to $unit"
+    else
+        err "malloc-arena: failed to edit $unit"
+        return 1
+    fi
+}
+
 # ── Run all patches ─────────────────────────────────────────────────────
 
-apply_ble_nonfatal_adv
-apply_ble_adv_helper
-apply_eatt_disable
-apply_backingfiles_bfq
-apply_hardware_watchdog
-apply_archive_mount_lock_scripts
-apply_rfkill_unblock_wifi
-apply_rclone_config_mutable_migration
-apply_rclone_watchdog_fix
+run_patch apply_ble_nonfatal_adv
+run_patch apply_ble_adv_helper
+run_patch apply_eatt_disable
+run_patch apply_backingfiles_bfq
+run_patch apply_hardware_watchdog
+run_patch apply_archive_mount_lock_scripts
+run_patch apply_rfkill_unblock_wifi
+run_patch apply_4cplus_wifi_nvram_fix
+run_patch apply_rclone_config_mutable_migration
+run_patch apply_rclone_watchdog_fix
+run_patch apply_mounted_archive_watchdog
+run_patch apply_snapshot_eviction_by_age
+run_patch apply_snapshot_slot_pick_hardening
+run_patch apply_malloc_arena_cap
 
 # Future patches that must survive an OTA update get appended here. Each
 # one self-checks board / precondition / marker so the whole script stays
 # a safe no-op on non-applicable systems.
+
+if [ "${PATCH_FAILURES:-0}" -gt 0 ]; then
+    err "$PATCH_FAILURES patch(es) failed to apply — see messages above"
+    exit 1
+fi
+exit 0

@@ -47,11 +47,40 @@ unsafe impl Send for SendCam {}
 /// `ord` sorts oldest-first; the live image is always newest.
 #[derive(Clone, Debug)]
 pub struct Source {
-    pub ord: u64,
+    /// `snap-NNNNNN` slot number. A deterministic TIE-BREAK only — never
+    /// an age signal: numbering restarts beneath stale leftovers after a
+    /// reflash. `u64::MAX` marks the live image.
+    pub slot: u64,
+    /// When this image was frozen (`snap.bin` inode mtime). `None` when
+    /// the inode could not be read; such a source sorts before every
+    /// known-age one so it can never win a merge conflict, while its
+    /// uniquely-recoverable files still surface.
+    pub mtime: Option<std::time::SystemTime>,
     /// Path of the image inside the XFS volume, e.g. "snapshots/snap-000001/snap.bin".
     pub image_path: PathBuf,
     pub label: String,
     pub toc: Option<Vec<TocEntry>>,
+}
+
+/// Order snapshot sources oldest-first for [`Archive::build_merged_tree`],
+/// which overwrites as it walks so the LAST source wins each path.
+///
+/// Key is `(mtime, slot)`. Rust orders `None < Some`, which is exactly the
+/// policy we want: unknown-age snapshots first (among themselves by slot),
+/// then known ones by when they were frozen, with the slot breaking exact
+/// ties (e.g. a restore that flattened timestamps).
+///
+/// The live image is NOT sorted here — it is appended afterwards and
+/// always wins, because "live" is a semantic role rather than a timestamp
+/// claim; a rolled-back clock must not let a frozen snapshot outrank the
+/// image the car is currently writing.
+///
+/// Deliberately does NOT reuse the Pi's highest-slot guard
+/// (`space.rs::releasable`): that guard exists so eviction never deletes
+/// a past-dated brand-new snapshot, and applying it to merge order would
+/// rank stale high-numbered leftovers last — recreating this very bug.
+fn sort_snapshot_sources(sources: &mut [Source]) {
+    sources.sort_by(|a, b| (a.mtime, a.slot).cmp(&(b.mtime, b.slot)));
 }
 
 #[derive(Clone, Debug)]
@@ -133,7 +162,9 @@ impl Archive {
         let xfs = Arc::new(Mutex::new(xfs));
         let mut warnings = Vec::new();
 
-        // Enumerate sources: snapshots (ordered by number) then the live image.
+        // Enumerate sources: snapshots oldest-first BY IMAGE MTIME (slot
+        // numbers are not time-monotonic — see sort_snapshot_sources),
+        // then the live image last.
         let mut sources = Vec::new();
         {
             let mut fs = xfs.lock().unwrap();
@@ -157,18 +188,33 @@ impl Archive {
                     warnings.push(format!("{}: no snap.bin, skipping", d.name));
                     continue;
                 }
+                // Age comes from the image's mtime, not the slot number.
+                let mtime = match fs.file_mtime(&image_path) {
+                    Ok(t) => Some(t),
+                    Err(e) => {
+                        warnings.push(format!(
+                            "{}: unreadable snap.bin timestamp ({e:#}); treating as oldest so it \
+                             cannot override newer snapshots",
+                            d.name
+                        ));
+                        None
+                    }
+                };
                 sources.push(Source {
-                    ord: num,
+                    slot: num,
+                    mtime,
                     label: d.name.clone(),
                     toc: None,
                     image_path,
                 });
             }
-            sources.sort_by_key(|s| s.ord);
-            // The live image is the newest source of all.
+            sort_snapshot_sources(&mut sources);
+            // The live image is the newest source of all — appended after
+            // the sort so it always wins, whatever the clock said.
             if fs.file_size(Path::new(LIVE_IMAGE)).is_ok() {
                 sources.push(Source {
-                    ord: u64::MAX,
+                    slot: u64::MAX,
+                    mtime: None,
                     label: "live".to_string(),
                     toc: None,
                     image_path: PathBuf::from(LIVE_IMAGE),
@@ -616,6 +662,64 @@ mod tests {
 
     fn tree(paths: &[&str]) -> BTreeMap<String, FileMeta> {
         paths.iter().map(|p| (p.to_string(), meta(0))).collect()
+    }
+
+    fn snap(slot: u64, mtime_secs: Option<u64>) -> Source {
+        Source {
+            slot,
+            mtime: mtime_secs
+                .map(|s| std::time::UNIX_EPOCH + std::time::Duration::from_secs(s)),
+            label: format!("snap-{slot:06}"),
+            toc: None,
+            image_path: PathBuf::from(format!("snapshots/snap-{slot:06}/snap.bin")),
+        }
+    }
+
+    /// Slot numbers are NOT time-monotonic in the field: a reflash can
+    /// leave a stale high-numbered snapshot above a restarted sequence
+    /// (verified device: snap-000414 frozen Jul 9 sitting above
+    /// snap-000413 frozen Aug 8). `build_merged_tree` overwrites as it
+    /// walks sources, so ordering by slot let the STALE snapshot win and
+    /// serve its older file data as authoritative.
+    #[test]
+    fn sources_order_by_mtime_not_slot_number() {
+        let mut sources = vec![
+            snap(414, Some(1_784_600_000)), // stale leftover: highest slot, OLDEST
+            snap(0, Some(1_785_300_000)),
+            snap(413, Some(1_786_200_000)), // genuinely newest
+        ];
+        sort_snapshot_sources(&mut sources);
+        let order: Vec<&str> = sources.iter().map(|s| s.label.as_str()).collect();
+        assert_eq!(order, vec!["snap-000414", "snap-000000", "snap-000413"]);
+    }
+
+    /// An unreadable inode must never win a merge conflict, but its
+    /// uniquely-recoverable files should still surface — so it sorts
+    /// before every known-age snapshot, with slot breaking ties among
+    /// unknowns.
+    #[test]
+    fn sources_with_unknown_mtime_sort_first_by_slot() {
+        let mut sources = vec![
+            snap(50, Some(1_700_000_000)),
+            snap(9, None),
+            snap(7, None),
+        ];
+        sort_snapshot_sources(&mut sources);
+        let order: Vec<&str> = sources.iter().map(|s| s.label.as_str()).collect();
+        assert_eq!(order, vec!["snap-000007", "snap-000009", "snap-000050"]);
+    }
+
+    /// Equal mtimes (restore that flattened timestamps) fall back to slot
+    /// order, which is the best remaining signal.
+    #[test]
+    fn sources_with_equal_mtime_fall_back_to_slot() {
+        let mut sources = vec![
+            snap(12, Some(1_786_200_000)),
+            snap(3, Some(1_786_200_000)),
+        ];
+        sort_snapshot_sources(&mut sources);
+        let order: Vec<&str> = sources.iter().map(|s| s.label.as_str()).collect();
+        assert_eq!(order, vec!["snap-000003", "snap-000012"]);
     }
 
     #[test]

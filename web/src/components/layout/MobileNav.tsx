@@ -1,27 +1,28 @@
 import { useState, useEffect } from "react"
 import { NavLink } from "react-router-dom"
 import {
-  LayoutDashboard,
-  Video,
-  FolderOpen,
-  ScrollText,
-  MapPin,
-  MessageCircle,
-  Settings,
-  X,
-  Shield,
-  TerminalSquare,
-  HeartPulse,
-  Timer,
-  LogOut,
-  Users,
-  Paintbrush,
-  Volume2,
-  BellRing,
-  Wifi,
-  Camera,
-  BatteryCharging,
-} from "lucide-react"
+  BrushIcon,
+  CardiologyIcon,
+  ChargerIcon,
+  CloseIcon,
+  DashboardIcon,
+  FolderOpenIcon,
+  GroupIcon,
+  LocationOnIcon,
+  LogoutIcon,
+  NotificationsActiveIcon,
+  PhotoCameraIcon,
+  ReceiptLongIcon,
+  SettingsIcon,
+  ShieldIcon,
+  SmartToyIcon,
+  Terminal2Icon,
+  TimerIcon,
+  VerifiedUserIcon,
+  VideocamIcon,
+  VolumeUpIcon,
+  WifiIcon,
+} from "@/components/icons"
 import { cn } from "@/lib/utils"
 import { useAwayMode } from "@/hooks/useAwayMode"
 import { useKeepAwake } from "@/hooks/useKeepAwake"
@@ -36,32 +37,35 @@ interface MobileNavProps {
 }
 
 const baseNavItems = [
-  { to: "/", icon: LayoutDashboard, label: "Dashboard" },
-  { to: "/viewer", icon: Video, label: "Viewer" },
-  { to: "/files", icon: FolderOpen, label: "Files" },
-  { to: "/snapshots", icon: Camera, label: "Snapshots" },
-  { to: "/logs", icon: ScrollText, label: "Logs" },
-  { to: "/drives", icon: MapPin, label: "Drives" },
-  { to: "/community", icon: Users, label: "Community" },
-  { to: "/notifications", icon: BellRing, label: "Notifications" },
-  { to: "/settings", icon: Settings, label: "Settings" },
+  { to: "/", icon: DashboardIcon, label: "Dashboard" },
+  { to: "/viewer", icon: VideocamIcon, label: "Viewer" },
+  { to: "/files", icon: FolderOpenIcon, label: "Files" },
+  { to: "/snapshots", icon: PhotoCameraIcon, label: "Snapshots" },
+  { to: "/logs", icon: ReceiptLongIcon, label: "Logs" },
+  { to: "/drives", icon: LocationOnIcon, label: "Drives" },
+  { to: "/community", icon: GroupIcon, label: "Community" },
+  { to: "/notifications", icon: NotificationsActiveIcon, label: "Notifications" },
+  { to: "/settings", icon: SettingsIcon, label: "Settings" },
 ]
 
 function buildNavItems(
   mode: ReturnType<typeof useCommunityPrefs>["mode"],
 ) {
-  // Charging history is a standard view now — slot it right after Drives.
   const items = baseNavItems.flatMap((item) =>
     item.to === "/drives"
-      ? [item, { to: "/charging", icon: BatteryCharging, label: "Charging" }]
+      ? [
+          item,
+          { to: "/charging", icon: ChargerIcon, label: "Charging" },
+          { to: "/safety", icon: VerifiedUserIcon, label: "Safety Score" },
+        ]
       : [item],
   )
   return items
     .filter((item) => item.to !== "/community" || mode !== "none")
     .map((item) => {
       if (item.to !== "/community") return item
-      if (mode === "wraps-only") return { ...item, icon: Paintbrush, label: "Wraps" }
-      if (mode === "chimes-only") return { ...item, icon: Volume2, label: "Lock Chimes" }
+      if (mode === "wraps-only") return { ...item, icon: BrushIcon, label: "Wraps" }
+      if (mode === "chimes-only") return { ...item, icon: VolumeUpIcon, label: "Lock Chimes" }
       return item
     })
 }
@@ -88,18 +92,16 @@ export function MobileNav({ open, onClose }: MobileNavProps) {
 
   return (
     <>
-      {/* Backdrop */}
       <div
         className="fixed inset-0 z-[600] bg-black/60"
         onClick={onClose}
       />
 
-      {/* Drawer */}
       <div className="glass-sidebar fixed left-0 top-0 z-[700] flex h-full w-64 flex-col">
         <div className="flex min-h-16 items-center justify-between px-4 py-3">
           <div className="flex items-center gap-3">
             <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-blue-500/20">
-              <Shield className="h-5 w-5 text-blue-400" />
+              <ShieldIcon className="h-5 w-5 text-blue-400" />
             </div>
             <div>
               <span className="text-lg font-semibold tracking-tight text-slate-100" style={{ fontFamily: '"Inter", -apple-system, system-ui, sans-serif' }}>
@@ -116,7 +118,7 @@ export function MobileNav({ open, onClose }: MobileNavProps) {
             onClick={onClose}
             className="rounded-lg p-1.5 text-slate-500 hover:bg-white/5 hover:text-slate-300"
           >
-            <X className="h-5 w-5" />
+            <CloseIcon className="h-5 w-5" />
           </button>
         </div>
 
@@ -157,7 +159,6 @@ export function MobileNav({ open, onClose }: MobileNavProps) {
           })}
         </nav>
 
-        {/* Terminal link (secondary) */}
         <NavLink
           to="/terminal"
           onClick={onClose}
@@ -170,11 +171,10 @@ export function MobileNav({ open, onClose }: MobileNavProps) {
             )
           }
         >
-          <TerminalSquare className="h-3.5 w-3.5 shrink-0" />
+          <Terminal2Icon className="h-3.5 w-3.5 shrink-0" />
           <span>Terminal</span>
         </NavLink>
 
-        {/* Support link (secondary) */}
         <NavLink
           to="/support"
           onClick={onClose}
@@ -187,11 +187,10 @@ export function MobileNav({ open, onClose }: MobileNavProps) {
             )
           }
         >
-          <MessageCircle className="h-3.5 w-3.5 shrink-0" />
-          <span>Support</span>
+          <SmartToyIcon className="h-3.5 w-3.5 shrink-0" />
+          <span>AI Support &amp; Help</span>
         </NavLink>
 
-        {/* Connection status */}
         <div className={cn(
           "mx-2 mb-1 flex items-center gap-2 rounded-lg px-3 py-2 text-xs",
           connState === "connected" ? "text-emerald-400" : connState === "reconnecting" ? "text-amber-400" : "text-red-400"
@@ -205,15 +204,13 @@ export function MobileNav({ open, onClose }: MobileNavProps) {
           </span>
         </div>
 
-        {/* Away Mode indicator */}
         {awayModeStatus.state === "active" && (
           <div className="mx-2 mb-1 flex items-center gap-2 rounded-lg px-3 py-2 text-xs text-blue-400">
-            <Wifi className="h-3.5 w-3.5 animate-pulse" />
+            <WifiIcon className="h-3.5 w-3.5 animate-pulse" />
             <span className="opacity-70">Away Mode</span>
           </div>
         )}
 
-        {/* Keep-awake indicator */}
         {isAwake && (
           <div className={cn(
             "mx-2 mb-2 flex items-center gap-2 rounded-lg px-3 py-2 text-xs",
@@ -222,9 +219,9 @@ export function MobileNav({ open, onClose }: MobileNavProps) {
               : "text-amber-400"
           )}>
             {status.state === "active" ? (
-              <HeartPulse className="h-3.5 w-3.5 animate-pulse" />
+              <CardiologyIcon className="h-3.5 w-3.5 animate-pulse" />
             ) : (
-              <Timer className="h-3.5 w-3.5 animate-pulse" />
+              <TimerIcon className="h-3.5 w-3.5 animate-pulse" />
             )}
             <span className="opacity-70">
               {status.state === "active" ? "Keeping awake" : "Waiting for archive..."}
@@ -232,13 +229,12 @@ export function MobileNav({ open, onClose }: MobileNavProps) {
           </div>
         )}
 
-        {/* Logout */}
         {authRequired && (
           <button
             onClick={() => { logout(); onClose() }}
             className="mx-2 mb-4 flex items-center gap-2 rounded-lg px-3 py-2 text-xs text-slate-600 transition-colors hover:bg-white/5 hover:text-slate-400"
           >
-            <LogOut className="h-3.5 w-3.5" />
+            <LogoutIcon className="h-3.5 w-3.5" />
             <span>Logout</span>
           </button>
         )}

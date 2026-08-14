@@ -1,5 +1,5 @@
 import { useState, useEffect } from "react"
-import { Users, Paintbrush, Volume2 } from "lucide-react"
+import { BrushIcon, GroupIcon, VolumeUpIcon } from "@/components/icons"
 import { PrefCard } from "@/components/settings/PrefCard"
 
 export function CommunityFeaturesSection() {
@@ -55,13 +55,13 @@ export function CommunityFeaturesSection() {
 
   return (
     <PrefCard
-      icon={<Users className="h-3.5 w-3.5" />}
+      icon={<GroupIcon className="h-3.5 w-3.5" />}
       halo="violet"
       title="Community Features"
     >
       <label className="flex cursor-pointer items-start justify-between gap-3">
         <div className="flex items-start gap-2">
-          <Paintbrush className="mt-0.5 h-3.5 w-3.5 shrink-0 text-blue-400" />
+          <BrushIcon className="mt-0.5 h-3.5 w-3.5 shrink-0 text-blue-400" />
           <div>
             <span className="text-xs font-medium text-slate-200">
               Wraps &amp; License Plates
@@ -84,7 +84,7 @@ export function CommunityFeaturesSection() {
 
       <label className="flex cursor-pointer items-start justify-between gap-3 border-t border-white/5 pt-3">
         <div className="flex items-start gap-2">
-          <Volume2 className="mt-0.5 h-3.5 w-3.5 shrink-0 text-blue-400" />
+          <VolumeUpIcon className="mt-0.5 h-3.5 w-3.5 shrink-0 text-blue-400" />
           <div>
             <span className="text-xs font-medium text-slate-200">Lock Chimes</span>
             <span className="mt-0.5 block text-[10px] text-slate-500">

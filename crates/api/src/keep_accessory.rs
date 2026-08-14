@@ -1,15 +1,9 @@
-//! POST /api/system/keep-accessory — manual control for Keep-Accessory
-//! Power.
+//! Manual Keep-Accessory Power control.
 //!
-//! Spawns `sentryusb-ble-action`, which routes the action through the
-//! telemetry daemon's warm BLE session over IPC (no competing radio
-//! grab). The Pi's automation (`tesla_telemetry::keep_accessory`)
-//! manages this hands-free for 12V-powered Pis; this endpoint is the
-//! manual override that backs the web / SC toggle.
+//! `sentryusb-ble-action` routes commands through the telemetry daemon's warm
+//! BLE session instead of competing for the radio.
 //!
-//! Write-only protocol: the car exposes no readable "is keep-accessory
-//! on?" state, so there is deliberately no GET — the UI tracks the last
-//! value it set (mirrors how the Tesla app's own toggle behaves).
+//! The vehicle exposes no readable state, so this protocol is write-only.
 
 use std::time::Duration;
 
@@ -47,8 +41,7 @@ pub async fn set_keep_accessory(
     };
     info!("[keep-accessory] manual request: {}", verb);
 
-    // 30s covers a cold direct-BLE fallback if the telemetry daemon
-    // (and its warm session) happens to be down.
+    // Allow time for direct-BLE fallback when the warm session is unavailable.
     match sentryusb_shell::run_with_timeout(
         Duration::from_secs(30),
         "/root/bin/sentryusb-ble-action",
@@ -58,13 +51,8 @@ pub async fn set_keep_accessory(
     {
         Ok(_) => {
             info!("[keep-accessory] {} ok", verb);
-            // Fire a `keep_accessory` push so the manual override produces the
-            // same user-facing signal as the automatic geofence-driven flips
-            // do (see tesla_telemetry::keep_accessory::notify_event). Fan out
-            // through the local Notification Center, which is gated by the
-            // `keep_accessory` pref toggle and routes to every configured
-            // channel including Sentry Connect. Best-effort — failures don't
-            // affect the API response.
+            // Send the same preference-gated notification as automatic changes.
+            // Notification failures do not affect the control response.
             let title = if req.on {
                 "Keep Accessory ON (manual)"
             } else {
@@ -115,13 +103,10 @@ pub async fn set_keep_accessory(
     }
 }
 
-/// Default home geofence radius (meters) when unset. ~120m swallows the
-/// reverse-geocode drift that makes a home occasionally read as a neighbor.
+/// Default home geofence radius in meters, allowing for GPS drift.
 const DEFAULT_HOME_RADIUS_M: f64 = 120.0;
 
-/// GET /api/system/keep-accessory-config → the persisted keep-accessory
-/// settings the daemon reads (the 12V gate + the home geofence). Powers
-/// the Settings card and the setup-wizard subsection.
+/// GET /api/system/keep-accessory-config
 pub async fn keep_accessory_config_get(
     State(_s): State<AppState>,
 ) -> (StatusCode, Json<serde_json::Value>) {
@@ -135,8 +120,7 @@ pub async fn keep_accessory_config_get(
                     Some("yes") | Some("true") | Some("1")
                 );
                 let lat = g("KEEP_ACCESSORY_HOME_LAT").and_then(|s| s.trim().parse::<f64>().ok());
-                // Normalize on read: configs written before the wrap fix may
-                // hold a world-copy longitude (e.g. -221 for 139°E).
+                // Normalize longitudes produced by map world copies.
                 let lon = g("KEEP_ACCESSORY_HOME_LON")
                     .and_then(|s| s.trim().parse::<f64>().ok())
                     .map(crate::normalize_lon);
@@ -165,40 +149,87 @@ pub struct KeepAccessoryConfigBody {
     pub home_lat: Option<f64>,
     pub home_lon: Option<f64>,
     pub home_radius_m: Option<f64>,
+    /// Preserve sessions leaving the geofence under this stored tag before the
+    /// derived Home set and its rate change. Ignored if the geofence is unchanged.
+    pub freeze_home_as: Option<String>,
 }
 
-/// PUT /api/system/keep-accessory-config → persist the keep-accessory
-/// settings to sentryusb.conf. Only the fields present in the body are
-/// written. The daemon re-reads config every tick, so no restart needed.
+/// PUT /api/system/keep-accessory-config
+/// Persist supplied fields; the daemon rereads configuration each tick.
 pub async fn keep_accessory_config_set(
     State(_s): State<AppState>,
     Json(body): Json<KeepAccessoryConfigBody>,
 ) -> (StatusCode, Json<serde_json::Value>) {
+    // Center and radius changes both redefine the derived Home set.
+    let freeze_as = body.freeze_home_as.clone().filter(|t| !t.trim().is_empty());
+    let home_moving =
+        body.home_lat.is_some() || body.home_lon.is_some() || body.home_radius_m.is_some();
+
+    // Freeze and persist the same normalized geofence values.
+    let new_lat = body.home_lat.filter(|v| v.is_finite()).map(|v| v.clamp(-90.0, 90.0));
+    // Map world copies can produce longitudes outside the canonical range.
+    let new_lon = body.home_lon.filter(|v| v.is_finite()).map(crate::normalize_lon);
+    // Keep the radius within 20 m–2 km.
+    let new_radius = body.home_radius_m.map(|r| r.clamp(20.0, 2000.0).round());
+    let enabled = body.enabled;
+
+    let mut frozen = 0usize;
+    if home_moving {
+        if let Some(tag) = freeze_as {
+            let store = _s.drives.store.clone();
+            match tokio::task::spawn_blocking(move || {
+                let new_home =
+                    crate::charging::pending_home_geofence(new_lat, new_lon, new_radius);
+                crate::charging::freeze_home_sessions(&store, &tag, new_home)
+            })
+            .await
+            {
+                Ok(Ok(f)) => {
+                    frozen = f.tagged;
+                    // The freeze marks copied rates dirty; wake the cloud sweep.
+                    if f.rates_dirty {
+                        _s.cloud.uploader.nudge();
+                    }
+                }
+                // Preserve history atomically with the requested move.
+                Ok(Err(e)) => {
+                    return crate::json_error(
+                        StatusCode::BAD_REQUEST,
+                        &format!("home not moved — could not preserve past charges: {e}"),
+                    )
+                }
+                Err(e) => {
+                    return crate::json_error(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        &format!("home not moved — freeze task failed: {e}"),
+                    )
+                }
+            }
+        }
+    }
+
     let result = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
         let config_path = sentryusb_config::find_config_path();
         let (mut active, _) = sentryusb_config::parse_file(config_path)?;
-        if let Some(enabled) = body.enabled {
+        if let Some(enabled) = enabled {
             active.insert(
                 "KEEP_ACCESSORY_ENABLED".to_string(),
                 if enabled { "yes" } else { "no" }.to_string(),
             );
         }
-        if let Some(lat) = body.home_lat.filter(|v| v.is_finite()) {
-            let lat = lat.clamp(-90.0, 90.0);
+        if let Some(lat) = new_lat {
             active.insert("KEEP_ACCESSORY_HOME_LAT".to_string(), format!("{lat:.6}"));
         }
-        if let Some(lon) = body.home_lon.filter(|v| v.is_finite()) {
-            // Leaflet world-copy clicks can arrive as e.g. -221.4 for 138.6°E.
-            let lon = crate::normalize_lon(lon);
+        if let Some(lon) = new_lon {
             active.insert("KEEP_ACCESSORY_HOME_LON".to_string(), format!("{lon:.6}"));
         }
-        if let Some(r) = body.home_radius_m {
-            // Clamp to a sane range (20m–2km) so a fat-finger can't make
-            // the geofence cover the county or vanish.
-            let r = r.clamp(20.0, 2000.0).round() as i64;
-            active.insert("KEEP_ACCESSORY_HOME_RADIUS_M".to_string(), r.to_string());
+        if let Some(r) = new_radius {
+            active.insert(
+                "KEEP_ACCESSORY_HOME_RADIUS_M".to_string(),
+                (r as i64).to_string(),
+            );
         }
-        // RO root → flip rw for the write (same pattern as ble_enabled_set).
+        // The root filesystem is normally read-only.
         let _ = std::process::Command::new("bash")
             .args(["-c", "/root/bin/remountfs_rw"])
             .status();
@@ -210,7 +241,14 @@ pub async fn keep_accessory_config_set(
     match result {
         Ok(Ok(())) => {
             info!("[keep-accessory] config updated");
-            (StatusCode::OK, Json(serde_json::json!({ "ok": true })))
+            if home_moving {
+                // Charging summaries contain geofence-derived Home tags.
+                crate::charging::invalidate_charging_list();
+            }
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({ "ok": true, "frozen": frozen })),
+            )
         }
         Ok(Err(e)) => crate::json_error(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -223,17 +261,13 @@ pub async fn keep_accessory_config_set(
     }
 }
 
-/// The telemetry daemon's GPS fix cache (`/mutable` on the Pi; honors
-/// the `SENTRYUSB_MUTABLE_DIR` dev override). Shared with away-mode's
-/// geofence watcher.
+/// GPS fix cache shared with Away Mode, respecting the mutable-dir override.
 pub(crate) fn gps_file() -> String {
     format!("{}/keep_accessory_gps.json", sentryusb_config::mutable_dir())
 }
 
-/// GET /api/system/keep-accessory-gps → the car's last raw GPS fix, written
-/// by the telemetry daemon's location poll. Drives the Settings/setup
-/// "Use current location" button. Returns nulls until a fix is available
-/// (feature must be enabled + the daemon must have polled location).
+/// GET /api/system/keep-accessory-gps
+/// Return the last raw vehicle GPS fix, or null fields until one is available.
 pub async fn keep_accessory_gps_get(
     State(_s): State<AppState>,
 ) -> (StatusCode, Json<serde_json::Value>) {

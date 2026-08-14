@@ -11,19 +11,13 @@ import {
 } from "recharts"
 import type { ChargePoint } from "@/types/charging"
 
-// Power on the left axis (kW), state-of-charge on the right (%) — the
-// two natural y-scales of a charge session. Mirrors TemperatureChart's
-// dark theme and tick styling so the charging detail reads as part of
-// the same UI. Nulls render as gaps (connectNulls keeps the line whole
-// across a missed sample).
-const POWER_COLOR = "#34d399" // emerald — energy in
-const SOC_COLOR = "#60a5fa" // blue — battery level
+// Power and state of charge use independent axes; missed samples remain gaps.
+const POWER_COLOR = "#34d399"
+const SOC_COLOR = "#60a5fa"
 
 const LEFT_MARGIN = 4
 const RIGHT_MARGIN = 8
 const YAXIS_WIDTH = 40
-// Bold horizontal unit captions sitting below each axis's values, on the
-// same baseline as the time ticks — which get squeezed between them.
 const AXIS_LABEL_STYLE = {
   fill: "#94a3b8",
   fontSize: 11,
@@ -38,15 +32,11 @@ function ChargePowerChart({
   projection,
 }: {
   points: ChargePoint[]
-  // Dashed SoC continuation from the last sample to the charge limit,
-  // shown while a charge is in progress. Omit for completed sessions.
+  // Project state of charge only for an active session.
   projection?: { ts: number; soc: number }[]
 }) {
   const hasProjection = !!projection && projection.length > 0
-  // The last actual point carries `socProjected` too, so the dashed line
-  // joins the solid one instead of starting from a gap. Memoized so the
-  // 30s live poll on the detail page doesn't rebuild the array (and force
-  // a recharts re-layout) when `points`/`projection` haven't changed.
+  // Seed the projected series at the last actual point to join both lines.
   const data: ChartPoint[] = useMemo(
     () => [
       ...points.map((p, i) => ({
@@ -72,7 +62,7 @@ function ChargePowerChart({
       <ResponsiveContainer minHeight={0} minWidth={0}>
         <LineChart
           data={data}
-          margin={{ top: 10, right: RIGHT_MARGIN, bottom: 24, left: LEFT_MARGIN }}
+          margin={{ top: 24, right: RIGHT_MARGIN, bottom: 24, left: LEFT_MARGIN }}
         >
           <CartesianGrid stroke="#1e242f" strokeDasharray="3 3" vertical={false} />
           <XAxis
@@ -98,7 +88,7 @@ function ChargePowerChart({
             tickMargin={4}
             width={YAXIS_WIDTH}
             domain={[0, "dataMax + 2"]}
-            label={{ value: "kW", position: "bottom", offset: 8, style: AXIS_LABEL_STYLE }}
+            label={{ value: "kW", position: "top", offset: 14, style: AXIS_LABEL_STYLE }}
           />
           <YAxis
             yAxisId="soc"
@@ -112,7 +102,7 @@ function ChargePowerChart({
             width={YAXIS_WIDTH}
             domain={[0, 100]}
             ticks={[0, 25, 50, 75, 100]}
-            label={{ value: "SoC", position: "bottom", offset: 8, style: AXIS_LABEL_STYLE }}
+            label={{ value: "SoC", position: "top", offset: 14, style: AXIS_LABEL_STYLE }}
           />
           <Tooltip
             content={({ active, payload }) => {
@@ -136,8 +126,7 @@ function ChargePowerChart({
                       value={`${Math.round(p.socProjected)}%`}
                     />
                   )}
-                  {/* Range intentionally omitted here — it has its own chart
-                      below and just duplicates the battery curve in miles. */}
+                  {/* Range has a separate chart below. */}
                 </div>
               )
             }}

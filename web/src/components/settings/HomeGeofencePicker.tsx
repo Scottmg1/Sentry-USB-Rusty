@@ -1,6 +1,7 @@
 import { useEffect, useState, type ReactNode } from "react"
-import { MapPin, Loader2 } from "lucide-react"
+import { LocationOnIcon, ProgressActivityIcon } from "@/components/icons"
 import { cn } from "@/lib/utils"
+import { normalizeLon } from "@/lib/geo"
 import { KeepAccessoryMap } from "@/components/settings/KeepAccessoryMap"
 
 export interface HomeGeofenceValues {
@@ -13,14 +14,13 @@ const RADIUS_PRESETS = [50, 100, 200, 500]
 const RADIUS_MIN = 20
 const RADIUS_MAX = 2000
 
-/**
- * Shared home-geofence editor: interactive map (pin + radius circle), a
- * radius input with presets, and an optional "Use current location"
- * button. Pure presentation — the parent owns the values + persistence.
- * Used by both Keep Accessory (12V power geofence) and Away Mode
- * (Automatic AP geofence); the surrounding copy is passed in so neither
- * feature's wording leaks into the other.
- */
+function formatCoords(lat: number | null, lon: number | null): string {
+  // Reject NaN config values before formatting.
+  if (lat == null || lon == null || !Number.isFinite(lat) || !Number.isFinite(lon)) return ""
+  return `${lat.toFixed(5)}, ${normalizeLon(lon).toFixed(5)}`
+}
+
+/** Controlled home-geofence editor shared by Keep Accessory and Away Mode. */
 export function HomeGeofencePicker({
   values,
   onChange,
@@ -31,20 +31,19 @@ export function HomeGeofencePicker({
 }: {
   values: HomeGeofenceValues
   onChange: (patch: Partial<HomeGeofenceValues>) => void
-  /** Optional — fetch the car's last GPS fix to set the home center. */
+  /** Fetch the car's last GPS fix for the home center. */
   onUseCurrentLocation?: () => Promise<{ lat: number; lon: number } | null>
-  /** Caption under the map (e.g. "outside the circle counts as away → …"). */
+  /** Caption below the map. */
   mapHint?: ReactNode
   /** Caption under the radius input. */
   radiusHint?: ReactNode
-  /** Persistence failure from the owning hook — shown so a failed PUT isn't silent. */
+  /** Persistence failure supplied by the owning hook. */
   saveError?: string | null
 }) {
   const [locating, setLocating] = useState(false)
   const [locError, setLocError] = useState<string | null>(null)
 
-  // Local text state so the radius field can be cleared/typed freely; we
-  // only clamp to [20, 2000] on blur/Enter instead of fighting keystrokes.
+  // Clamp the free-form radius only on blur or Enter.
   const [radiusText, setRadiusText] = useState(String(values.radiusM))
   useEffect(() => {
     setRadiusText(String(values.radiusM))
@@ -53,12 +52,64 @@ export function HomeGeofencePicker({
   function commitRadius() {
     const n = Math.round(Number(radiusText))
     if (!Number.isFinite(n) || radiusText.trim() === "") {
-      setRadiusText(String(values.radiusM)) // revert junk/empty to last good
+      setRadiusText(String(values.radiusM))
       return
     }
     const clamped = Math.min(RADIUS_MAX, Math.max(RADIUS_MIN, n))
     setRadiusText(String(clamped))
     if (clamped !== values.radiusM) onChange({ radiusM: clamped })
+  }
+
+  // Coordinates remain free-form until blur or Enter.
+  const [coordText, setCoordText] = useState(() => formatCoords(values.homeLat, values.homeLon))
+  const [coordError, setCoordError] = useState<string | null>(null)
+  // Both coordinates must be finite; parse errors and an unset home are distinct.
+  const haveHome = Number.isFinite(values.homeLat) && Number.isFinite(values.homeLon)
+  // Synchronize during render to avoid a second pass after every map move.
+  // Object.is converges even when a malformed config produced NaN.
+  const [syncedFrom, setSyncedFrom] = useState({ lat: values.homeLat, lon: values.homeLon })
+  if (!Object.is(values.homeLat, syncedFrom.lat) || !Object.is(values.homeLon, syncedFrom.lon)) {
+    setSyncedFrom({ lat: values.homeLat, lon: values.homeLon })
+    setCoordText(formatCoords(values.homeLat, values.homeLon))
+    // Clear parse errors after an external coordinate change.
+    setCoordError(null)
+  }
+
+  function commitCoords() {
+    const trimmed = coordText.trim()
+    if (trimmed === "") {
+      setCoordError(null)
+      setCoordText(formatCoords(values.homeLat, values.homeLon))
+      return
+    }
+    // Reject empty halves before Number("") can coerce them to zero.
+    const parts = trimmed.split(",")
+    const rawLat = parts.length === 2 ? parts[0].trim() : ""
+    const rawLon = parts.length === 2 ? parts[1].trim() : ""
+    const lat = rawLat === "" ? NaN : Number(rawLat)
+    const lon = rawLon === "" ? NaN : Number(rawLon)
+    if (!Number.isFinite(lat) || !Number.isFinite(lon)) {
+      setCoordError(
+        'Couldn\'t parse that — enter as "latitude, longitude" (e.g. 30.22214, -97.61833).',
+      )
+      return
+    }
+    // Validate typed longitude before normalization so a typo cannot wrap to
+    // another valid location. Existing world-copy values remain displayable.
+    if (Math.abs(lat) > 90 || Math.abs(lon) > 180) {
+      setCoordError("Out of range — latitude must be within ±90, longitude within ±180.")
+      return
+    }
+    const normalizedLon = normalizeLon(lon)
+    setCoordError(null)
+    // Canonicalize formatting even when the parsed value did not change.
+    const committedText = formatCoords(lat, normalizedLon)
+    setCoordText(committedText)
+    // Compare canonical display precision so focus/blur cannot trigger a PUT
+    // or truncate the backend's extra decimal.
+    if (committedText !== formatCoords(values.homeLat, values.homeLon)) {
+      onChange({ homeLat: lat, homeLon: normalizedLon })
+    }
   }
 
   async function useCurrent() {
@@ -79,8 +130,6 @@ export function HomeGeofencePicker({
     }
   }
 
-  const haveHome = values.homeLat != null && values.homeLon != null
-
   return (
     <div className="space-y-3 rounded-lg border border-white/5 bg-white/[0.02] p-3">
       <div className="flex items-center justify-between gap-2">
@@ -93,9 +142,9 @@ export function HomeGeofencePicker({
             className="inline-flex items-center gap-1.5 rounded-md border border-white/10 bg-white/5 px-2.5 py-1 text-xs text-slate-200 transition-colors hover:border-blue-500/40 disabled:opacity-50"
           >
             {locating ? (
-              <Loader2 className="h-3 w-3 animate-spin" />
+              <ProgressActivityIcon className="h-3 w-3 animate-spin" />
             ) : (
-              <MapPin className="h-3 w-3" />
+              <LocationOnIcon className="h-3 w-3" />
             )}
             Use current location
           </button>
@@ -108,19 +157,40 @@ export function HomeGeofencePicker({
         onPlace={(la, lo) => onChange({ homeLat: la, homeLon: lo })}
       />
       {mapHint && <p className="text-xs text-slate-600">{mapHint}</p>}
-      {haveHome ? (
-        <p className="text-xs text-slate-400">
-          📍 {values.homeLat!.toFixed(5)}, {values.homeLon!.toFixed(5)}
+
+      {/* Manual coordinates remain available without GPS. */}
+      <div>
+        <label className="mb-1 block text-xs font-medium text-slate-400">
+          Coordinates
+        </label>
+        <input
+          type="text"
+          inputMode="text"
+          autoComplete="off"
+          spellCheck={false}
+          value={coordText}
+          onChange={(e) => setCoordText(e.target.value)}
+          onBlur={commitCoords}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") (e.target as HTMLInputElement).blur()
+          }}
+          placeholder="30.22214, -97.61833"
+          className="w-full rounded-lg border border-white/10 bg-white/5 px-3 py-2 text-sm text-slate-100 outline-none transition placeholder:text-slate-600 focus:border-blue-500/50 focus:ring-1 focus:ring-blue-500/25"
+        />
+        <p className="mt-1 text-xs text-slate-600">
+          Latitude, longitude — north &amp; east are positive, south &amp; west are negative.
         </p>
-      ) : (
+        {coordError && <p className="mt-1 text-xs text-red-400">{coordError}</p>}
+      </div>
+      {!haveHome && (
         <p className="text-xs text-amber-400/80">
-          No home set — tap the map to drop your home pin.
+          No home set — tap the map or enter coordinates above to drop your home pin.
         </p>
       )}
+
       {locError && <p className="text-xs text-red-400">{locError}</p>}
       {saveError && <p className="text-xs text-red-400">{saveError}</p>}
 
-      {/* Adjustable radius — number input + quick presets */}
       <div>
         <label className="mb-1 block text-xs font-medium text-slate-400">
           Radius (meters)

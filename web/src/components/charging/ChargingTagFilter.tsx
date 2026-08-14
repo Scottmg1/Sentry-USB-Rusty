@@ -1,10 +1,8 @@
 import { useEffect, useRef, useState } from "react"
-import { Check, Tag } from "lucide-react"
+import { CheckIcon, SellIcon } from "@/components/icons"
 import { cn } from "@/lib/utils"
 
-// Tag filter for the Charging page, mirroring the Drives filter UX: a
-// pill that opens a checklist of every charge tag. Selecting tags keeps
-// only sessions carrying at least one of them (union match).
+// Selected tags use union matching.
 export function ChargingTagFilter({
   tags,
   selected,
@@ -47,7 +45,7 @@ export function ChargingTagFilter({
             : "border-white/10 bg-white/[0.03] text-slate-300 hover:bg-white/[0.06]",
         )}
       >
-        <Tag className="h-3.5 w-3.5" />
+        <SellIcon className="h-3.5 w-3.5" />
         Tags
         {count > 0 && (
           <span className="rounded-full bg-emerald-400/20 px-1.5 text-[10px] text-emerald-100">
@@ -80,7 +78,7 @@ export function ChargingTagFilter({
                           : "border-white/15 text-transparent",
                       )}
                     >
-                      <Check className="h-3 w-3" />
+                      <CheckIcon className="h-3 w-3" />
                     </span>
                     <span className="min-w-0 flex-1 truncate">{t}</span>
                   </button>

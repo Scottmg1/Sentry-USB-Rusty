@@ -110,7 +110,6 @@ async fn handle_terminal_ws(socket: WebSocket, addr: SocketAddr) {
         return;
     }
 
-    // Step 1: wait for auth
     let auth_raw = match receiver.next().await {
         Some(Ok(Message::Text(t))) => t,
         _ => {
@@ -138,7 +137,6 @@ async fn handle_terminal_ws(socket: WebSocket, addr: SocketAddr) {
         return;
     }
 
-    // Step 2: validate credentials
     if !validate_credentials(&username, &password).await {
         record_failure(&ip);
         warn!("[terminal] Failed auth for user {:?} from {}", username, ip);
@@ -150,7 +148,6 @@ async fn handle_terminal_ws(socket: WebSocket, addr: SocketAddr) {
 
     let _ = sender.send(send_msg_text("auth_ok", "")).await;
 
-    // Step 3: spawn PTY
     let pty_system = native_pty_system();
     let pair = match pty_system.openpty(PtySize {
         rows: 24,
@@ -214,7 +211,6 @@ async fn handle_terminal_ws(socket: WebSocket, addr: SocketAddr) {
     };
     let master = std::sync::Arc::new(std::sync::Mutex::new(pair.master));
 
-    // Channel: blocking PTY reader thread -> async WS sender
     let (out_tx, mut out_rx) = mpsc::channel::<Vec<u8>>(32);
 
     let read_handle = tokio::task::spawn_blocking(move || {
@@ -233,7 +229,6 @@ async fn handle_terminal_ws(socket: WebSocket, addr: SocketAddr) {
         }
     });
 
-    // Forward PTY -> WebSocket
     let send_task = tokio::spawn(async move {
         while let Some(chunk) = out_rx.recv().await {
             let text = String::from_utf8_lossy(&chunk).into_owned();
@@ -241,13 +236,11 @@ async fn handle_terminal_ws(socket: WebSocket, addr: SocketAddr) {
                 break;
             }
         }
-        // Best-effort close frame
         let _ = sender
             .send(send_msg_text("exit", "Terminal session ended"))
             .await;
     });
 
-    // WebSocket -> PTY + resize
     let master_for_recv = master.clone();
     let recv_task = tokio::spawn(async move {
         while let Some(Ok(msg)) = receiver.next().await {
@@ -279,8 +272,7 @@ async fn handle_terminal_ws(socket: WebSocket, addr: SocketAddr) {
                             }
                         }
                         "ping" => {
-                            // Pong is handled by the WS send task via output channel;
-                            // no-op here matches the Go server's heartbeat semantics.
+                            // Application-level pings require no terminal action.
                         }
                         _ => {}
                     }
@@ -291,9 +283,7 @@ async fn handle_terminal_ws(socket: WebSocket, addr: SocketAddr) {
         }
     });
 
-    // When either side finishes (client disconnect, PTY EOF), tear down:
-    //  - kill child (sends SIGHUP via PTY teardown)
-    //  - drop master (closes PTY, wakes blocking reader)
+    // Either side ending tears down the child and PTY.
     tokio::select! {
         _ = send_task => {}
         _ = recv_task => {}
@@ -301,15 +291,14 @@ async fn handle_terminal_ws(socket: WebSocket, addr: SocketAddr) {
 
     let _ = child.kill();
     let _ = child.wait();
-    // Drop master explicitly to unblock the reader thread if it's still alive.
+    // Closing the master unblocks the reader thread.
     drop(master);
     let _ = read_handle.await;
 
     info!("[terminal] session ended for {} from {}", username, ip);
 }
 
-// Perl script reads password from stdin, verifies against /etc/shadow via crypt(3).
-// Username passed as $ARGV[0].
+// Password arrives on stdin; username is `$ARGV[0]`.
 const VERIFY_PASSWORD_SCRIPT: &str = r#"use strict;
 use warnings;
 my $username = $ARGV[0];

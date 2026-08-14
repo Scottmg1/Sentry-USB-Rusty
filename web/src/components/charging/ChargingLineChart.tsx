@@ -12,19 +12,13 @@ import {
 import type { ChargePoint } from "@/types/charging"
 
 export interface ChargeSeries {
-  // Key into ChargePoint. Kept loose so callers can also pass derived
-  // keys after mapping points; the chart only reads number | null.
+  // Derived point keys are valid when callers map data before rendering.
   key: keyof ChargePoint
   name: string
   color: string
 }
 
-// One generic line chart over a charge session's per-sample points,
-// plotting one or more series on a shared left axis. Mirrors the dark
-// theme and tick styling of the drive charts so the charging detail
-// reads as part of the same UI. Used for range, amperage, voltage and
-// the temperature series — each is a separate card with its own unit,
-// matching how Tessie / TeslaScope present them.
+// Shared renderer for charge-session series with one unit per card.
 function ChargingLineChart({
   points,
   series,

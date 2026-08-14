@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react"
-import { Loader2, AlertTriangle } from "lucide-react"
+import { ProgressActivityIcon, WarningIcon } from "@/components/icons"
 import { cn } from "@/lib/utils"
 import { HomeGeofencePicker } from "@/components/settings/HomeGeofencePicker"
 
@@ -10,13 +10,7 @@ export interface KeepAccessoryValues {
   radiusM: number
 }
 
-/**
- * Shared, controlled keep-accessory config form — used by both the setup
- * wizard and the Settings card. Pure presentation: the parent owns the
- * values and the persistence. `onUseCurrentLocation` is optional (the
- * setup wizard may run before BLE is paired); when provided it fetches the
- * car's last GPS fix to set the home geofence center.
- */
+/** Controlled keep-accessory form shared by setup and settings. */
 export function KeepAccessoryConfig({
   values,
   onChange,
@@ -29,16 +23,10 @@ export function KeepAccessoryConfig({
   onUseCurrentLocation?: () => Promise<{ lat: number; lon: number } | null>
   /** Persistence failure from the owning hook — surfaced under the geofence map. */
   saveError?: string | null
-  /**
-   * When true (Settings context), live-check whether "Use BLE for
-   * keep-awake" is on and warn if it isn't — the home→OFF release needs
-   * the car reachable over BLE through the archive, or accessory power
-   * can stay stuck ON at home. Off in the setup wizard (the BLE keep-awake
-   * toggle lives right there in the same step).
-   */
+  /** Warn when BLE keep-awake cannot guarantee the home-state release. */
   checkKeepAwake?: boolean
 }) {
-  // Keep-awake dependency: null = unknown/loading, true/false = saved state.
+  // Null means the saved keep-awake dependency has not loaded.
   const [keepAwakeOn, setKeepAwakeOn] = useState<boolean | null>(null)
   const [enablingKa, setEnablingKa] = useState(false)
 
@@ -74,7 +62,6 @@ export function KeepAccessoryConfig({
 
   return (
     <div className="space-y-3">
-      {/* 12V power gate — the whole feature is off unless this is on */}
       <label
         className={cn(
           "flex cursor-pointer items-start gap-3 rounded-lg border p-3 transition-colors",
@@ -102,11 +89,10 @@ export function KeepAccessoryConfig({
         </div>
       </label>
 
-      {/* Keep-awake dependency warning — the home→OFF release needs the car
-          reachable over BLE through the archive. */}
+      {/* BLE must remain reachable to release accessory power after archiving. */}
       {checkKeepAwake && values.enabled && keepAwakeOn === false && (
         <div className="flex items-start gap-2 rounded-lg border border-amber-500/30 bg-amber-500/10 p-3">
-          <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-amber-400" />
+          <WarningIcon className="mt-0.5 h-4 w-4 shrink-0 text-amber-400" />
           <div className="space-y-2">
             <p className="text-xs text-amber-200/90">
               <span className="font-medium">Turn on “Use BLE for keep-awake” too.</span> It keeps
@@ -119,14 +105,13 @@ export function KeepAccessoryConfig({
               disabled={enablingKa}
               className="inline-flex items-center gap-1.5 rounded-md border border-amber-500/40 bg-amber-500/15 px-2.5 py-1 text-xs font-medium text-amber-100 transition-colors hover:bg-amber-500/25 disabled:opacity-50"
             >
-              {enablingKa && <Loader2 className="h-3 w-3 animate-spin" />}
+              {enablingKa && <ProgressActivityIcon className="h-3 w-3 animate-spin" />}
               Turn on keep-awake
             </button>
           </div>
         </div>
       )}
 
-      {/* Home geofence — only relevant once the feature is enabled */}
       {values.enabled && (
         <HomeGeofencePicker
           values={{ homeLat: values.homeLat, homeLon: values.homeLon, radiusM: values.radiusM }}

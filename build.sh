@@ -1,16 +1,10 @@
 #!/bin/bash
-# Build script for SentryUSB Rust binary
-# Usage: ./build.sh [target]
-#   target: arm64 (default), armv7, native
+# Usage: ./build.sh [arm64|armv7|native] (default: arm64)
 
 set -e
 
-# Build frontend. Prefer this repo's own web/ (current layout); fall back
-# to the legacy ../Sentry-USB/web sibling for old checkouts. static/ is
-# gitignored (never committed — a stale committed copy once silently
-# shipped an old UI), so this step is what populates it; without it a
-# bare cargo build embeds the "frontend not built" placeholder that
-# crates/sentryusb/build.rs writes.
+# Populate the gitignored embed directory; otherwise build.rs supplies its
+# frontend-not-built placeholder. Legacy checkouts may use the sibling web app.
 WEB_DIR="$(dirname "$0")/web"
 if [ ! -f "$WEB_DIR/package.json" ]; then
     WEB_DIR="$(dirname "$0")/../Sentry-USB/web"
@@ -19,8 +13,7 @@ if [ -d "$WEB_DIR" ] && [ -f "$WEB_DIR/package.json" ]; then
     echo "Building frontend from $WEB_DIR..."
     (cd "$WEB_DIR" && npm run build)
     echo "Copying frontend to static/"
-    # Full wipe (not /*) so a stale placeholder index.html and old
-    # pre-compressed .br/.gz siblings can't survive into the embed.
+    # Remove the placeholder and stale pre-compressed siblings.
     rm -rf crates/sentryusb/static
     mkdir -p crates/sentryusb/static
     cp -r "$WEB_DIR/dist/"* crates/sentryusb/static/
@@ -28,11 +21,8 @@ else
     echo "WARNING: no web/ found — binary will embed the 'frontend not built' placeholder."
 fi
 
-# Pre-compress static assets so embed.rs can serve raw .br / .gz bytes
-# without burning per-request CPU on the Pi Zero 2W. Skips already-
-# compressed formats (woff2, png, jpg, ico). Brotli is optional —
-# without it the server falls back to gzip, and without gzip it falls
-# back to identity + the tower-http CompressionLayer.
+# Pre-compress eligible assets to avoid per-request work on low-end Pis.
+# Brotli is optional; the server falls back to gzip or dynamic compression.
 if [ -d crates/sentryusb/static ]; then
     HAS_BROTLI=0
     if command -v brotli >/dev/null 2>&1; then
@@ -45,14 +35,11 @@ if [ -d crates/sentryusb/static ]; then
     echo "Pre-compressing static assets..."
     COUNT=0
     while IFS= read -r -d '' f; do
-        # Skip if the file is already a compressed sibling or already-
-        # compressed binary format. Anything passing this filter is
-        # text/SVG/JSON/JS/CSS/HTML.
+        # Skip compressed siblings and formats that are already compressed.
         case "$f" in
             *.br|*.gz|*.woff2|*.png|*.jpg|*.jpeg|*.webp|*.ico|*.gif|*.mp4|*.mp3|*.zip) continue ;;
         esac
-        # Only worth compressing files above ~1 KB. Smaller files have
-        # no compression win and just clutter the binary.
+        # Compression below 1 KiB usually increases the embedded size.
         SIZE=$(wc -c < "$f")
         if [ "$SIZE" -lt 1024 ]; then continue; fi
 
@@ -98,10 +85,7 @@ else
     exit 1
 fi
 
-# Workspace cross-build above produces every workspace binary; report
-# the telemetry sampler too so the release flow / dev knows it's
-# there. Pi-gen install must place it at /root/bin/sentryusb-tesla-telemetry
-# for the sentryusb-telemetry.service unit to find it.
+# Report the workspace-built telemetry sampler used by its systemd unit.
 TELEMETRY_BINARY="$(dirname "$BINARY")/sentryusb-tesla-telemetry"
 if [ -f "$TELEMETRY_BINARY" ]; then
     TSIZE=$(du -h "$TELEMETRY_BINARY" | cut -f1)

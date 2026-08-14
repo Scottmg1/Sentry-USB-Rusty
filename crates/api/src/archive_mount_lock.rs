@@ -1,21 +1,11 @@
 //! Cross-process ownership of the `/mnt/archive` network mount.
 //!
-//! The archive share (CIFS/NFS) is mounted by two parties: archiveloop's
-//! connect-archive.sh at the start of each archive cycle, and the backup
-//! path in `backup.rs` when the user hits Backup Now with no cycle
-//! running. Both sides take an exclusive `flock` on
-//! [`ARCHIVE_MOUNT_LOCK_PATH`] around their mount/unmount transitions
-//! (archiveloop via `flock` on fd 210 in connect/disconnect-archive.sh;
-//! keep the path in sync with those scripts). Without it, archiveloop can
-//! adopt a mount the backup created and then have it unmounted mid-cycle,
-//! or its disconnect can `umount -f -l` a backup mid-write.
+//! Archiveloop and on-demand backups share this flock so neither unmounts the
+//! archive share during the other's mount transition or write transaction.
+//! Keep [`ARCHIVE_MOUNT_LOCK_PATH`] synchronized with the CIFS/NFS scripts.
 //!
-//! Deliberately NOT held across a whole archive cycle: post-archive
-//! -process.sh curls the backup API while its cycle runs, so a
-//! cycle-scoped lock would deadlock that request — the same trap the
-//! gadget cycle_lock doc comment warns about. The lock covers only
-//! mount → use → unmount windows; a long rsync runs lock-free on a mount
-//! archiveloop owns.
+//! Archiveloop holds it only for mount/unmount transitions, not the full cycle,
+//! because its post-archive phase may invoke the backup API.
 
 use std::fs::{File, OpenOptions};
 use std::io;
@@ -26,17 +16,14 @@ use std::time::{Duration, Instant};
 /// connect-archive.sh and disconnect-archive.sh.
 pub const ARCHIVE_MOUNT_LOCK_PATH: &str = "/tmp/sentryusb_archive_mount.lock";
 
-/// Exclusive hold on the archive-mount lock; released on drop (the
-/// flock dies with the file handle).
+/// Exclusive archive-mount lock, released when its file handle is dropped.
 #[derive(Debug)]
 pub struct ArchiveMountGuard {
     _file: File,
 }
 
-/// Acquire the archive-mount flock, waiting up to `timeout` for whoever
-/// holds it (archiveloop holds it for seconds around a mount/unmount).
-/// Polls `LOCK_NB` rather than parking in `flock(2)` so the wait is
-/// bounded. Blocking call — run it on a blocking thread.
+/// Acquire the flock within `timeout` by polling `LOCK_NB`.
+/// This is a blocking call and must run on a blocking thread.
 pub fn acquire(timeout: Duration) -> io::Result<ArchiveMountGuard> {
     acquire_path(Path::new(ARCHIVE_MOUNT_LOCK_PATH), timeout)
 }
@@ -69,9 +56,7 @@ fn acquire_path(path: &Path, timeout: Duration) -> io::Result<ArchiveMountGuard>
 #[cfg(unix)]
 fn try_flock_exclusive(file: &File) -> io::Result<bool> {
     use std::os::unix::io::AsRawFd;
-    // Same primitive as shell `flock`: the lock lives on the open file
-    // description, so it also excludes other threads of this process and
-    // stays held across await points until the guard drops.
+    // The open-file-description lock excludes processes and sibling threads.
     let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
     if rc == 0 {
         return Ok(true);

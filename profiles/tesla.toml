@@ -1,0 +1,69 @@
+# Vehicle profile: Tesla TeslaCam (Sentry + Dashcam). Describes how Tesla
+# writes footage to the drive so a client can identify the ecosystem and
+# render the correct camera layout. Same schema as the Dash-USB sibling.
+
+[profile]
+id = "tesla"
+display_name = "Tesla TeslaCam"
+brand = "Tesla"
+
+[recording]
+root = "TeslaCam"
+# Segment filenames: 2026-07-17_19-34-53-front.mp4
+filename_regex = '^(?P<y>\d{4})-(?P<mo>\d{2})-(?P<d>\d{2})_(?P<h>\d{2})-(?P<mi>\d{2})-(?P<s>\d{2})-(?P<camera>front|back|left_repeater|right_repeater|left_pillar|right_pillar)\.mp4$'
+segment_seconds = 60
+# RecentClips holds roughly the last hour of continuous footage.
+rolling_window_minutes = 60
+# ~35 MB per camera per 60 s segment (HW3/HW4 average, H.265).
+approx_bytes_per_camera_segment = 35000000
+
+[[cameras]]
+id = "front"
+label = "Front"
+
+[[cameras]]
+id = "back"
+label = "Rear"
+
+[[cameras]]
+id = "left_repeater"
+label = "Left Repeater"
+
+[[cameras]]
+id = "right_repeater"
+label = "Right Repeater"
+
+# Pillar cameras are HW4-only. Optional: the viewer only shows them when
+# files for them exist.
+[[cameras]]
+id = "left_pillar"
+label = "Left Pillar"
+optional = true
+
+[[cameras]]
+id = "right_pillar"
+label = "Right Pillar"
+optional = true
+
+[viewer]
+# Row-major playback grid; "" is an empty cell. Optional cameras (pillars)
+# not in the grid are appended by the viewer when present.
+grid = [["left_repeater", "front", "right_repeater"], ["", "back", ""]]
+
+# Not consumed by SentryUSB (it manages the virtual drive via its own setup
+# config); present only for schema parity with the Dash-USB profile.
+[virtual_drive]
+default_size = "64G"
+min_size = "32G"
+min_free_bytes = 0
+filesystem = "exfat"
+label = "TESLACAM"
+
+[snapshots]
+default_interval_secs = 0
+
+[features]
+# Tesla has persistent SentryClips/SavedClips event tiers.
+event_folders = true
+archive_everything_default = false
+nofua = true

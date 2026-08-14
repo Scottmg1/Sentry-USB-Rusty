@@ -88,15 +88,27 @@ enum SnapshotAction {
         /// Snapshot name passed through by the `release_snapshot.sh` wrapper.
         name: String,
     },
+    /// Delete /mutable/TeslaCam symlinks into snapshots that no longer exist.
+    Sweep {
+        /// Count what would be removed without deleting anything.
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 #[derive(Subcommand)]
 enum SpaceAction {
     /// Delete old snapshots until `/backingfiles` has enough free space.
     Manage {
-        /// Reserved for future compat (e.g. reserve size); ignored for now.
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
-        args: Vec<String>,
+        /// Free-space target in BYTES, as archiveloop's freespacemanager
+        /// computes it and the manage_free_space.sh wrapper forwards.
+        /// Omitted: use the same `10 GiB + total/33` formula. Parsed
+        /// strictly — a malformed value is rejected rather than coerced
+        /// (a reserve of 0 would "satisfy" instantly, and any garbage
+        /// silently falling back to a different policy is what made the
+        /// bash and Rust paths diverge in the first place).
+        #[arg(value_parser = clap::value_parser!(u64).range(1..))]
+        reserve_bytes: Option<u64>,
     },
 }
 
@@ -176,16 +188,63 @@ async fn main() {
     let db_path = sentryusb_drives::DEFAULT_DB_PATH;
     let store = match sentryusb_drives::DriveStore::open(db_path) {
         Ok(s) => Arc::new(s),
-        Err(e) => {
-            // Try in-memory if DB path doesn't work (e.g., on dev machine)
-            tracing::warn!("Failed to open drive DB at {}: {}. Using in-memory.", db_path, e);
+        Err(e) if args.dev => {
+            // Explicit dev mode: no /backingfiles exists, in-memory is
+            // the intended store.
+            tracing::warn!("Failed to open drive DB at {}: {}. Using in-memory (--dev).", db_path, e);
             Arc::new(sentryusb_drives::DriveStore::open_memory().expect("failed to create in-memory DB"))
+        }
+        Err(e) => {
+            // A real device whose DB will not open must not serve an
+            // empty in-memory store: empty history is indistinguishable,
+            // in the UI, from "all my drives were deleted", and every
+            // background job would run against fiction whose writes
+            // vanish on reboot. Serve an explicit degraded mode instead:
+            // the SPA plus a banner, 503 on every data endpoint, and a
+            // recovery allowlist (logs, storage health/repair, reboot).
+            // No store, processor, or cloud uploader is constructed. A
+            // periodic reopen probe exits cleanly once the DB comes back
+            // — a transient cause (mount ordering, a lock, fsck) heals
+            // on its own via systemd's Restart=always.
+            tracing::error!(
+                "Failed to open drive DB at {}: {}. Entering degraded mode —                  common causes are a full disk, a locked DB, or a damaged file.                  Do NOT re-run setup before checking the DB file.",
+                db_path,
+                e
+            );
+            tokio::spawn(async {
+                let mut tick = tokio::time::interval(std::time::Duration::from_secs(30));
+                tick.tick().await; // skip the immediate tick
+                loop {
+                    tick.tick().await;
+                    let ok = tokio::task::spawn_blocking(|| {
+                        sentryusb_drives::DriveStore::open(sentryusb_drives::DEFAULT_DB_PATH).is_ok()
+                    })
+                    .await
+                    .unwrap_or(false);
+                    if ok {
+                        tracing::info!(
+                            "drive DB opens again — exiting degraded mode; systemd restarts into normal service"
+                        );
+                        std::process::exit(0);
+                    }
+                }
+            });
+            let degraded = sentryusb_api::degraded::DegradedState {
+                auth: auth.clone(),
+                hub: hub.clone(),
+                reason: std::sync::Arc::new(e.to_string()),
+            };
+            let app = sentryusb_api::degraded::build_degraded_router(degraded);
+            serve_with_common_layers(app, auth, args.port, args.dev, t0).await;
+            return;
         }
     };
     // Remove orphaned files older binaries wrote to /mutable (drive-data.json
     // moved to /backingfiles, plus a couple of pre-Rust state files). Runs
     // after DriveStore::open so any one-shot importer that needs the legacy
-    // path has already had a chance to consume it.
+    // path has already had a chance to consume it. Only reached after a
+    // successful persistent open (an open failure exits above), so the
+    // legacy JSON can never be deleted without having been imported.
     sentryusb_drives::cleanup_legacy_mutable_files();
     phase!("drive_store_opened");
 
@@ -289,11 +348,41 @@ async fn main() {
     // preference). Detects a /backingfiles that failed to mount at boot
     // and runs the guarded xfs_repair ladder; see api::storage_repair.
     sentryusb_api::storage_repair::spawn_boot_check(hub.clone());
+    // Boot-time sweep of TeslaCam symlinks orphaned by releases that skipped the
+    // link purge. Delayed off the boot path; internally guarded and idempotent,
+    // so a skipped run just retries next boot.
+    tokio::spawn(async {
+        tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+        match tokio::task::spawn_blocking(|| {
+            sentryusb_gadget::snapshot::sweep_dangling_links(false)
+        })
+        .await
+        {
+            Ok(Ok(0)) => {}
+            Ok(Ok(n)) => tracing::info!("Dangling-link sweep removed {} stale TeslaCam link(s)", n),
+            Ok(Err(e)) => tracing::info!("Dangling-link sweep skipped: {}", e),
+            Err(e) => tracing::warn!("Dangling-link sweep task failed: {}", e),
+        }
+    });
     phase!("startup_tasks_spawned");
 
     // Build the API router
-    let mut app = sentryusb_api::build_router(app_state.clone());
+    let app = sentryusb_api::build_router(app_state.clone());
+    phase!("router_built");
 
+    serve_with_common_layers(app, auth, args.port, args.dev, t0).await;
+}
+
+/// Shared serving tail for normal and degraded startup: media mounts,
+/// SPA fallback, compression, auth gate, slow-request journal, bind,
+/// serve. Runs until shutdown.
+async fn serve_with_common_layers(
+    mut app: axum::Router,
+    auth: sentryusb_api::auth::AuthState,
+    port: u16,
+    dev: bool,
+    t0: std::time::Instant,
+) {
     // Serve TeslaCam video files via the bind mount of /mutable/TeslaCam
     // at /var/www/html/TeslaCam. Modern browsers (Chrome 80+, Firefox 70+,
     // Safari iOS 13+, ExoPlayer) parse Tesla's `ctts` atom natively, so
@@ -310,7 +399,7 @@ async fn main() {
     );
 
     // Static file serving with SPA fallback (unless dev mode)
-    if !args.dev {
+    if !dev {
         app = app.fallback(embed::spa_handler);
         info!("Serving embedded static files");
     } else {
@@ -378,15 +467,20 @@ async fn main() {
         auth,
         sentryusb_api::auth::auth_middleware,
     ));
-    phase!("router_built");
 
-    let addr = std::net::SocketAddr::from((std::net::Ipv6Addr::UNSPECIFIED, args.port));
+    // Slow-request journal — outermost, so its timing covers auth +
+    // compression + handler and login slowness is visible too.
+    app = app.layer(axum::middleware::from_fn(
+        sentryusb_api::router::slow_request_log,
+    ));
+
+    let addr = std::net::SocketAddr::from((std::net::Ipv6Addr::UNSPECIFIED, port));
     info!("SentryUSB server listening on {}", addr);
 
     let listener = tokio::net::TcpListener::bind(addr)
         .await
         .expect("failed to bind address");
-    phase!("listener_bound");
+    info!(boot_phase = "listener_bound", elapsed_ms = t0.elapsed().as_millis() as u64);
 
     info!(
         boot_phase = "ready",
@@ -496,12 +590,36 @@ async fn run_snapshot(action: SnapshotAction) -> i32 {
                 }
             }
         }
+        SnapshotAction::Sweep { dry_run } => {
+            let result = tokio::task::spawn_blocking(move || {
+                sentryusb_gadget::snapshot::sweep_dangling_links(dry_run)
+            })
+            .await;
+            match result {
+                Ok(Ok(n)) => {
+                    println!("{} dangling link(s) {}", n, if dry_run { "found" } else { "removed" });
+                    0
+                }
+                Ok(Err(e)) => {
+                    eprintln!("snapshot sweep: {}", e);
+                    1
+                }
+                Err(e) => {
+                    eprintln!("snapshot sweep task panicked: {}", e);
+                    1
+                }
+            }
+        }
     }
 }
 
 async fn run_space(action: SpaceAction) -> i32 {
     match action {
-        SpaceAction::Manage { .. } => match sentryusb_gadget::space::manage_free_space().await {
+        SpaceAction::Manage { reserve_bytes } => match sentryusb_gadget::space::manage_free_space(
+            reserve_bytes,
+        )
+        .await
+        {
             Ok(()) => 0,
             Err(e) => {
                 eprintln!("space manage: {}", e);

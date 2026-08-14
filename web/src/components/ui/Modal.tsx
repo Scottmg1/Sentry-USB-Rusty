@@ -1,5 +1,6 @@
 import { useEffect, type ReactNode } from "react"
-import { X } from "lucide-react"
+import { createPortal } from "react-dom"
+import { CloseIcon } from "@/components/icons"
 import { cn } from "@/lib/utils"
 
 interface ModalProps {
@@ -37,7 +38,8 @@ export function Modal({
     return () => window.removeEventListener("keydown", onKey)
   }, [dismissable, onClose])
 
-  return (
+  // Portal outside filtered/positioned ancestors that would contain the overlay.
+  return createPortal(
     <div
       className="modal-shell"
       onClick={dismissable ? onClose : undefined}
@@ -53,7 +55,7 @@ export function Modal({
           <span className="modal-title">{title}</span>
           {dismissable && (
             <button className="modal-close" onClick={onClose} aria-label="Close">
-              <X className="h-4 w-4" />
+              <CloseIcon className="h-4 w-4" />
             </button>
           )}
         </div>
@@ -62,6 +64,7 @@ export function Modal({
           <div className="border-t border-white/5 px-4 py-3">{footer}</div>
         )}
       </div>
-    </div>
+    </div>,
+    document.body
   )
 }

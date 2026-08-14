@@ -7,7 +7,7 @@
 
 use std::path::Path;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension, ToSql};
@@ -31,15 +31,19 @@ use tracing::{info, warn};
 use crate::aggregate::compute_route_aggregates;
 use crate::backfill::backfill_route_aggregates;
 use crate::blob::{
-    decode_f32s, decode_gear_runs, decode_points, decode_u8s, encode_f32s, encode_gear_runs,
-    encode_points, encode_u8s,
+    decode_f32s, decode_flag_runs, decode_gear_runs, decode_points, decode_u8s, encode_f32s,
+    encode_flag_runs, encode_gear_runs, encode_points, encode_u8s,
 };
 use crate::schema::{self, meta_get, meta_set};
 use crate::syncguard::{self, check_sync_size_guard, read_sync_cache, write_sync_cache};
-use crate::types::{GearRun, GpsPoint, Route, RouteAggregates, RouteSummary, StoreData};
+use crate::types::{FlagRun, GearRun, GpsPoint, Route, RouteAggregates, RouteSummary, StoreData};
 
 /// Default SQLite DB path on the Pi.
 pub const DEFAULT_DATA_PATH: &str = "/backingfiles/drive-data.db";
+
+/// While the drive caches are dirty, serve the last-built copy for this
+/// long instead of rebuilding per request (see `stale_cache_within_debounce`).
+const CACHE_REBUILD_DEBOUNCE_SECS: i64 = 15;
 
 /// JSON staging mirror — regenerated on demand by `ExportJSONForSync` so
 /// `post-archive-process.sh` can ship it to the archive server. Lives on
@@ -68,6 +72,13 @@ const ARCHIVE_SYNC_ROUTE_COUNT_KEY: &str = "archive_sync_route_count";
 /// archive backup would never pick up new charging history until the
 /// next drive.
 const ARCHIVE_SYNC_SAMPLE_COUNT_KEY: &str = "archive_sync_sample_count";
+
+/// Meta key: UTC date (`YYYY-MM-DD`) of the last successful archive JSON
+/// export. Gates the multi-minute full-history export to once per day —
+/// same rationale as the daily drive-DB backup gate; on a grown DB the
+/// per-archive-cycle export was a disk storm with no recovery-granularity
+/// gain (rsync ships whole-file anyway; same-day copies overwrite).
+const ARCHIVE_SYNC_EXPORT_DATE_KEY: &str = "archive_sync_export_date";
 // Bump on every drive-list-shape change so existing on-disk caches
 // rebuild on first boot after upgrade.
 //
@@ -99,7 +110,21 @@ const ARCHIVE_SYNC_SAMPLE_COUNT_KEY: &str = "archive_sync_sample_count";
 // v8 (2026-07-06): event-clip gap-fill — the summary grouper now admits
 // SavedClips/SentryClips rows that fill RecentClips holes (and filters
 // all other event rows, which it previously passed through untouched).
-const DRIVE_LIST_CACHE_ALGO_VERSION: &str = "8";
+//
+// v9 (2026-08-08): unanchored driving clusters — event routes with
+// gear-verified ego movement now form drives even when no RecentClips
+// route sits within the chain window (a user save can move an entire
+// short drive out of RecentClips). Stale v8 caches hide those drives.
+//
+// v10 (2026-08-13): Safety Score — per-drive safety totals + score on
+// DriveSummary (v18 columns, safety.rs). Stale v9 caches lack the
+// fields entirely.
+//
+// v11 (2026-08-14): Safety Score recalibration — Tesla-style conditional
+// braking/turning ratios (v19 denominator columns), rebalanced weights,
+// hour-weighted late-night miles. Stale v10 caches hold v1-formula
+// scores computed from absolute rates.
+const DRIVE_LIST_CACHE_ALGO_VERSION: &str = "11";
 
 /// Version tag for the per-clip aggregate FORMULA (compute_route_aggregates).
 /// Distinct from the cache algo version above: this gates a one-shot
@@ -113,7 +138,12 @@ const DRIVE_LIST_CACHE_ALGO_VERSION: &str = "8";
 /// wall-time to the incoming clip's autopilot mode. "geodesic-stable-4"
 /// recomputes per-clip distances with the numerically-stable geodesic
 /// central angle (calc.rs) that fixes the short-segment undercount.
-const AGGREGATE_FORMULA_VERSION: &str = "geodesic-stable-4";
+/// "safety-5" adds the v18 per-clip Safety Score scalars
+/// (compute_clip_safety) — the gate recomputes every row so existing
+/// archives get safety data without re-extraction. "safety-cond-6" adds
+/// the v19 conditional-ratio denominators (brake >0.1g / turn >0.2g
+/// time) and recomputes all safety columns under the same walk.
+const AGGREGATE_FORMULA_VERSION: &str = "safety-cond-6";
 
 /// Version tag for the route `file` KEY format. Gates a one-shot rewrite of
 /// `routes.file` / `processed_files.file` to the canonical form (see
@@ -178,6 +208,35 @@ pub fn cleanup_legacy_mutable_files() {
 pub struct DriveStore {
     path: String,
     conn: Mutex<Connection>,
+    /// Read-only connections for API SELECTs. WAL lets these run
+    /// concurrently with `conn`'s write transactions, so a processor
+    /// batch can no longer starve dashboard/charging reads for seconds.
+    /// Two handles so one long scan doesn't serialize every other read.
+    /// Empty for `:memory:` stores (a second handle would be a separate
+    /// empty DB) — `with_read_conn` falls back to the writer there.
+    read_conns: Vec<Mutex<Connection>>,
+    /// Round-robin pick among `read_conns`.
+    read_rr: AtomicU64,
+    /// Unix seconds of the last drive-cache rebuild. Debounces rebuild
+    /// thrash during archive ingest, where every `add_route` re-dirties
+    /// the cache and every stats poll would otherwise re-run the full
+    /// grouper.
+    last_cache_rebuild: AtomicI64,
+    /// Minimum clip timestamp among route INSERTS since the last cache
+    /// build. Set instead of `drive_cache_dirty` when the mutation is a
+    /// pure insert with a parseable timestamp — the append fast path
+    /// regroups only from a provably independent cut before it. Any
+    /// other mutation sets the full flag, which supersedes this.
+    append_watermark: Mutex<Option<chrono::NaiveDateTime>>,
+    /// Successful append-splice count; tests assert the fast path ran.
+    append_splices: AtomicI64,
+    /// True while the processor runs a bulk ingest pass. Gates the
+    /// rebuild debounce so interactive mutations (tag edit, delete,
+    /// upload) still rebuild immediately.
+    bulk_ingest: AtomicBool,
+    /// Unix seconds of the last route-overview recompute; pairs with
+    /// `bulk_ingest` the same way `last_cache_rebuild` does.
+    last_overview_rebuild: AtomicI64,
     /// Cached row counts so `/api/drives/status` doesn't hit SQLite for
     /// every poll.
     route_count: AtomicI64,
@@ -192,6 +251,25 @@ pub struct DriveStore {
     /// fresh cache without recomputing. Lock order: this is always taken
     /// BEFORE `conn` and never while holding it — deadlock-free.
     rebuild_lock: Mutex<()>,
+    /// Cached `/api/drives/routes` overview JSON; rebuilt lazily on the first
+    /// request after a route mutation.
+    route_overview_cache: Mutex<Option<RouteOverviewCache>>,
+    /// Serializes overview rebuilds. Without it, concurrent cold misses
+    /// each ran the full-store decode — the single heaviest allocation in
+    /// the process — so two map requests during an archive could stack
+    /// hundreds of MB and OOM a 1GB board. The drive-list caches have had
+    /// `rebuild_lock` for this reason; the overview path never got one.
+    /// Lock order: this BEFORE `route_overview_cache`, never the reverse.
+    overview_rebuild_lock: Mutex<()>,
+    /// Bumped on every route mutation. New mutation paths must bump it too.
+    route_overview_gen: AtomicU64,
+}
+
+/// Valid while `generation` and `max_points` match the request.
+struct RouteOverviewCache {
+    generation: u64,
+    max_points: usize,
+    json: String,
 }
 
 impl DriveStore {
@@ -216,13 +294,31 @@ impl DriveStore {
         let conn = open_connection(&path)
             .with_context(|| format!("open: sql.Open {}", path))?;
 
+        // Opened AFTER the writer so the DB file (and WAL) exist. A
+        // failure here is fatal: silently falling back to the writer
+        // would reintroduce the read-starvation this pool removes.
+        let read_conns = vec![
+            Mutex::new(open_readonly_connection_for(&path, ReadRole::Api)?),
+            Mutex::new(open_readonly_connection_for(&path, ReadRole::Api)?),
+        ];
+
         let store = DriveStore {
             path,
             conn: Mutex::new(conn),
+            read_conns,
+            read_rr: AtomicU64::new(0),
+            last_cache_rebuild: AtomicI64::new(0),
+            append_watermark: Mutex::new(None),
+            append_splices: AtomicI64::new(0),
+            bulk_ingest: AtomicBool::new(false),
+            last_overview_rebuild: AtomicI64::new(0),
             route_count: AtomicI64::new(0),
             processed_count: AtomicI64::new(0),
             drive_cache_dirty: AtomicBool::new(true),
             rebuild_lock: Mutex::new(()),
+            route_overview_cache: Mutex::new(None),
+            overview_rebuild_lock: Mutex::new(()),
+            route_overview_gen: AtomicU64::new(0),
         };
 
         store.load_locked(IMPORT_SOURCE_CANDIDATES)?;
@@ -239,10 +335,20 @@ impl DriveStore {
         let store = DriveStore {
             path: ":memory:".to_string(),
             conn: Mutex::new(conn),
+            read_conns: Vec::new(),
+            read_rr: AtomicU64::new(0),
+            last_cache_rebuild: AtomicI64::new(0),
+            append_watermark: Mutex::new(None),
+            append_splices: AtomicI64::new(0),
+            bulk_ingest: AtomicBool::new(false),
+            last_overview_rebuild: AtomicI64::new(0),
             route_count: AtomicI64::new(0),
             processed_count: AtomicI64::new(0),
             drive_cache_dirty: AtomicBool::new(false),
             rebuild_lock: Mutex::new(()),
+            route_overview_cache: Mutex::new(None),
+            overview_rebuild_lock: Mutex::new(()),
+            route_overview_gen: AtomicU64::new(0),
         };
         // Still run migrate + backfill so tests exercise the real schema.
         let guard = store.conn.lock().unwrap();
@@ -265,9 +371,81 @@ impl DriveStore {
     /// Holds the same connection mutex everything else uses, so callers
     /// share WAL serialization with `add_route` / `save` / etc. Keep the
     /// closure short — long-running work blocks all other DB I/O.
+    #[track_caller]
     pub fn with_locked_conn<R>(&self, f: impl FnOnce(&Connection) -> R) -> R {
+        let caller = std::panic::Location::caller();
+        let t0 = std::time::Instant::now();
         let guard = self.conn.lock().unwrap();
-        f(&guard)
+        let waited = t0.elapsed();
+        let t1 = std::time::Instant::now();
+        let out = f(&guard);
+        drop(guard);
+        log_slow_conn("writer", caller, waited, t1.elapsed());
+        out
+    }
+
+    /// Run a SELECT-only closure on a read-only connection. Under WAL
+    /// these see the last committed state and never queue behind the
+    /// writer mutex — the processor can batch-ingest clips while API
+    /// reads keep answering. Tries every handle before blocking so one
+    /// slow scan doesn't head-of-line-block half the reads behind a
+    /// blind round-robin pick. `:memory:` stores (tests) fall back to
+    /// the writer connection.
+    #[track_caller]
+    pub fn with_read_conn<R>(&self, f: impl FnOnce(&Connection) -> R) -> R {
+        let caller = std::panic::Location::caller();
+        if self.read_conns.is_empty() {
+            let t0 = std::time::Instant::now();
+            let guard = self.conn.lock().unwrap();
+            let waited = t0.elapsed();
+            let t1 = std::time::Instant::now();
+            let out = f(&guard);
+            drop(guard);
+            log_slow_conn("writer(fallback)", caller, waited, t1.elapsed());
+            return out;
+        }
+        let start = self.read_rr.fetch_add(1, Ordering::Relaxed) as usize;
+        let n = self.read_conns.len();
+        let t0 = std::time::Instant::now();
+        let guard = 'pick: {
+            for offset in 0..n {
+                if let Ok(g) = self.read_conns[(start + offset) % n].try_lock() {
+                    break 'pick g;
+                }
+            }
+            self.read_conns[start % n].lock().unwrap()
+        };
+        let waited = t0.elapsed();
+        let t1 = std::time::Instant::now();
+        let out = f(&guard);
+        drop(guard);
+        log_slow_conn("read", caller, waited, t1.elapsed());
+        out
+    }
+
+    /// `VACUUM INTO dest` on a DEDICATED connection — SQLite takes only a
+    /// read snapshot of the source, so the daily backup no longer seizes
+    /// the writer mutex for the whole multi-minute copy of a grown DB.
+    /// `:memory:` stores fall back to the shared connection (tests).
+    pub fn vacuum_into(&self, dest: &str) -> Result<()> {
+        if self.path == ":memory:" {
+            return self.with_locked_conn(|conn| {
+                conn.execute("VACUUM INTO ?1", params![dest]).map(|_| ())
+            })
+            .map_err(Into::into);
+        }
+        let conn = Connection::open(&self.path)?;
+        conn.execute_batch("PRAGMA busy_timeout = 5000;")?;
+        conn.execute("VACUUM INTO ?1", params![dest])?;
+        Ok(())
+    }
+
+    /// Mark the start/end of a processor bulk-ingest pass. While set,
+    /// the drive-cache getters may serve a copy up to
+    /// `CACHE_REBUILD_DEBOUNCE_SECS` stale instead of re-running the
+    /// grouper per poll.
+    pub fn set_bulk_ingest(&self, active: bool) {
+        self.bulk_ingest.store(active, Ordering::Release);
     }
 
     /// Re-load (re-migrate + re-import). Safe to call multiple times.
@@ -382,7 +560,12 @@ impl DriveStore {
                      autosteer_distance_m = NULL, tacc_distance_m = NULL, \
                      fsd_pend_ms_end = NULL, park_ms_start = NULL, \
                      fsd_at_end = NULL, fsd_accel_pushes_early = NULL, \
-                     ap_at_start = NULL",
+                     ap_at_start = NULL, \
+                     safety_hard_brake_ms = NULL, safety_hard_brake_events = NULL, \
+                     safety_aggr_turn_ms = NULL, safety_aggr_turn_events = NULL, \
+                     safety_speeding_ms = NULL, safety_moving_ms = NULL, \
+                     safety_manual_moving_ms = NULL, \
+                     safety_brake_any_ms = NULL, safety_turn_any_ms = NULL",
                     [],
                 )?;
                 info!(
@@ -432,6 +615,10 @@ impl DriveStore {
             }
         }
         self.drive_cache_dirty.store(false, Ordering::Release);
+        // load() re-imports/re-migrates route rows; drop the lazy route
+        // overview cache so the next request recomputes.
+        self.route_overview_gen.fetch_add(1, Ordering::Release);
+        *self.route_overview_cache.lock().unwrap() = None;
         self.refresh_counts()?;
         Ok(())
     }
@@ -447,17 +634,70 @@ impl DriveStore {
 
     /// Return the set of all processed file paths (normalized to forward
     /// slashes). Called once per ProcessDirectory run.
+    /// Which of `keys` (already-normalized paths) are processed. Chunked
+    /// IN-lookups on the `WITHOUT ROWID` primary key — O(keys), not
+    /// O(lifetime history) like [`Self::processed_set`].
+    pub fn processed_subset(
+        &self,
+        keys: &[String],
+    ) -> Result<std::collections::HashSet<String>> {
+        const CHUNK: usize = 400;
+        self.with_read_conn(|conn| {
+            let mut out = std::collections::HashSet::with_capacity(keys.len());
+            for chunk in keys.chunks(CHUNK) {
+                let placeholders = vec!["?"; chunk.len()].join(",");
+                let mut stmt = conn.prepare(&format!(
+                    "SELECT file FROM processed_files WHERE file IN ({placeholders})"
+                ))?;
+                let params = rusqlite::params_from_iter(chunk.iter());
+                let rows = stmt.query_map(params, |row| row.get::<_, String>(0))?;
+                for r in rows {
+                    out.insert(r?);
+                }
+            }
+            Ok(out)
+        })
+    }
+
+    /// Processed non-event keys under the given `YYYY-MM-DD` day dirs,
+    /// via primary-key range scans (`day/` ..= `day0`). Event keys live
+    /// under `SavedClips/` / `SentryClips/` and fall outside every range.
+    /// Keys not laid out as `date-dir/file` (non-TeslaCam layouts) are
+    /// missed — callers union with on-disk paths, which covers anything
+    /// still present regardless of layout.
+    pub fn processed_files_for_days(&self, days: &[String]) -> Result<Vec<String>> {
+        self.with_read_conn(|conn| {
+            let mut out = Vec::new();
+            let mut stmt = conn.prepare_cached(
+                "SELECT file FROM processed_files WHERE file >= ?1 AND file < ?2",
+            )?;
+            for day in days {
+                // '0' is the successor of '/' in ASCII, so this half-open
+                // range is exactly the `day/` prefix.
+                let rows = stmt.query_map(
+                    params![format!("{day}/"), format!("{day}0")],
+                    |row| row.get::<_, String>(0),
+                )?;
+                for r in rows {
+                    out.push(r?);
+                }
+            }
+            Ok(out)
+        })
+    }
+
     pub fn processed_set(&self) -> Result<std::collections::HashSet<String>> {
-        let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare_cached("SELECT file FROM processed_files")?;
-        let files = stmt
-            .query_map([], |row| row.get::<_, String>(0))?
-            .filter_map(|r| r.ok())
-            // Rows are already normalized on write; reuse the owned String
-            // instead of re-allocating one per row through normalize_path.
-            .map(|f| if f.contains('\\') { f.replace('\\', "/") } else { f })
-            .collect();
-        Ok(files)
+        self.with_read_conn(|conn| {
+            let mut stmt = conn.prepare_cached("SELECT file FROM processed_files")?;
+            let files = stmt
+                .query_map([], |row| row.get::<_, String>(0))?
+                .filter_map(|r| r.ok())
+                // Rows are already normalized on write; reuse the owned String
+                // instead of re-allocating one per row through normalize_path.
+                .map(|f| if f.contains('\\') { f.replace('\\', "/") } else { f })
+                .collect();
+            Ok(files)
+        })
     }
 
     /// Mark a file processed without adding route data. Idempotent.
@@ -508,7 +748,61 @@ impl DriveStore {
         raw_park_count: u32,
         raw_frame_count: u32,
         gear_runs: &[GearRun],
+        flag_runs: &[FlagRun],
     ) -> Result<()> {
+        let route = Route {
+            file: relative_path.to_string(),
+            date: date_dir.to_string(),
+            points: points.to_vec(),
+            gear_states: gears.to_vec(),
+            autopilot_states: ap_states.to_vec(),
+            speeds: speeds.to_vec(),
+            accel_positions: accel_positions.to_vec(),
+            raw_park_count,
+            raw_frame_count,
+            gear_runs: gear_runs.to_vec(),
+            flag_runs: flag_runs.to_vec(),
+            source: None,
+            external_signature: None,
+            tessie_autopilot_percent: None,
+            // BLE telemetry rollup is written separately by
+            // `write_route_telemetry` after this insert lands; leave
+            // None here.
+            ..Default::default()
+        };
+        self.add_route_obj(relative_path, route)
+    }
+
+    /// [`Self::add_route`] variant taking the full extraction result —
+    /// the ingest path, which alone carries the v20 IMU accel channels.
+    pub fn add_route_extracted(
+        &self,
+        relative_path: &str,
+        date_dir: &str,
+        gps: &crate::types::ExtractedGps,
+    ) -> Result<()> {
+        let route = Route {
+            file: relative_path.to_string(),
+            date: date_dir.to_string(),
+            points: gps.points.clone(),
+            gear_states: gps.gear_states.clone(),
+            autopilot_states: gps.autopilot_states.clone(),
+            speeds: gps.speeds.clone(),
+            accel_positions: gps.accel_positions.clone(),
+            raw_park_count: gps.raw_park_count,
+            raw_frame_count: gps.raw_frame_count,
+            gear_runs: gps.gear_runs.clone(),
+            flag_runs: gps.flag_runs.clone(),
+            accel_x: gps.accel_x.clone(),
+            accel_y: gps.accel_y.clone(),
+            ..Default::default()
+        };
+        self.add_route_obj(relative_path, route)
+    }
+
+    /// Shared body of the two `add_route*` fronts.
+    fn add_route_obj(&self, relative_path: &str, route: Route) -> Result<()> {
+        let points = route.points.clone();
         let norm = normalize_path(relative_path);
         let now = now_unix();
 
@@ -522,25 +816,6 @@ impl DriveStore {
 
         let mut route_inserted: i64 = 0;
         if !points.is_empty() {
-            let route = Route {
-                file: relative_path.to_string(),
-                date: date_dir.to_string(),
-                points: points.to_vec(),
-                gear_states: gears.to_vec(),
-                autopilot_states: ap_states.to_vec(),
-                speeds: speeds.to_vec(),
-                accel_positions: accel_positions.to_vec(),
-                raw_park_count,
-                raw_frame_count,
-                gear_runs: gear_runs.to_vec(),
-                source: None,
-                external_signature: None,
-                tessie_autopilot_percent: None,
-                // BLE telemetry rollup is written separately by
-                // `write_route_telemetry` after this insert lands; leave
-                // None here.
-                ..Default::default()
-            };
             let agg = compute_route_aggregates(&route);
             // Indexed point lookup so the counter update below knows
             // insert vs upsert — replaces a full COUNT(*) per clip.
@@ -571,10 +846,37 @@ impl DriveStore {
 
         tx.commit()?;
         drop(conn);
-        self.drive_cache_dirty.store(true, Ordering::Release);
+        // Counters BEFORE the invalidation publish: a rebuilder that
+        // consumes the watermark/flag must never read a pre-increment
+        // route count into the cache's validity marker.
         self.processed_count
             .fetch_add(pf_inserted as i64, Ordering::Relaxed);
-        self.route_count.fetch_add(route_inserted, Ordering::Relaxed);
+        self.route_count.fetch_add(route_inserted, Ordering::Release);
+        // A pointless mark-processed (no GPS -> no route row) can't change
+        // the drive list, stats, or overview — leave the caches alone.
+        // During ingest of a mostly-parked card these were the majority of
+        // calls, each one forcing a grouper rebuild on the next poll.
+        if !points.is_empty() {
+            // Classify for the cache rebuild: a pure INSERT with a
+            // parseable clip timestamp only extends the timeline, so the
+            // rebuild can regroup from an independent cut instead of
+            // re-walking history. An upsert rewrote an existing row
+            // (anywhere in history) and an unparseable name can't be
+            // placed — both need the full path.
+            match crate::grouper::parse_clip_timestamp(&norm) {
+                Some(ts) if route_inserted == 1 => {
+                    let mut wm = self.append_watermark.lock().unwrap();
+                    *wm = Some(match *wm {
+                        Some(cur) if cur <= ts => cur,
+                        _ => ts,
+                    });
+                }
+                _ => {
+                    self.drive_cache_dirty.store(true, Ordering::Release);
+                }
+            }
+            self.route_overview_gen.fetch_add(1, Ordering::Release);
+        }
         Ok(())
     }
 
@@ -604,9 +906,10 @@ impl DriveStore {
     where
         F: FnOnce(&[RouteSummary]) -> R,
     {
-        let conn = self.conn.lock().unwrap();
-        let summaries = select_all_route_summaries(&conn)?;
-        Ok(f(&summaries))
+        self.with_read_conn(|conn| {
+            let summaries = select_all_route_summaries(conn)?;
+            Ok(f(&summaries))
+        })
     }
 
     /// Fetch full `Route` rows (with all BLOB columns decoded) for the
@@ -620,9 +923,10 @@ impl DriveStore {
     where
         F: FnOnce(&[Route]) -> R,
     {
-        let conn = self.conn.lock().unwrap();
-        let routes = select_routes_by_files(&conn, files)?;
-        Ok(f(&routes))
+        self.with_read_conn(|conn| {
+            let routes = select_routes_by_files(conn, files)?;
+            Ok(f(&routes))
+        })
     }
 
     /// Files of every **driving** event-folder route row — i.e. the
@@ -639,12 +943,22 @@ impl DriveStore {
     /// in the drive list — exactly the parked presence 60c5602 removed —
     /// so the driving filter stays.
     ///
-    /// The predicate is `grouper::row_has_driving` — the SAME one the
-    /// grouper applies to stored rows when admitting gap-fills — so the
-    /// manifest and the drive list never disagree on which event clips are
-    /// part of a drive.
+    /// The predicate is `grouper::row_has_driving`, which is what the
+    /// grouper applies to stored rows for ANCHORED gap-fill admission
+    /// (interior holes and chains) — those agree exactly.
+    ///
+    /// It is deliberately NOT the stricter `telemetry_gear_driving` the
+    /// grouper requires for UNANCHORED clusters. A row whose only
+    /// evidence is a speed sample or raw frame counters (legacy builds,
+    /// drive-data.json imports) can therefore reach the playback
+    /// manifest while staying out of the drive list. That asymmetry is
+    /// intended: cross-linking a clip into RecentClips only affects
+    /// playback continuity, whereas minting a drive from weak evidence
+    /// puts a phantom trip in the user's history. Do not "restore
+    /// parity" by gear-gating here — anchored speed/raw evidence is
+    /// legitimate for playback.
     pub fn gap_fill_files(&self) -> Result<Vec<String>> {
-        let conn = self.conn.lock().unwrap();
+        self.with_read_conn(|conn| {
         let mut stmt = conn.prepare(
             "SELECT file, raw_park_count, raw_frame_count, gear_runs_blob, max_speed_mps \
              FROM routes \
@@ -676,6 +990,7 @@ impl DriveStore {
             }
         }
         Ok(out)
+        })
     }
 
     /// Wipe routes + processed_files + drive_tags and bulk-insert `data`.
@@ -728,6 +1043,7 @@ impl DriveStore {
         let _ = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)");
         drop(conn);
         self.drive_cache_dirty.store(true, Ordering::Release);
+        self.route_overview_gen.fetch_add(1, Ordering::Release);
         self.refresh_counts()?;
         Ok(())
     }
@@ -802,8 +1118,63 @@ impl DriveStore {
             mark_mutable_dirty(&tx, "drive", drive_key)?;
         }
         tx.commit()?;
-        self.drive_cache_dirty.store(true, Ordering::Release);
+        drop(conn);
+
+        // Tags never enter grouping, stats, FSD analytics, or the map
+        // overview (RouteOverview has no tags field) — they are joined
+        // into the list JSON after grouping, keyed on the drive's
+        // startTime. So a tag edit patches the cached list in place
+        // instead of dirtying everything, which used to re-run the full
+        // grouper AND the overview rebuild per tag click.
+        if !self.patch_cached_drive_tags(drive_key, tags)? {
+            self.drive_cache_dirty.store(true, Ordering::Release);
+        }
         Ok(())
+    }
+
+    /// Patch `tags` for the drive whose startTime is `drive_key` directly
+    /// in the cached list JSON. False → caller must dirty the cache (no
+    /// cache yet, cache already dirty, or the key isn't a visible drive —
+    /// e.g. one hidden by the Tessie/SEI overlap filter).
+    fn patch_cached_drive_tags(&self, drive_key: &str, tags: &[String]) -> Result<bool> {
+        // rebuild_lock so a concurrent rebuild can't write a list built
+        // from pre-edit tag rows after we patch (lock order: rebuild_lock
+        // before conn, as everywhere else).
+        let _rebuild = self.rebuild_lock.lock().unwrap();
+        if self.drive_cache_dirty.load(Ordering::Acquire) {
+            return Ok(false);
+        }
+        let Some(json) = self.with_read_conn(|conn| schema::meta_get(conn, "drive_list_cache"))?
+        else {
+            return Ok(false);
+        };
+        if json.is_empty() {
+            return Ok(false);
+        }
+        // Typed round-trip, not Value: Value's map re-serializes keys in
+        // sorted order, drifting the cached bytes away from what a full
+        // rebuild emits. Vec<DriveSummary> reproduces the rebuild's
+        // serializer exactly.
+        let mut list: Vec<crate::types::DriveSummary> = match serde_json::from_str(&json) {
+            Ok(v) => v,
+            Err(_) => return Ok(false),
+        };
+        // Every drive with this key, not just the first: two visible
+        // signature-split drives can share a start_time, and a full
+        // rebuild applies the tag map to all of them.
+        let clean: Vec<String> = tags.iter().filter(|t| !t.is_empty()).cloned().collect();
+        let mut hit = false;
+        for entry in list.iter_mut().filter(|d| d.start_time == drive_key) {
+            entry.tags = clean.clone();
+            hit = true;
+        }
+        if !hit {
+            return Ok(false);
+        }
+        let patched = serde_json::to_string(&list)?;
+        let conn = self.conn.lock().unwrap();
+        schema::meta_set(&conn, "drive_list_cache", &patched)?;
+        Ok(true)
     }
 
     /// Tags for a drive, or an empty vec.
@@ -888,9 +1259,46 @@ impl DriveStore {
         Ok(())
     }
 
+    /// ADD one tag to many sessions in a SINGLE transaction.
+    ///
+    /// Used when the home geofence moves: the "Home" tag is derived, so every
+    /// past session at the old address is about to lose it (and any cost that
+    /// came from the Home rate). Freezing them under a real stored tag keeps
+    /// that history — but only if it is all-or-nothing. Tagging them one call
+    /// at a time meant a failure halfway left some sessions frozen and the rest
+    /// silently stripped, which is worse than not offering the feature.
+    ///
+    /// Additive on purpose: it never rewrites a session's existing tags, so a
+    /// failed read of the current tag map cannot wipe them. Re-running with the
+    /// same label is a no-op thanks to INSERT OR IGNORE.
+    pub fn add_charge_tag_bulk(&self, session_ts: &[i64], tag: &str) -> Result<usize> {
+        let tag = tag.trim();
+        if tag.is_empty() || crate::charging::is_reserved_tag(tag) {
+            anyhow::bail!("refusing to store a reserved or empty tag: {tag:?}");
+        }
+        if session_ts.is_empty() {
+            return Ok(0);
+        }
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        {
+            let mut stmt = tx.prepare(
+                "INSERT OR IGNORE INTO charge_tags(session_ts, tag) VALUES(?1, ?2)",
+            )?;
+            for ts in session_ts {
+                stmt.execute(params![ts, tag])?;
+            }
+        }
+        for ts in session_ts {
+            mark_mutable_dirty(&tx, "charge", &ts.to_string())?;
+        }
+        tx.commit()?;
+        Ok(session_ts.len())
+    }
+
     /// Tags for one charge session, or an empty vec.
     pub fn get_charge_tags(&self, session_ts: i64) -> Result<Vec<String>> {
-        let conn = self.conn.lock().unwrap();
+        self.with_read_conn(|conn| {
         let mut stmt = conn.prepare_cached(
             "SELECT tag FROM charge_tags WHERE session_ts = ?1 ORDER BY tag",
         )?;
@@ -899,13 +1307,14 @@ impl DriveStore {
             .filter_map(|r| r.ok())
             .collect();
         Ok(out)
+        })
     }
 
     /// Full session_ts → tags map for charge sessions.
     pub fn get_all_charge_tags(
         &self,
     ) -> Result<std::collections::HashMap<i64, Vec<String>>> {
-        let conn = self.conn.lock().unwrap();
+        self.with_read_conn(|conn| {
         let mut stmt = conn.prepare_cached(
             "SELECT session_ts, tag FROM charge_tags ORDER BY session_ts, tag",
         )?;
@@ -917,18 +1326,20 @@ impl DriveStore {
             out.entry(k).or_default().push(t);
         }
         Ok(out)
+        })
     }
 
     /// Every charge tag name in use, sorted and deduplicated.
     pub fn get_all_charge_tag_names(&self) -> Result<Vec<String>> {
-        let conn = self.conn.lock().unwrap();
-        let mut stmt =
-            conn.prepare_cached("SELECT DISTINCT tag FROM charge_tags ORDER BY tag")?;
-        let tags = stmt
-            .query_map([], |row| row.get::<_, String>(0))?
-            .filter_map(|r| r.ok())
-            .collect();
-        Ok(tags)
+        self.with_read_conn(|conn| {
+            let mut stmt =
+                conn.prepare_cached("SELECT DISTINCT tag FROM charge_tags ORDER BY tag")?;
+            let tags = stmt
+                .query_map([], |row| row.get::<_, String>(0))?
+                .filter_map(|r| r.ok())
+                .collect();
+            Ok(tags)
+        })
     }
 
     // ── Charge-cost overrides ───────────────────────────────────────────
@@ -976,19 +1387,20 @@ impl DriveStore {
 
     /// Manual cost override for one charge session, if set.
     pub fn get_charge_cost(&self, session_ts: i64) -> Result<Option<(f64, String)>> {
-        let conn = self.conn.lock().unwrap();
-        let mut stmt = conn
-            .prepare_cached("SELECT amount, currency FROM charge_costs WHERE session_ts = ?1")?;
-        let mut rows = stmt.query_map(params![session_ts], |row| {
-            Ok((
-                row.get::<_, f64>(0)?,
-                row.get::<_, Option<String>>(1)?.unwrap_or_default(),
-            ))
-        })?;
-        match rows.next() {
-            Some(r) => Ok(Some(r?)),
-            None => Ok(None),
-        }
+        self.with_read_conn(|conn| {
+            let mut stmt = conn
+                .prepare_cached("SELECT amount, currency FROM charge_costs WHERE session_ts = ?1")?;
+            let mut rows = stmt.query_map(params![session_ts], |row| {
+                Ok((
+                    row.get::<_, f64>(0)?,
+                    row.get::<_, Option<String>>(1)?.unwrap_or_default(),
+                ))
+            })?;
+            match rows.next() {
+                Some(r) => Ok(Some(r?)),
+                None => Ok(None),
+            }
+        })
     }
 
     /// Full session_ts → (amount, currency) map of manual cost overrides,
@@ -996,7 +1408,7 @@ impl DriveStore {
     pub fn get_all_charge_costs(
         &self,
     ) -> Result<std::collections::HashMap<i64, (f64, String)>> {
-        let conn = self.conn.lock().unwrap();
+        self.with_read_conn(|conn| {
         let mut stmt =
             conn.prepare_cached("SELECT session_ts, amount, currency FROM charge_costs")?;
         let rows = stmt.query_map([], |row| {
@@ -1012,6 +1424,7 @@ impl DriveStore {
             out.insert(k, (amount, currency));
         }
         Ok(out)
+        })
     }
 
     // ── Cloud mutable sync ─────────────────────────────────────────────
@@ -1026,18 +1439,19 @@ impl DriveStore {
 
     /// Every locally-changed mutable awaiting push: (kind, key, changed_at ms).
     pub fn dirty_mutables(&self) -> Result<Vec<(String, String, i64)>> {
-        let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare_cached(
-            "SELECT kind, key, changed_at FROM mutable_dirty ORDER BY changed_at ASC",
-        )?;
-        let rows = stmt.query_map([], |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)?))
-        })?;
-        let mut out = Vec::new();
-        for r in rows {
-            out.push(r?);
-        }
-        Ok(out)
+        self.with_read_conn(|conn| {
+            let mut stmt = conn.prepare_cached(
+                "SELECT kind, key, changed_at FROM mutable_dirty ORDER BY changed_at ASC",
+            )?;
+            let rows = stmt.query_map([], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)?))
+            })?;
+            let mut out = Vec::new();
+            for r in rows {
+                out.push(r?);
+            }
+            Ok(out)
+        })
     }
 
     /// Drop a dirty row after a successful push — only if `changed_at`
@@ -1061,9 +1475,17 @@ impl DriveStore {
         uploaded_at: i64,
     ) -> Result<()> {
         let conn = self.conn.lock().unwrap();
+        // The delete-outbox guard lives INSIDE the writer statement:
+        // a bulk_delete that queued this session (atomically retiring
+        // its charge_uploads row) must never be overwritten by an
+        // in-flight upload ack, or a later re-import of the same
+        // session_ts would read as already-uploaded forever. A separate
+        // read-then-write check has a window; this does not, because
+        // both writers serialize on the connection mutex.
         conn.execute(
             "INSERT INTO charge_uploads(session_ts, cloud_charge_id, wrapped_charge_key, uploaded_at) \
-             VALUES(?1, ?2, ?3, ?4) \
+             SELECT ?1, ?2, ?3, ?4 \
+             WHERE NOT EXISTS(SELECT 1 FROM charge_delete_outbox WHERE session_ts = ?1) \
              ON CONFLICT(session_ts) DO UPDATE SET \
                cloud_charge_id = ?2, wrapped_charge_key = ?3, uploaded_at = ?4",
             params![session_ts, cloud_charge_id, wrapped_charge_key_b64, uploaded_at],
@@ -1071,29 +1493,112 @@ impl DriveStore {
         Ok(())
     }
 
+    /// Every delete-outbox row: (session_ts, cloud_charge_id, settled).
+    /// Pending rows (acked_at NULL) await the cloud's terminal ack;
+    /// settled rows ride one extra sweep (a final delete is issued) to
+    /// close the late-committing-upload race, then get removed.
+    pub fn charge_delete_outbox_all(&self) -> Result<Vec<(i64, String, bool)>> {
+        self.with_read_conn(|conn| {
+            let mut stmt = conn.prepare_cached(
+                "SELECT session_ts, cloud_charge_id, acked_at IS NOT NULL                  FROM charge_delete_outbox ORDER BY session_ts",
+            )?;
+            let rows = stmt.query_map([], |r| {
+                Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, bool>(2)?))
+            })?;
+            rows.collect::<std::result::Result<Vec<_>, _>>().map_err(Into::into)
+        })
+    }
+
+    /// Whether a session is in the delete outbox (any state). The
+    /// uploader consults this at ack time so an in-flight upload that
+    /// raced a local delete never re-marks the session as uploaded.
+    pub fn charge_delete_outbox_contains(&self, session_ts: i64) -> Result<bool> {
+        self.with_read_conn(|conn| {
+            let n: i64 = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM charge_delete_outbox WHERE session_ts = ?1)",
+                params![session_ts],
+                |r| r.get(0),
+            )?;
+            Ok(n != 0)
+        })
+    }
+
+    /// Terminal ack from the cloud: mark settled (kept one more round).
+    pub fn charge_delete_ack(&self, session_ts: i64, now_unix: i64) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE charge_delete_outbox SET acked_at = ?2 WHERE session_ts = ?1",
+            params![session_ts, now_unix],
+        )?;
+        Ok(())
+    }
+
+    /// Grace round complete — drop the settled row. Conditional on it
+    /// still being settled: a second bulk_delete of a re-imported
+    /// session re-queues the row (acked_at back to NULL) and a stale
+    /// sweep snapshot must not erase that pending generation.
+    pub fn charge_delete_remove(&self, session_ts: i64) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "DELETE FROM charge_delete_outbox \
+             WHERE session_ts = ?1 AND acked_at IS NOT NULL",
+            params![session_ts],
+        )?;
+        Ok(())
+    }
+
+    /// [`charge_uploads_map`] bounded to sessions starting at or after
+    /// `from` — the charge sweep's scan window.
+    pub fn charge_uploads_map_since(
+        &self,
+        from: i64,
+    ) -> Result<std::collections::HashMap<i64, (String, String, i64)>> {
+        self.with_read_conn(|conn| {
+            let mut stmt = conn.prepare_cached(
+                "SELECT session_ts, cloud_charge_id, wrapped_charge_key, uploaded_at \
+                 FROM charge_uploads WHERE session_ts >= ?1",
+            )?;
+            let rows = stmt.query_map(params![from], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, i64>(3)?,
+                ))
+            })?;
+            let mut out = std::collections::HashMap::new();
+            for r in rows {
+                let (ts, id, key, at) = r?;
+                out.insert(ts, (id, key, at));
+            }
+            Ok(out)
+        })
+    }
+
     /// session_ts → (cloud_charge_id, wrapped_charge_key b64, uploaded_at)
     /// for every uploaded (or skipped) charge session.
     pub fn charge_uploads_map(
         &self,
     ) -> Result<std::collections::HashMap<i64, (String, String, i64)>> {
-        let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare_cached(
-            "SELECT session_ts, cloud_charge_id, wrapped_charge_key, uploaded_at FROM charge_uploads",
-        )?;
-        let rows = stmt.query_map([], |r| {
-            Ok((
-                r.get::<_, i64>(0)?,
-                r.get::<_, String>(1)?,
-                r.get::<_, String>(2)?,
-                r.get::<_, i64>(3)?,
-            ))
-        })?;
-        let mut out = std::collections::HashMap::new();
-        for r in rows {
-            let (ts, id, key, at) = r?;
-            out.insert(ts, (id, key, at));
-        }
-        Ok(out)
+        self.with_read_conn(|conn| {
+            let mut stmt = conn.prepare_cached(
+                "SELECT session_ts, cloud_charge_id, wrapped_charge_key, uploaded_at FROM charge_uploads",
+            )?;
+            let rows = stmt.query_map([], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, i64>(3)?,
+                ))
+            })?;
+            let mut out = std::collections::HashMap::new();
+            for r in rows {
+                let (ts, id, key, at) = r?;
+                out.insert(ts, (id, key, at));
+            }
+            Ok(out)
+        })
     }
 
     /// Reverse lookup: cloud chargeId → local session_ts.
@@ -1191,6 +1696,7 @@ impl DriveStore {
         }
         drop(conn);
         self.drive_cache_dirty.store(true, Ordering::Release);
+        self.route_overview_gen.fetch_add(1, Ordering::Release);
         self.refresh_counts()?;
         Ok(())
     }
@@ -1240,6 +1746,7 @@ impl DriveStore {
         let _ = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)");
         drop(conn);
         self.drive_cache_dirty.store(true, Ordering::Release);
+        self.route_overview_gen.fetch_add(1, Ordering::Release);
         self.route_count.fetch_sub(deleted as i64, Ordering::Relaxed);
         self.processed_count
             .fetch_sub(deleted_processed as i64, Ordering::Relaxed);
@@ -1276,6 +1783,12 @@ impl DriveStore {
         let (stats, diag) = {
             let mut conn = self.conn.lock().unwrap();
             let s = crate::json_compat::import_json(&mut conn, path, on_progress)?;
+            // Imported telemetry carries historical timestamps, which sit
+            // below the charge sweep's cursor — those sessions would never
+            // be swept again. Propagated: a failed delete here means the
+            // meta table itself is broken.
+            schema::meta_del(&conn, schema::CHARGE_SWEEP_CURSOR_KEY)
+                .context("import: reset charge sweep cursor")?;
             let _ = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)");
             // Persist the diagnostics record while we still hold the writer
             // lock. Best-effort — a failure here is logged but not fatal,
@@ -1286,6 +1799,7 @@ impl DriveStore {
             s
         };
         self.drive_cache_dirty.store(true, Ordering::Release);
+        self.route_overview_gen.fetch_add(1, Ordering::Release);
         self.refresh_counts()?;
         let after = self.route_count.load(Ordering::Relaxed);
         info!(
@@ -1400,17 +1914,23 @@ impl DriveStore {
         // sync (samples cover charging-only days). Tag-only edits don't
         // bump either count and stay stale for one cycle — same accepted
         // trade-off as the shell's drives_count check.
-        let (samples_now, last_synced, last_synced_samples) = {
-            let conn = self.conn.lock().unwrap();
-            let samples: i64 = conn
-                .query_row("SELECT COUNT(*) FROM telemetry_samples", [], |r| r.get(0))
-                .unwrap_or(0);
-            let routes: Option<i64> =
-                schema::meta_get(&conn, ARCHIVE_SYNC_ROUTE_COUNT_KEY)?.and_then(|s| s.parse().ok());
-            let samples_baseline: Option<i64> = schema::meta_get(&conn, ARCHIVE_SYNC_SAMPLE_COUNT_KEY)?
-                .and_then(|s| s.parse().ok());
-            (samples, routes, samples_baseline)
-        };
+        // Read pool, not the writer: this runs at the tail of every
+        // processing pass and the COUNT walks the whole samples table.
+        // A COUNT failure propagates — treating it as 0 would spuriously
+        // mismatch the baseline and trigger a full multi-minute export.
+        let (samples_now, last_synced, last_synced_samples, last_export_date) =
+            self.with_read_conn(|conn| -> Result<_> {
+                let samples: i64 = conn
+                    .query_row("SELECT COUNT(*) FROM telemetry_samples", [], |r| r.get(0))
+                    .context("sync_to_archive: telemetry count")?;
+                let routes: Option<i64> = schema::meta_get(conn, ARCHIVE_SYNC_ROUTE_COUNT_KEY)?
+                    .and_then(|s| s.parse().ok());
+                let samples_baseline: Option<i64> =
+                    schema::meta_get(conn, ARCHIVE_SYNC_SAMPLE_COUNT_KEY)?
+                        .and_then(|s| s.parse().ok());
+                let export_date = schema::meta_get(conn, ARCHIVE_SYNC_EXPORT_DATE_KEY)?;
+                Ok((samples, routes, samples_baseline, export_date))
+            })?;
         if last_synced == Some(routes_now)
             && last_synced_samples == Some(samples_now)
             && Path::new(archive).exists()
@@ -1422,12 +1942,25 @@ impl DriveStore {
             return Ok(());
         }
 
+        // Daily gate: counts moved, but an export already ran today. The
+        // count baselines are deliberately NOT advanced, so tomorrow's
+        // first pass exports everything accumulated since this one.
+        let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+        if last_export_date.as_deref() == Some(today.as_str()) && Path::new(archive).exists() {
+            info!(
+                "[drives] archive_json_export_skipped reason=already_today date={}",
+                today
+            );
+            return Ok(());
+        }
+
         self.export_json_to_file(mirror)?;
         sync_to_path(mirror, archive, cache)?;
 
         let conn = self.conn.lock().unwrap();
         schema::meta_set(&conn, ARCHIVE_SYNC_ROUTE_COUNT_KEY, &routes_now.to_string())?;
         schema::meta_set(&conn, ARCHIVE_SYNC_SAMPLE_COUNT_KEY, &samples_now.to_string())?;
+        schema::meta_set(&conn, ARCHIVE_SYNC_EXPORT_DATE_KEY, &today)?;
         Ok(())
     }
 
@@ -1494,8 +2027,11 @@ impl DriveStore {
         let _rebuild = self.rebuild_lock.lock().unwrap();
 
         // A concurrent caller may have rebuilt while we waited for the
-        // rebuild lock — if the flag is clean and a cache exists, done.
-        if !force && !self.drive_cache_dirty.load(Ordering::Acquire) {
+        // rebuild lock — if both flags are clean and a cache exists, done.
+        if !force
+            && !self.drive_cache_dirty.load(Ordering::Acquire)
+            && self.append_watermark.lock().unwrap().is_none()
+        {
             let conn = self.conn.lock().unwrap();
             if let Some(json) = schema::meta_get(&conn, "drive_list_cache")? {
                 if !json.is_empty() {
@@ -1504,13 +2040,58 @@ impl DriveStore {
             }
         }
 
-        // Snapshot point: clear the dirty flag BEFORE opening the read
-        // snapshot. A mutation landing in the gap is still visible to the
-        // snapshot (it begins after) AND re-dirties the flag — worst case
-        // one redundant rebuild, never a missed one. Clearing later would
-        // let a mid-rebuild mutation be swallowed.
-        self.drive_cache_dirty.store(false, Ordering::Release);
+        // Debounce (bulk ingest only): a rebuild that finished moments
+        // ago — typically while we waited on rebuild_lock — is fresh
+        // enough. last != 0 implies the caches were written at least once.
+        if !force && self.bulk_ingest.load(Ordering::Acquire) {
+            let last = self.last_cache_rebuild.load(Ordering::Acquire);
+            if last != 0 && now_unix() - last < CACHE_REBUILD_DEBOUNCE_SECS {
+                return Ok(());
+            }
+        }
 
+        // Snapshot point: clear both flags BEFORE opening the read
+        // snapshot. A mutation landing in the gap is still visible to the
+        // snapshot (it begins after) AND re-flags — worst case one
+        // redundant rebuild, never a missed one. Clearing later would
+        // let a mid-rebuild mutation be swallowed.
+        let full = force || self.drive_cache_dirty.swap(false, Ordering::AcqRel);
+        let watermark = self.append_watermark.lock().unwrap().take();
+
+        // Append fast path: pure inserts only, all at or after the
+        // watermark. Regroups from a provably independent cut; any bail
+        // falls through to the full rebuild below.
+        if !full {
+            if let Some(wm) = watermark {
+                match self.try_append_rebuild(wm) {
+                    Ok(true) => {
+                        self.last_cache_rebuild.store(now_unix(), Ordering::Release);
+                        return Ok(());
+                    }
+                    Ok(false) => {
+                        info!("[drives] append fast path bailed — full rebuild");
+                    }
+                    Err(e) => {
+                        warn!("[drives] append fast path failed ({e}) — full rebuild");
+                    }
+                }
+            } else {
+                // Nothing to do (another rebuilder consumed the work).
+                return Ok(());
+            }
+        }
+
+        // The invalidation state is already consumed; if the rebuild
+        // fails now, nothing else re-flags it and every later getter
+        // would serve the stale cache as clean. Re-dirty on any error.
+        let res = self.full_rebuild_inner();
+        if res.is_err() {
+            self.drive_cache_dirty.store(true, Ordering::Release);
+        }
+        res
+    }
+
+    fn full_rebuild_inner(&self) -> Result<()> {
         // Phase 1: snapshot inputs. On a file-backed store this uses a
         // dedicated READ-ONLY connection — WAL lets it scan the summary
         // rows concurrently with the shared connection's writers, so the
@@ -1535,8 +2116,278 @@ impl DriveStore {
         let artifacts = compute_drive_caches(inputs)?;
 
         // Phase 3 (locked, fast): persist.
-        let conn = self.conn.lock().unwrap();
-        write_drive_caches(&conn, &artifacts)
+        {
+            let conn = self.conn.lock().unwrap();
+            write_drive_caches(&conn, &artifacts)?;
+        }
+        self.last_cache_rebuild.store(now_unix(), Ordering::Release);
+        Ok(())
+    }
+
+    /// Append fast path: everything strictly before an independent cut
+    /// is provably unchanged, so splice freshly grouped suffix drives
+    /// onto the cached list and re-derive stats + FSD from the result
+    /// with the same artifact math as a full rebuild. Ok(false) = bail
+    /// to the full path (never wrong, only slower).
+    fn try_append_rebuild(&self, watermark: chrono::NaiveDateTime) -> Result<bool> {
+        use crate::grouper::{DRIVE_GAP_MS, GAP_FILL_MAX_MS};
+        // No grouping rule reaches across a void wider than the drive
+        // gap plus twice the gap-fill cap (chain hop, hole width, anchor
+        // cap are all bounded by GAP_FILL_MAX). One extra cap of margin.
+        let quiet_ms = DRIVE_GAP_MS + 2 * GAP_FILL_MAX_MS;
+        let window_start = watermark
+            - chrono::Duration::milliseconds(quiet_ms + GAP_FILL_MAX_MS)
+            - chrono::Duration::days(1);
+
+        // Cached artifacts + guards, all under one read lease.
+        let (list_json, no_hidden, algo_ok, tags_count_meta) =
+            self.with_read_conn(|conn| -> Result<_> {
+                Ok((
+                    schema::meta_get(conn, "drive_list_cache")?,
+                    schema::meta_get(conn, "drive_list_cache_no_hidden")?,
+                    schema::meta_get(conn, "drive_list_cache_algo")?.as_deref()
+                        == Some(DRIVE_LIST_CACHE_ALGO_VERSION),
+                    schema::meta_get(conn, "drive_list_cache_tags_count")?,
+                ))
+            })?;
+        let Some(list_json) = list_json.filter(|j| !j.is_empty()) else {
+            return Ok(false);
+        };
+        if no_hidden.as_deref() != Some("1") || !algo_ok || tags_count_meta.is_none() {
+            return Ok(false);
+        }
+        let mut kept: Vec<crate::types::DriveSummary> = match serde_json::from_str(&list_json) {
+            Ok(v) => v,
+            Err(_) => return Ok(false),
+        };
+
+        // Window day list: from just before the window start through the
+        // newest date-keyed route (NOT the wall clock — imported or
+        // test data may live entirely in the past). Too wide a span is
+        // cheaper as a full rebuild.
+        let newest_day = self.with_read_conn(|conn| -> Result<Option<String>> {
+            // Any path family the window query below does not select
+            // (teslascope-style imports, backslash paths, odd digit
+            // keys) could hold rows past the cutoff that the full
+            // rebuild would group — bail rather than silently drop them.
+            let unknown: bool = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM routes WHERE                    (file < 'A' AND file NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]*')                    OR (file >= 'A'                        AND file NOT LIKE 'SavedClips/%'                        AND file NOT LIKE 'SentryClips/%'                        AND file NOT LIKE 'tessie/%'))",
+                [],
+                |r| r.get(0),
+            )?;
+            if unknown {
+                return Ok(None);
+            }
+            let f: Option<String> = conn
+                .query_row(
+                    "SELECT file FROM routes WHERE file < 'A' ORDER BY file DESC LIMIT 1",
+                    [],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            Ok(f.and_then(|f| f.get(..10).map(str::to_string)))
+        })?;
+        let Some(newest_day) = newest_day
+            .and_then(|d| chrono::NaiveDate::parse_from_str(&d, "%Y-%m-%d").ok())
+        else {
+            return Ok(false);
+        };
+        let first_day = window_start.date();
+        let span = (newest_day - first_day).num_days();
+        if !(0..=60).contains(&span) {
+            return Ok(false);
+        }
+        let days: Vec<String> = (0..=span + 1)
+            .map(|d| (first_day + chrono::Duration::days(d)).format("%Y-%m-%d").to_string())
+            .collect();
+
+        // Load window summaries (date-dir day ranges + all event rows)
+        // and the full tag map, on one snapshot.
+        let (mut window, tags, tags_count, window_max_updated) =
+            self.with_read_conn(|conn| -> Result<_> {
+                let mut clauses: Vec<String> = Vec::new();
+                let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+                // '~' (0x7E) upper bounds cover both `DAY/...` and the
+                // event-style `DAY_HH-MM-SS/...` native keys ('_' sorts
+                // above '0'). Tessie imports live under their own prefix.
+                for day in &days {
+                    clauses.push("(file >= ? AND file < ?)".to_string());
+                    params.push(Box::new(format!("{day}/")));
+                    params.push(Box::new(format!("{day}~")));
+                    clauses.push("(file >= ? AND file < ?)".to_string());
+                    params.push(Box::new(format!("tessie/{day}/")));
+                    params.push(Box::new(format!("tessie/{day}~")));
+                }
+                clauses.push(
+                    "file LIKE 'SavedClips/%' OR file LIKE 'SentryClips/%' \
+                     OR file LIKE 'SavedClips\\%' OR file LIKE 'SentryClips\\%'"
+                        .to_string(),
+                );
+                let where_sql = format!("WHERE {}", clauses.join(" OR "));
+                let refs: Vec<&dyn rusqlite::ToSql> =
+                    params.iter().map(|b| b.as_ref()).collect();
+                let rows = select_route_summaries_where(conn, &where_sql, &refs)?;
+
+                let mut tags = std::collections::HashMap::<String, Vec<String>>::new();
+                let mut tags_count: i64 = 0;
+                let mut stmt = conn.prepare_cached("SELECT drive_key, tag FROM drive_tags")?;
+                let trows = stmt.query_map([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })?;
+                for r in trows {
+                    let (k, t) = r?;
+                    tags.entry(k).or_default().push(t);
+                    tags_count += 1;
+                }
+
+                // Appended rows carry the newest updated_at stamps, so
+                // the validity marker advances from the window alone.
+                let mut max_upd: i64 = 0;
+                let mut stmt2 = conn.prepare_cached(
+                    "SELECT COALESCE(MAX(updated_at), 0) FROM routes WHERE file >= ? AND file < ?",
+                )?;
+                for day in &days {
+                    for prefix in ["", "tessie/"] {
+                        let m: i64 = stmt2
+                            .query_row(
+                                params![
+                                    format!("{prefix}{day}/"),
+                                    format!("{prefix}{day}~")
+                                ],
+                                |r| r.get(0),
+                            )
+                            .unwrap_or(0);
+                        max_upd = max_upd.max(m);
+                    }
+                }
+                Ok((rows, tags, tags_count, max_upd))
+            })?;
+
+        // Timestamps for the quiet-zone search; unparseable window rows
+        // can't be placed — bail.
+        let mut stamped: Vec<(chrono::NaiveDateTime, usize)> = Vec::new();
+        for (i, r) in window.iter().enumerate() {
+            match crate::grouper::parse_clip_timestamp(&r.file) {
+                Some(ts) => {
+                    if ts >= window_start {
+                        stamped.push((ts, i));
+                    }
+                }
+                None => return Ok(false),
+            }
+        }
+        stamped.sort_by_key(|&(ts, _)| ts);
+
+        // Latest void of quiet_ms ending at or before the watermark.
+        // Both edges must be loaded clips so the void is fully observed.
+        let mut cutoff: Option<chrono::NaiveDateTime> = None;
+        for w in stamped.windows(2) {
+            let (a, b) = (w[0].0, w[1].0);
+            if b <= watermark && (b - a).num_milliseconds() >= quiet_ms {
+                cutoff = Some(b);
+            }
+        }
+        // No prior clip at all inside the window start edge: if the
+        // earliest stamped clip is the watermark's own drive and nothing
+        // precedes it back to window_start, everything before the window
+        // is separated by at least the margin day — treat the earliest
+        // stamp as the cut only if the cache's last drive ends before
+        // (earliest - quiet).
+        let Some(cutoff) = cutoff.or_else(|| {
+            let first = stamped.first()?.0;
+            let last_end = kept.last().and_then(|d| {
+                chrono::NaiveDateTime::parse_from_str(&d.end_time, "%Y-%m-%dT%H:%M:%S").ok()
+            });
+            match last_end {
+                Some(e) if (first - e).num_milliseconds() >= quiet_ms => Some(first),
+                None if kept.is_empty() => Some(first),
+                _ => None,
+            }
+        }) else {
+            return Ok(false);
+        };
+
+        // Regroup everything at or after the cut.
+        let cutoff_keep = |ts: chrono::NaiveDateTime| ts >= cutoff;
+        let keep_idx: std::collections::HashSet<usize> = stamped
+            .iter()
+            .filter(|&&(ts, _)| cutoff_keep(ts))
+            .map(|&(_, i)| i)
+            .collect();
+        let mut suffix_rows = Vec::with_capacity(keep_idx.len());
+        let mut i = 0usize;
+        window.retain(|_| {
+            let keep = keep_idx.contains(&i);
+            i += 1;
+            keep
+        });
+        suffix_rows.append(&mut window);
+
+        let suffix = crate::grouper::group_summaries_fast(&suffix_rows, &tags);
+
+        // Splice: prefix strictly before the cut is untouched; sanity
+        // check the boundary, then renumber suffix ids to continue the
+        // global enumeration.
+        let cutoff_str = cutoff.format("%Y-%m-%dT%H:%M:%S").to_string();
+        kept.retain(|d| d.start_time < cutoff_str);
+        if kept
+            .last()
+            .is_some_and(|d| d.end_time.as_str() >= cutoff_str.as_str())
+        {
+            return Ok(false);
+        }
+        let base = kept.len() as i32;
+        for (k, mut d) in suffix.into_iter().enumerate() {
+            d.id = base + k as i32;
+            kept.push(d);
+        }
+
+        let route_count = self.route_count.load(Ordering::Relaxed);
+        let prev_max_updated = self.with_read_conn(|conn| {
+            schema::meta_get(conn, "drive_list_cache_max_updated_at")
+        })?
+        .and_then(|v| v.parse::<i64>().ok())
+        .unwrap_or(0);
+
+        let artifacts = artifacts_from_drives(
+            kept,
+            route_count,
+            tags_count,
+            prev_max_updated.max(window_max_updated),
+        )?;
+        {
+            let conn = self.conn.lock().unwrap();
+            write_drive_caches(&conn, &artifacts)?;
+        }
+        info!("[drives] append fast path spliced at {}", cutoff_str);
+        self.append_splices.fetch_add(1, Ordering::Relaxed);
+        Ok(true)
+    }
+
+    /// True when either invalidation flag is set — the full-dirty flag or
+    /// a pending append watermark.
+    fn cache_needs_rebuild(&self) -> bool {
+        self.drive_cache_dirty.load(Ordering::Acquire)
+            || self.append_watermark.lock().unwrap().is_some()
+    }
+
+    /// Serve the last-built cache entry while the dirty flag is set but a
+    /// rebuild finished within the debounce window. During bulk ingest
+    /// every `add_route` re-dirties the caches; without this, every stats
+    /// poll re-runs the full grouper (~400ms on a Pi 5, seconds on a
+    /// Zero 2 W) just to fold in a handful of new clips. None → out of
+    /// window or no cache yet; the caller rebuilds.
+    fn stale_cache_within_debounce(&self, key: &str) -> Result<Option<String>> {
+        if !self.bulk_ingest.load(Ordering::Acquire) {
+            return Ok(None);
+        }
+        let last = self.last_cache_rebuild.load(Ordering::Acquire);
+        if last == 0 || now_unix() - last >= CACHE_REBUILD_DEBOUNCE_SECS {
+            return Ok(None);
+        }
+        Ok(self
+            .with_read_conn(|conn| schema::meta_get(conn, key))?
+            .filter(|j| !j.is_empty()))
     }
 
     /// Return the pre-computed drives list as a JSON string. On a cache hit
@@ -1548,56 +2399,206 @@ impl DriveStore {
     /// in the `meta` table for subsequent requests — holding the connection
     /// lock only for the snapshot and write phases, not the compute.
     pub fn get_cached_drives_json(&self) -> Result<String> {
-        if !self.drive_cache_dirty.load(Ordering::Acquire) {
-            let conn = self.conn.lock().unwrap();
-            if let Some(json) = schema::meta_get(&conn, "drive_list_cache")? {
+        if !self.cache_needs_rebuild() {
+            if let Some(json) = self.with_read_conn(|conn| schema::meta_get(conn, "drive_list_cache"))? {
                 if !json.is_empty() {
                     return Ok(json);
                 }
             }
+        } else if let Some(json) = self.stale_cache_within_debounce("drive_list_cache")? {
+            return Ok(json);
         }
 
         // force when the flag was clean (the entry itself was missing or
         // empty) — the stampede early-exit would otherwise skip the repair.
-        let force = !self.drive_cache_dirty.load(Ordering::Acquire);
+        let force = !self.cache_needs_rebuild();
         self.rebuild_caches_off_lock(force)?;
-        let conn = self.conn.lock().unwrap();
-        Ok(schema::meta_get(&conn, "drive_list_cache")?.unwrap_or_else(|| "[]".to_string()))
+        Ok(self
+            .with_read_conn(|conn| schema::meta_get(conn, "drive_list_cache"))?
+            .unwrap_or_else(|| "[]".to_string()))
+    }
+
+    /// Serve `/api/drives/routes` map-overview JSON from an in-memory cache;
+    /// recompute (full grouper) only after a route mutation.
+    pub fn get_cached_route_overviews_json(&self, max_points: usize) -> Result<String> {
+        // Read generation before routes: a mutation in between just forces one
+        // extra recompute next time, never a stale serve.
+        let generation = self.route_overview_gen.load(Ordering::Acquire);
+        {
+            let cache = self.route_overview_cache.lock().unwrap();
+            if let Some(c) = cache.as_ref() {
+                if c.max_points == max_points {
+                    if c.generation == generation {
+                        return Ok(c.json.clone());
+                    }
+                    // Bulk ingest bumps the generation on every clip, and a
+                    // recompute is the heaviest read in the store (full BLOB
+                    // decode of every route) — serve the last-built overview
+                    // for the debounce window instead of recomputing per
+                    // map request.
+                    if self.bulk_ingest.load(Ordering::Acquire)
+                        && now_unix() - self.last_overview_rebuild.load(Ordering::Acquire)
+                            < CACHE_REBUILD_DEBOUNCE_SECS
+                    {
+                        return Ok(c.json.clone());
+                    }
+                }
+            }
+        }
+        // Single-flight. The rebuild below decodes every route in the
+        // store; letting two requests do that concurrently multiplies the
+        // process's largest allocation.
+        let _rebuild = self.overview_rebuild_lock.lock().unwrap();
+
+        // Re-check: whoever held the lock may have just built exactly
+        // what this request wants.
+        {
+            let cache = self.route_overview_cache.lock().unwrap();
+            if let Some(c) = cache.as_ref() {
+                if c.max_points == max_points && c.generation == generation {
+                    return Ok(c.json.clone());
+                }
+            }
+        }
+
+        let overviews = self.build_overviews_streaming(max_points)?;
+        let json = serde_json::to_string(&overviews).unwrap_or_else(|_| "[]".to_string());
+        let mut cache = self.route_overview_cache.lock().unwrap();
+        *cache = Some(RouteOverviewCache { generation, max_points, json: json.clone() });
+        self.last_overview_rebuild.store(now_unix(), Ordering::Release);
+        Ok(json)
+    }
+
+    /// Streaming overview build: plan every drive from metadata, then
+    /// decode point BLOBs in bounded batches of consecutive drives.
+    /// Peak heap is one batch (~budgeted) plus the response, instead of
+    /// every route's full arrays (~350MB decoded on an 18.5k-route
+    /// store). Output is byte-identical to the old in-memory path —
+    /// enforced by the grouper's differential test and the db-level
+    /// parity test below.
+    fn build_overviews_streaming(
+        &self,
+        max_points: usize,
+    ) -> Result<Vec<crate::types::RouteOverview>> {
+        // One WAL snapshot for the WHOLE build — plan and every points
+        // batch see the same committed state, exactly like the old
+        // single select_all_routes. Without it a concurrent write could
+        // yield hybrids: ghost drives from deleted rows, or stale park
+        // ranges over rewritten points. A fresh RO connection (same
+        // pattern as rebuild_caches_off_lock's snapshot phase) so the
+        // multi-second build never occupies a pool lane. `:memory:`
+        // stores use the shared connection, which is one snapshot by
+        // construction.
+        if self.path == ":memory:" {
+            return self.with_locked_conn(|conn| Self::build_overviews_on(conn, max_points));
+        }
+        let rconn = open_readonly_connection(&self.path)?;
+        let tx = rconn.unchecked_transaction()?;
+        let out = Self::build_overviews_on(&tx, max_points)?;
+        drop(tx);
+        Ok(out)
+    }
+
+    fn build_overviews_on(
+        conn: &Connection,
+        max_points: usize,
+    ) -> Result<Vec<crate::types::RouteOverview>> {
+        // Decoded-point budget per batch: 1M points = 16MB decoded.
+        const BATCH_POINT_BUDGET: usize = 1_000_000;
+
+        let metas = select_overview_metas(conn)?;
+        let plans = crate::grouper::plan_overviews(&metas);
+
+        let mut out = Vec::with_capacity(plans.len());
+        let mut batch_start = 0usize;
+        while batch_start < plans.len() {
+            // Greedy: consecutive drives until the point budget is hit
+            // (always at least one drive, however large).
+            let mut batch_end = batch_start;
+            let mut budget = 0usize;
+            let mut files: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+            while batch_end < plans.len() {
+                let cost: usize = plans[batch_end]
+                    .fragments
+                    .iter()
+                    .map(|f| metas[f.meta_idx].n_points)
+                    .sum();
+                if batch_end > batch_start && budget + cost > BATCH_POINT_BUDGET {
+                    break;
+                }
+                budget += cost;
+                for f in &plans[batch_end].fragments {
+                    files.insert(metas[f.meta_idx].file.as_str());
+                }
+                batch_end += 1;
+            }
+
+            let file_list: Vec<&str> = files.into_iter().collect();
+            let points = select_points_by_files(conn, &file_list)?;
+
+            for (idx, drive) in plans[batch_start..batch_end].iter().enumerate() {
+                let id = (batch_start + idx) as i32;
+                let overview = crate::grouper::overview_from_fragments(
+                    id,
+                    drive,
+                    &metas,
+                    &mut |meta_idx| {
+                        // Defense in depth only: under the pinned
+                        // snapshot every planned file exists.
+                        Ok(points
+                            .get(&metas[meta_idx].file)
+                            .cloned()
+                            .unwrap_or_default())
+                    },
+                    max_points,
+                )?;
+                out.push(overview);
+            }
+            batch_start = batch_end;
+        }
+        Ok(out)
     }
 
     /// Return the pre-computed drive stats as a JSON string. `processed_count`
     /// is stored as 0 in the cache; callers must inject the live value.
     pub fn get_cached_drive_stats_json(&self) -> Result<String> {
-        if !self.drive_cache_dirty.load(Ordering::Acquire) {
-            let conn = self.conn.lock().unwrap();
-            if let Some(json) = schema::meta_get(&conn, "drive_stats_cache")? {
+        if !self.cache_needs_rebuild() {
+            if let Some(json) = self.with_read_conn(|conn| schema::meta_get(conn, "drive_stats_cache"))? {
                 if !json.is_empty() {
                     return Ok(json);
                 }
             }
+        } else if let Some(json) = self.stale_cache_within_debounce("drive_stats_cache")? {
+            return Ok(json);
         }
-        let force = !self.drive_cache_dirty.load(Ordering::Acquire);
+        let force = !self.cache_needs_rebuild();
         self.rebuild_caches_off_lock(force)?;
-        let conn = self.conn.lock().unwrap();
-        Ok(schema::meta_get(&conn, "drive_stats_cache")?.unwrap_or_else(|| "{}".to_string()))
+        Ok(self
+            .with_read_conn(|conn| schema::meta_get(conn, "drive_stats_cache"))?
+            .unwrap_or_else(|| "{}".to_string()))
     }
 
     /// Return the pre-computed FSD analytics as a JSON string.
     pub fn get_cached_fsd_analytics_json(&self) -> Result<String> {
-        if !self.drive_cache_dirty.load(Ordering::Acquire) {
-            let conn = self.conn.lock().unwrap();
-            if let Some(json) = schema::meta_get(&conn, "fsd_analytics_cache")? {
+        if !self.cache_needs_rebuild() {
+            if let Some(json) = self.with_read_conn(|conn| schema::meta_get(conn, "fsd_analytics_cache"))? {
                 // Treat "{}" as a cache miss: older builds could persist an
                 // empty-object placeholder which then masks real data forever.
                 if !json.is_empty() && json.trim() != "{}" {
                     return Ok(json);
                 }
             }
+        } else if let Some(json) = self
+            .stale_cache_within_debounce("fsd_analytics_cache")?
+            .filter(|j| j.trim() != "{}")
+        {
+            return Ok(json);
         }
-        let force = !self.drive_cache_dirty.load(Ordering::Acquire);
+        let force = !self.cache_needs_rebuild();
         self.rebuild_caches_off_lock(force)?;
-        let conn = self.conn.lock().unwrap();
-        Ok(schema::meta_get(&conn, "fsd_analytics_cache")?.unwrap_or_else(|| "{}".to_string()))
+        Ok(self
+            .with_read_conn(|conn| schema::meta_get(conn, "fsd_analytics_cache"))?
+            .unwrap_or_else(|| "{}".to_string()))
     }
 
     /// Refresh the cached row counts with full COUNT(*) queries. Called
@@ -1620,6 +2621,28 @@ impl DriveStore {
 // SQL helpers (private)
 // -----------------------------------------------------------------------------
 
+/// Journal a DB access whose mutex wait or closure runtime crossed
+/// 100ms — separates "slow SQL" from "queued behind the writer" from
+/// "queued behind another read" without a profiler on the Pi.
+fn log_slow_conn(
+    kind: &str,
+    caller: &'static std::panic::Location<'static>,
+    waited: std::time::Duration,
+    ran: std::time::Duration,
+) {
+    const SLOW: std::time::Duration = std::time::Duration::from_millis(100);
+    if waited >= SLOW || ran >= SLOW {
+        warn!(
+            "slow_db conn={} wait_ms={} run_ms={} at={}:{}",
+            kind,
+            waited.as_millis(),
+            ran.as_millis(),
+            caller.file(),
+            caller.line(),
+        );
+    }
+}
+
 fn open_connection(path: &str) -> Result<Connection> {
     let conn = Connection::open(path)?;
     apply_pragmas(&conn)?;
@@ -1630,11 +2653,77 @@ fn open_connection(path: &str) -> Result<Connection> {
 /// for long-running reads (the JSON export mirror) that would otherwise
 /// hold the shared writer connection's mutex for minutes. WAL mode on
 /// the writer lets this handle see a consistent snapshot.
+/// What a read-only handle is for. The two roles want opposite page
+/// strategies, so they no longer share pragmas.
+#[derive(Clone, Copy, PartialEq)]
+enum ReadRole {
+    /// The API read pool: small, repeated, latency-sensitive lookups.
+    /// Wants its working set to survive an archive run.
+    Api,
+    /// One-shot bulk walks (JSON export, cache-rebuild snapshot) that
+    /// stream hundreds of MB once and never re-read them.
+    Bulk,
+}
+
+/// Total system RAM in KiB, or `None` when /proc/meminfo is unreadable.
+fn mem_total_kb() -> Option<u64> {
+    let meminfo = std::fs::read_to_string("/proc/meminfo").ok()?;
+    meminfo
+        .lines()
+        .find_map(|l| l.strip_prefix("MemTotal:"))
+        .and_then(|v| v.trim().trim_end_matches(" kB").trim().parse().ok())
+}
+
+/// Page cache (KiB) for an API read connection, sized to the board.
+///
+/// This is a CAP, not an allocation — SQLite grows the pager cache only
+/// as queries touch pages, and the hot poll paths touch a handful. The
+/// tiers still stay conservative because the majority of installs are
+/// 512 MB Zero 2 Ws, where a bulk read through this pool (a month of
+/// tire history, say) could actually approach the cap.
+fn api_reader_cache_kb() -> i64 {
+    match mem_total_kb() {
+        // Unreadable /proc/meminfo — assume the smallest supported board.
+        None => 4_000,
+        // Zero 2 W and friends (512 MB). The hot set here is the tails
+        // of two small partial indexes plus a few leaves, which fits
+        // well inside this; anything larger is unjustified on a board
+        // whose image ships without swap.
+        Some(kb) if kb <= 600_000 => 4_000,
+        // 1 GB Pi 4/5.
+        Some(kb) if kb <= 1_200_000 => 16_000,
+        Some(kb) if kb <= 2_500_000 => 24_000,
+        Some(_) => 48_000,
+    }
+}
+
 fn open_readonly_connection(path: &str) -> Result<Connection> {
+    open_readonly_connection_for(path, ReadRole::Bulk)
+}
+
+fn open_readonly_connection_for(path: &str, role: ReadRole) -> Result<Connection> {
     let flags = OpenFlags::SQLITE_OPEN_READ_ONLY
         | OpenFlags::SQLITE_OPEN_URI
         | OpenFlags::SQLITE_OPEN_NO_MUTEX;
     let conn = Connection::open_with_flags(path, flags)?;
+    if role == ReadRole::Api {
+        // mmap_size = 0 is the point of this role. With mmap on, SQLite
+        // reads ride the OS page cache — which an archive run floods
+        // with many GB of video, evicting the DB's hot B-tree pages. The
+        // same queries then measured 1000x slower (1.1ms -> 7.4s) with
+        // identical, optimal query plans. A private heap cache is
+        // anonymous memory, which the kernel reclaims far less eagerly
+        // than clean file pages, so the hot set survives the archive.
+        conn.execute_batch(&format!(
+            "PRAGMA query_only = ON;
+             PRAGMA busy_timeout = 5000;
+             PRAGMA mmap_size = 0;
+             PRAGMA cache_size = -{};
+             PRAGMA temp_store = MEMORY;",
+            api_reader_cache_kb()
+        ))?;
+        return Ok(conn);
+    }
     // mmap_size matches apply_pragmas — this connection serves the
     // BLOB-heavy full-table scans (JSON export, cache-rebuild snapshot),
     // which benefit most from skipping the pager-buffer copy.
@@ -1802,24 +2891,26 @@ fn select_cache_inputs(conn: &Connection) -> Result<DriveCacheInputs> {
 fn compute_drive_caches(inputs: DriveCacheInputs) -> Result<DriveCacheArtifacts> {
     let DriveCacheInputs { summaries, tags, tags_count, max_updated_at } = inputs;
     let route_count = summaries.len() as i64;
+    let drives = crate::grouper::group_summaries_fast(&summaries, &tags);
+    artifacts_from_drives(drives, route_count, tags_count, max_updated_at)
+}
 
-    // Use the BLOB-free summary grouper so this cache and the
-    // `single_drive` endpoint (which also resolves drive IDs through
-    // the summary grouper) agree on drive count, boundaries, and IDs.
-    // The previous BLOB-grouper cache could split a clip mid-park-gap
-    // while the summary grouper kept the whole clip in one drive,
-    // producing different drive lists for /api/drives vs
-    // /api/drives/{id} and causing clicked drives to load wrong points.
-    //
-    // Heap win: ~5 MB instead of ~300 MB on a 5500-route DB (no BLOB
-    // decode here). Numerical drift on noisy GPS is fractions of a
-    // percent, invisible after the UI's 0.1-mi / whole-percent rounding.
-    //
-    // Group with original (un-hidden) IDs first — these are what
+/// Serialize list + stats + FSD caches from an already-grouped drive
+/// vec. Split out of [`compute_drive_caches`] so the append fast path
+/// can splice a suffix onto the cached list and run the identical
+/// artifact math — stats and FSD stay byte-equal by construction.
+fn artifacts_from_drives(
+    drives: Vec<crate::types::DriveSummary>,
+    route_count: i64,
+    tags_count: i64,
+    max_updated_at: i64,
+) -> Result<DriveCacheArtifacts> {
+
+    // Grouped with original (un-hidden) IDs — these are what
     // `find_drive_files` looks up against, so the cached list must
     // hold the same IDs even after the Tessie-overlap filter strips
-    // duplicates.
-    let drives = crate::grouper::group_summaries_fast(&summaries, &tags);
+    // duplicates. (The BLOB-free summary grouper is used everywhere for
+    // agreement on drive count, boundaries, and IDs.)
     let visible = crate::grouper::hide_tessie_overlapping_sei(drives.clone());
     info!(
         "drive cache: route_count={} drives={} visible={} tags={}",
@@ -1844,9 +2935,13 @@ fn compute_drive_caches(inputs: DriveCacheInputs) -> Result<DriveCacheArtifacts>
     // (tessie, teslascope, future importers) is imported data with fuzzy
     // or absent per-point autopilot telemetry — counted in totals, never
     // in FSD analytics. Matches Sentry-Drive's isImportedSource rule.
+    // Summon drives are likewise totals-only (mirrors Sentry-Drive's
+    // aggregate builder): autopilot_state stays unset while the car
+    // drives itself, so counting them would dilute the FSD score with
+    // fake "0% FSD" drives.
     let sei_drives: Vec<_> = drives
         .iter()
-        .filter(|d| !matches!(d.source.as_deref(), Some(s) if s != "sei"))
+        .filter(|d| !matches!(d.source.as_deref(), Some(s) if s != "sei") && !d.summon)
         .collect();
     let sei_total_km: f64 = sei_drives.iter().map(|d| d.distance_km).sum();
     let fsd_distance_km: f64 = sei_drives.iter().map(|d| d.fsd_distance_km).sum();
@@ -1921,6 +3016,13 @@ fn write_drive_caches(conn: &Connection, a: &DriveCacheArtifacts) -> Result<()> 
     schema::meta_set(conn, "drive_list_cache_max_updated_at", &a.max_updated_at.to_string())?;
     schema::meta_set(conn, "drive_stats_cache", &a.stats_json)?;
     schema::meta_set(conn, "fsd_analytics_cache", &a.fsd_json)?;
+    // Append fast-path gate: only when nothing is hidden does the cached
+    // visible list equal the full drive vec that stats/FSD sum over.
+    schema::meta_set(
+        conn,
+        "drive_list_cache_no_hidden",
+        if a.drives_total == a.visible_total { "1" } else { "0" },
+    )?;
     info!(
         "[drives] Drive list cache rebuilt ({} drives, {} visible after Tessie/SEI hide, from {} routes)",
         a.drives_total,
@@ -2009,6 +3111,17 @@ fn insert_or_update_route(
     let sb = encode_f32s(Some(&r.speeds));
     let acb = encode_f32s(Some(&r.accel_positions));
     let rb = encode_gear_runs(Some(&r.gear_runs));
+    // Empty flag_runs stores NULL, not a zero-length blob — "no flag
+    // evidence" must survive the round-trip as absence.
+    let fb = if r.flag_runs.is_empty() {
+        None
+    } else {
+        encode_flag_runs(Some(&r.flag_runs))
+    };
+    // v20 IMU accel channels: same NULL-for-absent rule — pre-IMU
+    // firmware and old extractions must read as "no channel".
+    let axb = if r.accel_x.is_empty() { None } else { encode_f32s(Some(&r.accel_x)) };
+    let ayb = if r.accel_y.is_empty() { None } else { encode_f32s(Some(&r.accel_y)) };
 
     let first_lat: Option<f64> = r.points.first().map(|p| p[0]);
     let first_lon: Option<f64> = r.points.first().map(|p| p[1]);
@@ -2044,7 +3157,13 @@ fn insert_or_update_route(
             odometer_mi_start, odometer_mi_end,
             location_name_start, location_name_end,
             fsd_pend_ms_end, park_ms_start, fsd_at_end, fsd_accel_pushes_early,
-            ap_at_start)
+            ap_at_start,
+            flag_runs_blob, sei_speed_abs_max,
+            safety_hard_brake_ms, safety_hard_brake_events,
+            safety_aggr_turn_ms, safety_aggr_turn_events,
+            safety_speeding_ms, safety_moving_ms, safety_manual_moving_ms,
+            safety_brake_any_ms, safety_turn_any_ms,
+            accel_x_blob, accel_y_blob)
          VALUES(
             ?1, ?2, ?3, ?4, ?5,
             NULL, NULL, ?6, ?7, ?8,
@@ -2058,7 +3177,11 @@ fn insert_or_update_route(
             ?36, ?37, ?38, ?39, ?40, ?41,
             ?42, ?43, ?44, ?45,
             ?46, ?47, ?48, ?49,
-            ?50, ?51, ?52, ?53, ?54)
+            ?50, ?51, ?52, ?53, ?54,
+            ?55, ?56,
+            ?57, ?58, ?59, ?60, ?61, ?62, ?63,
+            ?64, ?65,
+            ?66, ?67)
          ON CONFLICT(file) DO UPDATE SET
             date_dir            = excluded.date_dir,
             point_count         = excluded.point_count,
@@ -2112,7 +3235,20 @@ fn insert_or_update_route(
             park_ms_start       = excluded.park_ms_start,
             fsd_at_end          = excluded.fsd_at_end,
             fsd_accel_pushes_early = excluded.fsd_accel_pushes_early,
-            ap_at_start         = excluded.ap_at_start",
+            ap_at_start         = excluded.ap_at_start,
+            flag_runs_blob      = excluded.flag_runs_blob,
+            sei_speed_abs_max   = excluded.sei_speed_abs_max,
+            safety_hard_brake_ms     = excluded.safety_hard_brake_ms,
+            safety_hard_brake_events = excluded.safety_hard_brake_events,
+            safety_aggr_turn_ms      = excluded.safety_aggr_turn_ms,
+            safety_aggr_turn_events  = excluded.safety_aggr_turn_events,
+            safety_speeding_ms       = excluded.safety_speeding_ms,
+            safety_moving_ms         = excluded.safety_moving_ms,
+            safety_manual_moving_ms  = excluded.safety_manual_moving_ms,
+            safety_brake_any_ms      = excluded.safety_brake_any_ms,
+            safety_turn_any_ms       = excluded.safety_turn_any_ms,
+            accel_x_blob             = excluded.accel_x_blob,
+            accel_y_blob             = excluded.accel_y_blob",
         params![
             norm_file,
             &r.date,
@@ -2168,6 +3304,19 @@ fn insert_or_update_route(
             a.fsd_at_end as i64,
             a.fsd_accel_pushes_early,
             a.ap_at_start,
+            fb,
+            a.sei_speed_abs_max,
+            a.safety_hard_brake_ms,
+            a.safety_hard_brake_events,
+            a.safety_aggr_turn_ms,
+            a.safety_aggr_turn_events,
+            a.safety_speeding_ms,
+            a.safety_moving_ms,
+            a.safety_manual_moving_ms,
+            a.safety_brake_any_ms,
+            a.safety_turn_any_ms,
+            axb,
+            ayb,
         ],
     )?;
     Ok(())
@@ -2185,7 +3334,8 @@ fn select_all_routes(conn: &Connection) -> Result<Vec<Route>> {
                 hvac_runtime_s,
                 tire_fl_psi, tire_fr_psi, tire_rl_psi, tire_rr_psi,
                 odometer_mi_start, odometer_mi_end,
-                location_name_start, location_name_end
+                location_name_start, location_name_end,
+                flag_runs_blob, accel_x_blob, accel_y_blob
          FROM routes
          ORDER BY file",
     )?;
@@ -2194,6 +3344,92 @@ fn select_all_routes(conn: &Connection) -> Result<Vec<Route>> {
     let mut out = Vec::new();
     for r in rows {
         out.push(build_route_from_row(r?)?);
+    }
+    Ok(out)
+}
+
+/// Reduced per-route metadata for the overview planner: every fact the
+/// grouping topology consults, no point data. gear_states and event
+/// speeds are decoded per row, reduced to scalars, and dropped.
+fn select_overview_metas(conn: &Connection) -> Result<Vec<crate::grouper::OverviewClipMeta>> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT file,
+                coalesce(length(points_blob), 0) / 16,
+                gear_states_blob, gear_runs_blob,
+                raw_park_count, raw_frame_count,
+                CASE WHEN file LIKE 'SavedClips/%' OR file LIKE 'SentryClips/%'
+                          OR file LIKE 'SavedClips\\%' OR file LIKE 'SentryClips\\%'
+                     THEN speeds_blob ELSE NULL END,
+                source, external_signature
+         FROM routes
+         ORDER BY file",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, i64>(1)?,
+            row.get::<_, Option<Vec<u8>>>(2)?,
+            row.get::<_, Option<Vec<u8>>>(3)?,
+            row.get::<_, i64>(4)?,
+            row.get::<_, i64>(5)?,
+            row.get::<_, Option<Vec<u8>>>(6)?,
+            row.get::<_, Option<String>>(7)?,
+            row.get::<_, Option<String>>(8)?,
+        ))
+    })?;
+
+    let mut out = Vec::new();
+    for r in rows {
+        let (file, n_points, gs_blob, gr_blob, park, frame, sp_blob, source, sig) = r?;
+        let gear_states = decode_u8s(gs_blob.as_deref()).unwrap_or_default();
+        let gear_runs = decode_gear_runs(gr_blob.as_deref())
+            .with_context(|| format!("decode gear_runs {}", file))?
+            .unwrap_or_default();
+        let speeds = decode_f32s(sp_blob.as_deref())
+            .with_context(|| format!("decode speeds {}", file))?
+            .unwrap_or_default();
+        out.push(crate::grouper::OverviewClipMeta {
+            file,
+            n_points: n_points.max(0) as usize,
+            gear_runs,
+            gear_states_len: gear_states.len(),
+            gear_states_non_park: gear_states.iter().any(|&g| g != crate::types::GEAR_PARK),
+            gear_states_park_count: gear_states
+                .iter()
+                .filter(|&&g| g == crate::types::GEAR_PARK)
+                .count(),
+            raw_park_count: park.max(0) as u32,
+            raw_frame_count: frame.max(0) as u32,
+            speeds_driving: crate::grouper::speeds_driving(&speeds),
+            source,
+            external_signature: sig,
+        });
+    }
+    Ok(out)
+}
+
+/// Decoded points for the named files, chunked IN-lookups on the PK.
+fn select_points_by_files(
+    conn: &Connection,
+    files: &[&str],
+) -> Result<std::collections::HashMap<String, std::rc::Rc<Vec<GpsPoint>>>> {
+    const CHUNK: usize = 400;
+    let mut out = std::collections::HashMap::with_capacity(files.len());
+    for chunk in files.chunks(CHUNK) {
+        let placeholders = vec!["?"; chunk.len()].join(",");
+        let mut stmt = conn.prepare(&format!(
+            "SELECT file, points_blob FROM routes WHERE file IN ({placeholders})"
+        ))?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(chunk.iter()), |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, Option<Vec<u8>>>(1)?))
+        })?;
+        for r in rows {
+            let (file, blob) = r?;
+            let pts = crate::blob::decode_points(blob.as_deref())
+                .with_context(|| format!("decode points {}", file))?
+                .unwrap_or_default();
+            out.insert(file, std::rc::Rc::new(pts));
+        }
     }
     Ok(out)
 }
@@ -2217,7 +3453,8 @@ fn select_routes_by_files(conn: &Connection, files: &[&str]) -> Result<Vec<Route
                 hvac_runtime_s,
                 tire_fl_psi, tire_fr_psi, tire_rl_psi, tire_rr_psi,
                 odometer_mi_start, odometer_mi_end,
-                location_name_start, location_name_end
+                location_name_start, location_name_end,
+                flag_runs_blob, accel_x_blob, accel_y_blob
          FROM routes
          WHERE file IN ({})
          ORDER BY file",
@@ -2257,6 +3494,11 @@ type RouteRow = (
     Option<f64>, Option<f64>, Option<f64>, Option<f64>,
     Option<f64>, Option<f64>,
     Option<String>, Option<String>,
+    // v16 flag_runs_blob — appended last to keep prior indices stable.
+    Option<Vec<u8>>,
+    // v20 IMU accel blobs (lateral, longitudinal).
+    Option<Vec<u8>>,
+    Option<Vec<u8>>,
 );
 
 /// Shared row mapper for the two route SELECTs above. The column order
@@ -2290,6 +3532,9 @@ fn route_row_mapper(row: &rusqlite::Row<'_>) -> rusqlite::Result<RouteRow> {
         row.get::<_, Option<f64>>(24)?,
         row.get::<_, Option<String>>(25)?,
         row.get::<_, Option<String>>(26)?,
+        row.get::<_, Option<Vec<u8>>>(27)?,
+        row.get::<_, Option<Vec<u8>>>(28)?,
+        row.get::<_, Option<Vec<u8>>>(29)?,
     ))
 }
 
@@ -2305,6 +3550,7 @@ fn build_route_from_row(r: RouteRow) -> Result<Route> {
         tire_fl_psi, tire_fr_psi, tire_rl_psi, tire_rr_psi,
         odometer_mi_start, odometer_mi_end,
         location_name_start, location_name_end,
+        fb, axb, ayb,
     ) = r;
     let points = decode_points(pb.as_deref())
         .with_context(|| format!("decode points {}", file))?
@@ -2320,9 +3566,19 @@ fn build_route_from_row(r: RouteRow) -> Result<Route> {
     let gear_runs = decode_gear_runs(rb.as_deref())
         .with_context(|| format!("decode gear_runs {}", file))?
         .unwrap_or_default();
+    let flag_runs = decode_flag_runs(fb.as_deref())
+        .with_context(|| format!("decode flag_runs {}", file))?
+        .unwrap_or_default();
+    let accel_x = decode_f32s(axb.as_deref())
+        .with_context(|| format!("decode accel_x {}", file))?
+        .unwrap_or_default();
+    let accel_y = decode_f32s(ayb.as_deref())
+        .with_context(|| format!("decode accel_y {}", file))?
+        .unwrap_or_default();
     Ok(Route {
         file, date, points, gear_states, autopilot_states,
         speeds, accel_positions, raw_park_count, raw_frame_count, gear_runs,
+        flag_runs, accel_x, accel_y,
         source, external_signature, tessie_autopilot_percent,
         battery_pct_start, battery_pct_end,
         interior_temp_min, interior_temp_max, exterior_temp_avg,
@@ -2339,7 +3595,19 @@ fn build_route_from_row(r: RouteRow) -> Result<Route> {
 /// rows or routes whose 60s window had no samples; the consumer
 /// handles that via the `Option` shape inside `RouteTelemetryAggregates`.
 fn select_all_route_summaries(conn: &Connection) -> Result<Vec<RouteSummary>> {
-    let mut stmt = conn.prepare_cached(
+    select_route_summaries_where(conn, "", &[])
+}
+
+/// Shared column list + row mapper for RouteSummary selects. `where_sql`
+/// is appended verbatim (empty for the full table); rows always come
+/// back ORDER BY file so subsets preserve the full query's relative
+/// order for dedup-first-wins.
+fn select_route_summaries_where(
+    conn: &Connection,
+    where_sql: &str,
+    params: &[&dyn rusqlite::ToSql],
+) -> Result<Vec<RouteSummary>> {
+    let mut stmt = conn.prepare_cached(&format!(
         "SELECT file, date_dir, raw_park_count, raw_frame_count, gear_runs_blob,
                 distance_m, max_speed_mps, avg_speed_mps, speed_sample_count,
                 valid_point_count, fsd_engaged_ms, autosteer_engaged_ms,
@@ -2355,11 +3623,17 @@ fn select_all_route_summaries(conn: &Connection) -> Result<Vec<RouteSummary>> {
                 odometer_mi_start, odometer_mi_end,
                 location_name_start, location_name_end,
                 fsd_pend_ms_end, park_ms_start, fsd_at_end, fsd_accel_pushes_early,
-                ap_at_start
+                ap_at_start,
+                flag_runs_blob, sei_speed_abs_max,
+                safety_hard_brake_ms, safety_hard_brake_events,
+                safety_aggr_turn_ms, safety_aggr_turn_events,
+                safety_speeding_ms, safety_moving_ms, safety_manual_moving_ms,
+                safety_brake_any_ms, safety_turn_any_ms
          FROM routes
+         {where_sql}
          ORDER BY file",
-    )?;
-    let rows = stmt.query_map([], |row| {
+    ))?;
+    let rows = stmt.query_map(rusqlite::params_from_iter(params.iter()), |row| {
         let rb: Option<Vec<u8>> = row.get(4)?;
         Ok((
             row.get::<_, String>(0)?,
@@ -2421,6 +3695,23 @@ fn select_all_route_summaries(conn: &Connection) -> Result<Vec<RouteSummary>> {
                 row.get::<_, Option<i64>>(42)?,
                 row.get::<_, Option<i64>>(43)?,
             ),
+            // v16 summon evidence
+            (
+                row.get::<_, Option<Vec<u8>>>(44)?,
+                row.get::<_, Option<f64>>(45)?,
+            ),
+            // v18 safety scalars + v19 denominators
+            (
+                row.get::<_, Option<i64>>(46)?,
+                row.get::<_, Option<i64>>(47)?,
+                row.get::<_, Option<i64>>(48)?,
+                row.get::<_, Option<i64>>(49)?,
+                row.get::<_, Option<i64>>(50)?,
+                row.get::<_, Option<i64>>(51)?,
+                row.get::<_, Option<i64>>(52)?,
+                row.get::<_, Option<i64>>(53)?,
+                row.get::<_, Option<i64>>(54)?,
+            ),
         ))
     })?;
 
@@ -2462,10 +3753,25 @@ fn select_all_route_summaries(conn: &Connection) -> Result<Vec<RouteSummary>> {
             (odometer_mi_start, odometer_mi_end),
             (location_name_start, location_name_end),
             (fsd_pend_ms_end, park_ms_start, fsd_at_end, fsd_accel_pushes_early, ap_at_start),
+            (fb, sei_speed_abs_max),
+            (
+                safety_hard_brake_ms,
+                safety_hard_brake_events,
+                safety_aggr_turn_ms,
+                safety_aggr_turn_events,
+                safety_speeding_ms,
+                safety_moving_ms,
+                safety_manual_moving_ms,
+                safety_brake_any_ms,
+                safety_turn_any_ms,
+            ),
         ) = r?;
 
         let gear_runs = decode_gear_runs(rb.as_deref())
             .with_context(|| format!("decode gear_runs {}", file))?
+            .unwrap_or_default();
+        let flag_runs = decode_flag_runs(fb.as_deref())
+            .with_context(|| format!("decode flag_runs {}", file))?
             .unwrap_or_default();
 
         out.push(RouteSummary {
@@ -2474,6 +3780,7 @@ fn select_all_route_summaries(conn: &Connection) -> Result<Vec<RouteSummary>> {
             raw_park_count,
             raw_frame_count,
             gear_runs,
+            flag_runs,
             aggregates: RouteAggregates {
                 distance_m: distance_m.unwrap_or(0.0),
                 max_speed_mps: max_speed_mps.unwrap_or(0.0),
@@ -2498,6 +3805,16 @@ fn select_all_route_summaries(conn: &Connection) -> Result<Vec<RouteSummary>> {
                 start_lng: start_lon,
                 end_lat,
                 end_lng: end_lon,
+                sei_speed_abs_max,
+                safety_hard_brake_ms,
+                safety_hard_brake_events,
+                safety_aggr_turn_ms,
+                safety_aggr_turn_events,
+                safety_speeding_ms,
+                safety_moving_ms,
+                safety_manual_moving_ms,
+                safety_brake_any_ms,
+                safety_turn_any_ms,
             },
             source,
             external_signature,
@@ -2574,6 +3891,11 @@ fn run_one_shot_import(conn: &mut Connection, candidates: &[&str]) -> Result<()>
     if let Err(e) = persist_import_history(conn, &stats, &diag) {
         warn!("[drives] failed to persist import history: {}", e);
     }
+
+    // Same reason as the manual import path: imported telemetry lands
+    // below the charge sweep's cursor.
+    schema::meta_del(conn, schema::CHARGE_SWEEP_CURSOR_KEY)
+        .context("one-shot import: reset charge sweep cursor")?;
 
     // Set the marker BEFORE renaming. If we die between these two steps,
     // the worst outcome on next boot is an orphan JSON left alone (the
@@ -2719,6 +4041,10 @@ mod tests {
                 0,
                 2,
                 &[GearRun { gear: 4, frames: 2 }],
+                &[
+                    FlagRun { flags: 3, frames: 1, max_mps: Some(25.0) },
+                    FlagRun { flags: 0, frames: 1, max_mps: None },
+                ],
             )
             .unwrap();
         let routes = store.get_routes().unwrap();
@@ -2730,6 +4056,69 @@ mod tests {
         assert_eq!(routes[0].accel_positions, vec![0.5, 0.6]);
         assert_eq!(routes[0].raw_frame_count, 2);
         assert_eq!(routes[0].gear_runs.len(), 1);
+        // Per-run max_mps round-trips through the blob, including the
+        // NaN-encoded None on legacy runs.
+        assert_eq!(
+            routes[0].flag_runs,
+            vec![
+                FlagRun { flags: 3, frames: 1, max_mps: Some(25.0) },
+                FlagRun { flags: 0, frames: 1, max_mps: None },
+            ],
+        );
+        // The summary path carries the same flag evidence + the v16
+        // SEI abs-max column populated by compute_route_aggregates.
+        store
+            .with_route_summaries(|summaries| {
+                assert_eq!(summaries.len(), 1);
+                assert_eq!(summaries[0].flag_runs, routes[0].flag_runs);
+                assert_eq!(summaries[0].aggregates.sei_speed_abs_max, Some(26.0));
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn route_overview_cache_matches_live_and_invalidates_on_mutation() {
+        let store = DriveStore::open_memory().unwrap();
+        let add = |file: &str, lat: f64| {
+            store
+                .add_route(
+                    file,
+                    "2025-01-15",
+                    &vec![[lat, -122.4194], [lat + 0.001, -122.4195]],
+                    &[4, 4],
+                    &[1, 1],
+                    &[25.0, 26.0],
+                    &[0.5, 0.6],
+                    0,
+                    2,
+                    &[GearRun { gear: 4, frames: 2 }],
+                    &[],
+                )
+                .unwrap();
+        };
+
+        add("2025-01-15/2025-01-15_10-00-00-front.mp4", 37.7749);
+        // Cache == live output.
+        let live1 = serde_json::to_string(&crate::grouper::route_overviews(
+            store.get_routes().unwrap(),
+            20,
+        ))
+        .unwrap();
+        let cached1 = store.get_cached_route_overviews_json(20).unwrap();
+        assert_eq!(cached1, live1, "cache must equal live output");
+        // Hit.
+        assert_eq!(store.get_cached_route_overviews_json(20).unwrap(), live1);
+
+        // Mutation invalidates.
+        add("2025-01-15/2025-01-15_11-00-00-front.mp4", 40.0000);
+        let live2 = serde_json::to_string(&crate::grouper::route_overviews(
+            store.get_routes().unwrap(),
+            20,
+        ))
+        .unwrap();
+        let cached2 = store.get_cached_route_overviews_json(20).unwrap();
+        assert_ne!(cached2, cached1, "cache must refresh after a new route");
+        assert_eq!(cached2, live2, "refreshed cache must equal live output");
     }
 
     #[test]
@@ -2751,7 +4140,7 @@ mod tests {
         let store = DriveStore::open(&path_str).unwrap();
         let pts: Vec<GpsPoint> = vec![[37.7749, -122.4194], [37.7760, -122.4180]];
         store
-            .add_route("a/2025-02-02_09-00-00-front.mp4", "a", &pts, &[4, 4], &[0, 0], &[15.0, 16.0], &[0.0, 0.0], 0, 2, &[])
+            .add_route("a/2025-02-02_09-00-00-front.mp4", "a", &pts, &[4, 4], &[0, 0], &[15.0, 16.0], &[0.0, 0.0], 0, 2, &[], &[])
             .unwrap();
         let json = store.get_cached_drives_json().unwrap();
         assert!(json.contains("2025-02-02"), "file-backed rebuild should serve the drive: {json}");
@@ -2768,7 +4157,7 @@ mod tests {
         let store = DriveStore::open_memory().unwrap();
         let pts: Vec<GpsPoint> = vec![[37.7749, -122.4194], [37.7760, -122.4180]];
         store
-            .add_route("a/2025-01-01_10-00-00-front.mp4", "a", &pts, &[4, 4], &[0, 0], &[20.0, 21.0], &[0.0, 0.0], 0, 2, &[])
+            .add_route("a/2025-01-01_10-00-00-front.mp4", "a", &pts, &[4, 4], &[0, 0], &[20.0, 21.0], &[0.0, 0.0], 0, 2, &[], &[])
             .unwrap();
         // add_route marked the cache dirty; the getter must rebuild via the
         // off-lock path and serve a list containing the new drive.
@@ -2779,9 +4168,11 @@ mod tests {
         // A further mutation re-dirties; the next read rebuilds again and
         // reflects it (second route is 2.5h later — a separate drive).
         store
-            .add_route("a/2025-01-01_12-30-00-front.mp4", "a", &pts, &[4, 4], &[0, 0], &[20.0, 21.0], &[0.0, 0.0], 0, 2, &[])
+            .add_route("a/2025-01-01_12-30-00-front.mp4", "a", &pts, &[4, 4], &[0, 0], &[20.0, 21.0], &[0.0, 0.0], 0, 2, &[], &[])
             .unwrap();
-        assert!(store.drive_cache_dirty.load(Ordering::Acquire));
+        // A pure insert records an append watermark rather than the full
+        // dirty flag; either way the next read must rebuild.
+        assert!(store.cache_needs_rebuild());
         let json2 = store.get_cached_drives_json().unwrap();
         assert!(
             json2.matches("\"id\"").count() > json.matches("\"id\"").count(),
@@ -2793,6 +4184,338 @@ mod tests {
         assert!(stats.contains("drives_count"));
     }
 
+    /// All three cache JSONs after whatever path the getters chose must
+    /// equal a forced full rebuild's, byte for byte.
+    fn assert_caches_equal_full_rebuild(store: &DriveStore) {
+        let list_a = store.get_cached_drives_json().unwrap();
+        let stats_a = store.get_cached_drive_stats_json().unwrap();
+        let fsd_a = store.get_cached_fsd_analytics_json().unwrap();
+        store.drive_cache_dirty.store(true, Ordering::Release);
+        assert_eq!(store.get_cached_drives_json().unwrap(), list_a, "list diverged");
+        assert_eq!(store.get_cached_drive_stats_json().unwrap(), stats_a, "stats diverged");
+        assert_eq!(store.get_cached_fsd_analytics_json().unwrap(), fsd_a, "fsd diverged");
+    }
+
+    fn add_clip(store: &DriveStore, file: &str) {
+        let pts: Vec<GpsPoint> = vec![[37.7749, -122.4194], [37.7760, -122.4180]];
+        store
+            .add_route(file, "d", &pts, &[4, 4], &[0, 0], &[20.0, 21.0], &[0.0, 0.0], 0, 2, &[], &[])
+            .unwrap();
+    }
+
+    /// Appends after a primed cache take the splice path and match a
+    /// full rebuild exactly: extending the last drive, starting a new
+    /// drive, and gap-filling an event clip near the tail.
+    #[test]
+    fn append_fast_path_matches_full_rebuild() {
+        let store = DriveStore::open_memory().unwrap();
+        add_clip(&store, "2025-01-01/2025-01-01_10-00-00-front.mp4");
+        add_clip(&store, "2025-01-01/2025-01-01_12-30-00-front.mp4");
+        let _ = store.get_cached_drives_json().unwrap(); // prime (full)
+        assert_eq!(store.append_splices.load(Ordering::Relaxed), 0);
+
+        // Extend the last drive (2 min later).
+        add_clip(&store, "2025-01-01/2025-01-01_12-32-00-front.mp4");
+        assert_caches_equal_full_rebuild(&store);
+        assert_eq!(store.append_splices.load(Ordering::Relaxed), 1, "splice expected");
+
+        // New drive far later (next day).
+        add_clip(&store, "2025-01-02/2025-01-02_09-00-00-front.mp4");
+        assert_caches_equal_full_rebuild(&store);
+        assert_eq!(store.append_splices.load(Ordering::Relaxed), 2);
+
+        // Two anchors with a hole, then an event clip filling it —
+        // event inserts are appends too.
+        add_clip(&store, "2025-01-02/2025-01-02_11-00-00-front.mp4");
+        add_clip(&store, "2025-01-02/2025-01-02_11-08-00-front.mp4");
+        let _ = store.get_cached_drives_json().unwrap();
+        store
+            .add_route(
+                "SavedClips/2025-01-02_11-30-00/2025-01-02_11-04-00-front.mp4",
+                "SavedClips",
+                &[[37.71, -122.41], [37.712, -122.412]],
+                &[],
+                &[],
+                &[3.0, 3.0],
+                &[],
+                0,
+                0,
+                &[],
+                &[],
+            )
+            .unwrap();
+        assert_caches_equal_full_rebuild(&store);
+        assert!(store.append_splices.load(Ordering::Relaxed) >= 3);
+    }
+
+    /// Mutations that can touch history must NOT take the splice path.
+    #[test]
+    fn non_append_mutations_take_the_full_path() {
+        let store = DriveStore::open_memory().unwrap();
+        add_clip(&store, "2025-01-01/2025-01-01_10-00-00-front.mp4");
+        add_clip(&store, "2025-01-01/2025-01-01_12-30-00-front.mp4");
+        let _ = store.get_cached_drives_json().unwrap();
+
+        // Upsert of an existing file (reprocess shape) — full flag.
+        add_clip(&store, "2025-01-01/2025-01-01_10-00-00-front.mp4");
+        assert!(store.drive_cache_dirty.load(Ordering::Acquire), "upsert must set full dirty");
+        assert_caches_equal_full_rebuild(&store);
+        assert_eq!(store.append_splices.load(Ordering::Relaxed), 0);
+
+        // Delete — full flag.
+        store
+            .delete_routes_by_files(&["2025-01-01/2025-01-01_12-30-00-front.mp4".to_string()], &[])
+            .unwrap();
+        assert!(store.drive_cache_dirty.load(Ordering::Acquire));
+        assert_caches_equal_full_rebuild(&store);
+        assert_eq!(store.append_splices.load(Ordering::Relaxed), 0);
+    }
+
+    /// A continuous timeline with no quiet zone inside the window makes
+    /// the splice unsafe; output must still match via the full fallback.
+    #[test]
+    fn append_without_quiet_zone_falls_back_correctly() {
+        let store = DriveStore::open_memory().unwrap();
+        // Hourly clips across two full days: 60-minute gaps everywhere,
+        // never a quiet-zone-sized void anywhere in the search window.
+        for day in ["2025-01-01", "2025-01-02"] {
+            for h in 0..24 {
+                add_clip(&store, &format!("{day}/{day}_{h:02}-00-00-front.mp4"));
+            }
+        }
+        let _ = store.get_cached_drives_json().unwrap();
+        let splices_before = store.append_splices.load(Ordering::Relaxed);
+        add_clip(&store, "2025-01-02/2025-01-02_23-45-00-front.mp4");
+        assert_caches_equal_full_rebuild(&store);
+        assert_eq!(
+            store.append_splices.load(Ordering::Relaxed),
+            splices_before,
+            "no quiet zone -> must not splice"
+        );
+    }
+
+    /// Outbox lifecycle: pending until acked, settled for one grace
+    /// round, then removed; membership is visible throughout.
+    #[test]
+    fn charge_delete_outbox_lifecycle() {
+        let store = DriveStore::open_memory().unwrap();
+        {
+            let conn = store.conn.lock().unwrap();
+            conn.execute(
+                "INSERT INTO charge_delete_outbox(session_ts, cloud_charge_id, queued_at)                  VALUES(1000, 'aa', 1), (2000, 'bb', 1)",
+                [],
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            store.charge_delete_outbox_all().unwrap(),
+            vec![(1000, "aa".into(), false), (2000, "bb".into(), false)]
+        );
+        assert!(store.charge_delete_outbox_contains(1000).unwrap());
+        assert!(!store.charge_delete_outbox_contains(3000).unwrap());
+
+        store.charge_delete_ack(1000, 99).unwrap();
+        assert_eq!(
+            store.charge_delete_outbox_all().unwrap(),
+            vec![(1000, "aa".into(), true), (2000, "bb".into(), false)],
+            "acked row settles but survives for the grace round"
+        );
+        assert!(store.charge_delete_outbox_contains(1000).unwrap());
+
+        store.charge_delete_remove(1000).unwrap();
+        assert_eq!(
+            store.charge_delete_outbox_all().unwrap(),
+            vec![(2000, "bb".into(), false)]
+        );
+        assert!(!store.charge_delete_outbox_contains(1000).unwrap());
+    }
+
+    /// The outbox guard inside charge_upload_mark: an ack for a session
+    /// the user deleted mid-flight must not resurrect its upload record.
+    #[test]
+    fn charge_upload_mark_refuses_outboxed_sessions() {
+        let store = DriveStore::open_memory().unwrap();
+        {
+            let conn = store.conn.lock().unwrap();
+            conn.execute(
+                "INSERT INTO charge_delete_outbox(session_ts, cloud_charge_id, queued_at)                  VALUES(1000, 'aa', 1)",
+                [],
+            )
+            .unwrap();
+        }
+        store.charge_upload_mark(1000, "aa", "k", 5).unwrap();
+        assert!(
+            store.charge_uploads_map().unwrap().is_empty(),
+            "outboxed session must not be marked uploaded"
+        );
+        store.charge_upload_mark(2000, "bb", "k", 5).unwrap();
+        assert!(store.charge_uploads_map().unwrap().contains_key(&2000));
+    }
+
+    /// A non-overlapping Tessie import in the suffix region must survive
+    /// an append splice: the window query loads `tessie/` day ranges, so
+    /// the regrouped suffix contains the imported drive.
+    #[test]
+    fn append_with_tessie_rows_matches_full_rebuild() {
+        let store = DriveStore::open_memory().unwrap();
+        add_clip(&store, "2025-01-01/2025-01-01_18-00-00-front.mp4");
+        add_clip(&store, "2025-01-02/2025-01-02_08-00-00-front.mp4");
+        add_clip(&store, "tessie/2025-01-02/2025-01-02_09-00-00-front-tessie-1.mp4");
+        let _ = store.get_cached_drives_json().unwrap();
+        let splices_before = store.append_splices.load(Ordering::Relaxed);
+        add_clip(&store, "2025-01-02/2025-01-02_08-02-00-front.mp4");
+        assert_caches_equal_full_rebuild(&store);
+        assert_eq!(
+            store.append_splices.load(Ordering::Relaxed),
+            splices_before + 1,
+            "tessie rows load into the window, so the splice still runs"
+        );
+    }
+
+    /// A path family the window query cannot enumerate forces the full
+    /// path — it might hold rows past the cutoff.
+    #[test]
+    fn append_with_unknown_family_falls_back() {
+        let store = DriveStore::open_memory().unwrap();
+        add_clip(&store, "2025-01-01/2025-01-01_18-00-00-front.mp4");
+        add_clip(&store, "2025-01-02/2025-01-02_08-00-00-front.mp4");
+        add_clip(&store, "teslascope/2025-01-02/2025-01-02_09-00-00-front-x-1.mp4");
+        let _ = store.get_cached_drives_json().unwrap();
+        let splices_before = store.append_splices.load(Ordering::Relaxed);
+        add_clip(&store, "2025-01-02/2025-01-02_08-02-00-front.mp4");
+        assert_caches_equal_full_rebuild(&store);
+        assert_eq!(
+            store.append_splices.load(Ordering::Relaxed),
+            splices_before,
+            "unknown family -> full rebuild"
+        );
+    }
+
+    /// The streaming builder must produce byte-identical overview JSON to
+    /// the retained in-memory oracle over a store exercising park splits,
+    /// speeds-gated gap-fill, and plain drives, at several point limits.
+    #[test]
+    fn streaming_overviews_match_in_memory_oracle() {
+        let store = DriveStore::open_memory().unwrap();
+        let pts: Vec<GpsPoint> = (0..6).map(|i| [37.7 + i as f64 * 0.001, -122.4]).collect();
+        store
+            .add_route("a/2025-01-01_10-00-00-front.mp4", "a", &pts, &[4, 4], &[0, 0], &[20.0, 21.0], &[0.0, 0.0], 0, 2, &[], &[])
+            .unwrap();
+        // Park-split clip.
+        store
+            .add_route(
+                "a/2025-01-01_10-00-40-front.mp4",
+                "a",
+                &pts,
+                &[4, 4, 0, 0, 4, 4],
+                &[0; 6],
+                &[15.0; 6],
+                &[0.0; 6],
+                300,
+                900,
+                &[
+                    crate::types::GearRun { gear: 4, frames: 300 },
+                    crate::types::GearRun { gear: 0, frames: 300 },
+                    crate::types::GearRun { gear: 4, frames: 300 },
+                ],
+                &[],
+            )
+            .unwrap();
+        // Speeds-gated interior event fill for the 10:00:40 -> 10:08 hole.
+        store
+            .add_route(
+                "SavedClips/2025-01-01_10-30-00/2025-01-01_10-04-00-front.mp4",
+                "SavedClips",
+                &pts,
+                &[],
+                &[],
+                &[3.0, 3.0],
+                &[],
+                0,
+                0,
+                &[],
+                &[],
+            )
+            .unwrap();
+        store
+            .add_route("a/2025-01-01_10-08-00-front.mp4", "a", &pts, &[4, 4], &[0, 0], &[18.0, 18.0], &[0.0, 0.0], 0, 2, &[], &[])
+            .unwrap();
+
+        for max_points in [2usize, 20, 500] {
+            let oracle = store.with_locked_conn(|conn| {
+                crate::grouper::route_overviews(select_all_routes(conn).unwrap(), max_points)
+            });
+            let streamed = store.build_overviews_streaming(max_points).unwrap();
+            assert_eq!(
+                serde_json::to_string(&oracle).unwrap(),
+                serde_json::to_string(&streamed).unwrap(),
+                "streaming builder diverged at max_points={max_points}"
+            );
+        }
+    }
+
+    /// Tag edits patch the cached list in place. The patched bytes must
+    /// be indistinguishable from a full rebuild's, and the stats cache
+    /// must not even be touched.
+    #[test]
+    fn tag_edit_patches_list_cache_identically_to_full_rebuild() {
+        let store = DriveStore::open_memory().unwrap();
+        let pts: Vec<GpsPoint> = vec![[37.7749, -122.4194], [37.7760, -122.4180]];
+        // Two separate drives (2.5h apart).
+        store
+            .add_route("a/2025-01-01_10-00-00-front.mp4", "a", &pts, &[4, 4], &[0, 0], &[20.0, 21.0], &[0.0, 0.0], 0, 2, &[], &[])
+            .unwrap();
+        store
+            .add_route("a/2025-01-01_12-30-00-front.mp4", "a", &pts, &[4, 4], &[0, 0], &[20.0, 21.0], &[0.0, 0.0], 0, 2, &[], &[])
+            .unwrap();
+        let list_before = store.get_cached_drives_json().unwrap();
+        let stats_before = store.get_cached_drive_stats_json().unwrap();
+
+        // Key of the first drive, straight from the built list.
+        let parsed: Vec<crate::types::DriveSummary> =
+            serde_json::from_str(&list_before).unwrap();
+        let key = parsed[0].start_time.clone();
+
+        // Patched path: cache stays clean, list carries the tag.
+        store
+            .set_drive_tags(&key, &["roadtrip".to_string()])
+            .unwrap();
+        assert!(
+            !store.drive_cache_dirty.load(Ordering::Acquire),
+            "tag edit must not dirty the caches"
+        );
+        let patched = store.get_cached_drives_json().unwrap();
+        assert!(patched.contains("roadtrip"));
+
+        // Oracle: force the full rebuild and compare bytes.
+        store.drive_cache_dirty.store(true, Ordering::Release);
+        let rebuilt = store.get_cached_drives_json().unwrap();
+        assert_eq!(patched, rebuilt, "patched list must match a full rebuild");
+
+        // Stats never contain tags; the edit must have left them alone.
+        assert_eq!(store.get_cached_drive_stats_json().unwrap(), stats_before);
+    }
+
+    /// A no-GPS clip only marks the file processed — it cannot change any
+    /// cache, so it must not invalidate them.
+    #[test]
+    fn add_route_without_points_leaves_caches_clean() {
+        let store = DriveStore::open_memory().unwrap();
+        let pts: Vec<GpsPoint> = vec![[37.7749, -122.4194], [37.7760, -122.4180]];
+        store
+            .add_route("a/2025-01-01_10-00-00-front.mp4", "a", &pts, &[4, 4], &[0, 0], &[20.0, 21.0], &[0.0, 0.0], 0, 2, &[], &[])
+            .unwrap();
+        let _ = store.get_cached_drives_json().unwrap();
+        let gen_before = store.route_overview_gen.load(Ordering::Acquire);
+
+        store
+            .add_route("a/2025-01-01_10-01-00-front.mp4", "a", &[], &[], &[], &[], &[], 0, 0, &[], &[])
+            .unwrap();
+        assert!(!store.drive_cache_dirty.load(Ordering::Acquire));
+        assert_eq!(store.route_overview_gen.load(Ordering::Acquire), gen_before);
+        assert!(store.is_processed("a/2025-01-01_10-01-00-front.mp4").unwrap());
+    }
+
     #[test]
     fn aggregate_formula_migration_recomputes_without_violating_not_null() {
         // Regression: the formula-version reset must NOT try to set the
@@ -2802,7 +4525,7 @@ mod tests {
         let store = DriveStore::open_memory().unwrap();
         let pts: Vec<GpsPoint> = vec![[37.7749, -122.4194], [37.7760, -122.4180]];
         store
-            .add_route("a.mp4", "2025-01-01", &pts, &[4, 4], &[1, 1], &[20.0, 21.0], &[0.0, 0.0], 0, 2, &[])
+            .add_route("a.mp4", "2025-01-01", &pts, &[4, 4], &[1, 1], &[20.0, 21.0], &[0.0, 0.0], 0, 2, &[], &[])
             .unwrap();
 
         {
@@ -2854,6 +4577,7 @@ mod tests {
                 0,
                 2,
                 &[GearRun { gear: GEAR_DRIVE, frames: 2 }],
+                &[],
             )
             .unwrap();
 
@@ -2873,6 +4597,7 @@ mod tests {
                 60,
                 60,
                 &[GearRun { gear: GEAR_PARK, frames: 60 }],
+                &[],
             )
             .unwrap();
 
@@ -2889,6 +4614,7 @@ mod tests {
                 0,
                 2,
                 &[GearRun { gear: GEAR_DRIVE, frames: 2 }],
+                &[],
             )
             .unwrap();
 
@@ -2911,7 +4637,7 @@ mod tests {
         let speeds = vec![10.0f32; n];
         let accel = vec![0.0f32; n];
         store
-            .add_route(file, "2025-01-01", &pts, &gears, &ap, &speeds, &accel, 0, 61, &[])
+            .add_route(file, "2025-01-01", &pts, &gears, &ap, &speeds, &accel, 0, 61, &[], &[])
             .unwrap();
     }
 
@@ -3016,7 +4742,7 @@ mod tests {
         let speeds = vec![10.0f32; n];
         let accel = vec![0.0f32; n];
         store
-            .add_route(file, "2025-01-01", &pts, &gears, &ap, &speeds, &accel, 0, 61, &[])
+            .add_route(file, "2025-01-01", &pts, &gears, &ap, &speeds, &accel, 0, 61, &[], &[])
             .unwrap();
     }
 
@@ -3098,7 +4824,7 @@ mod tests {
         let store = DriveStore::open_memory().unwrap();
         let pts: Vec<GpsPoint> = vec![[37.7749, -122.4194], [37.7760, -122.4180]];
         store
-            .add_route("2025-01-01/2025-01-01_10-00-00-front.mp4", "2025-01-01", &pts, &[4, 4], &[1, 1], &[20.0, 21.0], &[0.0, 0.0], 0, 2, &[])
+            .add_route("2025-01-01/2025-01-01_10-00-00-front.mp4", "2025-01-01", &pts, &[4, 4], &[1, 1], &[20.0, 21.0], &[0.0, 0.0], 0, 2, &[], &[])
             .unwrap();
         // Plant an absurd stored distance and bake it INTO the caches —
         // this is the old-formula world the gate exists to replace.
@@ -3170,14 +4896,14 @@ mod tests {
         store
             .add_route(
                 "RecentClips/2026-06-07/c-front.mp4", "2026-06-07", &pts,
-                &[4, 4], &[1, 1], &[20.0, 21.0], &[0.0, 0.0], 0, 2, &[],
+                &[4, 4], &[1, 1], &[20.0, 21.0], &[0.0, 0.0], 0, 2, &[], &[],
             )
             .unwrap();
         // Sentry-Drive-style import of the same clip (Windows separators).
         store
             .add_route(
                 "2026-06-07\\c-front.mp4", "2026-06-07", &pts,
-                &[4, 4], &[1, 1], &[20.0, 21.0], &[0.0, 0.0], 0, 2, &[],
+                &[4, 4], &[1, 1], &[20.0, 21.0], &[0.0, 0.0], 0, 2, &[], &[],
             )
             .unwrap();
 
@@ -3216,7 +4942,7 @@ mod tests {
         store
             .add_route(
                 "2026-06-07/dup-front.mp4", "2026-06-07", &pts2,
-                &[4, 4], &[1, 1], &[20.0, 21.0], &[0.0, 0.0], 0, 2, &[],
+                &[4, 4], &[1, 1], &[20.0, 21.0], &[0.0, 0.0], 0, 2, &[], &[],
             )
             .unwrap();
         // Native copy of the same clip (3 points), a lone native row, and a
@@ -3231,7 +4957,7 @@ mod tests {
             store
                 .add_route(
                     tmp, "2026-06-07", pts,
-                    &[4, 4], &[1, 1], &[20.0, 21.0], &[0.0, 0.0], 0, 2, &[],
+                    &[4, 4], &[1, 1], &[20.0, 21.0], &[0.0, 0.0], 0, 2, &[], &[],
                 )
                 .unwrap();
             let conn = store.conn.lock().unwrap();
@@ -3293,7 +5019,7 @@ mod tests {
         let pts: Vec<GpsPoint> = vec![[37.7749, -122.4194], [37.7750, -122.4194]];
         store
             .add_route(
-                "a.mp4", "2025-01-01", &pts, &[], &[], &[], &[], 0, 2, &[],
+                "a.mp4", "2025-01-01", &pts, &[], &[], &[], &[], 0, 2, &[], &[],
             )
             .unwrap();
         let out = store.with_route_summaries(|s| s.to_vec()).unwrap();
@@ -3429,6 +5155,7 @@ mod tests {
                 0,
                 2,
                 &[GearRun { gear: 4, frames: 2 }],
+                &[],
             )
             .unwrap();
 
@@ -3544,8 +5271,16 @@ mod tests {
     fn add_test_route(store: &DriveStore, name: &str) {
         let pts: Vec<GpsPoint> = vec![[37.7749, -122.4194], [37.7750, -122.4195]];
         store
-            .add_route(name, "2025-01-15", &pts, &[4, 4], &[1, 1], &[25.0, 26.0], &[0.5, 0.6], 0, 2, &[])
+            .add_route(name, "2025-01-15", &pts, &[4, 4], &[1, 1], &[25.0, 26.0], &[0.5, 0.6], 0, 2, &[], &[])
             .unwrap();
+    }
+
+    /// Pretend the last archive JSON export ran long ago so the daily
+    /// gate lets the next sync through.
+    fn rewind_export_date(store: &DriveStore) {
+        store.with_locked_conn(|conn| {
+            schema::meta_set(conn, ARCHIVE_SYNC_EXPORT_DATE_KEY, "2000-01-01").unwrap();
+        });
     }
 
     #[test]
@@ -3567,8 +5302,14 @@ mod tests {
         store.sync_to_archive_at(&mirror, &archive, &cache).unwrap();
         assert_eq!(std::fs::read_to_string(&archive).unwrap(), "sentinel");
 
-        // New route moves the baseline: archive rewritten.
+        // New route same day: counts moved but the daily gate holds —
+        // archive untouched, baselines not advanced.
         add_test_route(&store, "a/2025-01-15_11-00-00-front.mp4");
+        store.sync_to_archive_at(&mirror, &archive, &cache).unwrap();
+        assert_eq!(std::fs::read_to_string(&archive).unwrap(), "sentinel");
+
+        // Next day: the deferred route exports.
+        rewind_export_date(&store);
         store.sync_to_archive_at(&mirror, &archive, &cache).unwrap();
         let repushed = std::fs::read_to_string(&archive).unwrap();
         assert_ne!(repushed, "sentinel");
@@ -3587,7 +5328,8 @@ mod tests {
         add_test_route(&store, "a/2025-01-15_10-00-00-front.mp4");
         store.sync_to_archive_at(&mirror, &archive, &cache).unwrap();
 
-        // No new routes, but the sampler wrote a row: archive rewritten.
+        // No new routes, but the sampler wrote a row: archive rewritten
+        // (once past the daily gate).
         std::fs::write(&archive, "sentinel").unwrap();
         store.with_locked_conn(|conn| {
             conn.execute(
@@ -3596,6 +5338,7 @@ mod tests {
             )
             .unwrap();
         });
+        rewind_export_date(&store);
         store.sync_to_archive_at(&mirror, &archive, &cache).unwrap();
         let repushed = std::fs::read_to_string(&archive).unwrap();
         assert_ne!(repushed, "sentinel");
@@ -3654,4 +5397,38 @@ mod tests {
         assert_ne!(pushed, "stale-go-era-copy");
         assert!(pushed.contains("2025-01-15"));
     }
+    #[test]
+    fn bulk_tag_is_additive_and_rejects_reserved_labels() {
+        let store = DriveStore::open_memory().unwrap();
+        // Existing tags must survive: the freeze runs while the user still has
+        // a year of labels on these sessions, and clobbering them would be a
+        // worse loss than the derived tag it is trying to preserve.
+        store.set_charge_tags(1000, &["Public".into()]).unwrap();
+        store.set_charge_tags(2000, &["Road trip".into()]).unwrap();
+
+        let n = store.add_charge_tag_bulk(&[1000, 2000], "Old House").unwrap();
+        assert_eq!(n, 2);
+        assert_eq!(
+            store.get_charge_tags(1000).unwrap(),
+            vec!["Old House".to_string(), "Public".to_string()]
+        );
+        assert_eq!(
+            store.get_charge_tags(2000).unwrap(),
+            vec!["Old House".to_string(), "Road trip".to_string()]
+        );
+
+        // Idempotent — moving house twice with the same label must not duplicate.
+        store.add_charge_tag_bulk(&[1000], "Old House").unwrap();
+        assert_eq!(
+            store.get_charge_tags(1000).unwrap(),
+            vec!["Old House".to_string(), "Public".to_string()]
+        );
+
+        // Reserved labels are refused: they are re-derived, so storing one is a
+        // silent no-op that would leave the user believing history was kept.
+        assert!(store.add_charge_tag_bulk(&[1000], "Home").is_err());
+        assert!(store.add_charge_tag_bulk(&[1000], "fast charging").is_err());
+        assert!(store.add_charge_tag_bulk(&[1000], "   ").is_err());
+    }
+
 }

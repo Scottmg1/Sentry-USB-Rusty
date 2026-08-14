@@ -1,6 +1,6 @@
 #!/bin/bash -eu
 #
-# Build a SentryUSB (Rust) Raspberry Pi image locally using pi-gen + Docker.
+# Build a SentryUSB Raspberry Pi image with pi-gen and Docker.
 #
 # Prerequisites:
 #   - Docker installed and running
@@ -13,8 +13,7 @@
 #   ./build-image.sh /path/to/binary         # 64-bit with local binary
 #   ./build-image.sh --32bit /path/to/binary # 32-bit with local binary
 #
-# Note: the original armv6 Pi Zero W / Pi 1 are no longer supported; SentryUSB
-# requires Pi Zero 2 W or newer.
+# armv6 boards are unsupported; use Pi Zero 2 W or newer.
 #
 # Output:
 #   deploy/sentryusb-*.img.gz — ready to flash with Raspberry Pi Imager
@@ -51,22 +50,16 @@ done
 
 if $BUILD_32BIT; then
     ARCH_LABEL="32-bit (armhf — Pi 3A+ with 32-bit Pi OS)"
-    # 32-bit: single binary; SUFFIXES list has one entry to keep the
-    # loop logic below uniform with the 64-bit path.
+    # Keep one suffix so the staging loop is architecture-independent.
     SUFFIXES=("linux-armv7")
     CPUS=("cortex-a7")
     RUST_TARGET="armv7-unknown-linux-gnueabihf"
-    # Tesla vehicle-command is Go; cross-compile targets map independently
-    # from our Rust targets. GOARM=7 matches the Rust target (cortex-a7);
-    # the upstream armv6 tarball stays compatible for any board, but Go's
-    # GOARM=7 produces faster code on the targets we still support.
     GO_ARCH="arm"
     GO_ARM="7"
     CONFIG_FILE="pi-gen-config-32bit"
 else
     ARCH_LABEL="64-bit (arm64 — Pi 3A+/4/5/Zero 2)"
-    # 64-bit: three per-CPU-tuned variants. The runtime picker selects
-    # the right one at every service start.
+    # The service-start picker selects the best aarch64 variant.
     SUFFIXES=("linux-arm64-a53" "linux-arm64-a72" "linux-arm64-a76")
     CPUS=("cortex-a53" "cortex-a72" "cortex-a76")
     RUST_TARGET="aarch64-unknown-linux-gnu"
@@ -82,24 +75,20 @@ command -v docker &>/dev/null || error "Docker is required. Install it first."
 
 # ── Step 1: Get the SentryUSB binary variants ──
 #
-# Populates three parallel arrays:
+# Parallel arrays indexed by SUFFIXES:
 #   VARIANT_PATHS[i]   — local path to the sentryusb binary for SUFFIXES[i]
 #   TELEMETRY_PATHS[i] — local path to telemetry sampler for SUFFIXES[i] (optional)
 #   BLE_ACTION_PATHS[i]— local path to the BLE action CLI for SUFFIXES[i] (optional)
-# These get injected into pi-gen's stage_sentryusb/files/ in Step 4.
 VARIANT_PATHS=()
 TELEMETRY_PATHS=()
 BLE_ACTION_PATHS=()
 
 if [ -n "$LOCAL_BINARY" ]; then
-    # Local-binary mode: one binary on the CLI, stage it under all variants.
-    # The picker fallback chain handles boards that would prefer a more
-    # specific variant — they just fall back to whatever's actually there.
+    # Stage the supplied binary under every suffix so the picker finds it.
     info "Using local binary: $LOCAL_BINARY (staged under all ${#SUFFIXES[@]} variant slot(s))"
     for sfx in "${SUFFIXES[@]}"; do
         VARIANT_PATHS+=("$LOCAL_BINARY")
-        # telemetry/ble-action aren't derivable from a single arbitrary
-        # binary; 00-run.sh fetches them per-variant from releases.
+        # 00-run.sh fetches auxiliary binaries when none were supplied.
     done
 elif command -v cross &>/dev/null && command -v node &>/dev/null; then
     info "Building binaries from source (${#SUFFIXES[@]} variant(s))..."
@@ -111,10 +100,7 @@ elif command -v cross &>/dev/null && command -v node &>/dev/null; then
         mkdir -p "$SCRIPT_DIR/crates/sentryusb/static"
         cp -r dist/. "$SCRIPT_DIR/crates/sentryusb/static/"
     )
-    # Cross-compile once per CPU variant. RUSTFLAGS overrides the
-    # per-target-cpu setting in .cargo/config.toml; the target/ subdir
-    # used by cargo is keyed only by triple, so we move the output to a
-    # per-CPU stash to avoid clobbering between iterations.
+    # Stash each RUSTFLAGS variant separately because Cargo keys by target triple.
     for i in "${!SUFFIXES[@]}"; do
         sfx="${SUFFIXES[$i]}"
         cpu="${CPUS[$i]}"
@@ -154,15 +140,10 @@ else
     ok "Downloaded ${#SUFFIXES[@]} variant(s)"
 fi
 
-# Sanity: at least one main sentryusb binary must exist.
+# Every configured variant must have a main binary.
 for p in "${VARIANT_PATHS[@]}"; do
     [ -f "$p" ] || error "Missing sentryusb variant at $p"
 done
-
-# ── (tesla-control / tesla-keygen are no longer built or bundled) ──────
-# Keep-Awake BLE, pairing, keygen and every Tesla command are now native
-# (the tesla_ble crate + sentryusb-ble-action + sentryusb-tesla-telemetry,
-# all built in Step 1 above). The external Go binaries are gone.
 
 # ── Step 2: Clone pi-gen ──
 info "Setting up pi-gen..."
@@ -189,10 +170,7 @@ for i in "${!SUFFIXES[@]}"; do
     info "  → staged sentryusb-${sfx}"
 done
 
-# Telemetry sampler + BLE action CLI: one binary per variant when
-# available. For local-binary mode (no per-variant aux binaries exist)
-# the loops are skipped and 00-run.sh falls back to per-variant release
-# downloads.
+# Stage optional per-variant telemetry and BLE-action binaries.
 if [ "${#TELEMETRY_PATHS[@]}" -gt 0 ]; then
     for i in "${!SUFFIXES[@]}"; do
         sfx="${SUFFIXES[$i]}"
@@ -214,7 +192,7 @@ if [ "${#BLE_ACTION_PATHS[@]}" -gt 0 ]; then
     done
 fi
 
-# Picker script: the runtime selector that decides which variant runs.
+# Install the runtime CPU-variant picker.
 cp "$SCRIPT_DIR/pi-gen-sources/00-sentryusb-tweaks/files/sentryusb-pick-binary" \
     "$STAGE_FILES/sentryusb-pick-binary"
 chmod +x "$STAGE_FILES/sentryusb-pick-binary"
@@ -227,7 +205,7 @@ cp "$SCRIPT_DIR/server/ble/sentryusb-ble.service" "$WORK_DIR/stage_sentryusb/00-
 cp "$SCRIPT_DIR/server/ble/com.sentryusb.ble.conf" "$WORK_DIR/stage_sentryusb/00-sentryusb-tweaks/files/com.sentryusb.ble.conf" 2>/dev/null \
     || cp "$SCRIPT_DIR/../Sentry-USB/server/ble/com.sentryusb.ble.conf" "$WORK_DIR/stage_sentryusb/00-sentryusb-tweaks/files/com.sentryusb.ble.conf"
 
-# Trixie apt indices are much larger; increase export image margin
+# Trixie apt indexes require a larger export margin.
 if [[ "$OSTYPE" == darwin* ]]; then
     sed -i '' 's/200 \* 1024 \* 1024/800 * 1024 * 1024/' "$WORK_DIR/export-image/prerun.sh"
 else
@@ -261,5 +239,5 @@ echo ""
 echo "  After first boot, open http://sentryusb.local in your browser."
 echo ""
 
-# Cleanup
+# Remove the temporary pi-gen checkout.
 rm -rf "$WORK_DIR"

@@ -17,7 +17,7 @@ use anyhow::{Context, Result};
 use rusqlite::{params, Connection};
 
 use crate::aggregate::compute_route_aggregates;
-use crate::blob::{decode_f32s, decode_gear_runs, decode_points, decode_u8s};
+use crate::blob::{decode_f32s, decode_flag_runs, decode_gear_runs, decode_points, decode_u8s};
 use crate::types::Route;
 
 /// Routes per batch. Small enough to stay within ~5 MB heap; large
@@ -174,6 +174,9 @@ fn backfill_one_batch(conn: &mut Connection) -> Result<i64> {
         sb: Option<Vec<u8>>,
         acb: Option<Vec<u8>>,
         rb: Option<Vec<u8>>,
+        fb: Option<Vec<u8>>,
+        axb: Option<Vec<u8>>,
+        ayb: Option<Vec<u8>>,
     }
 
     let mut batch: Vec<Row> = Vec::new();
@@ -181,7 +184,8 @@ fn backfill_one_batch(conn: &mut Connection) -> Result<i64> {
         let mut stmt = conn.prepare(
             "SELECT file, date_dir, raw_park_count, raw_frame_count,
                     points_blob, gear_states_blob, ap_states_blob,
-                    speeds_blob, accel_blob, gear_runs_blob
+                    speeds_blob, accel_blob, gear_runs_blob, flag_runs_blob,
+                    accel_x_blob, accel_y_blob
              FROM routes
              WHERE max_speed_mps IS NULL
              LIMIT ?1",
@@ -198,6 +202,9 @@ fn backfill_one_batch(conn: &mut Connection) -> Result<i64> {
                 sb: row.get(7)?,
                 acb: row.get(8)?,
                 rb: row.get(9)?,
+                fb: row.get(10)?,
+                axb: row.get(11)?,
+                ayb: row.get(12)?,
             })
         })?;
         for r in rows {
@@ -228,6 +235,15 @@ fn backfill_one_batch(conn: &mut Connection) -> Result<i64> {
         let gear_runs = decode_gear_runs(r.rb.as_deref())
             .with_context(|| format!("decode gear_runs {}", r.file))?
             .unwrap_or_default();
+        let flag_runs = decode_flag_runs(r.fb.as_deref())
+            .with_context(|| format!("decode flag_runs {}", r.file))?
+            .unwrap_or_default();
+        let accel_x = decode_f32s(r.axb.as_deref())
+            .with_context(|| format!("decode accel_x {}", r.file))?
+            .unwrap_or_default();
+        let accel_y = decode_f32s(r.ayb.as_deref())
+            .with_context(|| format!("decode accel_y {}", r.file))?
+            .unwrap_or_default();
 
         let route = Route {
             file: r.file.clone(),
@@ -240,6 +256,9 @@ fn backfill_one_batch(conn: &mut Connection) -> Result<i64> {
             raw_park_count: r.raw_park_count,
             raw_frame_count: r.raw_frame_count,
             gear_runs,
+            flag_runs,
+            accel_x,
+            accel_y,
             source: None,
             external_signature: None,
             tessie_autopilot_percent: None,
@@ -278,8 +297,18 @@ fn backfill_one_batch(conn: &mut Connection) -> Result<i64> {
                 park_ms_start        = ?20,
                 fsd_at_end           = ?21,
                 fsd_accel_pushes_early = ?22,
-                ap_at_start          = ?23
-             WHERE file = ?24",
+                ap_at_start          = ?23,
+                sei_speed_abs_max    = ?24,
+                safety_hard_brake_ms     = ?25,
+                safety_hard_brake_events = ?26,
+                safety_aggr_turn_ms      = ?27,
+                safety_aggr_turn_events  = ?28,
+                safety_speeding_ms       = ?29,
+                safety_moving_ms         = ?30,
+                safety_manual_moving_ms  = ?31,
+                safety_brake_any_ms      = ?32,
+                safety_turn_any_ms       = ?33
+             WHERE file = ?34",
         )?;
         for (file, a) in &decoded {
             stmt.execute(params![
@@ -306,6 +335,16 @@ fn backfill_one_batch(conn: &mut Connection) -> Result<i64> {
                 a.fsd_at_end as i64,
                 a.fsd_accel_pushes_early,
                 a.ap_at_start,
+                a.sei_speed_abs_max,
+                a.safety_hard_brake_ms,
+                a.safety_hard_brake_events,
+                a.safety_aggr_turn_ms,
+                a.safety_aggr_turn_events,
+                a.safety_speeding_ms,
+                a.safety_moving_ms,
+                a.safety_manual_moving_ms,
+                a.safety_brake_any_ms,
+                a.safety_turn_any_ms,
                 file,
             ])
             .with_context(|| format!("update {}", file))?;

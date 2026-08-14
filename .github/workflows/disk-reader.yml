@@ -1,9 +1,7 @@
 name: disk-reader
 
-# The desktop sidecar (sentryusb-disk-reader) is host-architecture, not a
-# Pi binary, so it gets its own workflow: golden-image integration tests on
-# Linux (the only place we can mkfs.xfs), plus compile checks for the mac
-# and Windows targets it will ship on.
+# The host-native disk reader uses Linux for mkfs.xfs integration tests and
+# compile-checks its macOS and Windows targets separately from Pi releases.
 
 on:
   push:
@@ -66,10 +64,9 @@ jobs:
         run: |
           set -euo pipefail
           BIN=./target/release/sentryusb-disk-reader
-          # event.json was rewritten in epoch 2; merged view must show the
-          # newest version (with "camera":"3").
+          # Merged snapshots must expose the epoch-2 event.json replacement.
           $BIN cat golden.img "TeslaCam/SavedClips/2026-07-01_10-00-00/event.json" | grep -q '"camera":"3"'
-          # Clip C exists only in the live image + tocless snap-000003.
+          # Clip C exercises live-image plus TOC-less snapshot merging.
           $BIN ls golden.img "TeslaCam/RecentClips" | grep -q "2026-07-03_08-00-00-front.mp4"
           echo "merge semantics ok"
 

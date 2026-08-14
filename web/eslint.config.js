@@ -20,14 +20,11 @@ export default defineConfig([
       globals: globals.browser,
     },
     rules: {
-      // React Compiler-era diagnostics; compiler not in use, existing
-      // fetch-on-mount effects are stable. Warn until compiler adoption.
+      // Keep compiler-specific effect diagnostics advisory until adoption.
       'react-hooks/set-state-in-effect': 'warn',
-      // Stale-closure detector — kept at error; intentional omissions get
-      // inline suppressions with a reason.
+      // Intentional dependency omissions require an inline explanation.
       'react-hooks/exhaustive-deps': 'error',
-      // Underscore prefix marks intentionally unused (e.g. destructured
-      // props kept for the StepProps signature).
+      // Underscores mark intentionally unused signature fields.
       '@typescript-eslint/no-unused-vars': [
         'error',
         { argsIgnorePattern: '^_', varsIgnorePattern: '^_', caughtErrorsIgnorePattern: '^_' },
@@ -35,8 +32,7 @@ export default defineConfig([
     },
   },
   {
-    // Context provider modules export a hook alongside the provider;
-    // only affects dev HMR granularity, not production.
+    // Provider modules intentionally export their companion hooks.
     files: ['src/hooks/*.tsx'],
     rules: {
       'react-refresh/only-export-components': 'off',

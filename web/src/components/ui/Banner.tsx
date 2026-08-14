@@ -42,8 +42,7 @@ function Banner({ kind, icon, title, sub, action }: Omit<BannerItem, "id">) {
   )
 }
 
-// Banners are rendered in caller-supplied order. Callers sort by priority
-// (error > warn > info > update) before passing in.
+// Callers supply priority order; the stack preserves it.
 export function BannerStack({ banners }: { banners: BannerItem[] }) {
   if (banners.length === 0) return null
   return (

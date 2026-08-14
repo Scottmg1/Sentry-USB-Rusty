@@ -11,17 +11,8 @@ export type { DrivesFilteredStats }
 
 const PAGE_SIZE = 10
 
-// Module-scope cache for the Drives list. Survives the
-// component unmount/remount cycle as the user navigates
-// /drives → /drives/:id → /drives, so the list view paints
-// instantly on back-navigation instead of re-fetching from the
-// API every time. The cache is cleared by a full page reload.
-//
-// Cache hits within CACHE_STALE_MS skip the network fetch
-// entirely. Hits after that still render the cached data
-// immediately but trigger a silent background refresh so a
-// long-lived /drives session still picks up newly-processed
-// drives without forcing the user to manually reload.
+// Preserve list state across detail navigation. Fresh cache hits skip the
+// request; stale hits render immediately while refreshing in the background.
 interface DrivesCache {
   drives: DriveSummary[]
   routes: RouteOverview[]
@@ -45,10 +36,7 @@ export type DatePreset =
 
 export interface DrivesFilters {
   tag?: string
-  // Minimum distance is always persisted in MILES regardless of the
-  // user's DRIVE_MAP_UNIT preference, so the URL param (?minDist=...)
-  // and the filter comparison both stay on one unit. The popover UI
-  // converts to/from km for display when the user prefers metric.
+  // Persist minimum distance in miles; metric conversion is display-only.
   minDistanceMi?: number
 }
 
@@ -72,10 +60,7 @@ export interface DrivesListState {
   setFilters: (f: DrivesFilters) => void
   setSortDir: (d: "asc" | "desc") => void
   refresh: () => Promise<void>
-  // Patch the tags array on a single drive locally so the UI reflects an
-  // optimistic update without triggering a full /api/drives refetch. The
-  // backend cache invalidates itself on set_drive_tags, so the next natural
-  // refetch (e.g. navigation back to the page) will rebuild authoritatively.
+  // Apply tag edits optimistically until the next authoritative refresh.
   patchDriveTags: (id: number, tags: string[]) => void
 }
 
@@ -156,9 +141,7 @@ function filterDrives(
 
 export function useDrivesList(): DrivesListState {
   const [params, setParams] = useSearchParams()
-  // Hydrate from the module cache when available — this is what
-  // makes back-navigation instant. Cold start (no cache yet) shows
-  // an empty list + loading spinner; cache hit paints immediately.
+  // Hydrate synchronously so back-navigation does not flash an empty list.
   const [drives, setDrives] = useState<DriveSummary[]>(
     () => listCache?.drives ?? [],
   )
@@ -178,19 +161,14 @@ export function useDrivesList(): DrivesListState {
     let cancelled = false
     const cacheFresh =
       listCache !== null && Date.now() - listCache.at < CACHE_STALE_MS
-    // Back-navigation case: cache is fresh AND this is the
-    // first effect run after mount (refreshTick still 0). Skip
-    // the network entirely; the useState initializers already
-    // populated `drives`/`routes` from the cache.
+    // Initial mounts can use a fresh cache without another request.
     if (cacheFresh && refreshTick === 0) {
       return () => {
         cancelled = true
       }
     }
 
-    // Cold start → show the spinner so the user sees we're working.
-    // Stale cache or manual refresh → keep rendering the previous
-    // data and fetch silently in the background (no spinner flash).
+    // Only cold starts need a loading state; keep stale data visible.
     if (listCache === null) {
       /* eslint-disable-next-line react-hooks/set-state-in-effect */
       setLoading(true)
@@ -238,11 +216,7 @@ export function useDrivesList(): DrivesListState {
   const pageEnd = Math.min(total, safePage * PAGE_SIZE)
   const visible = filtered.slice((safePage - 1) * PAGE_SIZE, safePage * PAGE_SIZE)
 
-  // Aggregate stats over the *entire* filtered set (not just the visible
-  // page) — this is the "lifetime within current selection" number the
-  // header strip displays. Delegated to the shared helper so the formula
-  // stays in lockstep with anywhere else on the client that aggregates
-  // drives.
+  // Summary stats cover the full filtered set, not the current page.
   const filteredStats = useMemo<DrivesFilteredStats>(
     () => computeFilteredStats(filtered),
     [filtered],
@@ -282,8 +256,7 @@ export function useDrivesList(): DrivesListState {
       p.delete("page")
       p.delete("tag")
       p.delete("minDist")
-      // Legacy params from pre-refactor builds — clear them so the URL
-      // doesn't carry orphan state after the user touches the filters.
+      // Remove unsupported filter parameters once filters change.
       p.delete("origin")
       p.delete("destination")
       if (f.tag) p.set("tag", f.tag)
@@ -304,10 +277,7 @@ export function useDrivesList(): DrivesListState {
 
   const patchDriveTags = (id: number, tags: string[]) => {
     setDrives((prev) => prev.map((d) => (d.id === id ? { ...d, tags } : d)))
-    // Mirror the change into the module cache so a /drives →
-    // /drives/:id → /drives round-trip still shows the new tag.
-    // Without this, navigating back would paint the pre-edit
-    // drives from the stale cache snapshot.
+    // Keep the navigation cache consistent with the optimistic edit.
     if (listCache) {
       listCache = {
         ...listCache,

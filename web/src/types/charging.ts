@@ -1,7 +1,4 @@
-// Charge-session shapes returned by /api/charging and
-// /api/charging/{id}. Field names are camelCase to match the backend's
-// serde serialization (crates/api/src/charging.rs). All measured values
-// are optional — any column can be NULL on a given sample.
+// Charging API fields use serde's camelCase and may be null per sample.
 
 export interface ChargeSessionSummary {
   // Session id == start timestamp in unix seconds. Also the detail key.
@@ -13,8 +10,7 @@ export interface ChargeSessionSummary {
   locationLat: number | null
   locationLon: number | null
   energyAddedKwh: number | null
-  // Energy drawn from the charger (wall-side), kWh. >= energyAddedKwh;
-  // the gap is charging loss. efficiencyPct = added / used.
+  // Wall-side energy; its difference from energyAddedKwh is charging loss.
   energyUsedKwh: number | null
   efficiencyPct: number | null
   peakPowerKw: number | null
@@ -23,19 +19,17 @@ export interface ChargeSessionSummary {
   startRangeMi: number | null
   endRangeMi: number | null
   chargeLimitSoc: number | null
-  // User-assigned tags + the cost the backend derived from them (charged
-  // on energy used). `cost`/`rate` are null until a rate is configured.
+  // Cost is based on wall-side energy and remains null without a rate.
   tags: string[]
   cost: number | null
   rate: number | null
   currency: string
-  // True when peak power exceeds the AC Level 2 ceiling (>22 kW) — i.e. DC
-  // fast charging. Drives the "Fast charging" badge and, in the detail
-  // view, unlocks the manual per-charge cost.
+  // Peak power above 22 kW identifies DC fast charging.
   fastCharging: boolean
-  // True when `cost` is a user-entered per-charge override rather than a
-  // rate-derived value (so `rate` is null and the UI shows it as manual).
+  // Manual cost overrides have no derived rate.
   costOverridden: boolean
+  // Derived from the home geofence rather than stored as a tag.
+  atHome: boolean
 }
 
 export interface ChargePoint {
@@ -59,14 +53,21 @@ export interface ChargeSessionDetail extends ChargeSessionSummary {
   points: ChargePoint[]
 }
 
-// Live charge status for the dashboard banner (/api/charging/current).
-// `charging` is false when the car isn't actively charging; the other
-// fields are present only while charging.
+// Live metrics and controls require a fresh active-charging response.
 export interface CurrentCharge {
   charging: boolean
   soc: number | null
   limitSoc: number | null
   powerKw: number | null
+  currentA: number | null
+  voltageV: number | null
+  rateMph: number | null
+  energyAddedKwh: number | null
   minutesToFull: number | null
   rangeMi: number | null
+  chargingAmps: number | null
+  maxChargingAmps: number | null
+  chargePortOpen: boolean | null
+  controlsAvailable: boolean
+  controlsValidUntilTs: number | null
 }

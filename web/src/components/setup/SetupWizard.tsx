@@ -1,5 +1,12 @@
 import { useState, useCallback, useEffect, useRef } from "react"
-import { ChevronLeft, ChevronRight, Check, Loader2, AlertCircle, AlertTriangle } from "lucide-react"
+import {
+  CheckIcon,
+  ChevronLeftIcon,
+  ChevronRightIcon,
+  ErrorIcon,
+  ProgressActivityIcon,
+  WarningIcon,
+} from "@/components/icons"
 import { cn } from "@/lib/utils"
 import { SetupProgress } from "./SetupProgress"
 import { WelcomeStep } from "./steps/WelcomeStep"
@@ -8,6 +15,7 @@ import { NetworkStep } from "./steps/NetworkStep"
 import { StorageStep } from "./steps/StorageStep"
 import { CommunityStep } from "./steps/CommunityStep"
 import { ArchiveStep } from "./steps/ArchiveStep"
+import { rsyncSshPortError } from "./rsyncPort"
 import { KeepAwakeStep } from "./steps/KeepAwakeStep"
 import { NotificationsStep } from "./steps/NotificationsStep"
 import { SecurityStep } from "./steps/SecurityStep"
@@ -62,6 +70,10 @@ function archiveError(data: SetupFormData): string | null {
     if (!data.RSYNC_SERVER?.trim()) return "Server is required."
     if (!data.RSYNC_USER?.trim()) return "Username is required."
     if (!data.RSYNC_PATH?.trim()) return "Remote Path is required."
+    // Optional field, but a garbage value reaches the config and breaks
+    // every archive cycle. The setup runner rejects it server-side too.
+    const portError = rsyncSshPortError(data.RSYNC_SSH_PORT)
+    if (portError) return portError
   } else if (system === "rclone") {
     if (!data.RCLONE_DRIVE?.trim()) return "Remote Name is required."
     if (!data.RCLONE_PATH?.trim()) return "Remote Path is required."
@@ -739,7 +751,7 @@ export function SetupWizard({ initialData, onClose }: SetupWizardProps) {
         <div className="glass-card setup-wizard-glass flex w-full max-w-lg flex-col gap-5 p-8">
           <div className="flex items-start gap-4">
             <div className="flex h-12 w-12 shrink-0 items-center justify-center rounded-full bg-amber-500/20">
-              <AlertTriangle className="h-6 w-6 text-amber-400" />
+              <WarningIcon className="h-6 w-6 text-amber-400" />
             </div>
             <div>
               <h2 className="text-lg font-semibold text-slate-100">
@@ -847,7 +859,7 @@ export function SetupWizard({ initialData, onClose }: SetupWizardProps) {
             <>
               <div className="text-center">
                 <div className="mx-auto mb-3 flex h-14 w-14 items-center justify-center rounded-full bg-red-500/20">
-                  <AlertCircle className="h-7 w-7 text-red-400" />
+                  <ErrorIcon className="h-7 w-7 text-red-400" />
                 </div>
                 <h2 className="text-xl font-semibold text-slate-100">Setup Error</h2>
                 <p className="mt-2 text-sm text-red-400">{setupMessage}</p>
@@ -1003,7 +1015,7 @@ export function SetupWizard({ initialData, onClose }: SetupWizardProps) {
                   : "text-slate-400 hover:bg-white/5 hover:text-slate-200"
               )}
             >
-              <ChevronLeft className="h-4 w-4" />
+              <ChevronLeftIcon className="h-4 w-4" />
               Back
             </button>
 
@@ -1018,9 +1030,9 @@ export function SetupWizard({ initialData, onClose }: SetupWizardProps) {
                 className="flex items-center gap-1.5 rounded-lg bg-blue-500 px-5 py-2 text-sm font-medium text-white transition-colors hover:bg-blue-600 disabled:opacity-50"
               >
                 {saving ? (
-                  <Loader2 className="h-4 w-4 animate-spin" />
+                  <ProgressActivityIcon className="h-4 w-4 animate-spin" />
                 ) : (
-                  <Check className="h-4 w-4" />
+                  <CheckIcon className="h-4 w-4" />
                 )}
                 Apply & Run Setup
               </button>
@@ -1031,7 +1043,7 @@ export function SetupWizard({ initialData, onClose }: SetupWizardProps) {
                 className="flex items-center gap-1.5 rounded-lg bg-blue-500/20 px-4 py-2 text-sm font-medium text-blue-400 transition-colors hover:bg-blue-500/30 disabled:opacity-40 disabled:cursor-not-allowed"
               >
                 Next
-                <ChevronRight className="h-4 w-4" />
+                <ChevronRightIcon className="h-4 w-4" />
               </button>
             )}
           </div>
