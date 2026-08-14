@@ -314,12 +314,12 @@ export default function SafetyScore() {
       </button>
       {showLearnMore && (
         <p className="mt-2 rounded-lg bg-white/[0.03] p-3 text-xs leading-relaxed text-slate-400">
-          This score is estimated from dashcam SEI telemetry: braking and turning G-forces are
-          derived from speed and GPS between ~1 Hz samples, so it is not Tesla's official Safety
-          Score and reads events conservatively. Braking and turning use Tesla's conditional
-          measures and caps (harsh time relative to braking/turning time, capped at 5.2% and
-          17.1%), charged against weighted points (braking 45, turning 15, speeding 25,
-          late-night 15); driving on FSD reduces what can count against you.
+          This score is estimated from your dashcam SEI telemetry. Braking and turning G-forces
+          are derived from speed and GPS data - as such events are read conservatively. Braking
+          and turning factors are tuned to be similar to Tesla's conditional measures and caps.
+          <br />
+          <br />
+          Driving on FSD reduces what can count against you.
         </p>
       )}
 
@@ -449,8 +449,6 @@ export default function SafetyScore() {
       <p className="mt-6 text-xs leading-relaxed text-slate-600">
         Estimated from dashcam SEI telemetry data extracted by Sentry USB - not Tesla's official
         Safety Score.
-        <br />
-        Version 1.0 (estimated)
       </p>
       </>)}
     </div>
