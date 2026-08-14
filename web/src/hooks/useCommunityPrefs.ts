@@ -30,9 +30,7 @@ async function fetchPref(key: string): Promise<boolean | null> {
 }
 
 export function useCommunityPrefs(): CommunityPrefs {
-  // Default to enabled while loading and on missing keys — matches the
-  // legacy behavior where the Community tab was always visible. Users who
-  // don't want a feature can disable it from Settings.
+  // Missing preferences retain the enabled default.
   const [wrapsEnabled, setWrapsEnabled] = useState(true)
   const [chimesEnabled, setChimesEnabled] = useState(true)
   const [loading, setLoading] = useState(true)

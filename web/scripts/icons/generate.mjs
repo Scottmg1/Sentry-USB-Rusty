@@ -1,11 +1,5 @@
-// Regenerates src/components/icons.tsx from the symbol list in symbols.mjs.
-//
-//   npm run icons          rewrite src/components/icons.tsx
-//   npm run icons -- --check   verify the committed file is up to date (CI)
-//
-// Downloads each glyph from the @material-symbols/svg-400 package on jsDelivr
-// and inlines its path data, so the app itself carries no icon dependency.
-// Needs network access; responses are cached under node_modules/.cache.
+// Generates icons.tsx from symbols.mjs. `npm run icons -- --check` verifies it.
+// Downloaded glyphs are cached under node_modules/.cache.
 import { readFileSync, writeFileSync, mkdirSync, existsSync } from "node:fs"
 import { join, dirname } from "node:path"
 import { fileURLToPath } from "node:url"
@@ -47,9 +41,7 @@ async function fetchSymbol(name) {
   const svg = readFileSync(cached, "utf8")
   const inner = svg.match(/<svg[^>]*>([\s\S]*)<\/svg>/)?.[1].trim()
   if (!inner?.startsWith("<path")) throw new Error(`${name}: unexpected SVG content`)
-  // Most symbols use the 960px Symbols grid, but a few (auto_awesome) still
-  // ship on the legacy 48px grid. Carry each symbol's own viewBox through
-  // rather than assuming one — it also drives the mirror transform.
+  // Preserve each glyph's viewBox; Material Symbols use more than one grid.
   const viewBox = svg.match(/viewBox="([^"]+)"/)[1]
   return { inner, viewBox }
 }

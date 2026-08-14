@@ -1,11 +1,8 @@
 //! Config backup and restore.
 //!
-//! A backup is a JSON envelope containing
-//! the `sentryusb.conf` contents plus the user preferences, SSH keys, rclone
-//! config, Tesla BLE pairing keys, and notification-device credentials — the
-//! stuff the user doesn't want to re-set up after an SD-card reflash. Change
-//! detection via SHA-256 hash avoids filling the backup dir with identical
-//! copies.
+//! A JSON envelope contains configuration, preferences, SSH and BLE keys,
+//! rclone state, and notification credentials. A stable SHA-256 skips
+//! identical copies.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -24,14 +21,7 @@ const ARCHIVE_BACKUP_DIR: &str = "/mnt/archive/backups";
 const LAST_HASH_FILE: &str = "/mutable/backups/.last_hash";
 const BACKUP_VERSION: u32 = 1;
 
-// Paths included in a backup.
-//
-// The Rust wizard generates ed25519 keys (smaller, faster, modern) at
-// /root/.ssh/id_ed25519 — the Go-era code generated RSA at
-// /root/.ssh/id_rsa. Backups need to find whichever was generated, AND
-// restores need to write the key back to the path matching its type.
-// Always check ed25519 first since that's what new installs produce;
-// fall back to RSA so restoring an old Go-era backup still works.
+// Support both current Ed25519 keys and RSA keys from earlier installs.
 const SSH_ED25519_PRIVATE_KEY: &str = "/root/.ssh/id_ed25519";
 const SSH_ED25519_PUBLIC_KEY: &str = "/root/.ssh/id_ed25519.pub";
 const SSH_RSA_PRIVATE_KEY: &str = "/root/.ssh/id_rsa";
@@ -41,9 +31,7 @@ const BLE_PRIVATE_KEY: &str = "/root/.ble/key_private.pem";
 const BLE_PUBLIC_KEY: &str = "/root/.ble/key_public.pem";
 const NOTIFICATION_CREDS: &str = "/root/.sentryusb/notification-credentials.json";
 
-/// Read whichever SSH keypair exists on disk. ed25519 wins when both are
-/// present (newer install ran ssh-keygen on top of an old RSA key). Returns
-/// `(private_pem, public_pem)`; either may be empty if no keypair is set up.
+/// Read the Ed25519 keypair if present, otherwise RSA.
 fn read_ssh_keypair() -> (String, String) {
     if std::path::Path::new(SSH_ED25519_PRIVATE_KEY).exists() {
         return (
@@ -103,9 +91,7 @@ fn read_file_if_exists(path: &str) -> String {
     std::fs::read_to_string(path).unwrap_or_default()
 }
 
-/// Flatten the preferences Map<String, Value> to Map<String, String>, matching
-/// Go's `map[string]string`. JSON values stringify via their literal form for
-/// primitives; objects/arrays are serialized.
+/// Flatten preferences to strings, serializing structured JSON values.
 fn prefs_as_strings() -> HashMap<String, String> {
     let prefs = crate::preferences::load_prefs();
     let mut out = HashMap::with_capacity(prefs.len());
@@ -202,25 +188,13 @@ fn write_backup_to_dir(dir: &str, data: &BackupData) -> Result<(), String> {
     Ok(())
 }
 
-/// Run `write` against a mounted `/mnt/archive`, owning the mount for
-/// the duration. Serialized against archiveloop's connect/disconnect
-/// scripts via the shared archive-mount flock, so a mount this creates
-/// can't be adopted by an archive cycle mid-write, and archiveloop's
-/// `umount -f -l` can't land under an in-flight backup.
+/// Run `write` against `/mnt/archive` under the shared mount lock.
 ///
 /// If the share wasn't mounted, mounts it from fstab and unmounts it
-/// again before releasing the lock — a CIFS mount left up after the
-/// car drives away goes stale ("host is down") and wedges the next
-/// archive cycle, which is exactly what disconnect-archive.sh exists
-/// to prevent. A mount that was already up (an archive cycle's, whose
-/// post-archive step is what called us) is left alone; its owner
-/// unmounts it. The unmount runs even when `write` fails; an unmount
-/// failure is logged but doesn't mask the write result.
+/// again before releasing the lock. Pre-existing mounts remain owned by their
+/// caller. Cleanup runs after write failure without masking the write result.
 ///
-/// The whole transaction runs in its own spawned task: if the HTTP
-/// request future is cancelled (client disconnect), the lock guard must
-/// not drop mid-write and skip the unmount — the task detaches and
-/// finishes cleanup on its own.
+/// A detached task finishes cleanup even if the HTTP request is cancelled.
 async fn with_archive_mounted<F, Fut>(write: F) -> Result<(), String>
 where
     F: FnOnce() -> Fut + Send + 'static,
@@ -246,8 +220,7 @@ where
         return Err("archive mount point /mnt/archive does not exist".to_string());
     }
 
-    // Bounded wait: archiveloop holds this lock only for the seconds a
-    // mount/unmount transition takes, never across a whole cycle.
+    // Archiveloop holds this lock only during mount transitions.
     let guard = tokio::task::spawn_blocking(|| {
         crate::archive_mount_lock::acquire(Duration::from_secs(60))
     })
@@ -263,9 +236,7 @@ where
             &["/mnt/archive"],
         )
         .await;
-        // findmnt is ground truth, not mount's exit status: a timed-out
-        // mount(8) may still have completed the kernel transition, and
-        // that mount is ours to clean up.
+        // A timed-out mount process may still complete the kernel transition.
         if is_mounted().await {
             mounted_by_us = true;
         } else {
@@ -279,9 +250,7 @@ where
     let result = write().await;
 
     if mounted_by_us {
-        // Mirror disconnect-archive.sh: bounded, force+lazy so a dead
-        // share can't hang the API. On failure the mount lingers (same
-        // exposure as a crash mid-archive) — log and move on.
+        // Bound force/lazy unmount so an unreachable share cannot hang the API.
         if let Err(e) = sentryusb_shell::run_with_timeout(
             Duration::from_secs(15),
             "umount",
@@ -316,7 +285,7 @@ async fn sync_backup_to_rsync(data: &BackupData) -> Result<(), String> {
     let json_bytes = serde_json::to_vec_pretty(data).map_err(|e| e.to_string())?;
     std::fs::write(&tmp_path, &json_bytes).map_err(|e| e.to_string())?;
 
-    // Ensure remote backups/ dir exists. Best-effort.
+    // Remote directory creation is best-effort.
     let user_at_server = format!("{}@{}", user, server);
     let remote_dir = format!("{}/backups", rsync_path);
     let mut ssh_args: Vec<&str> = vec![
@@ -397,9 +366,7 @@ fn list_backups_in_dir(dir: &str, location: &str) -> Vec<BackupEntry> {
     out
 }
 
-/// Scratch path for the drive-DB snapshot. Lives on /backingfiles (the
-/// big data partition) — /tmp can be RAM-backed and /mutable is small,
-/// and the source DB is on the same filesystem anyway.
+/// Drive-DB scratch space on the large backing partition.
 const DB_EXPORT_TMP: &str = "/backingfiles/.backup-drive-data.db";
 const DRIVE_DB_PATH: &str = "/backingfiles/drive-data.db";
 
@@ -407,20 +374,11 @@ fn drive_data_filename(date: &str) -> String {
     format!("sentryusb-backup-{}.drive-data.db.gz", date)
 }
 
-/// Snapshot the drive DB (drives, charges, telemetry) into a gzipped
-/// copy ready to ship next to the JSON backup. `VACUUM INTO` takes a
-/// read transaction on the live DB so the copy is consistent even while
-/// the sampler writes; other DB users queue for the few seconds it
-/// takes, which is fine for a manual/nightly backup. Returns the .gz
-/// path.
 /// Marker for the last calendar day the drive-DB snapshot shipped
-/// successfully (content: "<date> <location>"). Lives on /mutable like
-/// `.last_hash` so recording it never touches the DB.
+/// successfully, containing `<date> <location>`.
 const DB_BACKUP_STAMP: &str = "/mutable/.last-drive-db-backup";
 
-/// Serializes VACUUM+gzip+ship across concurrent backup calls — two
-/// racers passing the date gate would otherwise fight over the shared
-/// DB_EXPORT_TMP scratch file.
+/// Serialize jobs that share [`DB_EXPORT_TMP`].
 static DB_BACKUP_JOB: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// True while a VACUUM/gzip/ship is in flight — the slow-request
@@ -441,8 +399,7 @@ async fn ship_drive_data_gated(
     let _job = DB_BACKUP_JOB.lock().await;
 
     if location == "ssd" {
-        // ship_drive_data refuses ssd targets — skip up front instead of
-        // paying VACUUM+gzip for an artifact that can never ship.
+        // Local storage is too small for dated database exports.
         info!("[backup] drive_db_snapshot_skipped reason=ssd_location");
         return false;
     }
@@ -452,7 +409,6 @@ async fn ship_drive_data_gated(
             "[backup] drive_db_snapshot_skipped reason=already_today date={}",
             date
         );
-        // The dated companion exists from the earlier run today.
         return true;
     }
 
@@ -495,12 +451,11 @@ async fn export_drive_data_gz(
         return Err("drive DB does not exist yet".to_string());
     }
     let gz = format!("{}.gz", DB_EXPORT_TMP);
-    // VACUUM INTO refuses to overwrite; clear leftovers from a crashed run.
+    // VACUUM INTO refuses to overwrite stale scratch files.
     let _ = std::fs::remove_file(DB_EXPORT_TMP);
     let _ = std::fs::remove_file(&gz);
 
-    // Dedicated connection: VACUUM INTO only reads the source DB, so the
-    // copy runs without seizing the app's writer mutex.
+    // A dedicated read connection avoids the application's writer mutex.
     let vacuum =
         tokio::task::spawn_blocking(move || store.vacuum_into(DB_EXPORT_TMP)).await;
     match vacuum {
@@ -519,11 +474,8 @@ async fn export_drive_data_gz(
     Ok(gz)
 }
 
-/// Ship the drive-DB snapshot to the same archive destination the JSON
-/// backup goes to. Deliberately NOT written to the /mutable local copy —
-/// that partition is a few hundred MB and a dated DB snapshot per backup
-/// would fill it. `location == "ssd"` therefore skips with an
-/// explanatory error the caller logs.
+/// Ship the drive-DB snapshot beside the JSON backup.
+/// Local mutable storage is intentionally excluded because it is too small.
 async fn ship_drive_data(location: &str, gz_path: &str, date: &str) -> Result<(), String> {
     if location == "ssd" {
         return Err(
@@ -541,7 +493,7 @@ async fn ship_drive_data(location: &str, gz_path: &str, date: &str) -> Result<()
             let gz = gz_path.to_string();
             let dest = format!("{}/{}", ARCHIVE_BACKUP_DIR, filename);
             with_archive_mounted(move || async move {
-                // Tens of MB onto a network mount — keep it off the runtime.
+                // Keep network file I/O off the async runtime.
                 tokio::task::spawn_blocking(move || {
                     std::fs::create_dir_all(ARCHIVE_BACKUP_DIR)
                         .map_err(|e| format!("create {}: {}", ARCHIVE_BACKUP_DIR, e))?;
@@ -578,8 +530,7 @@ async fn ship_drive_data(location: &str, gz_path: &str, date: &str) -> Result<()
             if drive.is_empty() {
                 return Err("rclone not configured".to_string());
             }
-            // rclone preserves the source filename; stage under the dated
-            // name so the remote gets sentryusb-backup-<date>.drive-data.db.gz.
+            // Stage with the dated filename preserved by rclone.
             let staged = format!("/backingfiles/{}", filename);
             std::fs::rename(gz_path, &staged).map_err(|e| format!("stage: {}", e))?;
             let dest = format!("{}:{}/backups/", drive, rclone_path);
@@ -631,20 +582,9 @@ pub async fn create_backup(
 
     let force = q.force.as_deref() == Some("1");
 
-    // Snapshot + ship the drive DB (drives, charges, telemetry) next to
-    // the JSON backup. Runs even when the config hash is unchanged —
-    // drive data changes every day the car is used, and a stale export
-    // is exactly how users lose drive history on a reflash. Best-effort:
-    // a DB export failure must never block the config backup.
-    //
-    // Gated to once per calendar day for AUTOMATIC calls: post-archive
-    // invokes this endpoint after EVERY successful archive, and on a
-    // grown DB (908MB measured) each VACUUM+gzip+ship was a multi-minute
-    // disk storm — the dated filename overwrites same-day copies anyway,
-    // so extra runs bought no recovery granularity. Manual Backup Now
-    // (force=1) still ships. The job mutex serializes concurrent calls
-    // over the shared scratch file; the marker advances only after a
-    // successful ship.
+    // Database data changes independently of config, so ship it even when the
+    // config hash is unchanged. Automatic exports are daily; forced exports
+    // bypass the gate. Failure does not block the config backup.
     data.drive_data_included = ship_drive_data_gated(&s, &location, &data.date, force).await;
     let current_hash = compute_backup_hash(&data);
     if !force && current_hash == read_last_hash() && !current_hash.is_empty() {
@@ -669,8 +609,7 @@ pub async fn create_backup(
             .unwrap_or_default();
         match archive_system.as_str() {
             "cifs" | "nfs" => {
-                // Cloned: the write closure must be 'static so the
-                // transaction task can outlive a cancelled request.
+                // The detached transaction may outlive its request.
                 let data = data.clone();
                 with_archive_mounted(move || async move {
                     write_backup_to_dir(ARCHIVE_BACKUP_DIR, &data)
@@ -686,7 +625,7 @@ pub async fn create_backup(
         }
     };
 
-    // Safety-net local copy when primary is an archive target.
+    // Retain a local safety copy for remote destinations.
     if location != "ssd" {
         if let Err(e) = write_backup_to_dir(LOCAL_BACKUP_DIR, &data) {
             warn!("[backup] Warning: failed to write local backup copy: {}", e);
@@ -709,9 +648,7 @@ pub async fn create_backup(
     })))
 }
 
-/// Backups change at most daily; the listing scans /backingfiles plus a
-/// possibly-network archive mount (7-10s observed while an archive owned
-/// the disk), so a short TTL makes repeat Settings visits instant.
+/// Cache potentially slow local and network directory scans briefly.
 const BACKUP_LIST_TTL: std::time::Duration = std::time::Duration::from_secs(60);
 
 static BACKUP_LIST_CACHE: std::sync::Mutex<
@@ -737,9 +674,7 @@ pub async fn list_backups(State(_s): State<AppState>) -> (StatusCode, Json<serde
             }
         }
     }
-    // Directory scans over /backingfiles and the archive mount — slow
-    // while an archive run saturates the disk (observed 7+ s), so keep
-    // them off the async workers.
+    // Keep local and network directory scans off the async runtime.
     let (code, body) = tokio::task::spawn_blocking(list_backups_blocking)
         .await
         .unwrap_or_else(|_| {
@@ -759,7 +694,7 @@ fn list_backups_blocking() -> (StatusCode, Json<serde_json::Value>) {
         all.extend(list_backups_in_dir(ARCHIVE_BACKUP_DIR, "archive"));
     }
 
-    // Dedupe by date: prefer archive copy if both exist.
+    // Prefer the archive copy when dates collide.
     let mut seen: HashMap<String, usize> = HashMap::new();
     for i in 0..all.len() {
         let d = all[i].date.clone();
@@ -833,9 +768,7 @@ fn write_with_mode(path: &str, contents: &str, _mode: u32) -> std::io::Result<()
 
 /// POST /api/system/restore
 ///
-/// Body: the JSON envelope produced by `create_backup`. Writes all bundled
-/// credential files back to their standard locations with correct modes.
-/// Restore a backup envelope into config + DB.
+/// Restore a backup envelope into configuration and credential files.
 pub async fn restore_backup(
     State(_s): State<AppState>,
     body: String,
@@ -856,7 +789,6 @@ pub async fn restore_backup(
         );
     }
 
-    // Remount filesystem read-write for the config write.
     let _ = sentryusb_shell::run("bash", &["-c", "/root/bin/remountfs_rw"]).await;
 
     let config_path = sentryusb_config::find_config_path();
@@ -883,12 +815,7 @@ pub async fn restore_backup(
                 std::fs::Permissions::from_mode(0o700),
             );
         }
-        // Pick the on-disk filename to match the embedded key type so the
-        // restored pubkey lines up with the privkey and `ssh-keygen -y`
-        // works as expected. Backups from the modern Rust wizard contain
-        // ed25519 keys (OPENSSH PRIVATE KEY); Go-era backups contain RSA
-        // (RSA PRIVATE KEY). Fall back to ed25519 for anything else
-        // because that's what new installs default to.
+        // Restore each private key under the filename matching its embedded type.
         let priv_pem = backup.ssh_private_key.trim_start();
         let is_rsa = priv_pem.starts_with("-----BEGIN RSA PRIVATE KEY-----");
         let (priv_path, pub_path) = if is_rsa {
@@ -908,11 +835,8 @@ pub async fn restore_backup(
     }
 
     if !backup.rclone_config.is_empty() {
-        // Establish the /mutable/configs/rclone symlink first so the restore
-        // never recreates a real directory on the read-only root (rclone's
-        // OAuth token refresh must be able to rewrite this file later).
-        // Falls back to the plain directory if the migration is unavailable
-        // (e.g. /mutable not mounted) — better a restored config than none.
+        // Keep mutable OAuth state off the read-only root; fall back in place if
+        // mutable storage is unavailable.
         if let Err(e) = sentryusb_setup::archive::ensure_rclone_config_on_mutable().await {
             warn!("[backup] rclone config migration failed, restoring in place: {}", e);
         }
@@ -939,7 +863,7 @@ pub async fn restore_backup(
                 if !backup.ble_public_key.is_empty() {
                     let _ = write_with_mode(BLE_PUBLIC_KEY, &backup.ble_public_key, 0o644);
                 }
-                // Mark as paired so the app doesn't prompt for re-pair.
+                // Preserve pairing state with the restored key.
                 let _ = std::fs::write("/root/.ble/paired", "1");
             }
             Err(e) => warn!("[backup] Failed to restore BLE private key: {}", e),
@@ -954,7 +878,6 @@ pub async fn restore_backup(
         }
     }
 
-    // Reparse the restored config so the wizard can re-populate fields.
     let active: HashMap<String, String> = sentryusb_config::parse_file(config_path)
         .map(|(a, _)| a.into_iter().collect())
         .unwrap_or_default();

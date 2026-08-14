@@ -52,7 +52,7 @@ export function UpdateSection({ onInstallStart }: Props) {
       const t = setTimeout(() => setShowUpdateModal(false), 3000)
       return () => clearTimeout(t)
     }
-    // On error the modal closes so the card's inline error is visible.
+    // Close on failure so the card's inline error remains visible.
     if (updateStatus === "idle" || updateStatus === "error") {
       setShowUpdateModal(false)
     }
@@ -172,19 +172,13 @@ export function UpdateSection({ onInstallStart }: Props) {
     setUpdateMessage("Checking internet connection...")
     setShowUpdateModal(true)
     setDownloadPercent(null)
-    // Track the version we're installing so the success modal and message
-    // can show it without trusting /api/system/version — the OLD daemon
-    // answers that endpoint until reboot fires and can return a stale tag.
+    // Retain the target version while the pre-reboot daemon serves the old one.
     const preUpdateVersion = version
     let newVersion: string | null = targetVersion ?? null
     setInstalledVersion(newVersion)
 
-    // Baseline for the reboot gate. The version tag can't prove a reboot
-    // (the old daemon rewrites /opt/sentryusb/version BEFORE `reboot`
-    // fires and keeps serving it — the source of the rare premature
-    // "Update complete"), so success requires the kernel boot_id to have
-    // changed. A null boot_id on either side never counts as proof; the
-    // watchdog handles that case.
+    // Version files change before reboot, so require a new kernel boot_id.
+    // Missing boot IDs never prove success; the watchdog handles that case.
     let preBootId: string | null = null
     try {
       const r = await fetch("/api/system/version", { cache: "no-store" })
@@ -242,8 +236,7 @@ export function UpdateSection({ onInstallStart }: Props) {
       }
       if (msg.status === "restarting") {
         sawRestartPending = true
-        // Reboot fires ~3 s after this event; polls that land earlier are
-        // rejected by the boot_id gate anyway.
+        // The boot-id gate rejects polls that arrive before reboot.
         setTimeout(enterReconnect, 3000)
       }
       if (msg.message) {
@@ -251,8 +244,7 @@ export function UpdateSection({ onInstallStart }: Props) {
       }
     })
 
-    // If the WS drops after the backend announced the restart, don't wait
-    // for the fallback timer — the reboot is what killed the socket.
+    // A socket drop after restart begins is evidence to enter reconnect mode.
     const unsubStatus = wsClient.onStatusChange((connected) => {
       if (!connected && sawRestartPending) enterReconnect()
     })
@@ -277,7 +269,7 @@ export function UpdateSection({ onInstallStart }: Props) {
           const data = await r.json()
           const polled = (data.version || "").trim()
           const bootId = data.boot_id || null
-          // Success gate: proven reboot + expected version.
+          // Require both a proven reboot and the expected version.
           if (!preBootId || !bootId || bootId === preBootId) return
           const norm = (s: string) => s.replace(/^v/, "")
           const versionOk = newVersion
@@ -295,9 +287,7 @@ export function UpdateSection({ onInstallStart }: Props) {
             setUpdateStatus("idle")
             setUpdateMessage(null)
             setInstalledVersion(null)
-            // Hard reload so every cached chunk and hook (useVersion,
-            // feature-gated UI) picks up against the freshly installed
-            // backend instead of holding the pre-update snapshot.
+            // Reload cached chunks and hooks against the installed backend.
             window.location.reload()
           }, 6000)
         } catch {
@@ -333,9 +323,7 @@ export function UpdateSection({ onInstallStart }: Props) {
       })
       if (!res.ok) throw new Error("Failed to start update")
 
-      // Last-resort entry into reconnect mode for a WS that was dead the
-      // whole time (no progress events, no restarting signal). Generous —
-      // a slow download alone can exceed the old 20 s guess.
+      // Fallback when no progress or restart event arrives over WebSocket.
       fallbackTimer = setTimeout(enterReconnect, 120000)
     } catch (err) {
       cleanup()
@@ -379,10 +367,7 @@ export function UpdateSection({ onInstallStart }: Props) {
         halo={headerHalo}
         title="Software Updates"
         badge={
-          // Always show the *current* installed version here. The available
-          // update's version is shown in the "Stable:"/"Pre-release:" card
-          // below; surfacing it in the badge made it look like the pending
-          // release was already installed. Accent just flags that one is waiting.
+          // Badge text stays on the installed version; accent signals availability.
           <Pill kind={stableUpdate || prereleaseUpdate ? "accent" : "slate"}>
             {version ?? "…"}
           </Pill>

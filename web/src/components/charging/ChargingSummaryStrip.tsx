@@ -12,18 +12,13 @@ export interface ChargingStats {
   count: number
   totalEnergyKwh: number
   totalDurationSecs: number
-  // Null when no session in the set has a cost (no rate configured) /
-  // a computable efficiency. `currency` decorates the cost cell.
+  // Null means no rate-derived cost or computable efficiency is available.
   totalCost: number | null
   currency: string
   avgEfficiency: number | null
 }
 
-// Compact stats strip for the Charging page, mirroring the Drives
-// summary strip: a few aggregate cells for the current filter set,
-// recomputed live as the date filter changes. No session-count cell is
-// duplicated in the pagination row, but charging has no pagination yet
-// so the count stays here.
+// Aggregates the current charging filter set.
 export function ChargingSummaryStrip({
   stats,
   loading,
@@ -44,9 +39,6 @@ export function ChargingSummaryStrip({
   const avgKwh = stats.count > 0 ? stats.totalEnergyKwh / stats.count : 0
 
   return (
-    // 2x2 grid when space is tight (mobile / shrunk browser); a single
-    // flex row with dividers once there's room (sm+). Dividers are
-    // hidden below sm so they don't take grid cells.
     <div className="grid grid-cols-2 gap-x-4 gap-y-3 sm:flex sm:flex-wrap sm:items-center sm:gap-x-5 sm:gap-y-2">
       <StatCell
         icon={<BatteryAndroidFrameBoltIcon className="h-3.5 w-3.5" />}

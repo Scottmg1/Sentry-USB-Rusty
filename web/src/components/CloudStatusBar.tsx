@@ -20,16 +20,10 @@ type CloudStatus = {
   pairingState: string
 }
 
-/**
- * Compact one-line Cloud status for the Dashboard. Clicking through goes to
- * Settings → Network where the full CloudPairingSection lives. Self-fetches
- * status (the full section also self-fetches; the cost is one extra poll).
- */
+/** Compact dashboard status linking to the full Cloud settings. */
 export function CloudStatusBar() {
   const [status, setStatus] = useState<CloudStatus | null>(null)
-  // SentryCloud is US/Canada-only — let users elsewhere permanently hide
-  // the "Connect" prompt (they can still pair from Settings if it ever
-  // becomes available). Only the unpaired prompt is dismissible.
+  // The regional pairing prompt is dismissible; settings remain accessible.
   const [dismissed, setDismissed] = useState(() => {
     try {
       return localStorage.getItem("cloud-bar-dismissed") === "1"
@@ -80,7 +74,6 @@ export function CloudStatusBar() {
 
   const linkTo = "/settings?tab=Car%20%26%20Network"
 
-  // Unpaired — compact "Connect" prompt, permanently dismissible.
   if (!status.paired) {
     if (dismissed) return null
     return (
@@ -116,7 +109,6 @@ export function CloudStatusBar() {
     )
   }
 
-  // Uploading — full progress strip
   if (status.pendingRouteCount > 0) {
     const total = status.pendingRouteCount + status.totalUploadedRouteCount
     const pct = total > 0 ? (status.totalUploadedRouteCount / total) * 100 : 0
@@ -158,7 +150,6 @@ export function CloudStatusBar() {
     )
   }
 
-  // Error — error chip
   if (status.lastUploadError) {
     return (
       <Link
@@ -177,7 +168,6 @@ export function CloudStatusBar() {
     )
   }
 
-  // Paired + idle — compact summary
   return (
     <Link
       to={linkTo}

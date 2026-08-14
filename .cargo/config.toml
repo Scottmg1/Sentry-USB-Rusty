@@ -1,23 +1,6 @@
-# Cross-compilation targets for Raspberry Pi.
-#
-# Linker config is per-target here. The target-cpu tuning is a SAFE DEFAULT
-# for local dev cross-builds (cortex-a72 scheduling on aarch64; cortex-a7
-# on armv7 — runs on every Pi 2+). CI builds the release matrix override
-# these defaults via the RUSTFLAGS env var to produce per-CPU-tuned
-# variants (a53/a72/a76 for aarch64). The runtime picker script
-# (sentryusb-pick-binary) chooses the right variant at boot.
-#
-# `-aes,-sha2` is NOT optional: LLVM's cortex-a72 (and a53!) CPU defs
-# assume the optional ARMv8 Cryptographic Extension, but Broadcom never
-# licensed it — BCM2710 (Pi 3 / Zero 2 W) and BCM2711 (Pi 4) have no
-# AES/SHA instructions, and RustCrypto skips its runtime hwcap check when
-# the feature is enabled at compile time, so a build without this
-# subtraction SIGILLs on those boards the moment anything hashes (issue
-# #88's root cause).
-#
-# DO NOT add further target-feature flags here without auditing each
-# enabled feature for cross-SoC compatibility — the local-dev default
-# must keep running on every Pi in the supported set.
+# Local cross-build defaults; CI overrides target-cpu for a53/a72/a76 releases.
+# BCM2710/2711 lack ARMv8 crypto despite LLVM's a53/a72 defaults, so compiled
+# AES/SHA would SIGILL (issue #88). Audit cross-SoC support before adding features.
 
 [target.aarch64-unknown-linux-gnu]
 linker = "aarch64-linux-gnu-gcc"

@@ -22,7 +22,6 @@ export function useDraggable(options: UseDraggableOptions = {}) {
   const dragStart = useRef<Position>({ x: 0, y: 0 })
   const posStart = useRef<Position>({ x: 0, y: 0 })
 
-  // Compute initial position on first render
   useEffect(() => {
     if (pos !== null || !elRef.current) return
     const el = elRef.current

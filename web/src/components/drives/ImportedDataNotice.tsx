@@ -5,17 +5,8 @@ import { BannerStack } from "@/components/ui/Banner"
 const DISMISS_KEY = "drives.importedDiscrepancyDismissed"
 
 /**
- * Heads-up banner shown on the Drives page when the library contains
- * imported (Tessie/Teslascope) drives. Rusty, Sentry Cloud, and Sentry
- * Drive each ingest and group clips a little differently — and imported
- * drives come from an external service's API rather than the dashcam —
- * so the headline totals can differ by a small amount across the three.
- * Dismissible; the choice persists in localStorage.
- *
- * `count` / `importedCount` are the filtered-window drive counts from
- * `DrivesFilteredStats` (importedCount == tessieCount: every non-SEI
- * drive). When there are no imported drives the three apps agree to
- * floating-point precision, so the banner stays hidden.
+ * Dismissible warning that imported providers may group drives differently.
+ * Counts reflect the current filter window and the choice persists locally.
  */
 export function ImportedDataNotice({
   count,
@@ -35,7 +26,7 @@ export function ImportedDataNotice({
   if (importedCount <= 0 || count <= 0 || dismissed) return null
 
   const sharePct = (importedCount / count) * 100
-  // Show one decimal under 10% so a handful of imports doesn't read "0%".
+  // Preserve one decimal below 10 percent.
   const shareLabel = sharePct >= 10 ? Math.round(sharePct).toString() : sharePct.toFixed(1)
 
   const dismiss = () => {

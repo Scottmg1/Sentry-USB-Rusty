@@ -11,18 +11,15 @@ use axum::http::StatusCode;
 use crate::router::AppState;
 use crate::status::get_sbc_model;
 
-/// Cache file written by `check_for_update`, read by `get_update_status` so
-/// the Settings page can render last-check results on load without forcing
-/// a network round-trip.
+/// Persists the last update check for `get_update_status`.
 const UPDATE_CHECK_CACHE: &str = "/tmp/sentryusb-update-check.json";
 
 static UPDATE_RUNNING: AtomicBool = AtomicBool::new(false);
 
-/// Salt for the telemetry fingerprint hash. Must match Go `telemetrySalt`.
+/// Keep fixed to preserve pseudonymous fingerprint continuity.
 const TELEMETRY_SALT: &str = "SENTRYUSB_2026_PROD";
 
-/// SHA-256 hash of a stable hardware identifier + salt. Uses the SBC serial
-/// number (survives reflash) with fallback to machine-id. Cached.
+/// Cached SHA-256 hash of the SBC serial, falling back to machine-id.
 pub(crate) fn get_fingerprint() -> &'static str {
     static CACHED: OnceLock<String> = OnceLock::new();
     CACHED.get_or_init(|| {
@@ -67,8 +64,7 @@ pub async fn check_internet(State(_s): State<AppState>) -> (StatusCode, Json<ser
     use std::time::Duration;
     use tokio::net::TcpStream;
 
-    // Port 443 works on Pi-hole networks (Pi-hole blocks port 53 for non-Pi-hole DNS).
-    // Race two probes so we succeed as soon as either connects.
+    // Race HTTPS probes because some Pi-hole networks block direct DNS probes.
     let t = Duration::from_secs(2);
     let probes: Vec<std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>> + Send>>> = vec![
         Box::pin(async move {
@@ -86,16 +82,8 @@ pub async fn check_internet(State(_s): State<AppState>) -> (StatusCode, Json<ser
     (StatusCode::OK, Json(serde_json::json!({"connected": connected})))
 }
 
-/// POST /api/system/update
-///
-/// Body (optional): `{"version": "vX.Y.Z"}` — install a specific release.
-/// Empty body / missing version → install whatever `/releases/latest`
-/// currently points to (backward-compatible "install latest" path).
-///
-/// On success the daemon broadcasts `complete` → `restarting` and then
-/// shells out to `reboot` ~3 s later, so the new binary is running by the
-/// time the user's tab reconnects. The 3 s gap is what lets the client
-/// mount the restart modal before the WebSocket goes away.
+/// Starts an OTA update. An optional `{"version":"vX.Y.Z"}` body selects a
+/// release; an empty body installs the latest release.
 pub async fn run_update(
     State(s): State<AppState>,
     body: String,
@@ -104,8 +92,7 @@ pub async fn run_update(
         return crate::json_error(StatusCode::CONFLICT, "Update already in progress");
     }
 
-    // Frontend conditionally attaches the body only when targetVersion is set
-    // (Settings.tsx:1597), so an empty string is the "install latest" case.
+    // The client omits the body when installing the latest release.
     let target_version: Option<String> = if body.trim().is_empty() {
         None
     } else {
@@ -130,9 +117,7 @@ pub async fn run_update(
                     "output": msg
                 }));
 
-                // Give the WS message a moment to land, then announce the restart and reboot.
-                // The 3 s wait between `restarting` and `reboot` lets the modal mount on the
-                // client before the WebSocket dies.
+                // Allow each WebSocket status to reach the client before rebooting.
                 tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                 hub.broadcast("update_status", &serde_json::json!({
                     "status": "restarting",
@@ -152,15 +137,11 @@ pub async fn run_update(
     (StatusCode::OK, Json(serde_json::json!({"status": "started"})))
 }
 
-/// Default GitHub source for OTA updates when the config doesn't override it.
+/// Default OTA source.
 const DEFAULT_UPDATE_OWNER: &str = "Sentry-Six";
 const DEFAULT_UPDATE_REPO_NAME: &str = "Sentry-USB-Rusty";
 
-/// Resolve the `owner/repo` slug for OTA updates. Honors `REPO` from the
-/// active sentryusb.conf (with the legacy hardcoded default as fallback)
-/// so a user running a fork can point self-update at their own releases
-/// via the wizard's Advanced → Update Source field. `REPO_NAME` stays
-/// hardcoded — forks must keep the original repo name.
+/// Resolves the configured owner while keeping the release repository name fixed.
 fn update_repo() -> String {
     let path = sentryusb_config::find_config_path();
     let (active, _commented) = sentryusb_config::parse_file(path).unwrap_or_default();
@@ -172,33 +153,10 @@ fn update_repo() -> String {
     format!("{}/{}", owner, DEFAULT_UPDATE_REPO_NAME)
 }
 
-/// Detect the release suffix matching the currently-running CPU variant.
-///
-/// Three-tier resolution:
-///   1. `/opt/sentryusb/active-variant` — written by the boot picker
-///      (sentryusb-pick-binary). If present, this is authoritative — it's
-///      exactly the variant that's running right now, so re-downloading
-///      the same suffix guarantees the update lands on a binary the picker
-///      will pick again.
-///   2. Live CPU detection mirroring the picker's rules (HWCAP atomics →
-///      a76, CPU part 0xD08 → a72, else a53). Used when the picker hasn't
-///      written the active-variant file yet (e.g., during the first
-///      migration update from an old single-binary install).
-///   3. Architecture-family fallback via dpkg/uname for armv7/amd64
-///      — those targets don't have per-CPU variants.
-///
-/// On Pi OS a 64-bit kernel can be paired with a 32-bit (armhf) userspace,
-/// in which case `uname -m` reports `aarch64` but the aarch64 binary can't
-/// actually load — exec returns ENOENT because the dynamic linker
-/// `/lib/ld-linux-aarch64.so.1` isn't installed. Trust dpkg first when
-/// determining the architecture family.
+/// Detects the release suffix selected by the boot picker or equivalent live
+/// CPU rules. Userspace architecture takes precedence over kernel architecture.
 async fn detect_release_suffix() -> anyhow::Result<String> {
-    // Tier 1: ask the picker what it chose at boot. Only trust values
-    // that are real release suffixes — old picker versions recorded
-    // whatever they ended up RUNNING (their on-disk fallback, or even
-    // "legacy"), and building download URLs from that either 404s or
-    // permanently installs the wrong CPU variant (issue #88's second
-    // act). Anything else falls through to live detection below.
+    // Older pickers recorded fallback names, so accept only release suffixes.
     const KNOWN_SUFFIXES: &[&str] = &[
         "linux-arm64-a53",
         "linux-arm64-a72",
@@ -220,11 +178,7 @@ async fn detect_release_suffix() -> anyhow::Result<String> {
         }
     }
 
-    // Tier 3 first (cheap arch-family check) — gates whether we even
-    // need to do per-CPU detection. If we're on armv7/amd64, there's
-    // only one variant per family. armv6 (armel / Pi Zero W / Pi 1) is
-    // no longer supported and errors out here so the user sees a
-    // diagnosable failure instead of a 404 on the download.
+    // dpkg reflects userspace on systems with a 64-bit kernel and 32-bit rootfs.
     let family = if let Ok(out) = sentryusb_shell::run("dpkg", &["--print-architecture"]).await {
         match out.trim() {
             "arm64" => "aarch64",
@@ -250,15 +204,10 @@ async fn detect_release_suffix() -> anyhow::Result<String> {
         }
     };
 
-    // Tier 2: aarch64 per-CPU detection — mirrors sentryusb-pick-binary's
-    // rules so an updater-side detection on a pre-picker install lands on
-    // the same variant the picker would have chosen.
+    // Mirror the boot picker's aarch64 rules on pre-picker installations.
     debug_assert_eq!(family, "aarch64");
     if let Ok(cpuinfo) = std::fs::read_to_string("/proc/cpuinfo") {
-        // HWCAP_ATOMICS = LSE = ARMv8.1+ = Cortex-A76 and newer. The a76
-        // build also keeps the ARMv8 crypto extension enabled (Pi 5 has
-        // it), so require the `aes` hwcap too — a v8.1+ board without
-        // crypto must get the a72 build instead of SIGILLing in SHA/AES.
+        // The a76 build requires both LSE atomics and the crypto extension.
         let has_hwcap = |cap: &str| {
             cpuinfo.lines().any(|line| {
                 line.starts_with("Features")
@@ -283,11 +232,7 @@ async fn detect_release_suffix() -> anyhow::Result<String> {
     Ok("linux-arm64-a53".to_string())
 }
 
-/// Stream a release binary to `dest`, broadcasting `downloading` progress
-/// (percent when Content-Length is known, byte counts either way) over the
-/// WS hub. Progress is advisory only — the caller still owns the atomic
-/// stage-then-rename install, so a failure here never touches the live
-/// binary.
+/// Streams a release to staging and broadcasts advisory download progress.
 async fn download_with_progress(
     hub: &sentryusb_ws::Hub,
     url: &str,
@@ -302,9 +247,7 @@ async fn download_with_progress(
         .send()
         .await?
         .error_for_status()?;
-    // GitHub redirects releases to a CDN; reqwest follows them, but the
-    // final response can omit Content-Length — percent goes null and the
-    // UI falls back to an indeterminate bar.
+    // CDN responses may omit Content-Length; the UI then uses indeterminate progress.
     let total = resp.content_length().filter(|t| *t > 0);
     let mut file = tokio::fs::File::create(dest).await?;
     let mut stream = resp.bytes_stream();
@@ -352,8 +295,7 @@ async fn self_update(
     let suffix = detect_release_suffix().await?;
     let repo = update_repo();
 
-    // Build the download URL — tag-specific if a target version was requested
-    // (Revert to Stable / Install Pre-release), otherwise the latest release.
+    // A requested version supports both prerelease installs and stable reverts.
     let url = if let Some(v) = &target_version {
         format!(
             "https://github.com/{}/releases/download/{}/sentryusb-{}",
@@ -366,9 +308,7 @@ async fn self_update(
         )
     };
 
-    // HEAD-check the binary exists before downloading so a typo'd version or
-    // a release that didn't get a binary uploaded surfaces as a clear error
-    // instead of an empty mv'd file.
+    // Fail clearly if the selected release has no matching binary.
     sentryusb_shell::run_with_timeout(
         std::time::Duration::from_secs(15),
         "curl",
@@ -382,19 +322,7 @@ async fn self_update(
         )
     })?;
 
-    // Remount root read-write. TeslaUSB-style images mount / read-only
-    // and put the writable portion behind an overlay or a per-script
-    // `remountfs_rw` helper. Try the helper first (which handles the
-    // overlay correctly on those setups), fall back to plain
-    // `mount -o remount,rw /` for vanilla rootfs images, and only then
-    // try the legacy `mount / -o remount,rw` ordering that used to be
-    // here. None of these are fatal individually — we try all three so
-    // at least one succeeds on every install layout. (Previously the
-    // single `mount / -o remount,rw` call silently failed on some
-    // images, which then caused every downstream `mv` into /root/bin
-    // to fail without surfacing an error — that's the root cause of
-    // the "UI says updated to v3.3.1 but binary on disk is still
-    // v3.3.0" bug we hit on the Rock Pi 4C+ tester.)
+    // Try overlay-aware, standard, and legacy remount forms for supported images.
     hub.broadcast(
         "update_status",
         &serde_json::json!({"status": "remounting", "message": "Preparing filesystem…"}),
@@ -403,15 +331,7 @@ async fn self_update(
     let _ = sentryusb_shell::run("mount", &["-o", "remount,rw", "/"]).await;
     let _ = sentryusb_shell::run("mount", &["/", "-o", "remount,rw"]).await;
 
-    // Stage the download on the SAME filesystem as the destination so the
-    // mv below is an atomic rename(2). The old staging path was /tmp
-    // (tmpfs): mv across filesystems falls back to unlink-dest + copy,
-    // and a power cut mid-copy — routine on a Pi that loses power the
-    // moment the car cuts accessory — left a partial (or no) binary at
-    // /opt/sentryusb and a service that can't start on the next boot.
-    // A power cut mid-download now only orphans the hidden .new file;
-    // the running binary is untouched until the rename. Bonus: the
-    // ~15 MB binary no longer transits tmpfs RAM on a 1 GB device.
+    // Same-filesystem staging makes the final rename atomic across power loss.
     sentryusb_shell::run("mkdir", &["-p", "/opt/sentryusb"]).await?;
     let tmp = "/opt/sentryusb/.sentryusb-update.new";
     download_with_progress(hub, &url, tmp).await?;
@@ -422,17 +342,12 @@ async fn self_update(
     );
     sentryusb_shell::run("chmod", &["+x", tmp]).await?;
 
-    // Write to the per-variant path so the picker symlink keeps resolving
-    // to a valid binary. Layout:
+    // Preserve the picker's multi-binary layout:
     //   /opt/sentryusb/sentryusb-{suffix}            ← we write here
     //   /opt/sentryusb/sentryusb-current → ↑         ← picker symlink
     //   /opt/sentryusb/sentryusb         → -current  ← back-compat symlink
     //
-    // Detection: if /opt/sentryusb/sentryusb-current exists (new layout),
-    // write to the variant path. Otherwise we're on a pre-multi-binary
-    // install — write to the legacy /opt/sentryusb/sentryusb path so the
-    // existing systemd unit still finds the binary. (The next install-pi.sh
-    // run will migrate the layout.)
+    // Pre-multi-binary installations still require the legacy destination.
     let dest = if std::path::Path::new("/opt/sentryusb/sentryusb-current").exists() {
         format!("/opt/sentryusb/sentryusb-{}", suffix)
     } else {
@@ -440,16 +355,7 @@ async fn self_update(
     };
     sentryusb_shell::run("mv", &[tmp, &dest]).await?;
 
-    // ── Tesla BLE telemetry sampler binary ──
-    //
-    // Pulled from the same release as the main binary so the schema
-    // version the sampler writes is locked to the schema the main
-    // binary expects. Best-effort: if the release doesn't include
-    // the telemetry binary (older release, unfinished CI) the update
-    // succeeds anyway and the sampler service stays inactive via its
-    // ConditionPathExists guard. Same arch-suffix, same repo, parallel
-    // URL shape — kept here rather than in migrate.rs so a single
-    // update pulls both binaries in lockstep.
+    // Keep the optional telemetry sampler on the main binary's release and ABI.
     let telemetry_url = if let Some(v) = &target_version {
         format!(
             "https://github.com/{}/releases/download/{}/sentryusb-tesla-telemetry-{}",
@@ -461,12 +367,7 @@ async fn self_update(
             repo, suffix
         )
     };
-    // Track per-binary install outcomes so the response message
-    // tells the user exactly what landed and what didn't. Previously
-    // these were all `let _ = ...` which silently swallowed failures
-    // — a read-only /root/bin (TeslaUSB safety pattern) would make
-    // the mv fail but the response still said "Updated to v3.3.1",
-    // leaving the user with v3.3.0 on disk and v3.3.1 in the UI.
+    // Auxiliary failures must remain visible even when the core update succeeds.
     let mut install_warnings: Vec<String> = Vec::new();
     hub.broadcast(
         "update_status",
@@ -480,8 +381,7 @@ async fn self_update(
     .await
     .is_ok();
     if head_ok {
-        // Staged next to its destination (not /tmp) so the mv below is an
-        // atomic same-fs rename — see the main-binary staging note above.
+        // Stage beside the destination for an atomic rename.
         let telemetry_tmp = "/opt/sentryusb/.sentryusb-tesla-telemetry-update.new";
         match sentryusb_shell::run_with_timeout(
             std::time::Duration::from_secs(120),
@@ -491,22 +391,7 @@ async fn self_update(
         .await
         {
             Ok(_) => {
-                // mkdir + chmod failures are tolerable individually
-                // (the dirs likely exist; non-executable still gets
-                // executed if we fix perms later). The mv is the
-                // one we MUST surface — if it fails the binary on
-                // disk doesn't get replaced.
-                //
-                // Install layout: the binary lands at its per-CPU
-                // variant path under /opt/sentryusb and /root/bin
-                // becomes a symlink to it — the same scheme the boot
-                // picker (sentryusb-pick-binary) manages for the main
-                // binary. The picker re-validates the symlink every
-                // boot, so a wrong-variant binary (SD card moved to a
-                // different Pi model) self-heals instead of SIGILL
-                // crash-looping forever (issue #88). `ln -sfn` also
-                // migrates legacy installs in place: it atomically
-                // replaces the old regular file at /root/bin.
+                // The picker repairs this per-CPU symlink when an SD card moves hosts.
                 if let Err(e) =
                     sentryusb_shell::run("mkdir", &["-p", "/root/bin"]).await
                 {
@@ -530,10 +415,7 @@ async fn self_update(
                 }
                 let telemetry_dest =
                     format!("/opt/sentryusb/sentryusb-tesla-telemetry-{}", suffix);
-                // mv first, ln only on success — a failed mv must NOT
-                // re-point /root/bin at a path that doesn't exist (that
-                // would replace a working legacy binary with a dangling
-                // symlink).
+                // Move first so a failed install cannot leave a dangling symlink.
                 let install_result =
                     match sentryusb_shell::run("mv", &[telemetry_tmp, &telemetry_dest])
                         .await
@@ -554,11 +436,7 @@ async fn self_update(
                     };
                 match install_result {
                     Ok(_) => {
-                        // Service file is installed by migrate.rs
-                        // (sentryusb's startup script). Restart here
-                        // so the freshly-installed binary picks up
-                        // immediately rather than waiting for the
-                        // post-reboot start.
+                        // Activate the new sampler without waiting for reboot.
                         let _ = sentryusb_shell::run(
                             "systemctl",
                             &["daemon-reload"],
@@ -579,8 +457,7 @@ async fn self_update(
                              uses an overlay you may need to remount manually \
                              or wait for the next reboot"
                         ));
-                        // Clean up the temp file so it doesn't sit
-                        // around eating /tmp forever.
+                        // Remove the failed staging file.
                         let _ = sentryusb_shell::run("rm", &["-f", telemetry_tmp]).await;
                     }
                 }
@@ -593,25 +470,14 @@ async fn self_update(
             }
         }
     } else {
-        // Release doesn't have a telemetry binary at this URL. This
-        // is a legitimate skip on older releases that predate the
-        // crate; surface it at info level only (no warning) since
-        // it's not actionable for the user.
+        // Older releases may not include the optional sampler.
         tracing::info!(
             "release does not include a telemetry binary at {} — skipping",
             telemetry_url
         );
     }
 
-    // ── BLE-action one-shot CLI ──
-    //
-    // Replaces the tesla-control shell-outs in run/awake_start
-    // (wake / sentry-mode / charge-port). Pulled from the same
-    // release as the main binary so action wire format stays in
-    // lockstep with whatever crypto/protocol changes ship together.
-    // Same best-effort pattern as the telemetry fetch above —
-    // missing artifact (older release) is a no-op rather than an
-    // update failure.
+    // Keep the optional BLE-action CLI on the main binary's protocol version.
     let action_url = if let Some(v) = &target_version {
         format!(
             "https://github.com/{}/releases/download/{}/sentryusb-ble-action-{}",
@@ -631,8 +497,7 @@ async fn self_update(
     .await
     .is_ok();
     if head_ok_action {
-        // Staged next to its destination for the same atomic-rename
-        // reason as the two binaries above.
+        // Stage beside the destination for an atomic rename.
         let action_tmp = "/opt/sentryusb/.sentryusb-ble-action-update.new";
         match sentryusb_shell::run_with_timeout(
             std::time::Duration::from_secs(120),
@@ -663,9 +528,7 @@ async fn self_update(
                         "ble-action: chmod +x failed: {e}"
                     ));
                 }
-                // Same variant-path + picker-managed-symlink layout as
-                // the telemetry binary above; see that block for the
-                // issue #88 rationale. mv first, ln only on success.
+                // Move first so a failed install cannot leave a dangling symlink.
                 let action_dest =
                     format!("/opt/sentryusb/sentryusb-ble-action-{}", suffix);
                 let install_result =
@@ -695,7 +558,6 @@ async fn self_update(
                     ));
                     let _ = sentryusb_shell::run("rm", &["-f", action_tmp]).await;
                 }
-                // No service to restart — awake_start invokes it on demand.
             }
             Err(e) => {
                 install_warnings.push(format!(
@@ -711,12 +573,7 @@ async fn self_update(
         );
     }
 
-    // Determine the tag to record. Use the requested target if any (it
-    // matches the binary we just installed); otherwise resolve /latest.
-    // Resolve via the shared HTTP client, like check_for_update already
-    // does — this was the last curl|grep|sed bash pipeline left here, and
-    // it interpolated the (config-controlled) repo name into a shell
-    // string. reqwest + serde needs no quoting at all.
+    // Record the requested tag, or resolve the tag backing `/latest`.
     let tag = match target_version {
         Some(v) => v,
         None => {
@@ -750,52 +607,14 @@ async fn self_update(
         let _ = std::fs::write("/opt/sentryusb/version", &tag);
     }
 
-    // Roll any per-binary install warnings into the user-visible
-    // success message. Without this the response was always "Updated
-    // to vX.Y.Z" regardless of whether the auxiliary binaries (telemetry
-    // sampler, ble-action CLI) actually landed on disk — causing the
-    // exact "UI says updated but binary on disk is the old one"
-    // confusion we hit on the Rock Pi 4C+ tester. Surface failures
-    // here so the user knows to investigate (usually: read-only
-    // rootfs needs a remount, or a release missing one of the assets).
-    // ── Re-apply install-time patches that must survive an OTA swap ──
-    //
-    // The standalone /usr/local/bin/sentryusb-apply-runtime-patches script
-    // re-applies things the binary swap can't own — e.g. the BCM4345C0
-    // non-fatal-adv patch to /root/bin/sentryusb-ble.py on Rock 4C+ which
-    // otherwise crash-loops the BLE daemon after every update. The script
-    // is idempotent + detection-gated, so it's a no-op on non-applicable
-    // boards and a no-op on already-patched files.
-    //
-    // Refresh the script body from the repo before running it.
-    //
-    // Bootstrap-only (the original behavior) had a fatal hole: a user with
-    // a stale on-disk copy from an earlier release would never receive new
-    // patches — update.rs skipped the download and invoked the rotten old
-    // script. So we re-download whenever we can, falling back to whatever
-    // is already on disk (warn-only) if that fails.
-    //
-    // The ref is the TAG WE JUST INSTALLED, not `main`: the script and the
-    // binary are one artifact. Pulling main next to a tagged binary can
-    // apply patches for shapes this binary does not implement, or drop a
-    // heal it still needs. See the fallback ladder just below.
+    // Refresh and reapply hardware-specific runtime patches after the binary swap.
     hub.broadcast(
         "update_status",
         &serde_json::json!({"status": "updating_scripts", "message": "Updating scripts…"}),
     );
     let patches_path = "/usr/local/bin/sentryusb-apply-runtime-patches";
-    // PIN TO THE TAG WE JUST INSTALLED. Fetching from `main` shipped the
-    // binary from release X alongside whatever patch script main happened
-    // to have — a script that may patch shapes this binary doesn't
-    // implement, or drop a heal this binary still needs. The script and
-    // the binary are one artifact and must come from one ref.
-    //
-    // Fallbacks, in order:
-    //   * tag known                → that tag (never main: a mismatched
-    //                                script is worse than an older one)
-    //   * tag unknown, script on disk → keep it, skip the download
-    //   * tag unknown, no script      → bootstrap from main so a device
-    //                                   with nothing still gets patches
+    // Pin the helper to the installed tag. With no tag, retain an existing
+    // helper or bootstrap from main only when no helper exists.
     let patches_ref = if !tag.is_empty() {
         Some(tag.clone())
     } else if std::path::Path::new(patches_path).exists() {
@@ -809,17 +628,9 @@ async fn self_update(
             repo, r
         )
     });
-    // Stage NEXT TO the target, not in /tmp: /tmp is a tmpfs (see
-    // setup/readonly.rs) while /usr/local/bin lives on the root
-    // filesystem, so `rename` across them fails with EXDEV. That failure
-    // used to be discarded, and the log still said "refreshed" — devices
-    // could keep re-running a stale patch script indefinitely while every
-    // update reported success. Same-filesystem staging keeps the swap
-    // atomic (no torn script if power drops mid-write).
+    // Stage on the target filesystem so replacement is atomic.
     let patches_tmp = "/usr/local/bin/.sentryusb-apply-runtime-patches.new";
-    // `None` = tag unknown AND a script is already on disk: skip the
-    // download and run what we have, rather than pulling an unpinned
-    // copy of main that may not match this binary.
+    // `None` keeps the installed helper when the release tag is unknown.
     let download = match &patches_url {
         Some(url) => {
             tracing::info!("update.rs: refreshing runtime-patches script from {}", url);
@@ -847,20 +658,12 @@ async fn self_update(
     };
     match download {
         Some(Ok(_)) => {
-            // Only swap the live script if the download produced a non-empty
-            // file (catches "200 OK + empty body" rare github edge cases).
+            // Never replace the live helper with an empty response.
             if std::fs::metadata(patches_tmp)
                 .map(|m| m.len() > 0)
                 .unwrap_or(false)
             {
-                // Validate the STAGED file before it replaces the live
-                // one. curl writes 0644, so the old sequence (rename,
-                // then chmod, ignoring its result) could leave a
-                // non-executable helper where a working one used to be
-                // — and a truncated download would replace a valid
-                // script with an unparseable one. Both are checked
-                // while the original is still intact; on failure we
-                // keep the existing helper.
+                // Validate permissions and syntax before replacing the live helper.
                 let staged_ok = sentryusb_shell::run("chmod", &["+x", patches_tmp])
                     .await
                     .is_ok()
@@ -881,8 +684,7 @@ async fn self_update(
                 match if staged_ok {
                     std::fs::rename(patches_tmp, patches_path)
                 } else {
-                    // Validation already handled above; don't touch the
-                    // live script at all.
+                    // Validation failure leaves the live helper untouched.
                     Ok(())
                 } {
                     Ok(()) if staged_ok => {
@@ -890,9 +692,6 @@ async fn self_update(
                     }
                     Ok(()) => {}
                     Err(e) => {
-                        // Never claim success on a failed swap: the whole
-                        // point of this refresh is that NEW patches reach
-                        // existing installs.
                         let _ = std::fs::remove_file(patches_tmp);
                         tracing::error!(
                             "update.rs: runtime-patches swap FAILED ({e}); keeping existing script"
@@ -929,8 +728,7 @@ async fn self_update(
                 );
             }
         }
-        // Download deliberately skipped (tag unknown, script already on
-        // disk) — the warning was recorded above.
+        // Tag unknown; retain the existing helper.
         None => {}
     }
 
@@ -957,9 +755,7 @@ async fn self_update(
             if tag.is_empty() { "latest".to_string() } else { tag }
         ))
     } else {
-        // Log full detail to the journal for ops, return a condensed
-        // version to the UI (4kB cap so a flood of warnings doesn't
-        // blow up the WebSocket message).
+        // Keep full journal detail but cap the WebSocket response at 4 KiB.
         for w in &install_warnings {
             tracing::warn!("update.rs: {}", w);
         }
@@ -981,10 +777,7 @@ async fn self_update(
     }
 }
 
-/// GET /api/system/version
-/// Kernel boot identifier — changes on every boot. Read per request (cheap)
-/// so it can never go stale. None on non-Linux hosts; the UI treats a null
-/// boot_id as "reboot unverified", never as proof of one.
+/// Reads the per-boot identifier used to verify that an update rebooted.
 fn read_boot_id() -> Option<String> {
     std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
         .ok()
@@ -996,7 +789,6 @@ pub async fn get_version() -> (StatusCode, Json<serde_json::Value>) {
     let version = env!("CARGO_PKG_VERSION");
     let sbc_model = get_sbc_model();
 
-    // Read installed version tag if available (installer writes it here).
     let installed = std::fs::read_to_string("/opt/sentryusb/version")
         .or_else(|_| std::fs::read_to_string("/root/.sentryusb_version"))
         .unwrap_or_else(|_| version.to_string());
@@ -1005,14 +797,11 @@ pub async fn get_version() -> (StatusCode, Json<serde_json::Value>) {
         "version": installed.trim(),
         "binary_version": version,
         "sbc_model": sbc_model,
-        // The version tag alone can't prove a reboot: the old daemon
-        // rewrites /opt/sentryusb/version BEFORE `reboot` fires and keeps
-        // serving it. The updater UI compares boot_id instead.
+        // The version file changes before reboot, so clients compare boot IDs.
         "boot_id": read_boot_id(),
     })))
 }
 
-/// Parse semver string like "v1.2.3" or "v1.2.3-beta.1" → (major, minor, patch, prerelease).
 /// Parses a semver tag, handling prerelease and edge cases.
 pub(crate) fn parse_semver(v: &str) -> Option<(u32, u32, u32, String)> {
     let v = v.trim().trim_start_matches('v');
@@ -1054,8 +843,8 @@ pub(crate) fn is_version_newer(candidate: &str, current: &str) -> bool {
     }
     match (u.3.is_empty(), c.3.is_empty()) {
         (true, true) => false,
-        (false, true) => true,   // user on prerelease, candidate stable → newer
-        (true, false) => false,  // user on stable, candidate prerelease → older
+        (false, true) => true,   // Stable supersedes prerelease at the same version.
+        (true, false) => false,
         (false, false) => c.3 > u.3,
     }
 }
@@ -1067,24 +856,7 @@ fn read_current_version() -> String {
         .unwrap_or_else(|_| env!("CARGO_PKG_VERSION").to_string())
 }
 
-/// POST /api/system/check-update
-///
-/// Fetches the GitHub "latest release" JSON via reqwest and parses it
-/// properly. The previous implementation shelled to `curl | grep | head`
-/// which hid curl failures (pipeline exit code is `head`'s, always 0
-/// on empty input) — a 403 rate limit or DNS blip would silently
-/// return `available: false` and the UI would tell the user they were
-/// up to date when they weren't.
-///
-/// The response shape carries both the simple fields (`available`,
-/// `latest`, `current`) kept for backward compatibility with earlier
-/// Rust clients **and** the richer fields the current web UI reads
-/// (`update_available`, `latest_version`, `release_url`,
-/// `release_notes`). Settings.tsx checks for `data.update_available`
-/// / `data.latest_version`; without them the UI defaults to "up to
-/// date" regardless of the actual result. This was the root cause of
-/// the user-reported "update never appears" bug even when the backend
-/// correctly found a newer release.
+/// Checks GitHub releases and returns both legacy and current response fields.
 pub async fn check_for_update(
     State(_s): State<AppState>,
     Query(params): Query<HashMap<String, String>>,
@@ -1092,8 +864,7 @@ pub async fn check_for_update(
     let current = read_current_version();
     let can_update = !current.is_empty() && current != "dev";
 
-    // Include prereleases if requested via query param OR if the user's
-    // update_channel preference is set to "prerelease".
+    // Either the request or saved channel can enable prerelease discovery.
     let mut include_prerelease = params.get("include_prerelease").map(String::as_str) == Some("true");
     if !include_prerelease {
         let prefs = crate::preferences::load_prefs();
@@ -1105,8 +876,7 @@ pub async fn check_for_update(
     let releases = match fetch_releases().await {
         Ok(rs) => rs,
         Err(msg) => {
-            // Fire a basic telemetry heartbeat so the support server still sees
-            // the device when GitHub is unreachable.
+            // Update-check telemetry is independent of GitHub availability.
             let cur_clone = current.clone();
             tokio::spawn(async move { send_telemetry(&cur_clone, false, "").await });
 
@@ -1130,9 +900,7 @@ pub async fn check_for_update(
 
     let mut new_stable_version = String::new();
 
-    // Detect whether the user is currently on a prerelease so we can offer
-    // the latest stable as a downgrade option when no forward upgrade is
-    // available.
+    // A prerelease installation may always revert to the latest stable.
     let on_prerelease = parse_semver(&current)
         .map(|(_, _, _, pre)| !pre.is_empty())
         .unwrap_or(false);
@@ -1153,9 +921,6 @@ pub async fn check_for_update(
             new_stable_version = stable.tag_name.clone();
         }
 
-        // If user is on a prerelease and the latest stable isn't flagged as
-        // a newer version (e.g. prerelease has a higher base version), offer
-        // the stable release as a revert/downgrade option.
         if on_prerelease && can_update && !stable_available {
             result["revert_stable"] = serde_json::json!({
                 "version": stable.tag_name,
@@ -1179,13 +944,12 @@ pub async fn check_for_update(
         }
     }
 
-    // Cache the result so the Settings page load can render last-check info
-    // without re-hitting GitHub.
+    // Cache the result for subsequent Settings loads.
     if let Ok(data) = serde_json::to_vec(&result) {
         let _ = std::fs::write(UPDATE_CHECK_CACHE, data);
     }
 
-    // Telemetry — only report stable updates, never prereleases.
+    // Report stable update availability only.
     let cur_clone = current.clone();
     let new_ver_clone = new_stable_version.clone();
     tokio::spawn(async move {
@@ -1195,7 +959,6 @@ pub async fn check_for_update(
     (StatusCode::OK, Json(result))
 }
 
-/// Minimal release info parsed from a GitHub release object.
 #[derive(Clone)]
 struct ReleaseInfo {
     tag_name: String,
@@ -1205,7 +968,7 @@ struct ReleaseInfo {
     draft: bool,
 }
 
-/// Fetch the most recent releases (stable + prerelease) from GitHub.
+/// Fetches recent stable and prerelease records from GitHub.
 async fn fetch_releases() -> Result<Vec<ReleaseInfo>, String> {
     let url = format!("https://api.github.com/repos/{}/releases?per_page=20", update_repo());
 
@@ -1256,9 +1019,7 @@ async fn fetch_releases() -> Result<Vec<ReleaseInfo>, String> {
         .collect())
 }
 
-/// Pick the first stable and the first prerelease from the list. Mirrors
-/// Go's `findLatestReleases` — assumes the GitHub API returns releases in
-/// publish-newest-first order. Draft releases are skipped.
+/// Selects the first non-draft stable and prerelease from GitHub's newest-first list.
 fn find_latest_releases(releases: &[ReleaseInfo]) -> (Option<&ReleaseInfo>, Option<&ReleaseInfo>) {
     let mut stable: Option<&ReleaseInfo> = None;
     let mut prerelease: Option<&ReleaseInfo> = None;
@@ -1280,20 +1041,11 @@ fn find_latest_releases(releases: &[ReleaseInfo]) -> (Option<&ReleaseInfo>, Opti
     (stable, prerelease)
 }
 
-/// Marker file. Once it exists, the install beacon has fired for this
-/// install and won't fire again. Lives under `/mutable/` so it survives
-/// SentryUSB updates but resets on a full SD-card reflash (which is
-/// indistinguishable from a fresh install anyway).
+/// Persistent per-install marker for the aggregate install beacon.
 const INSTALL_BEACON_MARKER: &str = "/mutable/.beaconed";
 
-/// POST update-check telemetry to the support server. The payload always
-/// carries `{current_version, update_available, new_version, arch, model}`.
-/// A device fingerprint is included **only** if the user has explicitly
-/// opted in via the `analytics_opt_in` preference (set by the setup wizard
-/// or Settings → System). Without an opt-in, the backend treats the call as
-/// an opted-out heartbeat (no DB row, IP-rate-limited).
-///
-/// Best-effort — errors are logged, never surfaced to the caller.
+/// Sends best-effort update telemetry. A device fingerprint is included only
+/// when `analytics_opt_in` is true; otherwise the payload is identifier-free.
 pub async fn send_telemetry(current: &str, update_available: bool, new_version: &str) {
     let opt_in = crate::preferences::load_prefs()
         .get("analytics_opt_in")
@@ -1339,23 +1091,13 @@ pub async fn send_telemetry(current: &str, update_available: bool, new_version: 
     }
 }
 
-/// Fire the aggregate install beacon exactly once per install. The beacon
-/// POSTs an empty body with no device identifier to `/sentryusb/install-beacon`.
-/// The backend briefly rate-limits by the connection's source IP and persists
-/// only a daily aggregate counter.
-///
-/// Guarded by `/mutable/.beaconed` — once that file exists, the beacon
-/// never fires again for this install (until /mutable is wiped, which on
-/// SentryUSB only happens on a full reflash).
+/// Sends one identifier-free install beacon, guarded by a persistent marker.
 pub fn spawn_install_beacon() {
     tokio::spawn(async move {
         if std::path::Path::new(INSTALL_BEACON_MARKER).exists() {
             return;
         }
-        // Retry on transient errors so a cold DNS cache at first boot
-        // doesn't drop the beacon. Three attempts max, then give up —
-        // if we can't reach the server after that, we'll just stay
-        // un-beaconed and try again next boot.
+        // Leave the marker absent after transient failure so the next boot retries.
         let url = "https://api.sentry-six.com/sentryusb/install-beacon";
         let client = match reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(10))
@@ -1373,7 +1115,7 @@ pub fn spawn_install_beacon() {
                 }
                 Ok(r) => {
                     tracing::warn!("[beacon] non-success status {}", r.status());
-                    // 4xx won't fix with retry; 5xx might.
+                    // Retry server errors only.
                     if !r.status().is_server_error() {
                         return;
                     }
@@ -1389,14 +1131,7 @@ pub fn spawn_install_beacon() {
     });
 }
 
-/// GET /api/system/update-status
-///
-/// Returns the cached result of the last `check_for_update` call so the
-/// Settings page can render last-known release info without forcing a
-/// fresh GitHub round-trip on every page load.
-///
-/// Live install progress is delivered via the `update_status` WebSocket
-/// channel (see `run_update`), not this endpoint.
+/// Returns the last cached update check; live progress uses the WebSocket channel.
 pub async fn get_update_status(State(_s): State<AppState>) -> (StatusCode, Json<serde_json::Value>) {
     match std::fs::read_to_string(UPDATE_CHECK_CACHE) {
         Ok(s) => match serde_json::from_str::<serde_json::Value>(&s) {

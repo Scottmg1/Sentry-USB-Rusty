@@ -1,20 +1,11 @@
 //! Cross-process serialization of USB-gadget disable/enable cycles.
 //!
-//! archiveloop wraps every gadget teardown/bring-up — the main loop's
-//! connect/disconnect and the gadget stall watchdog — in an exclusive
-//! `flock` on [`GADGET_CYCLE_LOCK_PATH`] (`GADGET_CYCLE_LOCK` in
-//! `run/archiveloop`). Rust code that cycles the gadget outside archiveloop
-//! must hold the same lock across its whole disable→work→enable window,
-//! otherwise the two sides interleave — worst case one re-enables the
-//! gadget while the other has cam_disk.bin mounted, putting two writers on
-//! one block device and corrupting the filesystem the car records to.
+//! Hold the shared archiveloop flock across the complete disable/work/enable
+//! window. Interleaving can expose a mounted image to the car and corrupt it.
 //!
-//! Deliberately NOT taken inside [`crate::enable`]/[`crate::disable`]:
-//! archiveloop's enable_gadget.sh/disable_gadget.sh shims curl back into
-//! /api/system/gadget-enable|disable *while archiveloop already holds the
-//! flock*, so locking at that depth would wedge the shim until its
-//! `--max-time 30` expires and fail archiveloop's cycle. Only callers that
-//! own a complete cycle take this lock.
+//! Do not acquire it inside [`crate::enable`] or [`crate::disable`]: shell
+//! shims call those endpoints while already holding the same non-reentrant
+//! lock. Only complete-cycle callers acquire it.
 
 use std::fs::{File, OpenOptions};
 use std::io;
@@ -24,18 +15,14 @@ use std::time::{Duration, Instant};
 /// Must match `GADGET_CYCLE_LOCK` in `run/archiveloop`.
 pub const GADGET_CYCLE_LOCK_PATH: &str = "/tmp/sentryusb_gadget_cycle.lock";
 
-/// Exclusive hold on the gadget-cycle lock; released on drop (the flock
-/// dies with the file handle).
+/// Exclusive gadget-cycle lock, released when its file handle is dropped.
 #[derive(Debug)]
 pub struct CycleGuard {
     _file: File,
 }
 
-/// Acquire the gadget-cycle flock, waiting up to `timeout` for whoever
-/// holds it (an archive media sync holds it for minutes, the stall
-/// watchdog for seconds). Polls `LOCK_NB` rather than parking in
-/// `flock(2)` so the wait is bounded. Blocking call — run it on a
-/// blocking thread.
+/// Acquire the flock within `timeout` by polling `LOCK_NB`.
+/// This is a blocking call and must run on a blocking thread.
 pub fn acquire(timeout: Duration) -> io::Result<CycleGuard> {
     acquire_path(Path::new(GADGET_CYCLE_LOCK_PATH), timeout)
 }
@@ -67,9 +54,7 @@ fn acquire_path(path: &Path, timeout: Duration) -> io::Result<CycleGuard> {
 #[cfg(unix)]
 pub(crate) fn try_flock_exclusive(file: &File) -> io::Result<bool> {
     use std::os::unix::io::AsRawFd;
-    // Same primitive as shell `flock`: the lock lives on the open file
-    // description, so it also excludes other threads of this process and
-    // stays held across await points until the guard drops.
+    // The open-file-description lock excludes processes and sibling threads.
     let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
     if rc == 0 {
         return Ok(true);

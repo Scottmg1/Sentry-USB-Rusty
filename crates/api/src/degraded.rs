@@ -1,12 +1,7 @@
 //! Router served when the drive DB cannot be opened on a real device.
 //!
-//! No `DriveStore` exists in this mode — no dummy store, no processor,
-//! no cloud uploader — so every DB-dependent endpoint answers
-//! `503 database_unavailable` instead of an empty `200` that would be
-//! indistinguishable from total data loss. What remains is an explicit
-//! recovery allowlist: status/version, logs, storage health + repair,
-//! reboot/shutdown, and auth so the allowlist stays gated. The status
-//! payload carries a `degraded` marker the SPA turns into a banner.
+//! Database-dependent endpoints return `503 database_unavailable`; an
+//! authenticated allowlist retains status, logs, repair, and system controls.
 
 use axum::extract::{FromRef, State};
 use axum::http::StatusCode;
@@ -19,7 +14,7 @@ use crate::auth::AuthState;
 pub struct DegradedState {
     pub auth: AuthState,
     pub hub: sentryusb_ws::Hub,
-    /// Why the DB failed to open, verbatim, for the banner and journal.
+    /// Database-open failure for the banner and journal.
     pub reason: std::sync::Arc<String>,
 }
 
@@ -35,9 +30,8 @@ impl FromRef<DegradedState> for sentryusb_ws::Hub {
     }
 }
 
-/// GET /api/status — 200, not 503: the SPA's connection banner treats a
-/// failing status poll as "disconnected", which would mask the real
-/// message. The `degraded` marker is what the frontend keys on.
+/// GET /api/status — return 200 with a degraded marker so the SPA can
+/// distinguish database failure from disconnection.
 async fn degraded_status(State(s): State<DegradedState>) -> Json<serde_json::Value> {
     Json(serde_json::json!({
         "degraded": "database_unavailable",
@@ -59,10 +53,9 @@ async fn unavailable(State(s): State<DegradedState>) -> (StatusCode, Json<serde_
 pub fn build_degraded_router(state: DegradedState) -> Router {
     Router::new()
         .route("/api/status", get(degraded_status))
-        // The SPA's initial routing needs this to know setup is done
-        // (otherwise it renders the setup wizard over the banner).
+        // Initial routing needs setup state before rendering the banner.
         .route("/api/setup/status", get(crate::setup::get_setup_status))
-        // Auth keeps the allowlist gated exactly as in normal mode.
+        // Keep the recovery allowlist authenticated.
         .route("/api/auth/login", post(crate::auth::handle_login))
         .route("/api/auth/logout", post(crate::auth::handle_logout))
         .route("/api/auth/check", get(crate::auth::handle_auth_check))
@@ -71,10 +64,8 @@ pub fn build_degraded_router(state: DegradedState) -> Router {
         .route("/api/system/shutdown", post(crate::system::shutdown))
         .route("/api/logs/{name}", get(crate::logs::get_log_tail))
         .route("/api/logs/{name}/page", get(crate::logs::get_log_page))
-        // The most likely fix path: the backing filesystem is damaged.
         .route("/api/storage/health", get(crate::storage_repair::storage_health))
         .route("/api/storage/repair", post(crate::storage_repair::storage_repair))
-        // Repair progress streams over the hub.
         .route("/api/ws", get(crate::router::ws_handler))
         .route("/api/{*rest}", axum::routing::any(unavailable))
         .with_state(state)

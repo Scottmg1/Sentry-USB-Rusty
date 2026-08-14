@@ -31,7 +31,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       setAuthRequired(data.auth_required)
       setState(data.authenticated || !data.auth_required ? "authenticated" : "unauthenticated")
     } catch {
-      // If check fails (e.g., server down), assume authenticated to avoid blocking
+      // A connectivity failure must not strand the UI behind the login screen.
       setState("authenticated")
     }
   }, [])
@@ -61,8 +61,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
   useEffect(() => {
     checkAuth()
-    // Re-check periodically so we detect invalidated sessions (e.g., after
-    // server restart which clears in-memory sessions).
+    // Server restarts invalidate in-memory sessions.
     const iv = setInterval(checkAuth, 10_000)
     return () => clearInterval(iv)
   }, [checkAuth])

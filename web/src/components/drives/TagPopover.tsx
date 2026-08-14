@@ -24,9 +24,7 @@ export function TagPopover({ tags, onChange }: TagPopoverProps) {
     return () => document.removeEventListener("mousedown", onDoc)
   }, [open])
 
-  // Pull every tag already used on other drives/charges when the popover
-  // opens, so the user can pick one instead of retyping it. The server
-  // list is SELECT DISTINCT, so a tag drops off once nothing uses it.
+  // Load tags currently used by another drive or charge.
   useEffect(() => {
     if (!open) return
     let cancelled = false
@@ -90,7 +88,6 @@ export function TagPopover({ tags, onChange }: TagPopoverProps) {
   const displayTag = hasTags ? tags[0] : null
   const extraCount = hasTags ? tags.length - 1 : 0
 
-  // Existing tags not already on this item, narrowed by what's typed.
   const query = draft.trim().toLowerCase()
   const available = suggestions.filter(
     (s) => !tags.includes(s) && (!query || s.toLowerCase().includes(query)),

@@ -16,20 +16,8 @@ interface DriveChartProps {
   startTime: string
 }
 
-// Chart layout constants — must stay in sync with the AreaChart's
-// `margin` prop, YAxis `width`, and XAxis `padding` below. We compute
-// the click→index mapping in pixel space ourselves because Recharts
-// 3.x's `onClick` handler doesn't reliably populate
-// `activeTooltipIndex` (the event fires before the chart's redux
-// store settles).
-//
-// For a `type="number"` XAxis, data is drawn inside
-//   [margin.left + yAxis.width + xPad.left,
-//    containerWidth - margin.right - xPad.right]
-// Skipping `margin.left` and the XAxis padding shifts the mapped time
-// by ~(margin.left + xPad.left + xPad.right) / plotWidth of the drive
-// duration — visible as ~30-60 sec of click-vs-map drift on a long
-// drive.
+// Keep these constants aligned with the chart props. Recharts 3 reports click
+// state too early, so seeking maps pixels through the explicit plot bounds.
 const LEFT_MARGIN = 4
 const RIGHT_MARGIN = 16
 const YAXIS_WIDTH = 36
@@ -46,15 +34,7 @@ function DriveChart({
   const baseMs = useMemo(() => new Date(startTime).getTime(), [startTime])
   const containerRef = useRef<HTMLDivElement>(null)
 
-  // Click anywhere in the chart → seek to that fractional position
-  // along the time axis. The XAxis is `type="number"` keyed on `time`,
-  // so Recharts positions points by their time value, NOT by array
-  // index. Sample density is non-uniform (each 1-minute clip has a
-  // different point count, plus small gaps can sit between clips), so
-  // mapping click-X to an array index would land on a different sample
-  // than the tooltip shows at the cursor. Resolve click-X → target
-  // time, then binary-search the (time-sorted) series for the nearest
-  // sample.
+  // Sample density varies, so map click X to time and binary-search the series.
   const handleClick = (e: React.MouseEvent<HTMLDivElement>) => {
     if (series.length < 2) return
     const container = containerRef.current
@@ -170,10 +150,7 @@ function formatTickTime(baseMs: number, relMs: number): string {
   return t.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })
 }
 
-// Tooltip needs second-level resolution so the user can verify the
-// clicked sample matches what the map's playback card shows — the
-// map card already includes seconds. Axis ticks keep minute
-// resolution (cleaner on a 30-min+ drive).
+// Tooltips include seconds to match the playback card; axis ticks stay compact.
 function formatTooltipTime(baseMs: number, relMs: number): string {
   const t = new Date(baseMs + relMs)
   if (Number.isNaN(t.getTime())) return ""

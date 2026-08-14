@@ -11,16 +11,8 @@ import {
 } from "recharts"
 import { useScrubberActions } from "@/hooks/useScrubberSync"
 
-// Layout constants — must stay in sync with the LineChart's `margin`,
-// YAxis `width`, and XAxis `padding` below. Click-to-seek is computed
-// in pixel space because Recharts 3.x's onClick fires before its
-// internal redux store settles, so `activeTooltipIndex` is unreliable.
-//
-// For a `type="number"` XAxis, data is drawn inside
-//   [margin.left + yAxis.width + xPad.left,
-//    containerWidth - margin.right - xPad.right]
-// Skipping `margin.left` or the X padding produces ~30-60 sec of
-// click-vs-map drift on a long drive.
+// Keep these constants aligned with chart props; seeking uses explicit pixel
+// bounds because Recharts 3 exposes click state before it settles.
 const LEFT_MARGIN = 4
 const RIGHT_MARGIN = 16
 const YAXIS_WIDTH = 44
@@ -28,31 +20,24 @@ const X_PADDING_LEFT = 10
 const X_PADDING_RIGHT = 4
 
 export interface TemperaturePoint {
-  // Unix ms — backend (drives_handler::temperature_series) emits the
-  // sample's `ts` already multiplied by 1000 so JS Date and recharts
-  // (which both work in ms) consume it directly.
+  // Unix milliseconds.
   ts: number
-  // Either or both may be undefined when the underlying telemetry row
-  // had NULL for that column. recharts skips undefined values in line
-  // series so a gap renders as a discontinuity, not a drop to zero.
+  // Undefined temperatures render as gaps rather than zero.
   interiorC?: number
   exteriorC?: number
 }
 
 interface TemperatureChartProps {
   points: TemperaturePoint[]
-  // True when DRIVE_MAP_UNIT === "km" (so the user prefers metric —
-  // we mirror that for temperature with °C). False → °F.
+  // Distance-system preference also selects Celsius versus Fahrenheit.
   metric: boolean
-  // Drive points (`[lat, lng, rel_ms, speed_mps]`) and start_time used
-  // to translate a clicked telemetry timestamp into a scrubber index.
-  // Optional: when omitted, the chart renders without click-to-seek.
+  // Optional drive timing enables click-to-seek.
   drivePoints?: [number, number, number, number][]
   startTime?: string
 }
 
-const INTERIOR_COLOR = "#f97316" // orange — warm = inside
-const EXTERIOR_COLOR = "#38bdf8" // sky — cool = outside (sky-500-ish)
+const INTERIOR_COLOR = "#f97316"
+const EXTERIOR_COLOR = "#38bdf8"
 
 export default function TemperatureChart({
   points,
@@ -61,9 +46,7 @@ export default function TemperatureChart({
   startTime,
 }: TemperatureChartProps) {
   const { setIndex } = useScrubberActions()
-  // Convert °C → °F once at the boundary so the chart's data, axis,
-  // and tooltip all speak the same unit. Skipping with `undefined`
-  // preserves the gap-handling behaviour from the raw payload.
+  // Convert once at the boundary while preserving undefined gaps.
   const converted = useMemo(() => {
     if (metric) return points
     return points.map((p) => ({
@@ -73,10 +56,7 @@ export default function TemperatureChart({
     }))
   }, [points, metric])
 
-  // Pre-compute the drive's start clock-time so we can convert a clicked
-  // telemetry `ts` (absolute Unix ms) to the matching scrubber index in
-  // O(log n) per click. The drive's points carry relative ms offsets
-  // from start_time so we binary-search by `(ts - baseMs)`.
+  // Convert absolute sample time to a relative offset for binary search.
   const baseMs = useMemo(
     () => (startTime ? new Date(startTime).getTime() : NaN),
     [startTime],
@@ -88,7 +68,6 @@ export default function TemperatureChart({
   const seekToTs = (ts: number) => {
     if (!drivePoints || drivePoints.length === 0) return
     const targetRel = ts - baseMs
-    // Binary search for nearest point by relative ms.
     let lo = 0
     let hi = drivePoints.length - 1
     while (lo < hi) {
@@ -105,10 +84,7 @@ export default function TemperatureChart({
     setIndex(best)
   }
 
-  // Click anywhere in the chart → seek by mapping click X to a fraction
-  // of the time domain, then resolving that ts to the nearest drive
-  // point. The telemetry samples are sparse (60s cadence) so we map
-  // through the time axis rather than directly to a sample index.
+  // Sparse samples require time-axis mapping rather than direct index mapping.
   const handleClick = (e: React.MouseEvent<HTMLDivElement>) => {
     if (!canSeek || converted.length < 2) return
     const container = containerRef.current

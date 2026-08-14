@@ -10,11 +10,7 @@ export interface DriveDetailState {
   refresh: () => Promise<void>
 }
 
-// Telemetry fields live on DriveSummary (built from RouteTelemetryAggregates
-// in the BLOB-free path) but NOT on the Drive struct returned by
-// /api/drives/:id. Without this merge the detail page would silently hide
-// Battery, Climate, Tire pressure, Odometer sections and render "Unknown
-// origin/destination" + "Drive to Drive" as the title.
+// The detail response omits summary telemetry, so merge its matching list row.
 function mergeTelemetry(detail: DriveDetail, summary: DriveSummary): DriveDetail {
   return {
     ...detail,

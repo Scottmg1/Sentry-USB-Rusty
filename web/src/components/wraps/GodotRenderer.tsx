@@ -13,18 +13,9 @@ interface GodotRendererProps {
   onCarLoaded?: () => void
 }
 
-/**
- * Hidden component that manages a Godot WASM instance in an offscreen iframe.
- * Used to render 3D preview images of Tesla wraps during the upload flow.
- *
- * Communication: React <-> iframe via postMessage <-> Godot bridge <-> Godot WASM
- */
-// The renderer iframe is served from the SentryUSB cloud (not the local Pi).
-// Pin every postMessage hop to this exact origin: send only TO it (was "*",
-// which any document the iframe later navigated to could read) and accept
-// inbound messages only FROM it (the listener below was unauthenticated, so
-// any page that could postMessage to this window could forge a
-// `capture_result` and inject an arbitrary image data-URL into the upload).
+/** Manages an offscreen Godot WASM renderer for wrap preview images. */
+// Restrict both postMessage directions to the cloud renderer origin so another
+// document cannot read commands or forge capture results.
 const GODOT_ORIGIN = "https://api.sentry-six.com"
 
 const GodotRenderer = forwardRef<GodotRendererHandle, GodotRendererProps>(
@@ -44,7 +35,7 @@ const GodotRenderer = forwardRef<GodotRendererHandle, GodotRendererProps>(
       },
       capture(distance?: number) {
         const angle = { type: "set_camera_angle", horizontal: -135, vertical: 25, distance: distance ?? 7 }
-        // Apply camera orientation twice to ensure it settles in the correct position
+        // Godot needs a second camera update after its first render settles.
         sendToGodot(angle)
         setTimeout(() => {
           sendToGodot(angle)
@@ -57,7 +48,6 @@ const GodotRenderer = forwardRef<GodotRendererHandle, GodotRendererProps>(
 
     useEffect(() => {
       const handleMessage = (e: MessageEvent) => {
-        // Only trust messages from the renderer iframe's own origin.
         if (e.origin !== GODOT_ORIGIN) return
         if (!e.data || !e.data.type) return
 

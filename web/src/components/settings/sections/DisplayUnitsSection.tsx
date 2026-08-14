@@ -5,12 +5,7 @@ import { useUnits } from "@/lib/units"
 import { cn } from "@/lib/utils"
 
 export function DisplayUnitsSection() {
-  // The Metric/Imperial pill is the source of truth: it sets the dashboard
-  // temperature (TEMPERATURE_UNIT) and the distance default together. The two
-  // toggles below are per-quantity overrides — each one opts a single readout
-  // OUT of the selected system, so its label always names the *opposite* unit
-  // (in Metric: "miles" / "°F"; in Imperial: "kilometres" / "°C"). Off =
-  // follow the pill; on = use the unit named in the label.
+  // Per-quantity toggles override the selected Metric or Imperial defaults.
   const { systemTempF, km, pressureBar, isMetric, setMetric, setSystemTempF, setKm, setPressureBar } =
     useUnits()
 
@@ -20,8 +15,6 @@ export function DisplayUnitsSection() {
       halo="violet"
       title="Display & Units"
       badge={
-        // Connected pill, borrowing the Keep Awake SegPicker's green palette
-        // (border-blue-500/40 bg-blue-500/10 text-blue-400 — hue-150 green).
         <span
           role="tablist"
           aria-label="Units"

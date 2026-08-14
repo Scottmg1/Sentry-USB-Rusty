@@ -52,8 +52,6 @@ const baseNavItems = [
 function buildNavItems(
   mode: ReturnType<typeof useCommunityPrefs>["mode"],
 ) {
-  // Charging history is a standard view now — slot it right after Drives
-  // so the two telemetry views sit together.
   const items = baseNavItems.flatMap((item) =>
     item.to === "/drives"
       ? [
@@ -98,7 +96,6 @@ export function Sidebar({ collapsed, onToggle }: SidebarProps) {
         collapsed ? "w-16" : "w-56"
       )}
     >
-      {/* Logo */}
       <div className="flex min-h-16 items-center gap-3 px-4 py-3">
         <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-blue-500/20">
           <ShieldIcon className="h-5 w-5 text-blue-400" />
@@ -117,7 +114,6 @@ export function Sidebar({ collapsed, onToggle }: SidebarProps) {
         )}
       </div>
 
-      {/* Navigation */}
       <nav className="flex-1 space-y-1 px-2 py-4">
         {navItems.map((item) => {
           const showBadge = updateAvailable && item.to === "/settings"
@@ -126,8 +122,7 @@ export function Sidebar({ collapsed, onToggle }: SidebarProps) {
               key={item.to}
               to={item.to}
               end={item.to === "/"}
-              // Native tooltip so the icon-only collapsed rail is still
-              // usable — without it, collapsed nav items are unlabeled.
+              // Label collapsed navigation with the native tooltip.
               title={collapsed ? item.label : undefined}
               aria-label={collapsed ? item.label : undefined}
               className={({ isActive }) =>
@@ -161,7 +156,6 @@ export function Sidebar({ collapsed, onToggle }: SidebarProps) {
         })}
       </nav>
 
-      {/* Terminal link (secondary) */}
       <NavLink
         to="/terminal"
         title={collapsed ? "Terminal" : undefined}
@@ -180,7 +174,6 @@ export function Sidebar({ collapsed, onToggle }: SidebarProps) {
         {!collapsed && <span>Terminal</span>}
       </NavLink>
 
-      {/* AI Support link (secondary) */}
       <NavLink
         to="/support"
         title={collapsed ? "AI Support & Help" : undefined}
@@ -199,7 +192,6 @@ export function Sidebar({ collapsed, onToggle }: SidebarProps) {
         {!collapsed && <span>AI Support &amp; Help</span>}
       </NavLink>
 
-      {/* Connection status */}
       <div
         title={collapsed ? (connState === "connected" ? "Connected" : connState === "reconnecting" ? "Reconnecting" : "Offline") : undefined}
         className={cn(
@@ -218,7 +210,6 @@ export function Sidebar({ collapsed, onToggle }: SidebarProps) {
         )}
       </div>
 
-      {/* Away Mode indicator */}
       {awayModeStatus.state === "active" && (
         <div title={collapsed ? "Away Mode" : undefined} className={cn("mx-2 mb-1 flex items-center gap-2 rounded-lg px-3 py-2 text-xs text-blue-400", collapsed && "justify-center")}>
           <WifiIcon className="h-3.5 w-3.5 animate-pulse" />
@@ -228,7 +219,6 @@ export function Sidebar({ collapsed, onToggle }: SidebarProps) {
         </div>
       )}
 
-      {/* Keep-awake indicator */}
       {isAwake && (
         <div
           title={collapsed ? (status.state === "active" ? "Keeping awake" : "Waiting for archive...") : undefined}
@@ -252,7 +242,6 @@ export function Sidebar({ collapsed, onToggle }: SidebarProps) {
         </div>
       )}
 
-      {/* Logout */}
       {authRequired && (
         <button
           onClick={logout}
@@ -268,7 +257,6 @@ export function Sidebar({ collapsed, onToggle }: SidebarProps) {
         </button>
       )}
 
-      {/* Collapse toggle — pinned to right edge, vertically centered */}
       <button
         onClick={onToggle}
         className="absolute right-0 top-1/2 z-40 -translate-y-1/2 translate-x-1/2 flex h-6 w-6 items-center justify-center rounded-full border border-white/10 bg-slate-900 text-slate-500 shadow-lg transition-colors hover:bg-slate-800 hover:text-slate-300"

@@ -23,12 +23,7 @@ export interface PiStatus {
   free_space: string
   uptime: string
   drives_active: string
-  /**
-   * Host-link state from /sys/class/udc ("configured" = the car is
-   * actually enumerated and talking). drives_active only reflects the
-   * configfs binding — the Pi's intent to present — and stays "yes"
-   * through a dead link. Present only on backends ≥ v3.13.4.
-   */
+  /** UDC host-link state; unlike drives_active, "configured" confirms enumeration. */
   udc_state?: string
   /** Seconds since the car last wrote to cam_disk.bin, -1 when unknown. */
   cam_last_write_secs?: number
@@ -39,7 +34,7 @@ export interface PiStatus {
   ether_speed: string
   fan_speed: string
   sbc_model?: string
-  /** Negative integer parsed from iwconfig "Signal level=-48 dBm". Present only on backends ≥ v2.7.4. */
+  /** Negative dBm value parsed from iwconfig. */
   wifi_signal_dbm?: number
   wifi_rx_bps?: number
   wifi_tx_bps?: number
@@ -234,13 +229,8 @@ export interface ClipTelemetry {
 }
 
 export const api = {
-  // Travel Mode (secret menu): keep the USB gadget connected to the car while
-  // still archiving on the road. Persisted in sentryusb.conf: the master
-  // toggle plus an optional "half snapshots" cadence flag (snapshot+archive
-  // every SNAPSHOT_INTERVAL/2 instead of the full interval while traveling)
-  // and a "fast retry" flag (retry ~every minute after a failed archive —
-  // for intermittent uplinks like Starlink). Omitted optional flags leave
-  // the persisted values untouched.
+  // Travel Mode keeps the USB gadget connected while archiving. Omitted
+  // optional cadence and retry flags leave their persisted values unchanged.
   getTravelMode: () =>
     request<{
       enabled: boolean

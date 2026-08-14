@@ -1,33 +1,11 @@
-//! Periodic single-line BLE diagnostic log.
+//! Writes a bounded, human-readable BLE status log once per minute.
 //!
-//! Background task in the sampler that appends one status line per
-//! minute to `/mutable/sentryusb-ble.log`. Designed to be human-
-//! scannable (grep for `car=Asleep` or `queries=0` to find issues)
-//! and rotated at a sensible cap so the file doesn't grow forever.
-//!
-//! The /api/logs/bluetooth endpoint reads the tail of this file so
-//! the operator can scroll back to see "what was happening at 3pm
-//! while I was at work" without needing a continuously-polling
-//! browser tab.
-//!
-//! Per-line shape (single ASCII line, ~120 chars):
+//! Line format:
 //!   [2026-05-25 16:30:12 MDT] car=Awake cam_age=45s
 //!     state_age=12s bc_age=18s samples_10m=24
 //!
-//! Fields:
-//!   car        - derived from cam_disk.bin mtime: Awake/Idle/Asleep
-//!   cam_age    - seconds since last write to cam_disk.bin
-//!   state_age  - seconds since last `state` sample landed
-//!   bc_age     - seconds since last body-controller sample landed
-//!   samples_10m - total samples in the last 10 minutes (any source)
-//!
-//! CONTRACT: this line is not just human-scannable. archiveloop's
-//! gadget stall watchdog (run/archiveloop, car_is_awake_via_ble) parses
-//! `state_age=<n>s` from the LAST line of this file as its car-awake
-//! gate (there is no sqlite3 CLI on the Pi). Renaming/reordering that
-//! field, dropping the trailing `s`, or writing other line shapes last
-//! silently disables stall auto-recovery — update the watchdog's sed
-//! pattern in lockstep with any format change.
+//! `run/archiveloop` parses `state_age=<n>s` from the final line. Keep the
+//! field and suffix synchronized with its watchdog parser.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -41,17 +19,12 @@ use crate::usb_watch::{CarState, observe_path};
 
 const LOG_PATH: &str = "/mutable/sentryusb-ble.log";
 const CAM_DISK_PATH: &str = "/backingfiles/cam_disk.bin";
-/// Tick interval — one log line per minute keeps the file manageable
-/// (~1500 lines/day, ~150 KB at 100 bytes/line) while preserving
-/// enough granularity to spot a multi-minute outage.
+/// One line per minute.
 const TICK: Duration = Duration::from_secs(60);
-/// Rotate when the file exceeds this. We don't keep an archive —
-/// just truncate to the second half — because the file is purely
-/// diagnostic and old data has limited value after a few days.
+/// Rotation threshold; only the newest half is retained.
 const ROTATE_AT_BYTES: u64 = 5 * 1024 * 1024; // 5 MB
 
-/// Spawn the logger task. Runs forever — the sampler process owns
-/// it and it dies when the process does.
+/// Spawns the process-lifetime logger task.
 pub fn spawn(db_path: PathBuf) {
     tokio::task::spawn(async move {
         if let Err(e) = run(db_path).await {
@@ -61,12 +34,9 @@ pub fn spawn(db_path: PathBuf) {
 }
 
 async fn run(db_path: PathBuf) -> Result<()> {
-    // Each tick we re-open the connection rather than holding one
-    // across awaits — sqlite connections aren't Send-safe across
-    // async boundaries by default and the open cost is trivial.
+    // Reopen SQLite each tick rather than holding it across awaits.
     let mut ticker = tokio::time::interval(TICK);
-    // Skip the immediate first fire so we don't log before the
-    // sampler has had a chance to insert anything.
+    // Skip the immediate first tick before sampling begins.
     ticker.tick().await;
     loop {
         ticker.tick().await;
@@ -87,8 +57,7 @@ fn build_line(db_path: &Path) -> Result<String> {
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
 
-    // Car state from cam_disk.bin mtime — the same signal the
-    // sampler's phase machine uses.
+    // Match the sampler phase machine's disk-activity signal.
     let car = observe_path(Path::new(CAM_DISK_PATH));
     let cam_age_secs: i64 = std::fs::metadata(CAM_DISK_PATH)
         .and_then(|m| m.modified())
@@ -97,8 +66,7 @@ fn build_line(db_path: &Path) -> Result<String> {
         .map(|d| now - d.as_secs() as i64)
         .unwrap_or(-1);
 
-    // Quick DB peek for sample freshness. New connection per tick;
-    // sqlite open is microseconds on a local file.
+    // Read sample freshness without sharing a connection across ticks.
     let conn = Connection::open_with_flags(
         db_path,
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
@@ -160,8 +128,7 @@ fn age_token(ts: Option<i64>, now: i64) -> String {
 fn append_line(line: &str) -> Result<()> {
     use std::io::Write;
     rotate_if_needed()?;
-    // O_APPEND so concurrent writers (unlikely but safe) get atomic
-    // single-line semantics on POSIX.
+    // O_APPEND preserves whole-line ordering across concurrent writers.
     let mut f = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -172,11 +139,7 @@ fn append_line(line: &str) -> Result<()> {
     Ok(())
 }
 
-/// Append a one-off, timestamped event line to the persistent BLE log
-/// (the same file the Logs → Bluetooth tab shows). Unlike the systemd
-/// journal — which is volatile on this Pi and wiped on every reboot —
-/// this survives power cuts, so keep-accessory ON/OFF decisions can be
-/// reviewed after the fact to diagnose parked-power behavior.
+/// Appends a timestamped event to the persistent Bluetooth diagnostics log.
 pub fn log_event(msg: &str) {
     let local: DateTime<Local> = Local::now();
     let ts_str = local.format("%Y-%m-%d %H:%M:%S %Z").to_string();
@@ -189,18 +152,15 @@ pub fn log_event(msg: &str) {
 fn rotate_if_needed() -> Result<()> {
     let meta = match std::fs::metadata(LOG_PATH) {
         Ok(m) => m,
-        Err(_) => return Ok(()), // file doesn't exist yet
+        Err(_) => return Ok(()), // No log to rotate yet.
     };
     if meta.len() < ROTATE_AT_BYTES {
         return Ok(());
     }
-    // Keep the most-recent half. Read second half, then truncate +
-    // write back. No archive — this is operational diagnostic, not
-    // an audit trail; older data has limited debugging value past
-    // a few days.
+    // Retain only the most recent half; this is not an audit log.
     let raw = std::fs::read(LOG_PATH).context("reading log for rotation")?;
     let half = raw.len() / 2;
-    // Trim to the next line boundary so we don't split a line.
+    // Start at the next complete line.
     let start = raw[half..]
         .iter()
         .position(|&b| b == b'\n')

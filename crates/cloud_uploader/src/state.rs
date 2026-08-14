@@ -37,18 +37,11 @@ pub struct CloudStatus {
     pub pairing_state: PairingState,
     pub pairing_error: Option<String>,
 
-    /// Set when an on-disk credentials file existed at startup but
-    /// failed to load (corrupt JSON, partial write, wrong perms, etc.).
-    /// `paired` will be `false` in this case. UI should surface this
-    /// distinctly from "never paired" — the user needs to re-pair.
+    /// Startup error for an existing credentials file; distinct from never paired.
     pub credentials_load_error: Option<String>,
 }
 
-/// Read/write access to the local charging rate-config document (the
-/// `charging_*` preference keys as one JSON object). Lives behind a
-/// trait because the preferences store is in the api crate, which
-/// depends on this crate — the binary wires the implementation in at
-/// spawn time.
+/// Access to charging preferences without introducing an API-crate cycle.
 pub trait RateConfigAccess: Send + Sync {
     fn load_doc(&self) -> serde_json::Value;
     fn store_doc(&self, doc: &serde_json::Value) -> anyhow::Result<()>;
@@ -61,8 +54,7 @@ pub struct CloudStateInner {
     pub cloud_base_url: String,
     pub credentials_path: String,
 
-    /// None when the binary didn't wire a preferences hook (tests).
-    /// Rate-config sync is skipped in that case.
+    /// `None` disables rate-config sync in tests.
     pub rate_config: Option<Arc<dyn RateConfigAccess>>,
 
     pub creds: Mutex<Option<CloudCredentialsV1>>,
@@ -119,11 +111,7 @@ impl CloudStateInner {
                 *guard = Some(creds);
             }
             Err(e) => {
-                // Distinguish "no credentials file" (normal new install) from
-                // "file exists but won't load" (corruption, partial write,
-                // wrong perms). The latter is the failure mode where the Pi
-                // silently appears unpaired while the cloud thinks it's still
-                // paired — surface it loudly so the user knows to re-pair.
+                // Existing but unreadable credentials require explicit re-pairing.
                 if std::path::Path::new(&self.credentials_path).exists() {
                     let msg = format!("{}", e);
                     warn!(
@@ -145,10 +133,7 @@ impl CloudStateInner {
     }
 
     pub async fn snapshot_status(&self) -> CloudStatus {
-        // Settings polls this every second while uploads are pending —
-        // both counts run in one blocking-pool hop on the read pool
-        // (pending count previously took the WRITER mutex inline on the
-        // reactor), and the async guards are not held across it.
+        // Run both counts together on the blocking pool without async guards.
         let store = self.store.clone();
         let (pending_route_count, total_uploaded_route_count, last_upload_secs) =
             tokio::task::spawn_blocking(move || {

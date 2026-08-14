@@ -27,15 +27,8 @@ export function ConnectionProvider({ children }: { children: React.ReactNode }) 
   const httpOk = useRef(true)
   const httpFailCount = useRef(0)
 
-  // HTTP is the primary connectivity signal. WebSocket connections cycle
-  // naturally (server timeouts, keepalive, etc.) and don't indicate a real
-  // connectivity problem. Only show "reconnecting"/"disconnected" when
-  // HTTP polls actually fail.
-  //
-  // Hysteresis: one failed poll is noise — a status handler held up by a
-  // busy disk, or this fetch queuing behind video streams on the
-  // browser's per-host connection limit. Two consecutive failures show
-  // "reconnecting", three show "disconnected".
+  // WebSockets cycle normally, so connectivity follows HTTP. Require two
+  // failures for reconnecting and three for disconnected to absorb stalls.
   function evaluate() {
     if (httpOk.current) {
       if (disconnectTimer.current) {
@@ -45,24 +38,19 @@ export function ConnectionProvider({ children }: { children: React.ReactNode }) 
       httpFailCount.current = 0
       setState("connected")
     } else if (httpFailCount.current >= 3) {
-      // Multiple HTTP failures — truly disconnected
       setState("disconnected")
     } else if (httpFailCount.current >= 2) {
       setState("reconnecting")
     }
   }
 
-  // Ensure WebSocket stays connected (it handles its own reconnection)
   useEffect(() => {
     wsClient.connect()
   }, [])
 
-  // HTTP heartbeat poll — primary connectivity signal
   useEffect(() => {
     let mounted = true
-    // The 15s abort outlives the 8s interval — without this guard a slow
-    // window runs overlapping polls, double-counting one stall as two
-    // consecutive failures (and holding two connection slots).
+    // Prevent overlapping polls from double-counting one slow response.
     let inFlight = false
 
     async function poll() {
@@ -70,8 +58,7 @@ export function ConnectionProvider({ children }: { children: React.ReactNode }) 
       inFlight = true
       try {
         const controller = new AbortController()
-        // 15s: over BLE the proxy itself allows 15s, and a poll that
-        // queues behind video streams counts its queue time here too.
+        // Match the BLE proxy timeout and allow for browser connection queues.
         const timeout = setTimeout(() => controller.abort(), 15000)
         const res = await fetch("/api/status", {
           signal: controller.signal,
@@ -81,8 +68,7 @@ export function ConnectionProvider({ children }: { children: React.ReactNode }) 
           httpOk.current = res.ok
           if (res.ok) {
             httpFailCount.current = 0
-            // Degraded mode: server reachable, DB not. The status body
-            // carries the marker; a parse failure just means normal mode.
+            // A malformed status body is treated as normal rather than degraded.
             try {
               const body = await res.clone().json()
               setDegraded(typeof body?.degraded === "string" ? body.degraded : null)
@@ -111,7 +97,6 @@ export function ConnectionProvider({ children }: { children: React.ReactNode }) 
   function retry() {
     wsClient.reconnect()
     setState("reconnecting")
-    // Immediate HTTP check
     fetch("/api/status")
       .then((res) => {
         httpOk.current = res.ok

@@ -8,8 +8,7 @@ import {
   BatteryAndroidFrameFullIcon,
 } from "@/components/icons"
 
-// The full battery_android_frame ladder. Material ships six partial fills
-// plus full, so the range splits into seven even bands of ~14.3%.
+// Seven glyphs divide charge levels into equal bands.
 const STEPS = [
   BatteryAndroidFrame1Icon,
   BatteryAndroidFrame2Icon,
@@ -19,12 +18,7 @@ const STEPS = [
   BatteryAndroidFrame6Icon,
 ]
 
-/**
- * Battery glyph that tracks the state of charge shown beside it, so a 20%
- * readout doesn't sit next to a full battery. Falls back to full when the
- * percentage is unknown, matching how the rest of the UI renders missing
- * telemetry.
- */
+/** Battery glyph selected by state of charge; unknown values use the full icon. */
 export function BatteryLevelIcon({
   pct,
   className = "h-4 w-4",

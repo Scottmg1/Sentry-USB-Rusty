@@ -68,7 +68,6 @@ export function SpeedTestModal({ onClose }: { onClose: () => void }) {
     }
   }
 
-  // Auto-start when modal opens; stop if user closes mid-run.
   useEffect(() => {
     void startTest()
     return () => stopTest()

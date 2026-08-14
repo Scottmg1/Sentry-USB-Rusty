@@ -1,7 +1,4 @@
-//! Active vehicle profile as a client needs it: identity (so SC knows this is
-//! a Tesla/SentryUSB box vs a GM/Dash-USB one), camera set + playback grid for
-//! the viewer, and the filename pattern for client-side grouping. Same shape
-//! the Dash-USB sibling serves at `/api/profile`.
+//! Client-facing active vehicle identity, camera layout, and recording format.
 
 use axum::http::StatusCode;
 use axum::Json;

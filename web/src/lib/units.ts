@@ -1,11 +1,7 @@
 import { useSyncExternalStore } from "react"
 
-// Shared unit preferences, backed by /api/setup/config. The header's
-// Metric/Imperial switch and the Display & Units toggles both read and
-// write these, so a change in one reflects live in the other (one source
-// of truth, no drift). Distance + dashboard temperature move together as
-// "metric"/"imperial"; the System tile's CPU temperature stays independent
-// (SYSTEM_TEMPERATURE_UNIT) per its own sub-toggle.
+// Shared setup preferences. Distance, pressure, and dashboard temperature move
+// together; the system-temperature preference remains independent.
 export type UnitState = {
   tempF: boolean // TEMPERATURE_UNIT === "F"
   systemTempF: boolean // SYSTEM_TEMPERATURE_UNIT === "F"
@@ -14,9 +10,7 @@ export type UnitState = {
   loaded: boolean
 }
 
-// Defaults form a coherent metric set (°C → km, bar, °C system temp).
-// Temperature is the anchor: see load(), where any unset key follows the
-// temperature unit so a partial config never reads as a mixed system.
+// Unset unit keys inherit the temperature system to avoid mixed defaults.
 let state: UnitState = {
   tempF: false,
   systemTempF: false,
@@ -53,9 +47,7 @@ async function load() {
     const s = readActive(cfg.SYSTEM_TEMPERATURE_UNIT)
     const d = readActive(cfg.DRIVE_MAP_UNIT)
     const p = readActive(cfg.PRESSURE_UNIT)
-    // Temperature is the anchor (itself defaulting to °C/metric). Any unit
-    // left unset inherits that system so the readouts stay coherent — metric
-    // → km + bar + °C system temp; imperial → mi + psi + °F.
+    // Temperature anchors any missing unit preferences.
     const tempF = t != null ? t === "F" : state.tempF
     const metric = !tempF
     set({
@@ -72,9 +64,7 @@ async function load() {
   }
 }
 
-// Refetch each time the first consumer (re)mounts so navigating back to
-// Settings picks up out-of-band edits (raw-config editor, setup wizard),
-// while staying live-synced between mounted consumers in between.
+// Refetch on the first mount so out-of-band config edits are observed.
 function subscribe(cb: () => void): () => void {
   const wasEmpty = listeners.size === 0
   listeners.add(cb)
@@ -84,10 +74,7 @@ function subscribe(cb: () => void): () => void {
   }
 }
 
-// Read-modify-write the whole config with `updates` applied, then reflect
-// them locally. Optimistic: state flips immediately, but reverts to the
-// prior snapshot if the save fails so the UI never shows a value that
-// didn't persist.
+// Apply updates optimistically and restore the prior snapshot on failure.
 async function writeKeys(updates: Record<string, string>, optimistic: Partial<UnitState>) {
   const prev = state
   set(optimistic)
@@ -119,8 +106,7 @@ export function useUnits() {
   const s = useSyncExternalStore(subscribe, snapshot, snapshot)
   return {
     ...s,
-    // Metric = Celsius + kilometres + bar; Imperial = Fahrenheit + miles +
-    // psi. The master switch flips the defaults for all three at once.
+    // The master switch updates dashboard temperature, distance, and pressure.
     isMetric: !s.tempF,
     setMetric: (metric: boolean) =>
       writeKeys(

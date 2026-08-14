@@ -35,8 +35,7 @@ const MONTHS = [
   "December",
 ]
 
-// Draft (string-input) mirrors of the persisted types, so numeric fields
-// can be empty mid-edit.
+// String drafts allow numeric fields to be temporarily empty.
 interface ScheduleDraft {
   label: string
   start: string
@@ -62,12 +61,7 @@ const newSchedule = (): ScheduleDraft => ({
   rate: "",
 })
 
-// Opens a modal editor for the electricity rates used to cost charge
-// sessions: a currency symbol, a flat default price-per-kWh for untagged
-// charges, and a per-tag plan (a flat rate plus optional time-of-use
-// schedules scoped by time, days, and months). Saving persists the prefs
-// and calls `onSaved` so the page can refetch (cost is computed
-// server-side from these values).
+// Edits global and per-tag flat or time-of-use rates; costs are server-derived.
 export function ChargingRatesButton({
   tags,
   onSaved,
@@ -85,9 +79,6 @@ export function ChargingRatesButton({
   const [busy, setBusy] = useState(false)
   const [saveError, setSaveError] = useState<string | null>(null)
 
-  // Seed the draft from the loaded rates + known tags, then open. The
-  // Rates button stays disabled until rates finish loading, so this
-  // always runs with the saved values in hand.
   const openEditor = () => {
     setSaveError(null)
     setCurrency(rates.currency)
@@ -101,8 +92,7 @@ export function ChargingRatesButton({
           label: s.label,
           start: s.start,
           end: s.end,
-          // Stored [] means "every day"; show that as all-on (Tessie-style),
-          // and onSave coerces all-on back to [].
+          // Stored [] means every day, represented as all selected while editing.
           days: s.days.length === 0 ? [0, 1, 2, 3, 4, 5, 6] : [...s.days],
           startMonth: s.startMonth,
           endMonth: s.endMonth,
@@ -111,15 +101,13 @@ export function ChargingRatesButton({
       }
     }
     for (const t of tags) seed(t)
-    // Keep plans for tags in prefs but not in the current list (e.g. a
-    // renamed tag) so saving doesn't drop them.
+    // Preserve plans for tags absent from the current session list.
     for (const t of Object.keys(rates.tags)) if (!(t in draft)) seed(t)
     setPlans(draft)
     setExpanded(new Set())
     setOpen(true)
   }
 
-  // Close on Escape while open.
   useEffect(() => {
     if (!open) return
     const onKey = (e: KeyboardEvent) => {
@@ -141,10 +129,7 @@ export function ChargingRatesButton({
     })
 
   const onSave = async () => {
-    // Reject equal start/end times before anything is persisted. The
-    // half-open window math treats "12AM to 12AM" as zero-width, so a
-    // schedule saved that way silently never prices a session — surface
-    // the problem instead of dropping or mangling the row.
+    // Equal bounds create a zero-width half-open interval.
     for (const [tag, plan] of Object.entries(plans)) {
       for (const s of plan.schedules) {
         if (
@@ -173,7 +158,7 @@ export function ChargingRatesButton({
           if (rate == null || !TIME_RE.test(s.start) || !TIME_RE.test(s.end)) {
             continue
           }
-          // All days or none selected → every day ([]).
+          // All or no selected days serialize as every day.
           const days =
             s.days.length === 0 || s.days.length === 7
               ? []
@@ -188,7 +173,7 @@ export function ChargingRatesButton({
             rate,
           })
         }
-        // Persist only configured plans (a flat rate or ≥1 valid schedule).
+        // Omit plans without a flat rate or valid schedule.
         if (flat != null || schedules.length > 0) {
           tagsOut[tag] = { flat, schedules }
         }
@@ -228,7 +213,6 @@ export function ChargingRatesButton({
             className="flex h-[100dvh] w-full flex-col border-white/10 bg-slate-950 shadow-2xl sm:h-auto sm:max-h-[90vh] sm:max-w-2xl sm:rounded-2xl sm:border"
             onClick={(e) => e.stopPropagation()}
           >
-            {/* Header */}
             <div className="flex items-center justify-between border-b border-white/10 px-4 py-3">
               <h2 className="text-sm font-semibold uppercase tracking-wider text-slate-300">
                 Electricity rates
@@ -243,7 +227,6 @@ export function ChargingRatesButton({
               </button>
             </div>
 
-            {/* Body */}
             <div className="flex-1 space-y-4 overflow-y-auto px-4 py-4">
               <div className="flex gap-3">
                 <Labeled label="Symbol" className="w-20">
@@ -300,7 +283,6 @@ export function ChargingRatesButton({
               </div>
             </div>
 
-            {/* Footer */}
             <div className="flex items-center justify-end gap-2 border-t border-white/10 px-4 py-3">
               {saveError && (
                 <span className="mr-auto text-xs text-rose-300">{saveError}</span>
@@ -610,8 +592,7 @@ const inputClass =
 const timeClass =
   "rounded-md border border-white/10 bg-slate-950/60 px-2 py-1 text-sm text-slate-100 [color-scheme:dark] focus:border-emerald-400/40 focus:outline-none"
 
-// Parse a rate input into a finite, non-negative number, or null for
-// blank/invalid (so the field clears the stored rate).
+// Blank, invalid, and negative inputs clear the stored rate.
 function parseRate(s: string): number | null {
   const t = s.trim()
   if (t === "") return null

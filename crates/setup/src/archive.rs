@@ -1,8 +1,4 @@
-//! Archive system configuration — replaces `configure.sh`.
-//!
-//! Sets up the archive backend (cifs, nfs, rsync, rclone, or none) by
-//! verifying credentials, installing dependencies, and writing the
-//! archive loop service.
+//! Archive backend validation, dependencies, mounts, helpers, and service setup.
 
 use std::time::Duration;
 
@@ -52,8 +48,7 @@ fn validate_archive_config(env: &SetupEnv, system: ArchiveSystem) -> Result<()> 
             require("RSYNC_USER")?;
             require("RSYNC_SERVER")?;
             require("RSYNC_PATH")?;
-            // Optional, but reject a typo here rather than let it degrade
-            // to port 22 and fail later inside the archive loop.
+            // Reject invalid explicit ports instead of silently using 22.
             sentryusb_config::validate_rsync_ssh_port(&env.config).map_err(ConfigError)?;
         }
         ArchiveSystem::Rclone => {
@@ -76,20 +71,8 @@ fn validate_archive_config(env: &SetupEnv, system: ArchiveSystem) -> Result<()> 
     Ok(())
 }
 
-/// Pre-populate root's known_hosts with the rsync server's SSH host key
-/// so the non-interactive archiveloop SSH-via-rsync calls succeed. Without
-/// this, the very first sync fails with "Host key verification failed."
-/// because OpenSSH refuses to add unknown hosts in batch mode, and the
-/// user has no way to accept it interactively (the call runs as root
-/// inside a systemd service, not in their shell). Idempotent: ssh-keyscan
-/// returns the same line on every run; we deduplicate against the
-/// existing known_hosts before appending.
-///
-/// Scans the configured SSH port, not just 22. OpenSSH files a non-default
-/// port's key under `[host]:port`, so a scan that ignored the port would
-/// store an entry rsync never matches (assuming anything answers on 22 at
-/// all), leaving every archive cycle stuck on "Host key verification
-/// failed".
+/// Adds the rsync server's host key for noninteractive archive jobs, using
+/// OpenSSH's configured-port notation and deduplicating existing entries.
 async fn trust_rsync_host_key(env: &SetupEnv, emitter: &SetupEmitter) -> Result<()> {
     let server = match env.config.get("RSYNC_SERVER") {
         Some(s) if !s.trim().is_empty() => s.trim().to_string(),
@@ -97,8 +80,7 @@ async fn trust_rsync_host_key(env: &SetupEnv, emitter: &SetupEmitter) -> Result<
     };
     let port = sentryusb_config::rsync_ssh_port(&env.config);
     let port_flags = sentryusb_shell::SshPort::new(port);
-    // Label progress in OpenSSH's own notation so it matches what the user
-    // will read back out of known_hosts.
+    // Match OpenSSH's nondefault-port host notation.
     let endpoint = match port {
         Some(p) => format!("[{}]:{}", server, p),
         None => server.clone(),
@@ -118,11 +100,7 @@ async fn trust_rsync_host_key(env: &SetupEnv, emitter: &SetupEmitter) -> Result<
     ).await {
         Ok(s) => s,
         Err(e) => {
-            // Don't fail the whole setup if the server is currently
-            // unreachable. The archive cycle reports a clearer error
-            // later, and re-running setup once the server is up fixes it.
-            // Spell out the manual escape hatch, since until the key is
-            // trusted every transfer fails, not just music sync.
+            // Unreachable archive servers remain a warning so setup can finish.
             let manual = match port {
                 Some(p) => format!("ssh-keyscan -p {} -H {}", p, server),
                 None => format!("ssh-keyscan -H {}", server),
@@ -183,9 +161,7 @@ async fn ensure_rsync(emitter: &SetupEmitter) -> Result<()> {
     Ok(())
 }
 
-/// True only when BLE is being used as the keep-awake mechanism.
-/// A VIN alone means BLE telemetry is set up — that doesn't block
-/// other keep-awake providers or require a Sentry case.
+/// A VIN alone enables telemetry; the explicit flag selects BLE keep-awake.
 fn ble_used_for_keep_awake(env: &SetupEnv) -> bool {
     env.is_set("TESLA_BLE_VIN")
         && matches!(
@@ -194,13 +170,7 @@ fn ble_used_for_keep_awake(env: &SetupEnv) -> bool {
         )
 }
 
-/// Check that at most one keep-awake provider is configured.
-///
-/// "Configured" means present AND non-empty (see [`SetupEnv::is_set`]).
-/// An empty `export KEY=''` — written when the wizard switches away from
-/// a provider — does NOT count, matching the runtime in `run/awake_start`
-/// (`${VAR:+x}`). Counting empties here is what bricked devices into a
-/// setup boot loop after a keep-awake method change.
+/// Requires at most one nonempty keep-awake provider, matching runtime checks.
 fn validate_wake_apis(env: &SetupEnv) -> Result<()> {
     let mut providers = Vec::new();
     if env.is_set("TESSIE_API_TOKEN") {
@@ -245,19 +215,7 @@ fn validate_sentry_case(env: &SetupEnv) -> Result<()> {
     Ok(())
 }
 
-/// Ensure bluez is installed and generate the BLE keypair. Caller-
-/// agnostic: invoked by `configure_tesla_ble` during setup and by the
-/// settings-page lazy-install endpoint on a live system. Idempotent —
-/// returns Ok(()) immediately if the keypair already exists.
-///
-/// No longer downloads tesla-control / tesla-keygen: keygen, pairing and
-/// every BLE command are native now (the `tesla_ble` crate +
-/// `sentryusb-ble-action`, which ships in the image). The function name
-/// is kept so the existing `ble-install` endpoint call site is stable.
-///
-/// Progress messages route through `progress` so callers can dispatch
-/// them to whatever surface they have (setup `SetupEmitter`,
-/// WebSocket broadcast, logs).
+/// Installs BlueZ and generates a native BLE keypair when absent.
 pub async fn install_tesla_ble_binaries<F>(progress: F) -> Result<()>
 where
     F: Fn(&str),
@@ -266,14 +224,11 @@ where
         return Ok(());
     }
 
-    // Root partition is mounted read-only in steady state on the Pi.
-    // Best-effort flip to rw so the writes below can land. No-op /
-    // missing-script case (mid-pi-gen, dev machines) is harmless.
+    // Persist keys on read-only-root installations.
     let _ = std::process::Command::new("bash")
         .args(["-c", "/root/bin/remountfs_rw"])
         .status();
 
-    // Install bluez
     if sentryusb_shell::run("dpkg", &["-s", "bluez"]).await.is_err() {
         progress("Installing bluez...");
         crate::apt::apt_install(
@@ -283,7 +238,7 @@ where
         ).await?;
     }
 
-    // Install pi-bluetooth if available
+    // `pi-bluetooth` is optional on non-Raspberry Pi distributions.
     if sentryusb_shell::run("bash", &["-c", "apt-cache search pi-bluetooth | grep -q pi-bluetooth"]).await.is_ok() {
         if sentryusb_shell::run("dpkg", &["-s", "pi-bluetooth"]).await.is_err() {
             let _ = crate::apt::apt_install(
@@ -294,12 +249,7 @@ where
         }
     }
 
-    // Generate BLE keys if they don't exist. Uses our Rust-side
-    // P-256 generator (sentryusb_tesla_ble::keys::generate_keypair)
-    // — no longer shells out to tesla-keygen. Writes PKCS#8 PEM for
-    // the private key (vs tesla-keygen's SEC1 format); our loader
-    // accepts both, so existing installs that already have a SEC1
-    // key file from tesla-keygen keep working untouched.
+    // New keys use PKCS#8; the loader retains SEC1 compatibility.
     if !std::path::Path::new("/root/.ble/key_private.pem").exists() {
         let dir = std::path::Path::new("/root/.ble");
         sentryusb_tesla_ble::keys::generate_keypair(dir)
@@ -311,12 +261,9 @@ where
     Ok(())
 }
 
-/// Configure Tesla BLE if VIN is set. Returns true if the phase did work.
-///
-/// Idempotent: if the binaries are already installed and keys exist, we do
-/// nothing and return false so the caller can skip announcing a phase.
+/// Configures opted-in Tesla BLE and reports whether work was needed.
 pub async fn configure_tesla_ble(env: &SetupEnv, emitter: &SetupEmitter) -> Result<bool> {
-    // BLE is opt-in: skip entirely if no VIN is configured.
+    // A configured VIN is the setup-time opt-in signal.
     if env
         .config
         .get("TESLA_BLE_VIN")
@@ -327,9 +274,7 @@ pub async fn configure_tesla_ble(env: &SetupEnv, emitter: &SetupEmitter) -> Resu
         return Ok(false);
     }
 
-    // The only durable artifact is the keypair — keygen, pairing and
-    // every command are native now (no tesla-control/tesla-keygen to
-    // install). If it already exists there's nothing to do.
+    // Native action binaries ship with the image; only the keypair is durable.
     if std::path::Path::new("/root/.ble/key_private.pem").exists() {
         return Ok(false);
     }
@@ -342,7 +287,7 @@ pub async fn configure_tesla_ble(env: &SetupEnv, emitter: &SetupEmitter) -> Resu
     Ok(true)
 }
 
-/// Full archive configuration flow. Returns true if the phase did work.
+/// Configures the selected archive backend and reports whether work was needed.
 pub async fn configure_archive(env: &SetupEnv, emitter: &SetupEmitter) -> Result<bool> {
     let archive_system = ArchiveSystem::from_config(&env.get("ARCHIVE_SYSTEM", "none"))?;
 
@@ -350,7 +295,7 @@ pub async fn configure_archive(env: &SetupEnv, emitter: &SetupEmitter) -> Result
     validate_sentry_case(env)?;
     validate_archive_config(env, archive_system)?;
 
-    // Idempotency: rsync installed, archive service already installed, already enabled.
+    // Skip a complete, enabled installation.
     let rsync_ok = sentryusb_shell::run("which", &["rsync"]).await.is_ok();
     let service_path = std::path::Path::new("/lib/systemd/system/sentryusb-archive.service");
     let service_enabled = sentryusb_shell::run(
@@ -366,24 +311,13 @@ pub async fn configure_archive(env: &SetupEnv, emitter: &SetupEmitter) -> Result
 
     ensure_rsync(emitter).await?;
 
-    // Port of run/nfs_archive/verify-and-configure-archive.sh::configure_archive
-    // and its cifs_archive counterpart. The bash flow always wrote an
-    // `/etc/fstab` entry for mount-based archive backends; without it
-    // `connect-archive.sh` (which calls `mount /mnt/archive` from fstab)
-    // fails all 10 retries every archive cycle, and clips never leave
-    // the Pi. `noauto` keeps the mount on-demand so boot doesn't hang
-    // waiting for a NAS that's usually offline except when parked at
-    // home. rsync/rclone paths don't need this — they talk directly.
+    // Mount backends require on-demand fstab entries; remote tools connect directly.
     match archive_system {
         ArchiveSystem::Nfs => configure_nfs_mount(env, emitter).await?,
         ArchiveSystem::Cifs => configure_cifs_mount(env, emitter).await?,
         ArchiveSystem::Rsync => trust_rsync_host_key(env, emitter).await?,
         ArchiveSystem::Rclone => {
-            // rclone rewrites rclone.conf whenever it refreshes an OAuth
-            // token (e.g. Google Drive, roughly hourly); on the read-only
-            // root that write fails and archiving dies once the token
-            // expires. Relocate the config to /mutable behind a symlink.
-            // Non-fatal: the OTA runtime patch retries on fielded devices.
+            // OAuth refreshes require rclone config to live on writable storage.
             emitter.progress("Ensuring rclone config lives on /mutable...");
             if let Err(e) = ensure_rclone_config_on_mutable().await {
                 emitter.progress(&format!(
@@ -394,14 +328,7 @@ pub async fn configure_archive(env: &SetupEnv, emitter: &SetupEmitter) -> Result
         _ => {}
     }
 
-    // Drop the per-archive-system bash helpers (archive-clips.sh,
-    // archive-is-reachable.sh, etc.) into /root/bin/. archiveloop reads
-    // these by fixed name regardless of which system is active, so we
-    // pick the right variant based on ARCHIVE_SYSTEM. Without this,
-    // archiveloop hits "command not found" on every cycle and clips
-    // never leave the Pi — the Go-era pi-gen image used to bake these
-    // in at build time, but `curl | bash install-pi.sh` doesn't run
-    // pi-gen, so the responsibility moved to the Rust setup runner.
+    // Install the selected backend under archiveloop's fixed helper names.
     install_archive_scripts(archive_system, emitter)?;
 
     crate::system::install_archive_service()?;
@@ -417,27 +344,17 @@ pub async fn configure_archive(env: &SetupEnv, emitter: &SetupEmitter) -> Result
 const RCLONE_CONFIG_LINK: &str = "/root/.config/rclone";
 const RCLONE_MUTABLE_DIR: &str = "/mutable/configs/rclone";
 
-/// Ensure `/root/.config/rclone` is a symlink to `/mutable/configs/rclone`.
-///
-/// rclone persists refreshed OAuth tokens by rewriting `rclone.conf` in
-/// place, which fails on the read-only root ("Failed to save config after
-/// 10 tries: ... read-only file system"). The legacy bash installer did
-/// this migration in `verify-and-configure-archive.sh`; the Rust flow
-/// installs that script but never runs it, so it happens here instead.
-///
-/// Skips (without error) when `/mutable` can't be mounted, so a wizard run
-/// on an unusual system never hard-fails on this.
+/// Ensures rclone's writable OAuth state is symlinked into `/mutable`.
 pub async fn ensure_rclone_config_on_mutable() -> Result<()> {
     let link = std::path::Path::new(RCLONE_CONFIG_LINK);
     let target = std::path::Path::new(RCLONE_MUTABLE_DIR);
 
-    // Fast path: correct symlink with an existing target.
+    // A correct, populated link needs no migration.
     if std::fs::read_link(link).ok().as_deref() == Some(target) && target.is_dir() {
         return Ok(());
     }
 
-    // /mutable must actually be the mounted partition before we move the
-    // config into it, or the "migrated" config lands on the RO root.
+    // Never migrate until `/mutable` is actually mounted.
     if sentryusb_shell::run("findmnt", &["--mountpoint", "/mutable"]).await.is_err() {
         let _ = sentryusb_shell::run("mount", &["/mutable"]).await;
         if sentryusb_shell::run("findmnt", &["--mountpoint", "/mutable"]).await.is_err() {
@@ -446,9 +363,7 @@ pub async fn ensure_rclone_config_on_mutable() -> Result<()> {
         }
     }
 
-    // Root may be read-only on a standalone re-run. Flip rw for the
-    // rename/symlink and restore ro only if it was ro before — mid-setup
-    // the runner keeps root rw and later phases still need it that way.
+    // Preserve the caller's root mount mode across a standalone migration.
     let was_ro = root_mounted_readonly();
     let _ = std::process::Command::new("bash")
         .args([
@@ -477,16 +392,13 @@ fn root_mounted_readonly() -> bool {
         .unwrap_or(false)
 }
 
-/// Filesystem state machine for the migration. Pure fs operations on the
-/// given paths (testable off-device). Handles: nothing yet, real directory,
-/// half-migrated (both real dir and mutable copy exist), and a wrong or
-/// dangling symlink.
+/// Migrates absent, real-directory, partial, and incorrect-symlink states.
 fn migrate_rclone_config(link: &std::path::Path, target: &std::path::Path) -> Result<()> {
     use std::os::unix::fs::{symlink, PermissionsExt};
 
     match std::fs::symlink_metadata(link) {
         Ok(meta) if meta.file_type().is_symlink() => {
-            // Wrong or dangling symlink → point it at the mutable dir.
+            // Repair wrong or dangling links.
             std::fs::create_dir_all(target)
                 .with_context(|| format!("create {}", target.display()))?;
             if std::fs::read_link(link).ok().as_deref() != Some(target) {
@@ -495,11 +407,7 @@ fn migrate_rclone_config(link: &std::path::Path, target: &std::path::Path) -> Re
             }
         }
         Ok(meta) if meta.is_dir() => {
-            // Real directory on the RO root. `rename` can't cross the
-            // filesystem boundary to /mutable, so copy then delete. If a
-            // mutable copy already exists (half-migrated, or an old install
-            // that lost its symlink), the mutable copy wins conflicts — it
-            // holds the freshest OAuth tokens.
+            // Cross-filesystem migration copies; mutable files win conflicts.
             copy_tree_no_clobber(link, target)?;
             std::fs::remove_dir_all(link).with_context(|| format!("remove {}", link.display()))?;
             symlink(target, link).with_context(|| format!("symlink {}", link.display()))?;
@@ -511,9 +419,7 @@ fn migrate_rclone_config(link: &std::path::Path, target: &std::path::Path) -> Re
             );
         }
         Err(_) => {
-            // Nothing configured yet: pre-provision the symlink so a later
-            // `rclone config` over SSH writes through to /mutable without
-            // needing a read-write root.
+            // Pre-provision the link before the first interactive configuration.
             std::fs::create_dir_all(target)
                 .with_context(|| format!("create {}", target.display()))?;
             if let Some(parent) = link.parent() {
@@ -524,13 +430,12 @@ fn migrate_rclone_config(link: &std::path::Path, target: &std::path::Path) -> Re
         }
     }
 
-    // Token material lives here — keep the dir private like ~/.ble et al.
+    // Protect token material.
     let _ = std::fs::set_permissions(target, std::fs::Permissions::from_mode(0o700));
     Ok(())
 }
 
-/// Recursively copy `src` into `dst`, never overwriting an existing file in
-/// `dst`. `std::fs::copy` preserves permissions (rclone.conf is 0600).
+/// Recursively copies missing files while preserving destination conflicts.
 fn copy_tree_no_clobber(src: &std::path::Path, dst: &std::path::Path) -> Result<()> {
     std::fs::create_dir_all(dst).with_context(|| format!("create {}", dst.display()))?;
     for entry in std::fs::read_dir(src).with_context(|| format!("read {}", src.display()))? {
@@ -549,14 +454,9 @@ fn copy_tree_no_clobber(src: &std::path::Path, dst: &std::path::Path) -> Result<
 
 // ── Per-archive-system bash helper scripts ────────────────────────────────
 //
-// Each archive backend has its own copies of these helpers under
-// `run/<system>_archive/`. They share filenames; archiveloop calls them by
-// fixed name (e.g. `/root/bin/archive-is-reachable.sh`). At setup time we
-// drop the matching variant into `/root/bin/` based on ARCHIVE_SYSTEM. A
-// follow-up wizard run with a different system swaps the files cleanly
-// because we always write the full set.
+// Install each backend's scripts under archiveloop's fixed helper names.
 
-// Shared by the CIFS and NFS variants of archive-clips.sh.
+// Shared by CIFS and NFS clip archival.
 const MOUNTED_ARCHIVE_MONITOR: &str = include_str!("../../../run/mounted-archive-monitor.sh");
 
 const CIFS_ARCHIVE_CLIPS: &str = include_str!("../../../run/cifs_archive/archive-clips.sh");
@@ -592,9 +492,7 @@ const NONE_CONNECT_ARCHIVE: &str = include_str!("../../../run/none_archive/conne
 const NONE_DISCONNECT_ARCHIVE: &str = include_str!("../../../run/none_archive/disconnect-archive.sh");
 const NONE_VERIFY_CONFIGURE: &str = include_str!("../../../run/none_archive/verify-and-configure-archive.sh");
 
-/// Drop the per-archive-system bash helpers into /root/bin/ with mode 0755.
-/// Idempotent — overwriting existing files is fine, and a stale entry from
-/// a prior run with a different ARCHIVE_SYSTEM gets cleanly replaced.
+/// Installs the selected backend's helpers with mode 0755.
 fn install_archive_scripts(system: ArchiveSystem, emitter: &SetupEmitter) -> Result<()> {
     let _ = std::fs::create_dir_all("/root/bin");
 
@@ -656,8 +554,7 @@ fn install_archive_scripts(system: ArchiveSystem, emitter: &SetupEmitter) -> Res
     Ok(())
 }
 
-/// Ensure the named package is installed (idempotent, skips if already
-/// there). Used by the on-demand archive-helper installs.
+/// Installs a missing archive-helper package.
 async fn ensure_pkg(pkg: &str, emitter: &SetupEmitter) -> Result<()> {
     if sentryusb_shell::run("dpkg", &["-s", pkg]).await.is_ok() {
         return Ok(());
@@ -676,13 +573,9 @@ async fn ensure_pkg(pkg: &str, emitter: &SetupEmitter) -> Result<()> {
     Ok(())
 }
 
-/// Strip any prior entry for `mount_point` with filesystem type `fstype`
-/// from `/etc/fstab` and append `new_line`. Keeps the file's other
-/// entries (root, /boot, /mutable, cam_disk, tmpfs, etc.) intact.
+/// Replaces one fstab entry identified by exact mount point and filesystem type.
 fn replace_fstab_entry(fstype: &str, mount_point: &str, new_line: &str) -> Result<()> {
-    // Root was remounted read-write at the start of the setup runner,
-    // but belt-and-suspenders re-remount here so a user who invokes the
-    // archive phase standalone doesn't hit an EROFS.
+    // Support standalone invocation on read-only-root systems.
     let _ = std::process::Command::new("mount")
         .args(["/", "-o", "remount,rw"])
         .output();
@@ -691,9 +584,7 @@ fn replace_fstab_entry(fstype: &str, mount_point: &str, new_line: &str) -> Resul
     let mut lines: Vec<String> = existing
         .lines()
         .filter(|l| {
-            // Match " nfs " / " cifs " as a whole field and the exact
-            // mount point. Avoids clobbering an unrelated entry that
-            // happens to mention the same substring.
+            // Compare parsed fields to avoid substring collisions.
             let fields: Vec<&str> = l.split_whitespace().collect();
             !(fields.len() >= 3 && fields[1] == mount_point && fields[2] == fstype)
         })
@@ -708,10 +599,7 @@ fn replace_fstab_entry(fstype: &str, mount_point: &str, new_line: &str) -> Resul
     Ok(())
 }
 
-/// Strip any prior entry for `mount_point` with filesystem type `fstype`
-/// from `/etc/fstab` without writing a replacement. Used when the wizard
-/// clears an optional share (e.g. MUSIC_SHARE_NAME) so the old line
-/// doesn't linger and confuse archiveloop on the next mount cycle.
+/// Removes one exact fstab entry when an optional share is cleared.
 fn remove_fstab_entry(fstype: &str, mount_point: &str) -> Result<()> {
     let _ = std::process::Command::new("mount")
         .args(["/", "-o", "remount,rw"])
@@ -747,9 +635,7 @@ async fn configure_nfs_mount(env: &SetupEnv, emitter: &SetupEmitter) -> Result<(
     ensure_pkg("nfs-common", emitter).await?;
     std::fs::create_dir_all("/mnt/archive").context("mkdir /mnt/archive")?;
 
-    // vers=3 + proto=tcp matches the bash flow. Broader NAS compat
-    // (UniFi Drive, Synology DSM 7, TrueNAS) than defaulting to v4.2,
-    // and `nolock` avoids NLM lock-server dependencies we don't need.
+    // NFSv3 over TCP broadens NAS compatibility; archive I/O needs no NLM.
     let line = format!(
         "{}:{} /mnt/archive nfs rw,noauto,nolock,proto=tcp,vers=3 0 0",
         server, share
@@ -757,10 +643,7 @@ async fn configure_nfs_mount(env: &SetupEnv, emitter: &SetupEmitter) -> Result<(
     replace_fstab_entry("nfs", "/mnt/archive", &line)?;
     emitter.progress("Added NFS mount to /etc/fstab");
 
-    // Optional read-only music share. archiveloop mounts /mnt/musicarchive
-    // from this entry and copy-music.sh rsyncs it into music_disk.bin;
-    // without the fstab line the mount retries and bails, so a configured
-    // MUSIC_SHARE_NAME would silently never sync.
+    // Music sync uses a separate read-only on-demand mount.
     let music_share = env.get("MUSIC_SHARE_NAME", "");
     if music_share.is_empty() {
         clear_music_archive_mount("nfs", emitter)?;
@@ -787,25 +670,19 @@ async fn configure_cifs_mount(env: &SetupEnv, emitter: &SetupEmitter) -> Result<
 
     ensure_pkg("cifs-utils", emitter).await?;
 
-    // Credentials live in a 0600 file referenced by fstab so the
-    // password doesn't leak into the world-readable fstab itself.
-    // Matches `/root/.teslaCamArchiveCredentials` from the bash flow.
+    // Keep credentials out of world-readable fstab.
     let creds_path = "/root/.teslaCamArchiveCredentials";
     let mut creds = format!("username={}\npassword={}\n", user, pass);
     if !domain.is_empty() {
         creds.push_str(&format!("domain={}\n", domain));
     }
     std::fs::write(creds_path, creds).context("write credentials file")?;
-    // `chmod 600` via shell — std::os::unix::fs::PermissionsExt isn't on
-    // the Windows dev host where we cargo-check, so we keep this off the
-    // std::os::unix path entirely. The setup phase only ever runs on
-    // Linux at execution time, so the shell call is the real code path.
+    // Use the runtime's Linux `chmod` without adding platform-specific Rust APIs.
     let _ = sentryusb_shell::run("chmod", &["600", creds_path]).await;
 
     std::fs::create_dir_all("/mnt/archive").context("mkdir /mnt/archive")?;
 
-    // Fstab mangles spaces in paths as \040. Preserves share names like
-    // "Tesla Cam" without breaking the field split.
+    // Escape spaces for fstab field parsing.
     let share_escaped = share.replace(' ', "\\040");
     let line = format!(
         "//{}/{} /mnt/archive cifs rw,noauto,credentials={},iocharset=utf8,file_mode=0777,dir_mode=0777,vers={} 0 0",
@@ -814,15 +691,7 @@ async fn configure_cifs_mount(env: &SetupEnv, emitter: &SetupEmitter) -> Result<
     replace_fstab_entry("cifs", "/mnt/archive", &line)?;
     emitter.progress("Added CIFS mount to /etc/fstab");
 
-    // Optional music share — CIFS counterpart of the NFS music block
-    // above. archiveloop's `connect-archive.sh` mounts /mnt/musicarchive
-    // from this fstab entry and `copy-music.sh` rsyncs from there into
-    // music_disk.bin. `ro` because we only ever read the share; reuses
-    // the same credentials file as the cam share (matches the bash
-    // `cifs_archive/verify-and-configure-archive.sh` flow). Without
-    // this block, CIFS installs that set MUSIC_SHARE_NAME never get
-    // a fstab entry, /mnt/musicarchive is never created, and music
-    // sync silently never runs — only NFS users hit the working path.
+    // CIFS music sync reuses credentials through a read-only on-demand mount.
     let music_share = env.get("MUSIC_SHARE_NAME", "");
     if !music_share.is_empty() {
         std::fs::create_dir_all("/mnt/musicarchive").context("mkdir /mnt/musicarchive")?;
@@ -839,11 +708,7 @@ async fn configure_cifs_mount(env: &SetupEnv, emitter: &SetupEmitter) -> Result<
     Ok(())
 }
 
-/// Drop the /mnt/musicarchive fstab line of `fstype` (if any) and remove
-/// the mount-point directory. Called when MUSIC_SHARE_NAME is cleared so
-/// archiveloop stops trying to mount a share the user no longer wants.
-/// `rmdir` is intentional — refuses to remove a dir that's still mounted
-/// or has content, which is the safe behavior.
+/// Removes a cleared music share; `rmdir` safely refuses mounted/nonempty paths.
 fn clear_music_archive_mount(fstype: &str, emitter: &SetupEmitter) -> Result<()> {
     let path = "/mnt/musicarchive";
     remove_fstab_entry(fstype, path)?;
@@ -880,12 +745,6 @@ mod tests {
 
     #[test]
     fn empty_provider_tokens_do_not_count_as_configured() {
-        // Reproduces the boot-loop bug ("Multiple control providers
-        // configured"). The wizard "clears" a deselected keep-awake
-        // provider by writing `export TESSIE_API_TOKEN=''`. An empty value
-        // must NOT count as a configured provider — matching the runtime's
-        // `${VAR:+x}` check in run/awake_start and the frontend's JS-falsy
-        // check. Only the validator miscounted it, bricking the device.
         let env = env_with(&[
             ("TESLA_BLE_VIN", "5YJ3E1EA4JF000001"),
             ("BLE_KEEP_AWAKE_ENABLED", "yes"),
@@ -901,7 +760,6 @@ mod tests {
 
     #[test]
     fn two_real_providers_are_rejected() {
-        // The actual "only 1" rule: two genuinely-set providers must fail.
         let env = env_with(&[
             ("TESLA_BLE_VIN", "5YJ3E1EA4JF000001"),
             ("BLE_KEEP_AWAKE_ENABLED", "yes"),
@@ -913,9 +771,6 @@ mod tests {
 
     #[test]
     fn provider_conflict_is_a_config_error() {
-        // Config-validation failures must be a downcastable ConfigError so
-        // the web server can tell "user must fix settings" apart from a
-        // transient failure and stop the silent setup boot-loop.
         let env = env_with(&[
             ("TESLA_BLE_VIN", "5YJ3E1EA4JF000001"),
             ("BLE_KEEP_AWAKE_ENABLED", "yes"),
@@ -946,8 +801,6 @@ mod tests {
 
     #[test]
     fn bare_vin_is_telemetry_only_not_a_provider() {
-        // A VIN with no BLE_KEEP_AWAKE_ENABLED is telemetry-only, so it can
-        // coexist with another keep-awake provider.
         let env = env_with(&[
             ("TESLA_BLE_VIN", "5YJ3E1EA4JF000001"),
             ("TESSIE_API_TOKEN", "real-token"),
@@ -982,7 +835,6 @@ mod tests {
     #[test]
     fn rsync_ssh_port_is_optional() {
         assert!(validate_archive_config(&rsync_env(None), ArchiveSystem::Rsync).is_ok());
-        // Cleared by the wizard when the user empties the field.
         assert!(validate_archive_config(&rsync_env(Some("")), ArchiveSystem::Rsync).is_ok());
     }
 
@@ -993,9 +845,6 @@ mod tests {
 
     #[test]
     fn invalid_rsync_ssh_port_is_a_config_error() {
-        // Must be a ConfigError so the runner stops with "fix your
-        // settings" instead of silently falling back to port 22 and
-        // boot-looping on an archive that can never connect.
         let err = validate_archive_config(&rsync_env(Some("not-a-port")), ArchiveSystem::Rsync)
             .unwrap_err();
         assert!(
@@ -1049,7 +898,6 @@ mod tests {
         let sb = MigrationSandbox::new("fresh");
         migrate_rclone_config(&sb.link(), &sb.target()).unwrap();
         assert_migrated(&sb);
-        // Idempotent on re-run.
         migrate_rclone_config(&sb.link(), &sb.target()).unwrap();
         assert_migrated(&sb);
     }
@@ -1065,7 +913,6 @@ mod tests {
             std::fs::read_to_string(sb.target().join("rclone.conf")).unwrap(),
             "[gdrive]\ntoken=old\n"
         );
-        // The conf is now reachable *through the link*.
         assert!(sb.link().join("rclone.conf").exists());
     }
 
@@ -1079,12 +926,10 @@ mod tests {
         std::fs::write(sb.target().join("rclone.conf"), "fresh-mutable-copy").unwrap();
         migrate_rclone_config(&sb.link(), &sb.target()).unwrap();
         assert_migrated(&sb);
-        // Mutable copy wins the conflict (it has the refreshed tokens)...
         assert_eq!(
             std::fs::read_to_string(sb.target().join("rclone.conf")).unwrap(),
             "fresh-mutable-copy"
         );
-        // ...but files only present on the root side are preserved.
         assert_eq!(
             std::fs::read_to_string(sb.target().join("only-on-root.txt")).unwrap(),
             "keep me"

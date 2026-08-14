@@ -14,12 +14,8 @@ interface ScrubberActionsValue {
   setTotal: (n: number) => void
 }
 
-// Two contexts so consumers that only need to dispatch (e.g.
-// DriveDetailContent calling setTotal once on mount, or DriveChart
-// calling setIndex on hover) don't subscribe to currentIndex and thus
-// don't re-render on every scrubber tick. Without this split, dragging
-// the scrubber re-renders the whole detail page (Speed chart and every
-// stat-tile section) at 60fps, which is the source of the drag lag.
+// Separate state from actions so dispatch-only consumers do not render on
+// every scrubber tick.
 const ScrubberStateContext = createContext<ScrubberStateValue | null>(null)
 const ScrubberActionsContext = createContext<ScrubberActionsValue | null>(null)
 
@@ -33,12 +29,7 @@ export function ScrubberProvider({ children }: ScrubberProviderProps) {
   const [playing, setPlaying] = useState(false)
   const [playbackSpeed, setPlaybackSpeed] = useState(1)
 
-  // totalPoints is captured by closure; the playback effect re-runs
-  // when totalPoints changes (rare -- once per drive load) and the
-  // setIndex setter functional-updates against the current state so
-  // it doesn't need a ref. Both action references stay stable across
-  // re-renders so the actions context object stays referentially
-  // equal and consumers that only use actions never re-render.
+  // Stable action references preserve the dispatch-only render boundary.
 
   useEffect(() => {
     if (!playing || totalPoints === 0) return
@@ -73,7 +64,6 @@ export function ScrubberProvider({ children }: ScrubberProviderProps) {
     [currentIndex, totalPoints, playing, playbackSpeed],
   )
 
-  // Actions object is built once -- the setters are all stable refs.
   const actionsValue = useMemo<ScrubberActionsValue>(
     () => ({ setIndex, setPlaying, setPlaybackSpeed, setTotal }),
     [setIndex, setTotal],
@@ -88,16 +78,14 @@ export function ScrubberProvider({ children }: ScrubberProviderProps) {
   )
 }
 
-/** Subscribe to scrubber state. Components using this re-render on
- *  every tick (currentIndex change). Use sparingly. */
+/** Subscribe to scrubber state; consumers render on every tick. */
 export function useScrubberState(): ScrubberStateValue {
   const ctx = useContext(ScrubberStateContext)
   if (!ctx) throw new Error("useScrubberState must be used inside <ScrubberProvider>")
   return ctx
 }
 
-/** Stable action setters; using this hook does NOT cause re-renders
- *  on scrubber state changes. Use when you only need to dispatch. */
+/** Stable action setters that do not subscribe to scrubber state. */
 export function useScrubberActions(): ScrubberActionsValue {
   const ctx = useContext(ScrubberActionsContext)
   if (!ctx) throw new Error("useScrubberActions must be used inside <ScrubberProvider>")

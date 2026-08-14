@@ -57,7 +57,6 @@ export default function BarChart({
               onClick={() => onBarClick?.(i)}
               className="cursor-pointer"
             >
-              {/* Bar */}
               <rect
                 x={x}
                 y={y}
@@ -69,7 +68,6 @@ export default function BarChart({
                 className="transition-opacity duration-200"
               />
 
-              {/* Value on top */}
               {showValues && item.value > 0 && (
                 <text
                   x={x + w / 2}
@@ -84,7 +82,6 @@ export default function BarChart({
                 </text>
               )}
 
-              {/* X-axis label */}
               <text
                 x={x + w / 2}
                 y={height - 4}
@@ -96,7 +93,6 @@ export default function BarChart({
                 {item.label}
               </text>
 
-              {/* Sub label (e.g., disengagement count) */}
               {item.subLabel && (
                 <text
                   x={x + w / 2}

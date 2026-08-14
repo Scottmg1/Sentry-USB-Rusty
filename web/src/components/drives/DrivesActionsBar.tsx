@@ -36,20 +36,14 @@ export function DrivesActionsBar({ onChanged }: DrivesActionsBarProps) {
   const menuRef = useRef<HTMLDivElement>(null)
   const fileInputRef = useRef<HTMLInputElement>(null)
 
-  // Ref-stable onChanged so the status effect never re-subscribes when
-  // the parent passes an inline callback.
+  // Keep inline parent callbacks from restarting the status subscription.
   const onChangedRef = useRef(onChanged)
   useEffect(() => {
     onChangedRef.current = onChanged
   })
 
-  // Backend processing state for the pill: the local `processing` flag
-  // only covers the trigger POST round-trip, but the job itself runs
-  // async on the Pi (and can be started elsewhere — post-archive,
-  // Dashboard). Initial fetch + drive_process/summon_check WS events,
-  // with a visibility-aware poll as the WS-drop fallback (Dashboard
-  // idiom). Completion also refreshes the list, so newly extracted or
-  // newly flagged drives appear without a manual reload.
+  // Jobs outlive the trigger request and may start elsewhere. WebSocket events
+  // drive status, with visible-page polling as a dropped-event fallback.
   useEffect(() => {
     let mounted = true
     const check = () =>
@@ -105,11 +99,9 @@ export function DrivesActionsBar({ onChanged }: DrivesActionsBarProps) {
       if (mode === "new") await triggerProcessNew()
       else if (mode === "summon") await triggerSummonCheck()
       else await triggerReprocessAll()
-      // Backend accepted and runs the job async — flip the pill to
-      // "Processing" right away instead of waiting a poll interval.
+      // Reflect accepted asynchronous work immediately.
       setBackendProcessing(true)
-      // Refresh the list so newly extracted drives appear when the
-      // user comes back.
+      // Refresh results when the user returns.
       window.setTimeout(onChanged, 2000)
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e))

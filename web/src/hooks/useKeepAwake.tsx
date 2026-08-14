@@ -32,11 +32,9 @@ export function KeepAwakeProvider({ children }: { children: React.ReactNode }) {
     const [mode, setMode] = useState<string | null>(null)
     const lastHeartbeat = useRef(0)
     const activityTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
-    // Timestamp of the last start/stop mutation. Polls that were in-flight
-    // before a mutation are ignored so they can't overwrite the fresh state.
+    // Ignore polls that began before the latest mutation.
     const lastMutation = useRef(0)
 
-    // Load user preference
     useEffect(() => {
         fetch("/api/config/preference?key=keep_awake_webui_mode")
             .then((r) => r.json())
@@ -46,7 +44,6 @@ export function KeepAwakeProvider({ children }: { children: React.ReactNode }) {
             .catch(() => { })
     }, [])
 
-    // Poll status
     useEffect(() => {
         let mounted = true
 
@@ -55,8 +52,7 @@ export function KeepAwakeProvider({ children }: { children: React.ReactNode }) {
             try {
                 const res = await fetch("/api/keep-awake/status")
                 const data: KeepAwakeStatus = await res.json()
-                // Ignore polls that started before the last mutation to prevent
-                // stale responses from overwriting the optimistic UI update.
+                // Preserve the optimistic result against stale responses.
                 if (mounted && startedAt >= lastMutation.current) setStatus(data)
             } catch { /* ignore */ }
         }
@@ -66,7 +62,6 @@ export function KeepAwakeProvider({ children }: { children: React.ReactNode }) {
         return () => { mounted = false; clearInterval(iv) }
     }, [])
 
-    // Auto mode: send heartbeats on user activity
     useEffect(() => {
         if (mode !== "auto") return
 
@@ -82,10 +77,9 @@ export function KeepAwakeProvider({ children }: { children: React.ReactNode }) {
         }
 
         function onActivity() {
-            // Reset idle timer
             if (activityTimer.current) clearTimeout(activityTimer.current)
             activityTimer.current = setTimeout(() => {
-                // User went idle — stop sending heartbeats (server will expire after 10 min)
+                // The server expires keep-awake after ten idle minutes.
             }, 10 * 60 * 1000)
 
             sendHeartbeat()
@@ -94,7 +88,6 @@ export function KeepAwakeProvider({ children }: { children: React.ReactNode }) {
         const events = ["click", "keydown", "scroll", "touchstart", "mousemove"] as const
         events.forEach((e) => window.addEventListener(e, onActivity, { passive: true }))
 
-        // Send initial heartbeat
         sendHeartbeat()
 
         return () => {
@@ -126,7 +119,6 @@ export function KeepAwakeProvider({ children }: { children: React.ReactNode }) {
 
     const updateMode = useCallback(async (newMode: string) => {
         setMode(newMode)
-        // Save preference to server
         try {
             await fetch("/api/config/preference", {
                 method: "PUT",
@@ -134,8 +126,7 @@ export function KeepAwakeProvider({ children }: { children: React.ReactNode }) {
                 body: JSON.stringify({ key: "keep_awake_webui_mode", value: newMode }),
             })
         } catch { /* ignore */ }
-        // When switching to auto, send an immediate heartbeat so the sidebar
-        // updates right away instead of waiting for the effect + user activity.
+        // Activate automatic mode without waiting for the next user event.
         if (newMode === "auto") {
             lastHeartbeat.current = 0
             try {
@@ -144,7 +135,6 @@ export function KeepAwakeProvider({ children }: { children: React.ReactNode }) {
                 setStatus((prev) => ({ ...prev, state: data.state }))
             } catch { /* ignore */ }
         }
-        // When switching to off, stop any active keep-awake
         if (newMode === "") {
             lastMutation.current = Date.now()
             setStatus({ state: "idle", mode: "" })

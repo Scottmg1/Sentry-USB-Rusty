@@ -7,11 +7,8 @@
 //! - Returns binary PNG for thumbnail/preview with `Cache-Control: max-age=3600`.
 //! - Preserves upstream status codes rather than collapsing to 200.
 //!
-//! Privacy: this module used to inject `X-Fingerprint` on upload/download so
-//! the backend could per-device rate-limit and maintain a block list. That
-//! header was removed entirely — the backend now rate-limits by IP and abuse
-//! is handled through the Discord moderation queue. The fingerprint helper
-//! in `update.rs` is no longer called from here.
+//! Privacy: only `X-Passcode` is forwarded; requests contain no device
+//! fingerprint.
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -34,9 +31,7 @@ fn valid_code(code: &str) -> bool {
         .is_match(code)
 }
 
-/// Forward request headers we want the backend to see. Currently only
-/// `X-Passcode` (admin auth). `X-Fingerprint` was deliberately removed
-/// — see module docstring.
+/// Forward only the admin `X-Passcode` header.
 fn forward_headers(src: &HeaderMap) -> reqwest::header::HeaderMap {
     let mut h = reqwest::header::HeaderMap::new();
     if let Some(v) = src.get("x-passcode") {
@@ -167,8 +162,6 @@ fn invalid_code() -> Response {
         .into_response()
 }
 
-// --- Community lock chimes ---
-
 pub async fn lock_chime_library(
     State(_s): State<AppState>,
     headers: HeaderMap,
@@ -184,7 +177,6 @@ pub async fn lock_chime_stream(
     if !valid_code(&code) {
         return invalid_code();
     }
-    // Streams audio (WAV) — binary passthrough with appropriate cache headers.
     let url = format!("{}/lockchime/download/{}", COMMUNITY_API, code);
     let resp = match crate::http_client()
         .get(&url)
@@ -249,11 +241,6 @@ pub async fn lock_chime_upload(
 /// note the upstream method is GET even though the local entry-point
 /// is POST), validate it as a 5s-or-less mono 44.1k WAV under 1MB,
 /// save it to /mutable/LockChime, and return JSON success.
-///
-/// Earlier ports of this just JSON-proxied the upstream call with a
-/// POST body — the support server returned 404 because it only
-/// accepts GET, and even if it had succeeded the bytes would have
-/// been forwarded to the browser instead of saved on the Pi.
 pub async fn lock_chime_download(
     State(_s): State<AppState>,
     Path(code): Path<String>,
@@ -277,7 +264,6 @@ pub async fn lock_chime_download(
 
     let status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
     if !status.is_success() {
-        // Forward upstream error JSON verbatim.
         let bytes = resp.bytes().await.unwrap_or_default();
         let mut r = Response::new(axum::body::Body::from(bytes));
         *r.status_mut() = status;
@@ -367,9 +353,6 @@ pub async fn lock_chime_download(
         )
             .into_response();
     }
-    // Default umask of 0022 gives 0644 on the freshly-written file,
-    // which is what we want for chime files anyway.
-
     Json(serde_json::json!({
         "success": true,
         "filename": final_name,
@@ -451,8 +434,6 @@ pub async fn lock_chime_admin_delete(
     .await
 }
 
-// --- Community wraps ---
-
 pub async fn wraps_library(
     State(_s): State<AppState>,
     headers: HeaderMap,
@@ -486,7 +467,7 @@ pub async fn wraps_upload(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    // Match Go's 2 MiB cap on multipart payload.
+    // Bound multipart uploads to 2 MiB.
     const MAX_BYTES: usize = 2 * 1024 * 1024;
     if body.len() > MAX_BYTES {
         return (
@@ -525,9 +506,6 @@ pub async fn wraps_upload(
 /// `lock_chime_download`: the upstream call is a GET (the local
 /// entry-point is POST to enable simple form posts), and the bytes
 /// are saved on the Pi rather than streamed back to the browser.
-///
-/// Without this fix every "Download to Pi" click returned 404 because
-/// the upstream server only accepts GET on /wraps/download/{code}.
 pub async fn wraps_download(
     State(_s): State<AppState>,
     Path(code): Path<String>,
@@ -580,8 +558,7 @@ pub async fn wraps_download(
             .into_response();
     }
 
-    // Sanitize filename: keep alphanumeric, spaces, dot, underscore, dash.
-    // Anything else gets stripped. Force .png suffix.
+    // Restrict filenames to safe characters and a PNG suffix.
     let raw_name = if wrap_name_header.is_empty() {
         code.clone()
     } else {

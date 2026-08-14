@@ -95,11 +95,8 @@ pub async fn upload_now(State(state): State<AppState>) -> impl IntoResponse {
     (StatusCode::ACCEPTED, Json(json!({ "ok": true })))
 }
 
-/// POST /api/cloud/backfill-ble — one-shot re-upload of every route
-/// whose local BLE rollup is non-NULL but was uploaded before the BLE
-/// fields rode inside the encrypted blob. Returns the count queued and
-/// nudges the sweep loop. Idempotent — calling twice in a row returns 0
-/// the second time.
+/// POST /api/cloud/backfill-ble
+/// Idempotently queue routes whose BLE rollups have not reached the cloud.
 pub async fn backfill_ble(State(state): State<AppState>) -> impl IntoResponse {
     match state.cloud.uploader.backfill_ble_reupload() {
         Ok(queued) => {
@@ -127,8 +124,7 @@ pub async fn get_queue(
     axum::extract::Query(q): axum::extract::Query<QueueQuery>,
 ) -> impl IntoResponse {
     let limit = q.limit.unwrap_or(100).clamp(1, 200);
-    // BLOB-length aggregation over every pending route — blocking pool,
-    // not the reactor (1.5s observed while an archive owned the disk).
+    // Pending-route aggregation may block on archive I/O.
     let uploader = state.cloud.uploader.clone();
     let queue = tokio::task::spawn_blocking(move || uploader.pending_queue(limit))
         .await

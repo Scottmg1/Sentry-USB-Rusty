@@ -65,10 +65,7 @@ fn enumerate_event_dirs(base: &Path) -> Vec<String> {
     dirs
 }
 
-/// Build the `[{ name, clips, hasMore }]` JSON the Viewer expects for one
-/// category:
-/// one code path for all three categories — each clip is a dated subfolder of
-/// `.mp4` files plus an optional `event.json`.
+/// Build Viewer JSON for one category of dated clip folders.
 fn list_clips_in(
     teslacam_dir: &Path,
     category: &str,
@@ -135,11 +132,7 @@ pub async fn get_clips(
     }
     let limit = params.limit.unwrap_or(20).min(200);
 
-    // Each dated clip folder is read off disk, and the folders are
-    // symlinks into on-demand (autofs) snapshot mounts — the first read
-    // can block for seconds while the kernel mounts the image. Run it on
-    // the blocking pool so it can't stall the async reactor and drop the
-    // WebSocket heartbeat ("Reconnecting to SentryUSB…").
+    // Autofs snapshot mounts can make the first directory read block.
     let category = category.to_string();
     let before = params.before;
     let response = tokio::task::spawn_blocking(move || {
@@ -152,15 +145,13 @@ pub async fn get_clips(
 
 /// GET /api/clips/telemetry?path=/TeslaCam/SentryClips/<event>&file=<camera>.mp4
 ///
-/// Response shape matches the Go `telemetryResponse` the web UI expects:
+/// Response shape expected by the web UI:
 /// { frames: [{t, lat, lng, speed_mps, gear, autopilot, accel_pos}], duration_sec, has_gps, has_autopilot }
 pub async fn get_clip_telemetry(
     State(_state): State<AppState>,
     Query(params): Query<std::collections::HashMap<String, String>>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    // Parsing GPS out of a clip reads and decodes the whole video file —
-    // heavy I/O + CPU. Run it on the blocking pool so opening a clip can't
-    // freeze the reactor (and drop the live WebSocket) for everyone else.
+    // Video parsing is blocking and CPU-intensive.
     tokio::task::spawn_blocking(move || clip_telemetry_blocking(params))
         .await
         .unwrap_or_else(|_| {
@@ -184,9 +175,7 @@ fn clip_telemetry_blocking(
         format!("{}/{}/{}", TESLACAM_DIR, clip_rel, file)
     };
 
-    // Lexical path cleaning + base-prefix check. Mirrors
-    // Reject any path that escapes TESLACAM_DIR
-    // via `..`, absolute rewrites, or symlinks on components we normalize away.
+    // Reject lexical traversal or absolute rewrites outside TESLACAM_DIR.
     let cleaned = {
         let mut p = std::path::PathBuf::from("/");
         for component in std::path::Path::new(&full_path).components() {
@@ -194,7 +183,6 @@ fn clip_telemetry_blocking(
                 std::path::Component::Normal(c) => p.push(c),
                 std::path::Component::RootDir => p = std::path::PathBuf::from("/"),
                 std::path::Component::ParentDir => {
-                    // Treat any `..` as an attempted escape — refuse.
                     return crate::json_error(
                         StatusCode::FORBIDDEN,
                         "path must be under TeslaCam",
@@ -210,9 +198,7 @@ fn clip_telemetry_blocking(
         return crate::json_error(StatusCode::FORBIDDEN, "path must be under TeslaCam");
     }
 
-    // Use raw extraction (no dedup) — dedup destroys the frame-to-time
-    // mapping needed for accurate telemetry overlay. GPS SEI at ~10fps means
-    // ~595 frames per 60s clip, which is small enough to serve directly.
+    // Deduplication would destroy the frame-to-time overlay mapping.
     let (points, gear_states, ap_states, speeds, accel_positions, flag_bytes, accel_x, accel_y) =
         match sentryusb_drives::extract::extract_gps_from_file_raw(cleaned_str.as_ref()) {
             Ok(raw) => raw,
@@ -241,11 +227,8 @@ fn clip_telemetry_blocking(
             0.0
         };
         // Bitfield: 1 left blinker, 2 right blinker, 4 brake, 8 accelerator.
-        // Decoded per frame all along; it just never left the extractor.
         let flags = *flag_bytes.get(i).unwrap_or(&0);
-        // v20 IMU linear acceleration (m/s²): lateral / longitudinal —
-        // 0.0 on firmware without the SEI fields. Same shape Sentry-Six's
-        // G-force meter consumes.
+        // IMU lateral/longitudinal acceleration; absent SEI fields yield zero.
         let gx = *accel_x.get(i).unwrap_or(&0.0);
         let gy = *accel_y.get(i).unwrap_or(&0.0);
         frames.push(serde_json::json!({
@@ -336,16 +319,12 @@ mod tests {
         let dir = TempDir::new().unwrap();
         fs::create_dir(dir.path().join("2025-02-22_17-58-00")).unwrap();
         fs::create_dir(dir.path().join("2025-02-23_09-12-00")).unwrap();
-        // Stray file should be ignored
         fs::write(dir.path().join("README.txt"), b"").unwrap();
 
         let dirs = enumerate_event_dirs(dir.path());
         assert_eq!(dirs, vec!["2025-02-23_09-12-00", "2025-02-22_17-58-00"]);
     }
 
-    /// RecentClips under `/mutable/TeslaCam` are dated `YYYY-MM-DD/` subfolders
-    /// (the snapshot symlink builder date-buckets them), not flat files — so
-    /// they list through the same code path as SavedClips/SentryClips.
     #[test]
     fn lists_recent_clips_from_dated_subdirs() {
         let root = TempDir::new().unwrap();
@@ -378,7 +357,6 @@ mod tests {
                 "2025-02-22_17-58-00-front.mp4",
             ],
         );
-        // RecentClips carry no event.json, so `event` is skipped entirely.
         assert!(clips[0].get("event").is_none());
     }
 
@@ -423,7 +401,6 @@ mod tests {
             fs::write(d.join(format!("{}-front.mp4", name)), b"").unwrap();
         }
 
-        // `limit` truncates and reports hasMore, newest first.
         let value = list_clips_in(root.path(), "SavedClips", 2, None);
         assert_eq!(value[0]["hasMore"].as_bool().unwrap(), true);
         let clips = value[0]["clips"].as_array().unwrap();
@@ -431,7 +408,6 @@ mod tests {
         assert_eq!(clips[0]["date"].as_str().unwrap(), "2025-02-22_10-00-00");
         assert_eq!(clips[1]["date"].as_str().unwrap(), "2025-02-21_10-00-00");
 
-        // `before` cursor drops entries at or after the cursor.
         let value = list_clips_in(root.path(), "SavedClips", 20, Some("2025-02-22_10-00-00"));
         assert_eq!(value[0]["hasMore"].as_bool().unwrap(), false);
         let clips = value[0]["clips"].as_array().unwrap();
@@ -449,8 +425,6 @@ mod tests {
         assert_eq!(value[0]["hasMore"].as_bool().unwrap(), false);
     }
 
-    /// The real `/mutable/TeslaCam` clip entries are symlinks into reflink
-    /// snapshots, so `enumerate_event_dirs` must follow symlinked directories.
     #[cfg(unix)]
     #[test]
     fn list_clips_follows_symlinked_dirs() {
@@ -458,12 +432,10 @@ mod tests {
         let saved = root.path().join("SavedClips");
         fs::create_dir_all(&saved).unwrap();
 
-        // A real clip dir living outside the category folder...
         let real = root.path().join("snapshot").join("2025-02-22_17-58-00");
         fs::create_dir_all(&real).unwrap();
         fs::write(real.join("2025-02-22_17-58-00-front.mp4"), b"").unwrap();
 
-        // ...reachable only through a symlink inside SavedClips/.
         std::os::unix::fs::symlink(&real, saved.join("2025-02-22_17-58-00")).unwrap();
 
         let value = list_clips_in(root.path(), "SavedClips", 20, None);

@@ -3,8 +3,7 @@ import { RotateRightIcon, WarningIcon } from "@/components/icons"
 
 interface Props {
   children: ReactNode
-  /** Rendered in place of children after a render error. Receives the error
-   *  and a reset callback that re-attempts rendering the children. */
+  /** Fallback receives the error and a callback that retries rendering. */
   fallback: (error: Error, reset: () => void) => ReactNode
 }
 
@@ -12,11 +11,7 @@ interface State {
   error: Error | null
 }
 
-/**
- * React unmounts the entire root when a render error reaches the top of the
- * tree — on the in-car browser that's a blank page with no way back short of
- * a manual reload. Boundaries turn that into a contained fallback.
- */
+/** Contains render failures so the in-car browser retains a recovery path. */
 export class ErrorBoundary extends Component<Props, State> {
   state: State = { error: null }
 
@@ -34,12 +29,7 @@ export class ErrorBoundary extends Component<Props, State> {
   }
 }
 
-/**
- * Card-shaped boundary for the settings grids: a crashing section degrades
- * to one broken card (with the message and a retry) while the rest of the
- * page keeps working. Sections that render several cards in a fragment
- * collapse to a single fallback card — acceptable for an error state.
- */
+/** Card fallback that isolates one failed settings section. */
 export function SectionErrorBoundary({ children }: { children: ReactNode }) {
   return (
     <ErrorBoundary

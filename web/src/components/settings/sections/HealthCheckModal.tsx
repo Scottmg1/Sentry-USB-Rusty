@@ -31,7 +31,6 @@ export function HealthCheckModal({ onClose }: { onClose: () => void }) {
       if (!res.ok) throw new Error(`Server responded with ${res.status}`)
       const data: HealthReport = await res.json()
       setReport(data)
-      // Auto-expand categories that have at least one warn/fail
       const exp: Record<string, boolean> = {}
       for (const cat of data.categories) {
         if (cat.items.some((i) => i.status !== "pass")) exp[cat.name] = true
@@ -44,9 +43,7 @@ export function HealthCheckModal({ onClose }: { onClose: () => void }) {
     }
   }
 
-  // Kick off the first check on mount. Using useEffect so we don't trigger
-  // side-effects during render (previous version called runCheck() inline,
-  // which silently looped and produced a blank modal when the fetch failed).
+  // Run the initial check after mount.
   useEffect(() => {
     void runCheck()
   }, [])

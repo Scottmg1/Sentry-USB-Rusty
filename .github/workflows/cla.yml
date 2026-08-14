@@ -15,36 +15,27 @@ permissions:
 jobs:
   cla:
     runs-on: ubuntu-latest
-    # contributor-assistant/github-action's latest release (v2.6.1) still
-    # runs on Node 20, which GitHub is deprecating (JS actions forced to
-    # Node 24 on 2026-06-16, Node 20 removed 2026-09-16). There's no newer
-    # release to bump to, so opt this job's JS actions into the Node 24
-    # runtime now — clears the deprecation warning and stays ahead of the
-    # forced cutover.
+    # v2.6.1 declares Node 20, so opt it into GitHub's Node 24 runtime.
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
     steps:
       - name: CLA Assistant
-        # Run on PR events and on every issue comment, then let the action do
-        # its own whitespace-tolerant matching of the sign phrase / "recheck".
-        # An exact `==` gate here silently skips sign comments that carry a
-        # trailing CR/whitespace (e.g. pasted from the web UI).
+        # Let the action handle whitespace-tolerant sign/recheck matching.
         if: github.event_name == 'pull_request_target' || github.event_name == 'issue_comment'
         uses: contributor-assistant/github-action@v2.6.1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          # PAT with `repo` scope, required so the bot can write signatures to
-          # the signatures branch. Add it as a repo secret named CLA_SIGN_TOKEN.
+          # PAT with repo scope for writes to the signatures branch.
           PERSONAL_ACCESS_TOKEN: ${{ secrets.CLA_SIGN_TOKEN }}
         with:
           path-to-document: 'https://github.com/Sentry-Six/Sentry-USB-Rusty/blob/main/CLA.md'
           path-to-signatures: 'signatures/version1/cla.json'
-          # Signatures are stored on a dedicated branch to keep main clean.
+          # Keep signatures off main.
           branch: 'cla-signatures'
           custom-pr-sign-comment: 'I have read the CLA Document and I hereby sign the CLA'
           custom-notsigned-prcomment: >
             Thanks for your pull request! Before we can merge it, please read our
             [Contributor License Agreement](https://github.com/Sentry-Six/Sentry-USB-Rusty/blob/main/CLA.md)
             and sign it by posting the comment below. You only need to do this once.
-          # Maintainers and bots who already hold rights or never need to sign.
+          # Maintainers and service accounts do not sign.
           allowlist: 'Scottmg1,ChadR23,chufleco,dependabot[bot]'

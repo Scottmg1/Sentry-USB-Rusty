@@ -9,21 +9,13 @@ interface Props {
   onOpenWizard?: () => void
 }
 
-/**
- * Settings card for the keep-accessory feature (12V-powered Pis): the 12V
- * gate, the home geofence (with "Use current location" + adjustable radius),
- * and a manual ON/OFF override that hits the car over BLE right now.
- */
+/** Settings card for 12V accessory power, its geofence, and BLE override. */
 export function KeepAccessorySection({ onOpenWizard }: Props = {}) {
   const { values, loaded, saving, saveError, update, useCurrentLocation, manualSet } = useKeepAccessory()
   const [msg, setMsg] = useState<string | null>(null)
   const [pending, setPending] = useState(false)
 
-  // Niche, 12V-only feature for glovebox-USB setups. Once it's been enabled in
-  // the session (everOn) we keep showing the full UI even if the user toggles
-  // it back off mid-edit, so settings don't vanish mid-change.
-  // Render-phase state adjustment (React's "storing information from
-  // previous renders" pattern) — sticky for the component's lifetime.
+  // Once shown, keep the form mounted for the session so edits do not disappear.
   const [everOn, setEverOn] = useState(false)
   if (values.enabled && !everOn) setEverOn(true)
   const showDisabled = loaded && !values.enabled && !everOn

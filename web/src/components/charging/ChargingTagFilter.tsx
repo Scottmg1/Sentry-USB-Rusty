@@ -2,9 +2,7 @@ import { useEffect, useRef, useState } from "react"
 import { CheckIcon, SellIcon } from "@/components/icons"
 import { cn } from "@/lib/utils"
 
-// Tag filter for the Charging page, mirroring the Drives filter UX: a
-// pill that opens a checklist of every charge tag. Selecting tags keeps
-// only sessions carrying at least one of them (union match).
+// Selected tags use union matching.
 export function ChargingTagFilter({
   tags,
   selected,

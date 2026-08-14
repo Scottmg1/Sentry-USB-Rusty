@@ -13,10 +13,7 @@ pub struct EncryptedRoute {
     pub route_id: String,
     pub route_blob_b64: String,
     pub wrapped_route_key_b64: String,
-    /// Compact summary sealed under the same routeKey with
-    /// `aad::route_summary`. The plaintext shape mirrors the Sentry
-    /// Cloud web client's summary format (v3) exactly — the browser
-    /// can't tell which side wrote a summary.
+    /// Summary v4 sealed under the route key with `aad::route_summary`.
     pub summary_ciphertext_b64: String,
 
     pub source_file: String,
@@ -76,9 +73,7 @@ fn round1(v: f64) -> f64 {
     (v * 10.0).round() / 10.0
 }
 
-/// Summary v4 `pv` point selection — must stay identical to the web
-/// implementation (step over original indices, skip invalid, append the
-/// last point, 5-decimal rounding).
+/// Summary v4 path-preview selection; must match the web implementation.
 fn path_preview_points(points: &[[f64; 2]]) -> Option<Vec<[f64; 2]>> {
     let total = points.len();
     if total < 2 {
@@ -105,12 +100,8 @@ fn path_preview_points(points: &[[f64; 2]]) -> Option<Vec<[f64; 2]>> {
     if out.len() >= 2 { Some(out) } else { None }
 }
 
-/// Compact per-clip summary, format v3: aggregates + `gr` gear runs +
-/// optional BLE battery/location fields. The Sentry Cloud web client
-/// computes the same summary after a full decrypt — field names,
-/// rounding, and filters must stay identical between the two
-/// implementations, since the browser consumes this plaintext without
-/// knowing which side produced it.
+/// Compact per-clip summary v4. Field names, rounding, and filters must match
+/// the web implementation.
 pub fn route_summary_json(route: &Route) -> serde_json::Value {
     let len = route.points.len();
     let ap = &route.autopilot_states;
@@ -120,9 +111,7 @@ pub fn route_summary_json(route: &Route) -> serde_json::Value {
     let mut fsd_dist_m = 0.0_f64;
     let mut as_dist_m = 0.0_f64;
     let mut tacc_dist_m = 0.0_f64;
-    // Autopilot state of ORIGINAL point index i (frame arrays usually
-    // align 1:1 with points; the scale handles reduced data). Must match
-    // the web's summary v4 implementation exactly.
+    // Map original point indices to autopilot frames, including reduced data.
     let ap_len = ap.len();
     let ap_at = |i: usize| -> u8 {
         if ap_len == 0 || len == 0 {
@@ -148,8 +137,7 @@ pub fn route_summary_json(route: &Route) -> serde_json::Value {
         let sp = route.speeds.get(i).copied().map(|s| s as f64).unwrap_or(0.0);
         let sp_val = if sp.is_finite() && sp > 0.0 { sp } else { 0.0 };
         if let Some((plat, plng)) = prev {
-            // v4: WGS-84 geodesic (same in-clip filters as v3). Per-mode
-            // distance goes to the DESTINATION point's mode.
+            // Attribute WGS-84 segment distance to the destination point's mode.
             let seg = calc::geodesic_m(plat, plng, lat, lng);
             if seg > 0.0 && seg < 5000.0 {
                 dist_m += seg;
@@ -176,8 +164,7 @@ pub fn route_summary_json(route: &Route) -> serde_json::Value {
         kept += 1;
     }
 
-    // Park intervals (clip-ms domain) from gear runs, for the v4
-    // grace-aware disengagement rule and the pk1 boundary field.
+    // Park intervals support disengagement grace and the `pk1` boundary field.
     let mut park_iv: Vec<(f64, f64)> = Vec::new();
     let mut pk1: Option<i64> = None;
     {
@@ -209,10 +196,8 @@ pub fn route_summary_json(route: &Route) -> serde_json::Value {
     let mut fsd1: Option<i64> = None;
     if !ap.is_empty() {
         let per_frame = 60_000.0 / ap.len() as f64;
-        // v4 `dis` applies the Park grace WITHIN the clip: a transition
-        // is pending 2000 ms; Park inside the window cancels it (arrival,
-        // not takeover); re-engaging FSD or expiry confirms it. A pending
-        // still open at clip end exports as `dPnd` for the aggregator.
+        // A transition waits 2 seconds: Park cancels it, while FSD re-entry or
+        // expiry confirms it. Export unresolved end-of-clip time as `dPnd`.
         let mut prev_fsd = false;
         let mut pend_ms = -1.0_f64;
         for (i, &v) in ap.iter().enumerate() {
@@ -282,9 +267,7 @@ pub fn route_summary_json(route: &Route) -> serde_json::Value {
         "apd": if ap_len > 0 { 1 } else { 0 },
     });
     let obj = out.as_object_mut().unwrap();
-    // Path preview: every floor(total/16)-th valid point plus the last,
-    // (0,0)/non-finite skipped, 5-decimal rounding — identical selection
-    // to the web implementation.
+    // Preview selection must remain identical to the web implementation.
     if let Some(pv) = path_preview_points(&route.points) {
         obj.insert("pv".into(), serde_json::json!(pv));
     }
@@ -300,9 +283,7 @@ pub fn route_summary_json(route: &Route) -> serde_json::Value {
     if let Some(v) = fsd1 {
         obj.insert("fsd1".into(), serde_json::json!(v));
     }
-    // Accel pushes — present only when computable (frame-aligned accel
-    // data), so a summary recomputed from reduced data can't overwrite
-    // a real count with zero.
+    // Omit pushes without frame-aligned data rather than overwriting with zero.
     if let Some(acp) = clip_accel_pushes(route) {
         obj.insert("acp".into(), serde_json::json!(acp));
     }
@@ -321,12 +302,8 @@ pub fn route_summary_json(route: &Route) -> serde_json::Value {
     out
 }
 
-/// Accelerator pushes while FSD is engaged, per clip — same rules as
-/// the Pi-local aggregator: a press starts when the pedal exceeds 1%
-/// at least 3s after FSD engaged, and counts once the pedal returns to
-/// 0%. Frame-indexed over the autopilot-state bytes; requires the
-/// accel array to be frame-aligned. The web client implements the same
-/// rule for locally-derived summaries — keep them identical.
+/// Counts accelerator presses over 1% at least 3 seconds after FSD engages,
+/// ending at 0%. Requires frame-aligned data and must match the web client.
 fn clip_accel_pushes(route: &Route) -> Option<u64> {
     let ap = &route.autopilot_states;
     let n = ap.len();
@@ -584,10 +561,7 @@ mod tests {
         assert_eq!(e.route_id, cached);
     }
 
-    /// BLE rollup fields ride inside the encrypted route blob — defend
-    /// the wire shape across future refactors. Cloud renders these on
-    /// the per-clip + per-drive summaries; losing them silently here
-    /// would be invisible until a user opened a drive on the dashboard.
+    /// Pins BLE rollup fields in the encrypted route wire format.
     #[test]
     fn ble_telemetry_roundtrips_through_blob() {
         let pi_key = [3u8; 32];
@@ -698,7 +672,7 @@ mod tests {
         assert_eq!(enc.charge_id, ids::charge_id_from_start_ts(summary.id));
         assert_eq!(enc.charge_id.len(), 64);
 
-        // Unwrap the chargeKey like the browser/sync would.
+        // Unwrap the charge key.
         let charge_key = unwrap_content_key(
             &pi_key,
             &enc.wrapped_charge_key_b64,
@@ -706,7 +680,7 @@ mod tests {
         )
         .unwrap();
 
-        // Summary slot: parses back to the same camelCase shape.
+        // Summary slot preserves its camelCase shape.
         let summary_back: serde_json::Value = open_json_b64(
             &charge_key,
             &aad::charge_summary(user_id, pi_id, &enc.charge_id),
@@ -717,7 +691,7 @@ mod tests {
         assert_eq!(summary_back["energyAddedKwh"], serde_json::json!(10.5));
         assert_eq!(summary_back["fastCharging"], serde_json::json!(false));
 
-        // Blob slot: summary fields flattened + points array.
+        // Blob slot flattens summary fields with the points array.
         let blob_back: serde_json::Value = open_json_b64(
             &charge_key,
             &aad::charge_blob(user_id, pi_id, &enc.charge_id),
@@ -727,7 +701,6 @@ mod tests {
         assert_eq!(blob_back["startMs"], serde_json::json!(summary.start_ms));
         assert_eq!(blob_back["points"].as_array().unwrap().len(), 1);
 
-        // Mutable slot.
         let mutable_back: ChargeMutable = open_json_b64(
             &charge_key,
             &aad::charge_mutable(user_id, pi_id, &enc.charge_id),
@@ -736,7 +709,7 @@ mod tests {
         .unwrap();
         assert_eq!(mutable_back, mutable);
 
-        // Cross-slot replay must fail the AEAD check (distinct AADs).
+        // Distinct AADs reject cross-slot replay.
         let swapped: Result<serde_json::Value> = open_json_b64(
             &charge_key,
             &aad::charge_summary(user_id, pi_id, &enc.charge_id),
@@ -745,8 +718,7 @@ mod tests {
         assert!(swapped.is_err());
     }
 
-    /// Route summaries must match the v4 shape the web client writes —
-    /// pin the keys + rounding contract.
+    /// Pins the web client's v4 keys and rounding contract.
     #[test]
     fn route_summary_matches_web_v4_shape() {
         let mut route = sample_route();
@@ -761,11 +733,11 @@ mod tests {
         assert_eq!(v["v"], serde_json::json!(4));
         assert_eq!(v["file"], serde_json::json!(route.file));
         assert_eq!(v["ptC"], serde_json::json!(2));
-        // ~111m between the two points at this latitude.
+        // Approximately 111 m at this latitude.
         let dm = v["dM"].as_i64().unwrap();
         assert!((100..125).contains(&dm), "dM was {}", dm);
         assert_eq!(v["dur"], serde_json::json!(60000));
-        // 2 of 4 frames FSD → 30000ms; 1 frame TACC → 15000ms.
+        // Two FSD frames and one TACC frame.
         assert_eq!(v["fsd"], serde_json::json!(30000));
         assert_eq!(v["tcc"], serde_json::json!(15000));
         assert_eq!(v["dis"], serde_json::json!(1));
@@ -778,19 +750,17 @@ mod tests {
         assert_eq!(v["ls"], serde_json::json!("Home"));
         assert!(v.get("be").is_none());
         assert!(v.get("le").is_none());
-        // v4: the single segment's destination point maps to frame 2
-        // (OFF), so per-mode distances stay zero; apd reflects AP data.
+        // The segment's destination maps to OFF, so mode distances stay zero.
         assert_eq!(v["fdM"], serde_json::json!(0));
         assert_eq!(v["adM"], serde_json::json!(0));
         assert_eq!(v["tdM"], serde_json::json!(0));
         assert_eq!(v["apd"], serde_json::json!(1));
-        // 2 points -> pv carries both plus the duplicated last index.
+        // Two points include both samples plus the final index.
         assert_eq!(v["pv"].as_array().unwrap().len(), 3);
         assert!(v.get("src").is_none());
     }
 
-    /// Cross-implementation vectors — the web's summarizeRoute produced
-    /// these exact values for identical inputs; both sides must agree.
+    /// Cross-implementation vectors from the web summarizer.
     fn v4_vector_route(ap: Vec<u8>, gear_runs: Vec<sentryusb_drives::types::GearRun>) -> Route {
         let mut route = sample_route();
         route.points = (0..60)
@@ -808,11 +778,7 @@ mod tests {
 
     #[test]
     fn route_summary_v4_cross_impl_vectors() {
-        // A: FSD 30 frames then manual, no Park -> grace expires, dis 1.
-        // dM/fdM cross-checked against the web's geodesicM on these exact
-        // points (329 m / 162 m). The earlier 328/161 were the pre-fix
-        // acos(law-of-cosines) values — ~1 m low on these 5.5 m hops,
-        // the short-segment undercount the stable central angle fixes.
+        // FSD then manual without Park: grace expires. Web vectors are 329/162 m.
         let mut ap = vec![1u8; 30];
         ap.extend(vec![0u8; 30]);
         let a = route_summary_json(&v4_vector_route(ap, vec![gr(4, 60)]));
@@ -824,14 +790,14 @@ mod tests {
         assert_eq!(a["pv"].as_array().unwrap().len(), 21);
         assert_eq!(a["pv"][0], serde_json::json!([53.5, -113.5]));
 
-        // B: Park lands within the 2s grace -> cancelled, dis 0.
+        // Park within grace cancels the disengagement.
         let mut ap = vec![1u8; 30];
         ap.extend(vec![0u8; 30]);
         let b = route_summary_json(&v4_vector_route(ap, vec![gr(4, 31), gr(0, 29)]));
         assert_eq!(b["dis"], serde_json::json!(0));
         assert!(b.get("dPnd").is_none());
 
-        // C: re-engaging FSD confirms the disengagement -> dis 1.
+        // Re-engaging FSD confirms the disengagement.
         let mut ap = vec![1u8; 30];
         ap.push(0);
         ap.extend(vec![1u8; 29]);
@@ -839,14 +805,14 @@ mod tests {
         assert_eq!(c["dis"], serde_json::json!(1));
         assert!(c.get("dPnd").is_none());
 
-        // D: transition in the final second -> pending exports as dPnd.
+        // A final-second transition exports as pending.
         let mut ap = vec![1u8; 59];
         ap.push(0);
         let d = route_summary_json(&v4_vector_route(ap, vec![gr(4, 60)]));
         assert_eq!(d["dis"], serde_json::json!(0));
         assert_eq!(d["dPnd"], serde_json::json!(1000));
 
-        // E: boundary fields — Park at clip start, FSD from frame 1.
+        // Park at clip start; FSD begins at frame 1.
         let mut ap = vec![0u8];
         ap.extend(vec![1u8; 59]);
         let e = route_summary_json(&v4_vector_route(ap, vec![gr(0, 1), gr(4, 59)]));
@@ -854,16 +820,15 @@ mod tests {
         assert_eq!(e["fsd1"], serde_json::json!(1000));
     }
 
-    /// Pins the acp rule (and its omission) against the web's
-    /// clipAccelPushes — both sides must produce identical summaries.
+    /// Pins accelerator-push behavior against the web implementation.
     #[test]
     fn route_summary_acp_counts_fsd_accel_pushes() {
         let mut route = sample_route();
         route.points = vec![[53.5, -113.5]; 20];
         route.speeds = vec![10.0; 20];
-        // All 20 frames FSD; dt = 3000ms/frame, engage at frame 0.
+        // Twenty FSD frames at 3 seconds per frame.
         route.autopilot_states = vec![1u8; 20];
-        // Two presses: frames 2-3 and 10-11, each returning to 0 after.
+        // Two presses, each followed by zero.
         let mut accel = vec![0.0f32; 20];
         accel[2] = 0.5;
         accel[3] = 0.5;
@@ -873,21 +838,17 @@ mod tests {
         let v = route_summary_json(&route);
         assert_eq!(v["acp"], serde_json::json!(2));
 
-        // Misaligned accel array -> acp omitted, never zero.
+        // Misaligned data omits `acp` rather than reporting zero.
         route.accel_positions = vec![0.0; 5];
         let v2 = route_summary_json(&route);
         assert!(v2.get("acp").is_none());
     }
 
-    /// Routes without BLE telemetry should still serialize compactly —
-    /// `skip_serializing_if = "Option::is_none"` keeps the wire small
-    /// for Pis without the BLE feature enabled, and the cloud's
-    /// `#[serde(default)]` deserialization fills None for every field.
+    /// Routes without BLE telemetry omit optional fields.
     #[test]
     fn route_without_ble_omits_fields_from_blob() {
         let route = sample_route();
         let json = serde_json::to_string(&route).unwrap();
-        // None of the BLE field names appear in the camelCase JSON.
         for name in [
             "batteryPctStart", "batteryPctEnd",
             "interiorTempMin", "interiorTempMax", "exteriorTempAvg",

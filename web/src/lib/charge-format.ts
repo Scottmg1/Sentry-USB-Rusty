@@ -1,6 +1,4 @@
-// Display formatters for charge-session values. Each tolerates
-// null/undefined and renders an em dash so the UI never shows "NaN" or
-// "null" when a sample column was empty.
+// Missing charge values render as an em dash rather than NaN or null.
 
 export function fmtEnergy(kwh: number | null | undefined): string {
   if (kwh == null) return "—"

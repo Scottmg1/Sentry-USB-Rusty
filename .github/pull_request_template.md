@@ -5,8 +5,8 @@
 ## Checklist
 
 - [ ] I ran `cargo fmt --all` and `cargo clippy`
-- [ ] I have read and agree to the [Contributor License Agreement](../blob/main/CLA.md) (the CLA Assistant bot will prompt me to sign)
-- [ ] If this PR touches MIT-derived scripts listed in [NOTICE](../blob/main/NOTICE), I noted it above so the license boundary is preserved
+- [ ] I have read and agree to the [Contributor License Agreement](../CLA.md) (the CLA Assistant bot will prompt me to sign)
+- [ ] If this PR touches MIT-derived scripts listed in [NOTICE](../NOTICE), I noted it above so the license boundary is preserved
 
 <!--
 Note: this project is source-available under the PolyForm Noncommercial

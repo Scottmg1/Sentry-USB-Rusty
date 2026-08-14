@@ -1,28 +1,20 @@
-//! Thin wrapper around the same SQLite DB the drives crate uses.
-//! Opens with WAL, applies the drives migrations (so `telemetry_samples`
-//! definitely exists), and exposes a one-shot insert.
+//! Telemetry access to the shared drives SQLite database.
 
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection};
 
 use crate::sample::Sample;
 
-/// Open the canonical drive-data DB and ensure schema v6+ is applied.
-/// The drives crate's `schema::migrate` is idempotent so running it
-/// here alongside the sentryusb-main service is safe.
+/// Opens the canonical database and applies idempotent drives migrations.
 pub fn open() -> Result<Connection> {
     let path = sentryusb_drives::DEFAULT_DB_PATH;
-    // Make sure the parent directory exists before SQLite tries to
-    // create the file — dev / fresh-Pi cases would otherwise fail.
+    // SQLite cannot create a missing parent directory.
     if let Some(parent) = std::path::Path::new(path).parent() {
         let _ = std::fs::create_dir_all(parent);
     }
     let conn = Connection::open(path)
         .with_context(|| format!("failed to open {}", path))?;
-    // busy_timeout matters here: this daemon shares the WAL DB with the
-    // main server process. Without it, a write that lands while the
-    // server holds the write lock fails instantly with SQLITE_BUSY and
-    // the sample is dropped; with it, rusqlite retries for up to 5s.
+    // The timeout covers transient write contention with the main server.
     conn.execute_batch(
         "PRAGMA journal_mode=WAL;
          PRAGMA synchronous=NORMAL;
@@ -33,14 +25,9 @@ pub fn open() -> Result<Connection> {
     Ok(conn)
 }
 
-/// Insert one sample. Duplicate `ts` rows are silently ignored
-/// (`INSERT OR IGNORE`) — the sampler's clock-tick cadence makes
-/// duplicates only possible if the daemon races itself on a clock
-/// adjustment, in which case keeping the older row is fine.
+/// Inserts a sample, preserving the first row when timestamps collide.
 pub fn insert(conn: &Connection, s: &Sample) -> Result<()> {
-    // `software_version` column is intentionally not written —
-    // Tesla doesn't expose `car_version` over BLE. The column stays
-    // nullable in the schema for forward-compat.
+    // BLE does not expose `car_version`; `software_version` remains nullable.
     conn.execute(
         "INSERT OR IGNORE INTO telemetry_samples \
          (ts, battery_pct, battery_temp_c, interior_temp_c, exterior_temp_c, hvac_on, \
@@ -178,7 +165,6 @@ mod tests {
             ..Sample::default()
         };
         insert(&conn, &s).unwrap();
-        // Second insert with the same ts must not error.
         insert(&conn, &s).unwrap();
         let count: i64 = conn
             .query_row("SELECT count(*) FROM telemetry_samples", [], |row| row.get(0))

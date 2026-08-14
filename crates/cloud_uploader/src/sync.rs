@@ -1,19 +1,6 @@
-//! Two-way mutable-state sync: drive/charge tags, charge cost
-//! overrides, and the per-Pi rate config, with the cloud as rendezvous
-//! and last-writer-wins on timestamps.
-//!
-//! PUSH: drain the local `mutable_dirty` queue (written by every
-//! user-facing tag/cost/rate setter), encrypt each item under its
-//! content key, POST to `/api/pi/sync/mutables`. `not_found` (deleted in
-//! cloud / never uploaded) and `stale` (server newer; the pull will
-//! overwrite us) both clear the dirty row.
-//!
-//! PULL: GET `/api/pi/sync/changes?sinceMs=<cursor>` for web-side writes
-//! scoped to this Pi's uploads, decrypt (the Pi holds piKey), apply via
-//! the `*_from_sync` store setters (no echo loop), advance the cursor in
-//! the drives `meta` table.
-//!
-//! Object deletions never propagate in either direction.
+//! Two-way, last-writer-wins sync for mutable drive and charge state.
+//! Pushes drain `mutable_dirty`; pulls use no-echo setters and advance a cursor.
+//! Object deletions do not propagate.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -115,8 +102,7 @@ struct RouteKeyItem {
     wrapped_route_key: String,
 }
 
-/// One full sync pass: push local dirty mutables, then pull web-side
-/// changes. Either half failing fails the pass (retried on next sweep).
+/// Pushes local changes, then pulls cloud changes; failures retry next sweep.
 pub async fn run_once(state: Arc<CloudStateInner>) -> Result<()> {
     let creds_snapshot = {
         let g = state.creds.lock().await;
@@ -178,28 +164,24 @@ async fn push_dirty(
     let charge_uploads = store.charge_uploads_map()?;
 
     let mut items: Vec<PushItem> = Vec::new();
-    // routeId → (dirty kind, dirty key, changed_at) so per-route acks can
-    // resolve which dirty drive row they belong to. A drive's dirty row
-    // clears only when every member route acked.
+    // Resolve per-route acknowledgements to dirty drives; clear only after all members.
     let mut route_owner: HashMap<String, (String, i64)> = HashMap::new();
     let mut drive_pending_routes: HashMap<String, usize> = HashMap::new();
-    // Non-drive items resolve 1:1 — remember (kind, key, changed_at) by id.
+    // Non-drive items resolve one-to-one by ID.
     let mut direct_owner: HashMap<(String, String), (String, String, i64)> = HashMap::new();
 
     for (kind, key, changed_at) in &dirty {
         match kind.as_str() {
             "drive" => {
                 let Some(files) = by_key.get(key) else {
-                    // Drive no longer exists locally (deleted/regrouped):
-                    // nothing to push, drop the dirty row.
+                    // Drop dirty state for deleted or regrouped drives.
                     let _ = store.clear_mutable_dirty(kind, key, *changed_at);
                     continue;
                 };
                 let tags = store.get_drive_tags(key).unwrap_or_default();
                 let file_refs: Vec<&str> = files.iter().map(|s| s.as_str()).collect();
                 let infos = store.route_sync_info_for_files(&file_refs)?;
-                // Backfill wrapped keys for member routes uploaded before
-                // the cache column existed.
+                // Backfill wrapped keys missing from the local cache.
                 let missing: Vec<String> = files
                     .iter()
                     .filter_map(|f| match infos.get(f) {
@@ -219,9 +201,7 @@ async fn push_dirty(
                         continue;
                     };
                     if !uploaded {
-                        // Not in the cloud yet. Route uploads don't carry
-                        // tags, so the dirty row survives (see below) and
-                        // the first sync pass after the upload pushes them.
+                        // Preserve tags until the route has uploaded.
                         continue;
                     }
                     let wrapped_b64 = match cached_key.clone().or_else(|| fetched.get(rid).cloned())
@@ -260,10 +240,7 @@ async fn push_dirty(
                     pushed_any = true;
                 }
                 if !pushed_any {
-                    // Every member route is still un-uploaded (or unknown).
-                    // Keep the dirty row if any member might upload later;
-                    // drop it when no member is upload-eligible at all
-                    // (e.g. a Tessie-only drive — never uploaded).
+                    // Keep state if any member may upload; otherwise discard it.
                     let any_eligible = files.iter().any(|f| matches!(infos.get(f), Some((_, _, false))));
                     if !any_eligible {
                         let _ = store.clear_mutable_dirty("drive", key, *changed_at);
@@ -276,13 +253,11 @@ async fn push_dirty(
                     continue;
                 };
                 let Some((charge_id, wrapped_b64, uploaded_at)) = charge_uploads.get(&ts) else {
-                    // Session not uploaded yet — the upload payload will
-                    // carry this state; keep the dirty row until then
-                    // (charges.rs clears it on stored/duplicate).
+                    // Preserve state until the session upload carries it.
                     continue;
                 };
                 if *uploaded_at < 0 {
-                    // Permanently skipped session — nothing to sync to.
+                    // Permanently skipped sessions have no cloud target.
                     let _ = store.clear_mutable_dirty(kind, key, *changed_at);
                     continue;
                 }
@@ -381,11 +356,7 @@ async fn push_dirty(
         let parsed: PushResponse = resp.json().await.context("parse sync push response")?;
 
         for r in &parsed.results {
-            // applied / stale / not_found / rejected_too_large all clear
-            // the dirty row: applied means the cloud has it, stale means
-            // the cloud is newer (the pull will bring it down), not_found
-            // means there's nothing to sync to, and rejected_too_large
-            // will never succeed on retry.
+            // Every terminal result clears dirty state; stale values return on pull.
             let done = matches!(
                 r.status.as_str(),
                 "applied" | "stale" | "not_found" | "rejected_too_large"
@@ -413,8 +384,7 @@ async fn push_dirty(
     Ok(())
 }
 
-/// Backfill wrappedRouteKeys for routes uploaded before the local cache
-/// column existed. Caches every fetched key.
+/// Fetches and caches missing wrapped route keys.
 async fn fetch_route_keys(
     state: &Arc<CloudStateInner>,
     client: &CloudClient,
@@ -436,7 +406,6 @@ async fn fetch_route_keys(
             .map_err(|e| anyhow!("route-keys rejected: {}", e))?;
         let parsed: RouteKeysResponse = resp.json().await.context("parse route-keys response")?;
         for item in parsed.items {
-            // Cache for next time.
             if let Ok(Some((file, _))) =
                 state.store.route_sync_info_by_cloud_id(&item.route_id)
             {
@@ -459,9 +428,7 @@ async fn pull_changes(
 ) -> Result<()> {
     let store = state.store.clone();
 
-    // Local dirty rows newer than an incoming change win locally — the
-    // push (this pass or the next) carries them up; LWW resolves on the
-    // server side.
+    // Newer local dirty rows win and are pushed under server-side LWW.
     let dirty: HashMap<(String, String), i64> = store
         .dirty_mutables()
         .unwrap_or_default()
@@ -575,13 +542,8 @@ async fn pull_changes(
                         }
                     }
                 };
-                // "Home" is a reserved, derived tag — strip any casing pulled from
-                // the cloud so a synced envelope can't reintroduce it as a stored tag.
-                // Reserved tags are DERIVED on read and must never be stored.
-                // The local write handler already enforces this; a tag arriving
-                // from the cloud has to clear the same bar, or a peer running an
-                // older build could reintroduce one as a real stored tag. Uses
-                // the shared vocabulary so this can't drift from the API's copy.
+                // Reserved tags are derived on read and must never be stored,
+                // including values synced from older peers.
                 let synced_tags: Vec<String> =
                     sentryusb_drives::charging::strip_reserved_tags(mutable.tags.clone());
                 if let Err(e) = store.set_charge_tags_from_sync(session_ts, &synced_tags) {

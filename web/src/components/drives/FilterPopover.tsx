@@ -12,10 +12,7 @@ interface FilterPopoverProps {
   drives: DriveSummary[]
   filters: DrivesFilters
   onChange: (f: DrivesFilters) => void
-  // True when the user's DRIVE_MAP_UNIT preference is "km". Controls
-  // whether the Minimum-distance input renders/accepts km or mi.
-  // DrivesFilters.minDistanceMi is always stored in MILES — the popover
-  // converts at the edge so the URL and the filter logic stay on one unit.
+  // Filters store miles and convert only at the input boundary.
   metric: boolean
 }
 
@@ -51,10 +48,7 @@ export function FilterPopover({ drives, filters, onChange, metric }: FilterPopov
   const activeCount =
     (filters.tag ? 1 : 0) + (filters.minDistanceMi !== undefined ? 1 : 0)
 
-  // Display value for the distance input: convert stored mi → km when
-  // the user prefers metric, and round to 1 decimal so the round-trip
-  // (10 km → 6.21371 mi → 10.0 km display) doesn't print floating-point
-  // ugliness in the input box.
+  // Round converted values to suppress floating-point artifacts in the input.
   const distanceDisplay =
     draft.minDistanceMi === undefined
       ? undefined

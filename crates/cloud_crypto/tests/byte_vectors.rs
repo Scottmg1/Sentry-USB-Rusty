@@ -1,7 +1,4 @@
-//! Byte-for-byte parity test against the server-side reference implementation.
-//!
-//! If the vectors in `aad-vectors.json` ever drift from the server, the
-//! protocol is broken — every packet will fail AEAD verification.
+//! Byte-for-byte protocol parity with the server-side reference vectors.
 
 use serde::Deserialize;
 use sentryusb_cloud_crypto::aad;

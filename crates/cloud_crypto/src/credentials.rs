@@ -89,12 +89,8 @@ pub fn save_atomic(path: &str, creds: &CloudCredentialsV1) -> Result<(), Credent
 
     fs::rename(&tmp_path, &final_path)?;
 
-    // Without this, the rename can be lost on a sudden power loss within
-    // seconds of pairing (SD cards on Pi Zero 2 W are the realistic case):
-    // the file body is fsynced but the directory entry update sits in the
-    // write-back cache. Best-effort: a fsync failure here doesn't undo
-    // the save we just did, and some filesystems (FUSE, 9p) don't support
-    // directory fsync at all — log and continue rather than fail the save.
+    // Persist the rename across sudden power loss. Directory fsync is
+    // best-effort because some filesystems do not support it.
     #[cfg(unix)]
     if let Some(parent) = final_path.parent() {
         let parent = if parent.as_os_str().is_empty() {
@@ -386,11 +382,7 @@ mod tests {
 
     #[test]
     fn save_atomic_survives_concurrent_no_op_dir_fsync() {
-        // Smoke test for the parent-dir fsync branch: save_atomic must
-        // succeed and produce a loadable file. The fsync itself is a
-        // durability hint and not directly observable from userspace, so
-        // we just confirm we didn't accidentally make save_atomic fail
-        // on a normal filesystem.
+        // Directory fsync is not directly observable; verify the result loads.
         let dir = std::env::temp_dir().join(format!("scc-fsync-test-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
         let path = dir.join("creds.json");
@@ -412,8 +404,7 @@ mod tests {
 
         let p_str = path.to_str().unwrap();
         save_atomic(p_str, &creds).expect("save_atomic should succeed on tempdir");
-        // Repeat to confirm overwrite path still works (tmpfile + rename
-        // dance happens twice).
+        // Exercise the overwrite path.
         save_atomic(p_str, &creds).expect("second save_atomic should succeed");
         let loaded = load(p_str).expect("load must round-trip");
         assert_eq!(loaded.user_id, "u");

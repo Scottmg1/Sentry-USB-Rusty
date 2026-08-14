@@ -1,13 +1,7 @@
 name: web-checks
 
-# Build & Release only runs on version tags, pull requests and manual
-# dispatch, so anything pushed straight to main skips the web lint gate until
-# someone cuts a release. This workflow closes that gap cheaply: same checks
-# as the `lint-web` job there, but scoped to web/** so it costs ~40s and skips
-# entirely when a push doesn't touch the frontend.
-#
-# Pull requests are deliberately NOT included — Build & Release already lints
-# them, and running both would just double the work on every PR.
+# Run the release workflow's web checks for direct frontend pushes. PRs already
+# receive the same checks from build.yml.
 
 on:
   push:
@@ -29,16 +23,13 @@ jobs:
           cache: npm
           cache-dependency-path: web/package-lock.json
       - name: Lint
-        # Keep this budget in step with the `lint-web` job in build.yml —
-        # only ratchet it DOWN (see eslint.config.js).
+        # Match build.yml and do not increase eslint.config.js's warning budget.
         run: |
           cd web
           npm ci
           npx eslint . --max-warnings 30
       - name: Production build
-        # Unconditional here: this workflow only fires on direct pushes to
-        # main touching web/**, which is exactly the path where nothing
-        # else compiles the bundle until someone cuts a release.
+        # Direct pushes otherwise receive no production bundle check.
         run: |
           cd web
           npm run build
@@ -47,11 +38,7 @@ jobs:
             exit 1
           fi
       - name: Icons up to date
-        # src/components/icons.tsx is generated from scripts/icons/symbols.mjs.
-        # Hand-editing it silently drifts from the Material Symbols source (a
-        # glyph pasted from a different optical size renders unlike the rest of
-        # the set), so re-generate and fail if the committed file differs.
-        # Downloads the glyphs from jsDelivr, so this step needs network.
+        # Verify generated icons against symbols.mjs; generation uses jsDelivr.
         run: |
           cd web
           npm run icons -- --check

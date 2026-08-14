@@ -27,14 +27,11 @@ const STR_PI_LOCAL_X25519: &[u8] = b"sentrycloud-pi-local-x25519-v1";
 
 const STR_REKEY: &[u8] = b"sentrycloud-rekey-v2";
 
-// Route tag/summary slots. The Sentry Cloud web client builds the same
-// AADs — the two implementations must match byte-for-byte. Same
-// routeKey as the route blob, distinct domain string per slot so
-// ciphertexts can't be replayed across slots.
+// Must match the web client byte-for-byte. Each slot has a distinct domain
+// string to prevent cross-slot ciphertext replay.
 const STR_ROUTE_TAGS: &[u8] = b"sentrycloud-route-tags-v1";
 const STR_ROUTE_SUMMARY: &[u8] = b"sentrycloud-route-summary-v1";
 
-// Charge sessions.
 const STR_CHARGE: &[u8] = b"sentrycloud-charge-v1";
 const STR_CHARGEKEY: &[u8] = b"sentrycloud-chargekey-v1";
 const STR_CHARGE_SUMMARY: &[u8] = b"sentrycloud-charge-summary-v1";

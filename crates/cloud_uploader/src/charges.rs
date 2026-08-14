@@ -1,12 +1,5 @@
-//! Charge-session upload sweep.
-//!
-//! Mirrors the route sweep in `uploader.rs`: derive completed sessions
-//! from `telemetry_samples` (shared logic in `sentryusb_drives::charging`
-//! — identity and grouping MUST match the local /api/charging view),
-//! encrypt each one under a fresh chargeKey, and batch-POST to
-//! `/api/pi/charges`. Only sessions that ended at least
-//! `SESSION_GAP_SECS` ago are eligible — grouping is final then, so the
-//! immutable blob never needs re-cutting.
+//! Uploads completed charge sessions derived with the same grouping rules as
+//! the local charging API. Open sessions remain local until grouping is final.
 
 use std::sync::Arc;
 
@@ -26,15 +19,12 @@ use crate::credentials_store::UnlockedCreds;
 use crate::encrypt::{self, ChargeMutable, CostOverride};
 use crate::state::{now_ms, CloudStateInner};
 
-/// Curve points per uploaded session. Charge curves don't need full
-/// sample density; downsampling bounds the blob size and keeps the
-/// cloud detail view fast to open.
+/// Maximum downsampled curve points per uploaded session.
 const MAX_BLOB_POINTS: usize = 200;
 
 const BATCH_LIMIT: usize = 32;
 
-/// `charge_uploads.uploaded_at` sentinel for permanently-skipped
-/// sessions (rejected_too_large), mirroring db_ext's route sentinel.
+/// `uploaded_at` sentinel for sessions rejected as too large.
 pub const PERMANENT_SKIP_SENTINEL: i64 = -1;
 
 #[derive(Serialize)]
@@ -80,7 +70,6 @@ mod tests {
             .collect()
     }
 
-    /// Long finished — outside the gap window.
     fn old(start: i64) -> Vec<ChargeRow> {
         session(start, 3)
     }
@@ -98,15 +87,13 @@ mod tests {
     #[test]
     fn holds_at_the_oldest_unsent_session() {
         let sessions = vec![old(1_000), old(50_000), old(100_000)];
-        // The middle one failed to upload; the cursor must not pass it.
+        // The cursor must not pass a failed upload.
         assert_eq!(
             sweep_frontier(&sessions, NOW, |ts| ts != 50_000),
             Some(50_000)
         );
     }
 
-    /// A session still inside the gap window may still grow, so its rows
-    /// must stay in scope.
     #[test]
     fn holds_at_a_still_open_session() {
         let mut sessions = vec![old(1_000)];
@@ -119,8 +106,6 @@ mod tests {
         assert_eq!(sweep_frontier(&[], NOW, |_| true), None);
     }
 
-    /// The frontier is a session START, never a row inside one — session
-    /// identity is that timestamp.
     #[test]
     fn frontier_is_always_a_session_start() {
         let sessions = vec![old(1_000), old(50_000)];
@@ -129,10 +114,7 @@ mod tests {
     }
 }
 
-/// Where the next sweep may start: the oldest session that is still open
-/// or still unsent, so a transient upload failure is retried rather than
-/// skipped. Falls back to the newest session's start once everything is
-/// settled. Always a session's FIRST ts — never a point inside one.
+/// Returns the oldest open or unsent session start, or the newest start when settled.
 fn sweep_frontier(
     sessions: &[Vec<charging::ChargeRow>],
     now_secs: i64,
@@ -167,19 +149,14 @@ pub async fn sweep_once(state: Arc<CloudStateInner>) -> Result<u32> {
         UnlockedCreds::unlock_with_serial(&creds_snapshot, &serial)
     })?;
 
-    // Derive eligible sessions. Sessions still inside the gap window may
-    // yet grow — skip them; the safety timer re-sweeps soon enough.
-    // The full charge-row scan + grouping is sync DB/CPU work — blocking
-    // pool, so the 10-minute safety sweep can't stall the reactor.
+    // Derivation is synchronous DB/CPU work; keep it off the async runtime.
     let store = state.store.clone();
     let pending = {
         let store = store.clone();
         tokio::task::spawn_blocking(move || -> Result<_> {
             let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
-            // Raw cursor string doubles as a CAS token: an import deletes
-            // the key mid-sweep, and overwriting that deletion with a
-            // stale frontier would hide restored history until the next
-            // daily full scan.
+            // The raw cursor is a CAS token so imports cannot be overwritten
+            // with a stale frontier mid-sweep.
             let (from, full_scan, cursor_token) = store.with_read_conn(|conn| -> Result<_> {
                 let token = schema::meta_get(conn, CHARGE_SWEEP_CURSOR_KEY)?;
                 if schema::meta_get(conn, CHARGE_SWEEP_FULL_DATE_KEY)?.as_deref()
@@ -194,8 +171,7 @@ pub async fn sweep_once(state: Arc<CloudStateInner>) -> Result<u32> {
                 Ok((cursor, false, token))
             })?;
 
-            // Sessions in scope all start at or after `from`, so uploads
-            // before it can never be consulted.
+            // Uploads before `from` cannot match sessions in scope.
             let uploads = store
                 .charge_uploads_map_since(from)
                 .context("charge_uploads_map")?;
@@ -205,9 +181,7 @@ pub async fn sweep_once(state: Arc<CloudStateInner>) -> Result<u32> {
             let now_secs = now_ms() / 1000;
             let sessions = charging::group_sessions(rows);
 
-            // `>` not `>=`, matching group_sessions' `<=` continuation:
-            // at exactly the gap a straggler row still joins the session,
-            // so calling it closed there could upload one about to grow.
+            // `>` matches `group_sessions` continuation at the exact gap.
             let closed = |s: &Vec<charging::ChargeRow>| {
                 s.last().is_some_and(|l| now_secs - l.ts > SESSION_GAP_SECS)
             };
@@ -215,13 +189,11 @@ pub async fn sweep_once(state: Arc<CloudStateInner>) -> Result<u32> {
                 s.first().is_some_and(|f| uploads.contains_key(&f.ts))
             };
 
-            // Computed BEFORE the uploads below, so it can only ever be
-            // too conservative.
+            // Compute before uploads so the frontier remains conservative.
             let frontier = sweep_frontier(&sessions, now_secs, |ts| uploads.contains_key(&ts));
             store.with_locked_conn(|conn| -> Result<()> {
                 if schema::meta_get(conn, CHARGE_SWEEP_CURSOR_KEY)? != cursor_token {
-                    // Import raced us; keep its reset. FULL_DATE stays
-                    // unstamped too, so the next sweep rescans from 0.
+                    // Preserve an import's reset and force the next full rescan.
                     return Ok(());
                 }
                 if let Some(ts) = frontier {
@@ -233,10 +205,8 @@ pub async fn sweep_once(state: Arc<CloudStateInner>) -> Result<u32> {
                 Ok(())
             })?;
 
-            // Delete-outbox exclusion is a POST gate only — it must
-            // NOT feed sweep_frontier's handled predicate above, or the
-            // cursor could advance past a re-imported session until the
-            // daily full scan.
+            // Outbox exclusion is only a POST gate; treating it as settled could
+            // advance past a re-imported session.
             let outboxed: std::collections::HashSet<i64> = store
                 .charge_delete_outbox_all()
                 .context("charge delete outbox")?
@@ -277,8 +247,7 @@ pub async fn sweep_once(state: Arc<CloudStateInner>) -> Result<u32> {
                     cost_map.insert(id, cost);
                 }
             }
-            // Cleared on stored/duplicate so the sync push doesn't re-send
-            // the same state.
+            // Clear after stored/duplicate to avoid redundant mutable sync.
             let dirty: std::collections::HashMap<String, i64> = store
                 .dirty_mutables()
                 .unwrap_or_default()
@@ -364,8 +333,7 @@ pub async fn sweep_once(state: Arc<CloudStateInner>) -> Result<u32> {
         if status.as_u16() == 409 {
             let body_text = resp.text().await.unwrap_or_default();
             if body_text.contains("pi_key_stale") {
-                // The route sweep owns the rekey-poll flow; just bail and
-                // let the next sweep (post-rekey) retry charges.
+                // The route sweep owns rekey polling; retry charges afterward.
                 return Err(anyhow!("pi_key_stale; awaiting rekey"));
             }
             return Err(anyhow!("charge upload: HTTP 409 body={}", body_text));
@@ -388,11 +356,8 @@ pub async fn sweep_once(state: Arc<CloudStateInner>) -> Result<u32> {
                     if result.status == "stored" {
                         total_stored += 1;
                     }
-                    // A local delete may have queued this session after
-                    // prep. charge_upload_mark itself refuses outboxed
-                    // sessions atomically; this check just also skips the
-                    // dirty-clear below (bulk_delete already dropped the
-                    // row) and fails CLOSED on a read error.
+                    // A delete may race preparation. The mark is atomic; this
+                    // check also prevents clearing dirty state and fails closed.
                     if store.charge_delete_outbox_contains(*session_ts).unwrap_or(true) {
                         continue;
                     }
@@ -404,8 +369,7 @@ pub async fn sweep_once(state: Arc<CloudStateInner>) -> Result<u32> {
                     ) {
                         warn!("charge_upload_mark failed for {}: {}", session_ts, e);
                     }
-                    // The payload carried the latest local mutable state;
-                    // matching dirty rows are now redundant.
+                    // The upload included the latest mutable state.
                     if let Some(at) = dirty.get(&session_ts.to_string()) {
                         let _ = store.clear_mutable_dirty("charge", &session_ts.to_string(), *at);
                     }
@@ -434,8 +398,7 @@ pub async fn sweep_once(state: Arc<CloudStateInner>) -> Result<u32> {
             );
         }
         if consent_required {
-            // Sessions stay queued; the user must accept the v2 consent
-            // text in the web UI. Surfaced via /api/cloud/status.
+            // Keep sessions queued until v2 consent is accepted.
             *state.last_upload_error.lock().await = Some("charge_consent_required".to_string());
             info!("charge upload: consent_required; pausing charge sweep");
             break;

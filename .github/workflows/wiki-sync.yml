@@ -1,12 +1,6 @@
 name: Sync wiki
 
-# Pushes the contents of `wiki/` (in main) to the repo's GitHub wiki
-# (Sentry-USB-Rusty.wiki.git). Runs on any push to main that touches
-# `wiki/`, plus a manual trigger from the Actions tab.
-#
-# The wiki must already exist on GitHub — visit the Wiki tab once and
-# create any first page so the wiki repo gets initialized; after that
-# this action handles everything.
+# Sync wiki/ to the initialized GitHub Wiki on relevant main pushes or manually.
 
 on:
   push:

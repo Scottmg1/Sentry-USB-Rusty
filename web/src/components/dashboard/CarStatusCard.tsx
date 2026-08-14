@@ -31,21 +31,17 @@ import {
   type BleHealth,
 } from "@/lib/bleHealth"
 
-// Lazy-load the chart only when the user expands the Tires chip —
-// recharts (380 KB) stays out of the dashboard's initial bundle for
-// users who only glance at the summary.
+// Keep Recharts out of the initial bundle until tire history is expanded.
 const TirePressureCard = lazy(() =>
   import("./TirePressureCard").then((m) => ({ default: m.TirePressureCard })),
 )
 
 export interface CarStatusSample {
   ts: number | null
-  // Age of the envelope (most recent state poll), in seconds.
+  // Age of the latest state envelope.
   seconds_ago?: number | null
-  // Live gear: "Park" / "Drive" / "Reverse" / "Neutral" / "Unknown".
   shift_state?: string | null
-  // Age of the gate snapshot that supplied shift_state. It is independent
-  // of seconds_ago, which belongs to the latest database sample.
+  // Gear freshness is independent from the latest database sample.
   shift_state_seconds_ago?: number | null
   battery_pct?: number | null
   interior_temp_c?: number | null
@@ -54,10 +50,7 @@ export interface CarStatusSample {
   tire_fr_psi?: number | null
   tire_rl_psi?: number | null
   tire_rr_psi?: number | null
-  // Per-field age (seconds) of the shown value. A field can be far older
-  // than `seconds_ago` when its poll has been failing while other polls
-  // keep the envelope fresh — that's what made a stale temp read as
-  // "updated 10s ago". Surfaced so the chip can flag it.
+  // Field ages can exceed the envelope age when one poll source fails.
   field_secs_ago?: {
     battery_pct?: number | null
     interior_temp_c?: number | null
@@ -68,26 +61,17 @@ export interface CarStatusSample {
 
 interface CarStatusCardProps {
   sample: CarStatusSample | null
-  // Shared backend health keeps the dashboard aligned with Settings.
-  // A rejected key is red; sleep, contention, and stale data are yellow.
+  // Auth failures are errors; sleep, contention, and stale data are warnings.
   bleHealth?: BleHealth | null
-  // ISO end-time of the most recent drive — used to derive
-  // "Parked Xh Ym". When the value is null the duration row is
-  // hidden (no drives recorded yet).
+  // End of the latest drive, used as the parked-since timestamp.
   latestDriveEnd: string | null
-  // Tire history for the expandable chart. Pass undefined to hide
-  // the Tires chip's expand affordance entirely (e.g. no telemetry).
+  // Undefined tire history hides the expand affordance.
   tireHistory?: TireHistoryResponse
   useFahrenheit: boolean
-  // Distance unit for the battery drop-down's range row (true = km).
   metric: boolean
-  // Live charge status. When the car is charging the Battery chip turns
-  // green and pulses; expanding it shows range, time-to-full and power.
-  // null/undefined hides the chip's expand affordance.
+  // Null charge status hides the battery expand affordance.
   currentCharge?: CurrentCharge | null
-  // Name of the currently-active lock-chime sound, if the feature
-  // is configured. null/undefined hides the indicator entirely so
-  // users who don't use lock chimes don't see a confusing chip.
+  // Null hides the lock-chime indicator.
   lockChimeName?: string | null
 }
 
@@ -108,8 +92,7 @@ function deriveTireStatus(sample: CarStatusSample | null): TireStatus {
   if (values.length === 0) {
     return { kind: "none", label: "—", color: "text-slate-500" }
   }
-  // Mirrors the zone thresholds the chart uses: optimal 36–45,
-  // warning bands 28–36 and 45–50, unsafe outside that.
+  // Keep these thresholds aligned with TirePressureCard.
   const anyUnsafe = values.some((v) => v < 28 || v > 50)
   if (anyUnsafe) {
     return { kind: "unsafe", label: "Unsafe", color: "text-rose-400" }
@@ -138,13 +121,9 @@ function formatTemp(c: number | null | undefined, useFahrenheit: boolean): strin
   return `${Math.round(value)}${unit}`
 }
 
-// A shown value older than this is flagged as stale next to the chip, so
-// a last-known reading (car asleep, or a field's poll failing while the
-// envelope stays fresh) can't masquerade as current. 10 min is well past
-// the ~15-30s active poll cadence, so live values are never flagged.
+// Ten minutes is safely beyond the active 15–30 second poll cadence.
 const STALE_AFTER_SECS = 600
 
-// Compact relative age ("4m", "2h", "3d") for a stale-value hint.
 function formatAge(secs: number): string {
   if (secs < 90) return `${Math.max(1, Math.round(secs))}s`
   const m = Math.round(secs / 60)
@@ -154,22 +133,12 @@ function formatAge(secs: number): string {
   return `${Math.round(h / 24)}d`
 }
 
-// Returns "· 2h ago" when the field is older than the threshold, else null.
 function staleHint(secs: number | null | undefined): string | null {
   if (secs == null || secs < STALE_AFTER_SECS) return null
   return `${formatAge(secs)} ago`
 }
 
-/**
- * Top-of-dashboard car-status overview. Replaces the old
- * stand-alone tire-pressure card with a single tile that shows the
- * last-known summary (parked duration, battery, cabin/ambient
- * temps, tire-health verdict) and reveals the tire-pressure history
- * chart inline when the user clicks the Tires chip.
- *
- * The chart bundle is lazy-loaded — clicking Tires is what pulls it
- * in, so users who never expand it pay zero recharts cost.
- */
+/** Dashboard vehicle summary with lazily expanded tire history. */
 export function CarStatusCard({
   sample,
   bleHealth,
@@ -182,17 +151,14 @@ export function CarStatusCard({
 }: CarStatusCardProps) {
   const [tiresOpen, setTiresOpen] = useState(false)
   const [batteryOpen, setBatteryOpen] = useState(false)
-  // Now tick — drives the parked-duration counter forward without
-  // Fifteen-second cadence also expires vehicle controls promptly when
-  // the browser cannot reach the Pi. Date.now() stays outside render.
+  // A 15-second tick advances parked time and expires stale controls.
   const [nowMs, setNowMs] = useState(() => Date.now())
   useEffect(() => {
     const id = setInterval(() => setNowMs(Date.now()), 15_000)
     return () => clearInterval(id)
   }, [])
 
-  // Live gear decides Parked vs Driving. Gate on freshness so a stale
-  // Drive sample from before the car slept doesn't read "Driving".
+  // Ignore stale gear snapshots when deriving parked versus driving.
   const freshShiftState = freshVehicleShiftState(
     sample?.shift_state,
     sample?.shift_state_seconds_ago,
@@ -206,8 +172,7 @@ export function CarStatusCard({
     sample?.seconds_ago ?? null,
   )
   const showHealthWarning = healthPresentation.severity !== "green"
-  // A persisted charge phase may outlive the Pi's connection to the car.
-  // Only present it as live charging while authenticated BLE health is green.
+  // A persisted charge phase is live only while BLE health is authenticated.
   const charging =
     healthPresentation.severity === "green" && !!currentCharge?.charging
   const showChargingControls = shouldShowChargingControls(
@@ -232,9 +197,7 @@ export function CarStatusCard({
       ? "text-amber-300"
       : "text-slate-100"
 
-  // Derived parked duration. We treat "latest drive ended in the
-  // past" as the parked-since timestamp; if there's no recorded
-  // drive yet we just show the state badge without a duration.
+  // Omit parked duration until a completed drive supplies its start point.
   const parkedDuration = useMemo(() => {
     if (isDriving) return null
     if (!latestDriveEnd) return null
@@ -249,7 +212,7 @@ export function CarStatusCard({
   const haveTireData =
     !!tireHistory && tireHistory.points.length > 0 && tireStatus.kind !== "none"
 
-  // Prefer the live charge SoC over the last BLE sample's battery_pct.
+  // Prefer live charging SoC to the last sampled battery value.
   const batterySoc = currentCharge?.soc ?? sample?.battery_pct
   const haveChargeDetail =
     currentCharge != null &&
@@ -259,14 +222,7 @@ export function CarStatusCard({
 
   return (
     <div className="glass-card relative p-4">
-      {/* Lock-chime chip pinned to the card's actual top-right
-          corner via absolute positioning, so it sits in the corner
-          regardless of the Parked row's height. Only renders when
-          a chime is active so users without the feature don't see
-          an empty placeholder. Click → /community?view=chimes
-          which lands directly on the lock-chime tab inside
-          Community (the LockChime page is mounted as a sub-view
-          of Community, not its own route). */}
+      {/* Lock chimes open their Community sub-view. */}
       {lockChimeName && (
         <Link
           to="/community?view=chimes"
@@ -279,9 +235,7 @@ export function CarStatusCard({
         </Link>
       )}
 
-      {/* Top row — car state + duration. Right padding reserves room
-          for the absolutely-positioned chime chip when present so
-          long durations / labels can't slide under it. */}
+      {/* Right padding reserves space for the optional chime chip. */}
       <div className={"flex items-center gap-3 " + (lockChimeName ? "pr-32 sm:pr-48" : "")}>
         <span className={`tile-icon ${statusHalo}`}>
           {showHealthWarning ? (
@@ -310,7 +264,6 @@ export function CarStatusCard({
         </div>
       </div>
 
-      {/* Chip row — battery / interior / exterior / tires */}
       <div className="mt-4 flex flex-wrap items-stretch gap-3">
         <StatusChip
           icon={
@@ -325,8 +278,7 @@ export function CarStatusCard({
           accent={charging}
           valueClass={charging ? "text-emerald-300" : undefined}
           onClick={haveChargeDetail ? () => setBatteryOpen((o) => !o) : undefined}
-          // Live charge SoC (currentCharge) is always fresh; only the
-          // last-BLE-sample battery_pct can be stale.
+          // Only the fallback BLE battery sample can be stale.
           stale={
             currentCharge?.soc != null
               ? null
@@ -377,8 +329,6 @@ export function CarStatusCard({
         />
       </div>
 
-      {/* Battery drop-down — range / time-to-full / power, shown when the
-          chip is expanded. Only the range row appears when idle. */}
       {batteryOpen && haveChargeDetail && currentCharge && (
         <div className="mt-4 border-t border-white/[0.06] pt-4">
           <div className="grid grid-cols-2 gap-3 sm:grid-cols-3">
@@ -433,8 +383,6 @@ export function CarStatusCard({
         </div>
       )}
 
-      {/* Expandable chart — only mounts when the user clicks Tires.
-          Lazy-loaded so users who don't expand never pull recharts. */}
       {tiresOpen && haveTireData && tireHistory && (
         <div className="mt-4 border-t border-white/[0.06] pt-4">
           <div className="mb-2 text-[11px] uppercase tracking-wider text-slate-500">
@@ -607,13 +555,10 @@ interface StatusChipProps {
   label: string
   value: string
   valueClass?: string
-  // Green-tinted chip + icon ring, used for the charging state.
   accent?: boolean
   onClick?: () => void
   trailing?: React.ReactNode
-  // When set (e.g. "2h ago"), the value is older than it looks: render a
-  // muted age suffix and dim the value so a stale reading isn't mistaken
-  // for a live one.
+  // Dim stale values and show their age.
   stale?: string | null
 }
 

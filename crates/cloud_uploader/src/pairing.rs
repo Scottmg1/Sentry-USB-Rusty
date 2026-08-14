@@ -219,8 +219,7 @@ pub fn pi_metadata() -> serde_json::Value {
         })
         .unwrap_or_else(|| "sentryusb".to_string());
 
-    // /proc/sys/kernel/osrelease is the same string `uname -r` prints,
-    // kernel-resident, no subprocess fork.
+    // Avoid a subprocess; this is the value returned by `uname -r`.
     let kernel = std::fs::read_to_string("/proc/sys/kernel/osrelease")
         .map(|s| s.trim().to_string())
         .unwrap_or_default();

@@ -10,23 +10,18 @@ interface Props {
   onChange?: (enabled: boolean) => void
 }
 
-/** "58 min" / "4 min" / "45 sec" — for showing snapshot cadences. */
+/** Compact snapshot cadence. */
 function fmtInterval(sec: number): string {
   if (sec < 90) return `${Math.round(sec)} sec`
   return `${Math.round(sec / 60)} min`
 }
 
-/**
- * Hidden "secret menu" reached by tapping the Away Mode card icon 5×.
- * Toggles Travel Mode — persisted flags the archive loop reads to keep the
- * USB drive connected to the car while archiving on the road, plus an
- * optional half-interval snapshot cadence for long trips.
- */
+/** Hidden Travel Mode controls for connected, on-road archiving. */
 export function TravelModeDialog({ onClose, onChange }: Props) {
   const [enabled, setEnabled] = useState(false)
   const [halfSnapshots, setHalfSnapshots] = useState(false)
   const [fastRetry, setFastRetry] = useState(false)
-  // Matches archiveloop's ${SNAPSHOT_INTERVAL:-3480} until status loads.
+  // Matches the archive-loop default until status loads.
   const [intervalSec, setIntervalSec] = useState(3480)
   const [loading, setLoading] = useState(true)
   const [saving, setSaving] = useState(false)
@@ -52,10 +47,7 @@ export function TravelModeDialog({ onClose, onChange }: Props) {
     }
   }, [])
 
-  // Poll archive status while the dialog is open and block toggling during an
-  // active archive: flipping Travel Mode mid-cycle would desync the keep-awake
-  // start/stop pair for the in-flight cycle. The signal is archiveloop's
-  // /tmp/archive_status.json, surfaced as DriveStatus.archiving (is_archiving()).
+  // Do not change travel flags mid-archive; that would desynchronize keep-awake.
   useEffect(() => {
     let cancelled = false
     const check = () =>
@@ -74,15 +66,15 @@ export function TravelModeDialog({ onClose, onChange }: Props) {
   }, [])
 
   async function toggle(next: boolean) {
-    if (archiving) return // toggle is also disabled in the UI; belt-and-suspenders
+    if (archiving) return
     setSaving(true)
-    setEnabled(next) // optimistic
+    setEnabled(next)
     try {
       const r = await api.setTravelMode(next)
       setEnabled(r.enabled)
       onChange?.(r.enabled)
     } catch {
-      setEnabled(!next) // revert on failure
+      setEnabled(!next)
     } finally {
       setSaving(false)
     }
@@ -91,13 +83,13 @@ export function TravelModeDialog({ onClose, onChange }: Props) {
   async function toggleHalf(next: boolean) {
     if (archiving) return
     setSaving(true)
-    setHalfSnapshots(next) // optimistic
+    setHalfSnapshots(next)
     try {
       const r = await api.setTravelMode(enabled, next)
       setHalfSnapshots(r.half_snapshots)
       setIntervalSec(r.snapshot_interval_sec)
     } catch {
-      setHalfSnapshots(!next) // revert on failure
+      setHalfSnapshots(!next)
     } finally {
       setSaving(false)
     }
@@ -106,12 +98,12 @@ export function TravelModeDialog({ onClose, onChange }: Props) {
   async function toggleFastRetry(next: boolean) {
     if (archiving) return
     setSaving(true)
-    setFastRetry(next) // optimistic
+    setFastRetry(next)
     try {
       const r = await api.setTravelMode(enabled, undefined, next)
       setFastRetry(r.fast_retry)
     } catch {
-      setFastRetry(!next) // revert on failure
+      setFastRetry(!next)
     } finally {
       setSaving(false)
     }

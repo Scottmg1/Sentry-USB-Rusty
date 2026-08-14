@@ -2,15 +2,11 @@ import { useEffect, useRef, useState } from "react"
 import L from "leaflet"
 import "leaflet/dist/leaflet.css"
 
-// A charge session is parked, so its map is a single pin at the
-// charger's location — not a route polyline. Mirrors MiniRouteMap's
-// lazy-on-visible, interaction-disabled, dark-tile styling so it sits
-// next to the drive thumbnails consistently. Renders nothing (an empty
-// rounded box) when there are no coordinates.
+// Charge sessions render one non-interactive pin and initialize only when visible.
 const DARK_TILES =
   "https://{s}.basemaps.cartocdn.com/dark_nolabels/{z}/{x}/{y}{r}.png"
 
-const PIN_COLOR = "#34d399" // emerald — matches the charging accent
+const PIN_COLOR = "#34d399"
 
 export function MiniPinMap({
   lat,
@@ -81,8 +77,7 @@ export function MiniPinMap({
     }
   }, [visible, lat, lon, zoom])
 
-  // `isolate` contains Leaflet's pane z-indexes (up to ~700) within this
-  // box so they can't paint over page UI like the tag popover.
+  // Isolate Leaflet pane z-indexes from surrounding page controls.
   return (
     <div
       ref={containerRef}

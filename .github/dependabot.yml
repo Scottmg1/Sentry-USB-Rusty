@@ -1,9 +1,5 @@
-# Dependency monitoring for Sentry-USB-Rusty.
-#
-# Weekly grouped PRs for minor + patch updates to keep noise down.
-# Everything targets main (main-dev is retired). Security advisories
-# fire immediately as separate ungrouped PRs against the default
-# branch.
+# Weekly grouped dependency updates target main; security advisories remain
+# separate and immediate.
 
 version: 2
 

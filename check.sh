@@ -2,10 +2,10 @@
 
 shopt -s globstar nullglob extglob
 
-# print shellcheck version so we know what Github uses
+# Record the ShellCheck version used by CI.
 shellcheck -V
 
-# SC1091 - Don't complain about not being able to find files that don't exist.
+# Runtime-sourced files are absent in the checkout.
 shellcheck --exclude=SC1091 \
            ./setup/pi/setup-sentryusb \
            ./pi-gen-sources/00-sentryusb-tweaks/files/rc.local \

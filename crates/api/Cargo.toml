@@ -22,10 +22,7 @@ regex = "1"
 libc = "0.2"
 tokio-stream = "0.1"
 tokio-util = { version = "0.7", features = ["io"] }
-# Direct SQLite access for the few API handlers that query
-# telemetry_samples (temperature_series, tire_history). The drives
-# crate already brings this transitively; declaring it here is just
-# so we can reference `rusqlite::params!` directly.
+# Direct SQLite access for telemetry sample handlers.
 rusqlite = { version = "0.40", features = ["bundled", "chrono", "blob"] }
 
 sentryusb-config = { path = "../config", package = "sentryusb-config" }
@@ -41,5 +38,5 @@ sentryusb-ble-health = { path = "../ble_health", package = "sentryusb-ble-health
 
 [dev-dependencies]
 tempfile = "3"
-# Only used by tests to read archives back and validate the hand-rolled writer.
+# Test-only ZIP reader for streaming-writer validation.
 zip = { version = "8", default-features = false, features = ["deflate"] }

@@ -3,36 +3,26 @@ import { HomeGeofencePicker } from "../settings/HomeGeofencePicker"
 import { useKeepAccessory } from "../../hooks/useKeepAccessory"
 
 /**
- * Set the home geofence from the Charging tab. Writes the same
- * KEEP_ACCESSORY_HOME_LAT/LON through the same endpoint as Keep Accessory, so
- * the two screens cannot drift. Uses HomeGeofencePicker, not the full
- * KeepAccessoryConfig, to keep the accessory-power switch off this screen.
- *
- * Every edit is drafted, never live: saving re-derives the Home tag on all past
- * charges and drops any Home-rate cost, so nothing is written until the user
- * confirms — and when history is at stake the confirm offers to keep it.
+ * Edits the shared home geofence. Changes stay drafted because saving may
+ * reclassify historical charges and invalidate their home-rate costs.
  */
 export function HomeLocationSection({
   onSaved,
   onDone,
-  /** Pin seed when opened from a specific charge. Also the only way in
-   *  without BLE, since "use current location" needs the car's GPS. */
+  /** Pin supplied by a charge when live BLE coordinates are unavailable. */
   seedLat,
   seedLon,
 }: {
   onSaved?: () => void
-  /** Close the dialog after a successful save. */
   onDone?: () => void
   seedLat?: number | null
   seedLon?: number | null
 }) {
-  // Renamed on destructure: it is a plain async function, but the `use` prefix
-  // makes rules-of-hooks reject calling it from a callback.
+  // Alias the context method so hook lint does not treat it as a hook call.
   const { values, loaded, saveError, useCurrentLocation: fetchCurrentLocation } =
     useKeepAccessory()
 
-  // Pending edits. Null = untouched, so the picker shows the saved geofence
-  // (or the seed when there is no saved one).
+  // Null drafts defer to the saved geofence or charge seed.
   const [draft, setDraft] = useState<{
     lat: number | null
     lon: number | null
@@ -44,9 +34,7 @@ export function HomeLocationSection({
   const [error, setError] = useState<string | null>(null)
   const [gpsAvailable, setGpsAvailable] = useState(false)
 
-  // Charges the current geofence claims — what a move would rewrite. null =
-  // unknown (loading or failed) and is treated as "there may be history", so a
-  // failed probe never waves the user past the warning.
+  // Treat unknown history conservatively so a failed probe cannot bypass confirmation.
   useEffect(() => {
     let alive = true
     fetch("/api/charging/home-sessions")
@@ -62,8 +50,7 @@ export function HomeLocationSection({
     }
   }, [])
 
-  // "Use current location" needs a GPS fix over the Tesla BLE link; without
-  // pairing the button would do nothing, so only offer it when a fix exists.
+  // Current location requires a Tesla BLE GPS fix.
   useEffect(() => {
     let alive = true
     fetch("/api/system/keep-accessory-gps")
@@ -79,9 +66,7 @@ export function HomeLocationSection({
 
   const savedLat = values.homeLat
   const savedLon = values.homeLon
-  // Seed wins: it only arrives when the user pointed at a specific charge, so
-  // showing the existing home instead would break the relocate flow. No seed
-  // (the Home chip) falls back to the saved geofence.
+  // A charge seed takes precedence; otherwise use the saved geofence.
   const baseLat = seedLat ?? savedLat ?? null
   const baseLon = seedLon ?? savedLon ?? null
 
@@ -100,8 +85,7 @@ export function HomeLocationSection({
 
   const risky = moved && (atRisk === null || atRisk > 0)
 
-  /** One request: the server freezes the old set (when asked) before moving
-   *  the geofence, and aborts the move if the freeze fails. */
+  /** The server atomically preserves requested history before moving the geofence. */
   const commit = async (freezeAs: string | null) => {
     if (shownLat == null || shownLon == null) return
     setBusy(true)
@@ -154,7 +138,6 @@ export function HomeLocationSection({
                 radiusM: patch.radiusM ?? d?.radiusM ?? shownRadius,
               }))
             }
-            // Drafted like every other edit.
             onUseCurrentLocation={
               gpsAvailable
                 ? async () => {

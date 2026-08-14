@@ -1,13 +1,5 @@
-//! Charge-deletion outbox drain.
-//!
-//! Local bulk-deletes queue rows in `charge_delete_outbox`; this stage
-//! batch-POSTs them to the cloud's bulk-delete endpoint. It runs AFTER
-//! the charge-upload stage in the serialized sweep so an upload that was
-//! prepared before a mid-sweep local delete gets retired in the same
-//! pass. Terminal acks (`deleted` | `missing`) settle a row; a settled
-//! row rides one more round — a final delete is issued — before removal,
-//! closing the race where an upload the client timed out on commits
-//! server-side after the first ack.
+//! Drains locally queued charge deletions after uploads. Settled rows receive
+//! one final delete before removal to cover late commits from timed-out uploads.
 
 use std::sync::Arc;
 
@@ -70,7 +62,7 @@ pub async fn sweep_once(state: Arc<CloudStateInner>) -> Result<u32> {
     let client =
         CloudClient::new(&creds_snapshot.cloud_base_url).with_bearer(&unlocked.pi_auth_token);
 
-    // charge_id → (session_ts, was_settled) for the ack loop.
+    // charge_id -> (session_ts, was_settled).
     let by_id: std::collections::HashMap<String, (i64, bool)> = rows
         .iter()
         .map(|(ts, id, settled)| (id.clone(), (*ts, *settled)))
@@ -97,8 +89,7 @@ pub async fn sweep_once(state: Arc<CloudStateInner>) -> Result<u32> {
             403 => {
                 let body_text = resp.text().await.unwrap_or_default();
                 if body_text.contains("user_suspended") {
-                    // Rows stay queued; erasure resumes when the account
-                    // does.
+                    // Keep rows queued until the account is reinstated.
                     *state.last_upload_error.lock().await = Some("user_suspended".to_string());
                     return Err(anyhow!("user_suspended; charge deletes paused"));
                 }
@@ -106,8 +97,7 @@ pub async fn sweep_once(state: Arc<CloudStateInner>) -> Result<u32> {
                 state.handle_remote_revoke().await;
                 return Err(anyhow!("auth rejected; pi unpaired"));
             }
-            // Old server without the endpoint — keep everything queued
-            // and retry on later sweeps once the cloud is upgraded.
+            // Keep rows queued when the endpoint is unavailable.
             404 | 405 | 501 => {
                 info!("charge delete: endpoint unavailable (HTTP {}); keeping queue", status);
                 return Ok(0);
@@ -126,8 +116,7 @@ pub async fn sweep_once(state: Arc<CloudStateInner>) -> Result<u32> {
                 continue;
             };
             match result.status.as_str() {
-                // Both are terminal: `missing` covers unknown, foreign,
-                // and already-deleted alike.
+                // `missing` includes unknown, foreign, and already-deleted rows.
                 "deleted" | "missing" => {
                     let res = if *was_settled {
                         store.charge_delete_remove(*session_ts)

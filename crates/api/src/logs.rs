@@ -27,20 +27,17 @@ fn log_path(name: &str) -> Option<&'static str> {
     }
 }
 
-/// Max bytes to return — prevents OOM on 512 MB Pi devices where syslog/kern
-/// can grow to 50–200 MB without rotation.
+/// Bound each response for low-memory devices and unrotated logs.
 const MAX_TAIL_BYTES: u64 = 512 * 1024;
 
 /// GET /api/logs/{name}
 ///
-/// Returns the tail of the log file as `text/plain`, matching the Go original.
+/// Returns the tail of the log file as `text/plain`.
 pub async fn get_log(
     State(s): State<AppState>,
     Path(name): Path<String>,
 ) -> Response {
-    // Special-case: the Bluetooth tab isn't a static file — it's a
-    // live dump built from systemctl + sysfs + telemetry DB +
-    // journalctl. Delegate to the dedicated handler.
+    // Bluetooth diagnostics are generated live rather than read from a file.
     if name == "bluetooth" {
         return crate::ble_debug::get_ble_debug(State(s)).await;
     }
@@ -55,8 +52,7 @@ pub async fn get_log_tail(Path(name): Path<String>) -> Response {
         return (StatusCode::BAD_REQUEST, "invalid log name").into_response();
     }
 
-    // Tail-reading a log seeks + reads up to 512 KB off the SD card — keep
-    // it off the reactor so a slow read can't stall the WebSocket heartbeat.
+    // Keep bounded SD-card reads off the async reactor.
     tokio::task::spawn_blocking(move || read_log_tail(name))
         .await
         .unwrap_or_else(|_| {
@@ -73,9 +69,7 @@ fn read_log_tail(name: String) -> Response {
 
     let mut file = match std::fs::File::open(&path) {
         Ok(f) => f,
-        // Known logs may legitimately be absent (e.g. archiveloop.log when no
-        // NAS is configured yet) — return empty 200 so the UI shows "no log
-        // output" instead of a scary console 404. Unknown names still 404.
+        // Known logs may not exist yet; unknown names still return 404.
         Err(_) if known => {
             return (
                 StatusCode::OK,
@@ -118,13 +112,7 @@ fn read_log_tail(name: String) -> Response {
         .into_response()
 }
 
-// ---------------------------------------------------------------------------
-// Paged reads
-// ---------------------------------------------------------------------------
-
-/// Default and maximum lines per page. 50 keeps the first paint cheap on the
-/// BLE transport, where the 512 KiB tail above cannot finish inside the
-/// client's deadline.
+/// Default and maximum page sizes, bounded for BLE transport latency.
 const DEFAULT_PAGE_LINES: usize = 50;
 const MAX_PAGE_LINES: usize = 2000;
 
@@ -138,11 +126,8 @@ pub struct LogPageQuery {
 
 /// GET /api/logs/{name}/page?lines=50&before=<offset>
 ///
-/// JSON sibling of `get_log` for incremental "load older lines" scrolling.
-/// Deliberately a separate route: `/api/logs/{name}` stays byte-for-byte
-/// text/plain for the web viewer, the download link and older app builds.
-/// The cursor travels in the body because the BLE proxy drops response
-/// headers.
+/// JSON sibling of `get_log` for incremental older-line scrolling.
+/// The text endpoint remains compatible, and BLE-safe cursors travel in JSON.
 pub async fn get_log_page(
     Path(name): Path<String>,
     Query(q): Query<LogPageQuery>,
@@ -151,7 +136,7 @@ pub async fn get_log_page(
         return page_error(StatusCode::BAD_REQUEST, "invalid log name");
     }
 
-    // A live systemctl/journalctl dump has no stable byte offsets to page over.
+    // Live diagnostics have no stable byte offsets.
     if name == "bluetooth" {
         return page_error(
             StatusCode::BAD_REQUEST,
@@ -179,7 +164,7 @@ fn page_response(content: String, start: u64) -> Response {
         StatusCode::OK,
         Json(serde_json::json!({
             "content": content,
-            // Feed back as `before` to walk further into the past.
+            // Feed this cursor back as `before`.
             "before": if has_more { Some(start) } else { None },
             "has_more": has_more,
         })),
@@ -196,8 +181,7 @@ fn read_log_page(name: String, lines: usize, before: Option<u64>) -> Response {
 
     let mut file = match std::fs::File::open(&path) {
         Ok(f) => f,
-        // Same rule as get_log: a known log that hasn't been created yet is an
-        // empty page, not an error.
+        // A known log that has not been created yet is an empty page.
         Err(_) if known => return page_response(String::new(), 0),
         Err(_) => return page_error(StatusCode::NOT_FOUND, "Log file not found"),
     };
@@ -239,8 +223,7 @@ fn page_window(
         return Ok((String::new(), 0));
     }
 
-    // A trailing newline terminates the final line rather than separating two,
-    // so exclude it from the count.
+    // A trailing newline terminates the final line; it does not add one.
     let mut scan_end = end;
     let mut one = [0u8; 1];
     if file.seek(SeekFrom::Start(end - 1)).is_ok()
@@ -277,8 +260,7 @@ fn page_window(
         start = pos;
     }
 
-    // Hitting the byte cap before the line count means one page is enormous —
-    // return the bounded fragment rather than an empty page that stalls paging.
+    // Return a bounded fragment if one page exceeds the byte cap.
     if end - start > MAX_TAIL_BYTES {
         start = end - MAX_TAIL_BYTES;
     }
@@ -345,7 +327,6 @@ mod tests {
 
     #[test]
     fn spans_the_chunk_boundary() {
-        // Forces the backwards walk across more than one 8 KiB read.
         let body: String = (0..4000).map(|i| format!("line {i}\n")).collect();
         let mut f = fixture(&body);
         let (content, _) = page_window(&mut f, 3, None).unwrap();

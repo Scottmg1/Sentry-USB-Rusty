@@ -14,30 +14,11 @@ import {
 } from "recharts"
 import { useUnits } from "@/lib/units"
 
-// Telemetry pressures arrive in PSI; bar is a display conversion driven by
-// the Display & Units "Tire pressure" toggle (PRESSURE_UNIT). 1 psi = this.
+// Telemetry is stored in PSI and converted only for display.
 const PSI_TO_BAR = 0.0689476
 
-// Tire-pressure zones — labels and styling per the user's spec. Each
-// band is a solid-feeling translucent block with the label centered
-// vertically inside; the boundaries between bands are drawn separately
-// as dashed ReferenceLines so the dividers read as a single line, not
-// two stacked borders.
-//
-// Colour intent: red (unsafe top + bottom), amber (harsher ride near top
-// of safe), green (optimal), orange (reduced handling near bottom of safe).
-// Opacity is high enough that the zones read as blocks rather than tints.
-//
-// The top (>50) and bottom (<28) UNSAFE bands cap their y1/y2 at the
-// chart's visible domain (20..55) — NOT at the conceptual zone range
-// (15..60). Recharts computes `position: "center"` from the literal
-// y1/y2 you give it; if y2 extends above the chart's max the label
-// gets pushed off the top edge and looks like it's hugging the
-// border instead of centred in the visible red strip. The other three
-// bands already sit entirely inside the domain so they're unaffected.
-// Zone bands keyed in PSI (the native telemetry unit). `gt`/`lt` carry the
-// threshold so the label can be rebuilt in whichever unit is active; `text`
-// is the unit-agnostic descriptor. Converted to bar at render time.
+// Cap zone bands to the visible domain: Recharts centers labels using literal
+// y1/y2 values, including portions outside the viewport. Thresholds stay in PSI.
 const ZONES_PSI = [
   { y1: 50, y2: 55, fill: "rgba(127, 29, 29, 0.55)", labelColor: "#fca5a5", gt: 50, text: "UNSAFE" },
   { y1: 45, y2: 50, fill: "rgba(63, 98, 18, 0.55)", labelColor: "#bef264", gt: 45, text: "HARSHER RIDE & WEAR" },
@@ -46,30 +27,23 @@ const ZONES_PSI = [
   { y1: 20, y2: 28, fill: "rgba(127, 29, 29, 0.55)", labelColor: "#fca5a5", lt: 28, text: "UNSAFE" },
 ] as const
 
-// Interior boundaries (dashed lines drawn between adjacent zones), in PSI.
-// Colour-coded to the warning band immediately above/below so the
-// divider reads as a transition cue, not chrome.
+// Interior zone boundaries in PSI.
 const ZONE_BOUNDARIES_PSI = [
-  { y: 50, color: "rgba(252, 165, 165, 0.7)" }, // red boundary above harsh
-  { y: 45, color: "rgba(190, 242, 100, 0.7)" }, // amber/lime above optimal
-  { y: 36, color: "rgba(252, 211, 77, 0.7)" }, // amber above reduced
-  { y: 28, color: "rgba(252, 165, 165, 0.7)" }, // red above bottom-unsafe
+  { y: 50, color: "rgba(252, 165, 165, 0.7)" },
+  { y: 45, color: "rgba(190, 242, 100, 0.7)" },
+  { y: 36, color: "rgba(252, 211, 77, 0.7)" },
+  { y: 28, color: "rgba(252, 165, 165, 0.7)" },
 ] as const
 
-// Y range (PSI) chosen so the visible bottom "UNSAFE" band has real
-// presence (~25-30% of the chart height). Going below 20 just wastes
-// space — tires never read that low in practice.
+// The PSI domain keeps the lower unsafe band visible without unused range.
 const Y_DOMAIN_PSI: [number, number] = [20, 55]
 
-// Per-tire line colours — green family so the lines read against the
-// coloured zone bands while staying distinguishable from each other on
-// hover. Picked far enough apart in lightness/hue that they don't melt
-// together or into the green OPTIMAL band when stacked.
+// Distinct line colors remain legible against the zone bands.
 const TIRE_COLORS = {
-  fl: "#34d399", // emerald-400  — front-left
-  fr: "#a3e635", // lime-400     — front-right
-  rl: "#5eead4", // teal-300     — rear-left
-  rr: "#facc15", // yellow-400   — rear-right (warm contrast against the greens)
+  fl: "#34d399",
+  fr: "#a3e635",
+  rl: "#5eead4",
+  rr: "#facc15",
 } as const
 
 export interface TirePoint {
@@ -86,15 +60,10 @@ export interface TireHistoryResponse {
 }
 
 interface TirePressureCardProps {
-  // Data is owned by the Dashboard so the *parent* decides whether
-  // this card mounts at all — that lets us skip pulling in recharts
-  // (380 KB) for users who have no tire telemetry. The card itself
-  // is now pure rendering.
+  // The parent controls mounting so Recharts is absent without tire data.
   data: TireHistoryResponse
   days?: number
-  // When true, render only the chart (no glass-card frame, no
-  // header, no latest-chip strip). Used by CarStatusCard which
-  // owns the chrome and embeds the chart as its expanded view.
+  // Chart-only mode lets CarStatusCard provide the surrounding chrome.
   chartOnly?: boolean
 }
 
@@ -105,8 +74,7 @@ export const TirePressureCard = memo(function TirePressureCard({
 }: TirePressureCardProps) {
   const { pressureBar } = useUnits()
 
-  // Pressures are stored in PSI; convert the whole series up front so the
-  // lines, latest chips and tooltip all read in the active unit (bar).
+  // Convert the full series once so axes, chips, and tooltips share a unit.
   const points = useMemo(
     () =>
       pressureBar
@@ -121,8 +89,7 @@ export const TirePressureCard = memo(function TirePressureCard({
     [data.points, pressureBar],
   )
 
-  // Latest reading per tire for the header strip — rendered inline
-  // beside the title so the card stays compact for the dashboard grid.
+  // Latest reading per tire for the header strip.
   const latest = useMemo(() => {
     const out: Partial<Record<"fl" | "fr" | "rl" | "rr", number>> = {}
     for (let i = points.length - 1; i >= 0; i--) {
@@ -142,7 +109,6 @@ export const TirePressureCard = memo(function TirePressureCard({
     return out
   }, [points])
 
-  // Unit-aware display helpers (active unit chosen by PRESSURE_UNIT).
   const conv = (psi: number) => (pressureBar ? psi * PSI_TO_BAR : psi)
   const unitUpper = pressureBar ? "BAR" : "PSI"
   const fmtThreshold = (psi: number) =>
@@ -297,8 +263,6 @@ export const TirePressureCard = memo(function TirePressureCard({
   )
 
   if (chartOnly) {
-    // Embedded use (e.g. inside CarStatusCard) — caller owns the
-    // surrounding chrome. Render just the chart.
     return chart
   }
 

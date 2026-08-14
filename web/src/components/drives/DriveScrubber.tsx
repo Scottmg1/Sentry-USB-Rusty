@@ -6,18 +6,13 @@ import { useScrubberActions, useScrubberState } from "@/hooks/useScrubberSync"
 interface DriveScrubberProps {
   points: [number, number, number, number][]
   startTime: string
-  // Parallel to `points` (length must match). When present, the bar
-  // overlays emerald-on-blue segments showing FSD engagement; otherwise
-  // the bar renders as a single solid blue track.
+  // FSD states must be index-aligned with points.
   fsdStates?: number[]
 }
 
 const SPEEDS = [0.5, 1, 2, 5] as const
 
-// Match DriveMap's polyline palette so the scrubber and the route
-// visually agree on which colour means "FSD engaged" vs "manual driving".
-// Tailwind's blue-* palette is theme-remapped to green in this app
-// (index.css), so we use literal hex here to render actual blue.
+// Match DriveMap's palette; literal blue avoids the theme-remapped Tailwind token.
 const COLOR_MANUAL = "#3b82f6"
 const COLOR_FSD = "#34d399"
 
@@ -27,11 +22,7 @@ export function DriveScrubber({ points, startTime, fsdStates }: DriveScrubberPro
   const max = Math.max(0, points.length - 1)
   const n = points.length
 
-  // requestAnimationFrame-throttled writes from the slider so dragging
-  // never queues more than one state update per frame. Combined with
-  // the split state/actions contexts (the parent detail page no longer
-  // re-renders on currentIndex change), the thumb tracks the mouse
-  // smoothly even with the map pulse + tooltip listening.
+  // Limit drag updates to one per animation frame.
   const rafRef = useRef<number | null>(null)
   const pendingRef = useRef<number | null>(null)
   const onSliderInput = (val: number) => {
@@ -46,10 +37,7 @@ export function DriveScrubber({ points, startTime, fsdStates }: DriveScrubberPro
     }
   }
 
-  // Compress fsdStates into contiguous on/off runs. Only the "on" runs
-  // need to render (the underlying track is already blue). Skip entirely
-  // when length doesn't match — a length mismatch means the data is
-  // unreliable and a plain bar is safer than a misaligned overlay.
+  // Render only contiguous engaged runs; mismatched data falls back to one track.
   const fsdSegments = useMemo(() => {
     if (!fsdStates || fsdStates.length !== n || n === 0) return null
     const out: { start: number; end: number }[] = []
@@ -103,9 +91,7 @@ export function DriveScrubber({ points, startTime, fsdStates }: DriveScrubberPro
         </span>
 
         <div className="relative h-4 flex-1">
-          {/* Visible track: solid manual-blue background, FSD segments
-              overlay in emerald. Vertically centred in the 16px-tall
-              container so the thumb has room to extend above/below. */}
+          {/* The track leaves vertical room for the thumb. */}
           <div
             className="pointer-events-none absolute left-0 right-0 top-1/2 h-1.5 -translate-y-1/2 overflow-hidden rounded-full"
             style={{ background: COLOR_MANUAL }}
@@ -128,9 +114,7 @@ export function DriveScrubber({ points, startTime, fsdStates }: DriveScrubberPro
             })}
           </div>
 
-          {/* Transparent input handles drag/click/keyboard. opacity-0
-              keeps it invisible while still capturing pointer + focus.
-              `peer` lets the thumb pick up a focus ring via Tailwind. */}
+          {/* The transparent range input retains pointer and keyboard behavior. */}
           <input
             type="range"
             min={0}
@@ -141,19 +125,14 @@ export function DriveScrubber({ points, startTime, fsdStates }: DriveScrubberPro
             aria-label="Drive scrubber"
           />
 
-          {/* Custom thumb — pointer-events-none so clicks pass through
-              to the input. Larger ring on focus for keyboard users. */}
+          {/* Pointer events pass through the custom thumb to the range input. */}
           <div
             className="pointer-events-none absolute top-1/2 h-3.5 w-3.5 -translate-x-1/2 -translate-y-1/2 rounded-full bg-white shadow ring-2 ring-emerald-500/80 transition-shadow peer-focus-visible:ring-emerald-300 peer-focus-visible:ring-offset-2 peer-focus-visible:ring-offset-slate-900"
             style={{ left: `${cursorPct}%` }}
             aria-hidden
           />
 
-          {/* Floating current-time label tracks the thumb position.
-              `whitespace-nowrap` keeps it on one line even near the
-              right edge of the bar where the translateX(-50%) puts the
-              label's right half outside the parent's content box —
-              without it, "7:16 PM" would wrap as "7:1" / "PM". */}
+          {/* Prevent the moving time label from wrapping near either edge. */}
           <div
             className="pointer-events-none absolute -bottom-5 whitespace-nowrap text-[10px] font-semibold tabular-nums text-emerald-300"
             style={{ left: `${cursorPct}%`, transform: "translateX(-50%)" }}

@@ -1,32 +1,18 @@
 //! Travel Mode: keep the USB gadget presented to the car at all times.
 //!
-//! On a road trip the Pi reaches the archive server through an always-on
-//! travel-router VPN, which breaks the normal "archive when home, keep
-//! recording when driving" assumption. Travel Mode lets the background
-//! archive loop keep snapshotting and uploading footage, but skips every
-//! step that would disconnect the USB gadget from the car so Sentry/Dashcam
-//! recording stays continuous.
+//! The archive loop may snapshot and upload over a travel connection while
+//! skipping gadget disconnection, preserving continuous recording.
 //!
-//! Two flags are persisted in sentryusb.conf — the same pattern as
-//! `AWAY_MODE_AUTO_ENABLED`:
+//! Three flags are persisted in `sentryusb.conf`:
 //!
 //! * `TRAVEL_MODE_ENABLED` (`yes`/`no`) — the master toggle.
 //! * `TRAVEL_MODE_HALF_SNAPSHOTS` (`yes`/`no`) — pace travel-mode
 //!   snapshot+archive cycles at half the user's `SNAPSHOT_INTERVAL`
-//!   instead of the full interval. Cleanup never runs in Travel Mode, so
-//!   on a long trip the cam disk eventually fills and the car starts
-//!   deleting its own oldest footage; halving the cycle shrinks the
-//!   window in which the car can delete a clip before it was snapshotted
-//!   and uploaded.
+//!   to reduce the window before footage is captured.
 //! * `TRAVEL_MODE_FAST_RETRY` (`yes`/`no`) — after a failed archive cycle,
-//!   retry in ~1 minute instead of waiting out the full interval. For
-//!   intermittent uplinks (Starlink dropping under a bridge, cellular dead
-//!   zones) where a brief outage would otherwise stall archiving for up to
-//!   an hour.
+//!   retry in about one minute instead of the full interval.
 //!
-//! The archiveloop bash script reads both fresh each cycle
-//! (`travel_mode_active` / `travel_mode_interval`), so toggling here takes
-//! effect without restarting the daemon.
+//! Archiveloop rereads these settings each cycle; no restart is required.
 
 use axum::Json;
 use axum::extract::State;
@@ -106,10 +92,10 @@ pub async fn status(State(_s): State<AppState>) -> (StatusCode, Json<serde_json:
 #[derive(Deserialize)]
 pub struct TravelBody {
     enabled: bool,
-    /// Absent (older UI) → leave the persisted cadence flag untouched.
+    /// If absent, preserve the persisted cadence flag.
     #[serde(default)]
     half_snapshots: Option<bool>,
-    /// Absent (older UI) → leave the persisted fast-retry flag untouched.
+    /// If absent, preserve the persisted fast-retry flag.
     #[serde(default)]
     fast_retry: Option<bool>,
 }
@@ -117,9 +103,8 @@ pub struct TravelBody {
 /// POST /api/travel-mode — body
 /// `{"enabled": bool, "half_snapshots"?: bool, "fast_retry"?: bool}`.
 ///
-/// Persists the flags so the settings survive reboot and the archiveloop
-/// picks them up on its next cycle. RO root → flip rw for the write, same
-/// pattern as `away_mode::set_mode`.
+/// Persist flags for archiveloop's next cycle, remounting the read-only root
+/// filesystem for the write.
 pub async fn set(
     State(_s): State<AppState>,
     Json(body): Json<TravelBody>,
@@ -232,7 +217,6 @@ mod tests {
 
     #[test]
     fn quoted_value_is_parsed() {
-        // sentryusb_config::unquote handles surrounding quotes.
         let p = temp_conf("export TRAVEL_MODE_ENABLED='yes'\n");
         assert!(read_settings_at(p.to_str().unwrap()).enabled);
         let _ = std::fs::remove_file(&p);

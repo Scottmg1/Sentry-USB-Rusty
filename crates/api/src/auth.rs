@@ -29,7 +29,7 @@ struct AuthInner {
 }
 
 impl AuthState {
-    /// Creates an AuthState with no credentials (auth disabled).
+    /// Create authentication state with no credentials.
     pub fn disabled() -> Self {
         AuthState {
             inner: std::sync::Arc::new(AuthInner {
@@ -43,11 +43,8 @@ impl AuthState {
 
     /// Whether authentication is required.
     pub fn auth_required(&self) -> bool {
-        // BOTH must be set. A username with no password is effectively
-        // unusable — there's no credential the user could supply that
-        // would let them log in — but the previous version would still
-        // gate the UI with 401s. That trapped users who tried to
-        // disable auth by blanking just one field.
+        // Partial credentials cannot authenticate anyone, so either blank field
+        // disables the gate.
         !self.inner.username.is_empty() && !self.inner.password.is_empty()
     }
 
@@ -170,10 +167,7 @@ impl AuthState {
 
         if let Ok(data) = serde_json::to_vec(&stored) {
             let _ = std::fs::write(path, data);
-            // Session tokens are bearer credentials — keep the file 0600
-            // so a non-root account or an over-broad backup can't read
-            // them. /root itself is 0700 on Pi OS; this is
-            // defense-in-depth, not the only barrier.
+            // Session tokens are bearer credentials; restrict the file to root.
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
@@ -223,13 +217,9 @@ pub fn init_auth() -> AuthState {
     state
 }
 
-/// True when any of the SENTRYUSB_SETUP_FINISHED marker files exists.
-/// Used by the auth middleware to decide whether `/api/setup/*` still
-/// needs to be reachable without credentials.
+/// True when setup has written a completion marker.
 ///
-/// Checks both boot partition paths — the setup wizard writes one or the
-/// other depending on whether `/sentryusb` resolves to `/boot/firmware`
-/// (Bookworm+) or `/boot` (older images).
+/// Both boot paths are supported across Pi OS layouts.
 fn setup_is_finished() -> bool {
     const MARKERS: &[&str] = &[
         "/sentryusb/SENTRYUSB_SETUP_FINISHED",
@@ -245,34 +235,24 @@ pub async fn auth_middleware(
     req: Request,
     next: Next,
 ) -> Response {
-    // Skip auth if not configured
     if !auth.auth_required() {
         return next.run(req).await;
     }
 
     let path = req.uri().path().to_string();
 
-    // Only protect /api/* paths
     if !path.starts_with("/api/") {
         return next.run(req).await;
     }
 
-    // Allow localhost
     if let Some(addr) = req.extensions().get::<axum::extract::ConnectInfo<std::net::SocketAddr>>() {
-        // Fold IPv4-mapped IPv6 (::ffff:127.0.0.1) back to v4 so loopback
-        // matches on a dual-stack listener.
+        // Canonicalize IPv4-mapped IPv6 on dual-stack listeners.
         if addr.ip().to_canonical().is_loopback() {
             return next.run(req).await;
         }
     }
 
-    // Always-exempt: login, logout, session check, and the status
-    // endpoints that the frontend uses to decide whether to show the
-    // login screen / wizard in the first place. These must work
-    // without a session cookie even after the device is fully set up
-    // — without `/api/setup/status` in this list, the SPA's initial
-    // routing call gets 401, can't tell setup is finished, and falls
-    // through to rendering the SetupWizard on every page load.
+    // The frontend needs these endpoints before it can choose login or setup.
     const EXEMPT_ALWAYS: &[&str] = &[
         "/api/status",
         "/api/setup/status",
@@ -284,26 +264,14 @@ pub async fn auth_middleware(
         return next.run(req).await;
     }
 
-    // Conditionally-exempt: `/api/setup/*` is only open while the
-    // setup wizard hasn't finished. On a fresh flash the user has no
-    // credentials yet, so the wizard needs to be reachable; once
-    // SENTRYUSB_SETUP_FINISHED exists, the same endpoints become
-    // privileged (otherwise anyone on the LAN could repoint archive
-    // URLs, change hostnames, re-run setup, etc. on a provisioned Pi).
-    //
-    // The setup-log poll (`/api/logs/setup`) is also exempt during
-    // setup. The wizard polls it once per second to render the live
-    // log; if auth blocks the poll, the log silently freezes mid-flow
-    // (the user sees the spinner but no text after auth gets configured
-    // on the security step). Limited to the literal "setup" log name
-    // — every other `/api/logs/*` path stays auth-gated.
+    // Setup endpoints are unauthenticated only until provisioning completes.
+    // Exempt only the setup log used by the wizard; all other logs stay gated.
     if !setup_is_finished()
         && (path.starts_with("/api/setup/") || path == "/api/logs/setup")
     {
         return next.run(req).await;
     }
 
-    // Check session cookie
     let cookie_header = req
         .headers()
         .get("cookie")
@@ -349,18 +317,12 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     result == 0
 }
 
-// --- HTTP Handlers ---
-
 use axum::Json;
 use axum::response::IntoResponse;
 use serde::Deserialize;
 
 
-/// Per-IP failed-login throttle: 5 failures in 5 minutes locks the IP
-/// out until the window drains. Same policy as the web terminal's
-/// shadow-auth limiter (terminal.rs) — without it the web login was
-/// the only credential surface on the box an attacker could
-/// brute-force without backoff.
+/// Lock an IP out after five failed logins within five minutes.
 const LOGIN_RATE_WINDOW: Duration = Duration::from_secs(5 * 60);
 const LOGIN_RATE_MAX_FAILS: usize = 5;
 

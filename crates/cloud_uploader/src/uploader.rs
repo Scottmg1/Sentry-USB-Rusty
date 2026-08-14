@@ -46,9 +46,7 @@ pub async fn run_sweep_loop(state: Arc<CloudStateInner>) {
             }
         }
 
-        // Charge sessions ride the same wake/timer cadence. A charge
-        // failure must not block route uploads (and vice versa), so each
-        // sweep reports independently.
+        // Route and charge failures are reported independently.
         match crate::charges::sweep_once(state.clone()).await {
             Ok(uploaded) if uploaded > 0 => {
                 info!("cloud charge sweep complete: {} sessions uploaded", uploaded);
@@ -61,9 +59,7 @@ pub async fn run_sweep_loop(state: Arc<CloudStateInner>) {
             }
         }
 
-        // Deletion outbox AFTER uploads: an upload prepared before a
-        // mid-sweep local delete is retired in the same pass instead of
-        // living in the cloud until the next wake.
+        // Drain deletions after uploads to retire mid-sweep races immediately.
         match crate::charge_deletes::sweep_once(state.clone()).await {
             Ok(n) if n > 0 => {
                 info!("cloud charge delete sweep: {} sessions retired", n);
@@ -76,15 +72,13 @@ pub async fn run_sweep_loop(state: Arc<CloudStateInner>) {
             }
         }
 
-        // Two-way mutable sync (tags / cost overrides / rate config).
         if let Err(e) = crate::sync::run_once(state.clone()).await {
             warn!("cloud sync error: {}", e);
         }
     }
 }
 
-/// One prepared upload batch from the blocking-pool prep step. `pending`
-/// rides along for the ack loop's route-id → source-file resolution.
+/// Prepared upload batch with source-file data for acknowledgement handling.
 struct PreparedBatch {
     pending: Vec<db_ext::PendingRoute>,
     wire_routes: Vec<UploadRoute>,
@@ -121,10 +115,7 @@ async fn sweep_once(state: Arc<CloudStateInner>) -> Result<u32> {
     let mut total_stored: u32 = 0;
     loop {
 
-        // Batch prep is sync DB + CPU work — route BLOB decodes under the
-        // store lock plus per-route encryption. Run it on the blocking
-        // pool so a backlogged sweep can't pin an async worker for
-        // seconds (which stalls every HTTP handler and flaps the UI).
+        // Route decoding and encryption are synchronous; keep them off async workers.
         let prep = {
             let store = state.store.clone();
             let pi_key = unlocked.pi_key;
@@ -138,14 +129,11 @@ async fn sweep_once(state: Arc<CloudStateInner>) -> Result<u32> {
                 }
 
                 let mut wire_routes: Vec<UploadRoute> = Vec::with_capacity(pending.len());
-                // file -> wrappedRouteKey b64, cached locally on ack so tag sync
-                // can rewrap without a cloud round-trip.
+                // Cache wrapped route keys on acknowledgement for tag sync.
                 let mut wrapped_by_file: std::collections::HashMap<String, String> = std::collections::HashMap::new();
                 let mut estimated_body_bytes: usize = 64;
                 for p in &mut pending {
-                    // Attach the clip's temperature samples so the cloud can
-                    // chart the drive's temperature series — the telemetry DB
-                    // never leaves the Pi otherwise.
+                    // Embed temperature samples because the telemetry DB remains local.
                     p.route.temp_samples = db_ext::temp_samples_for_route(&store, &p.file);
                     let encrypted = encrypt::encrypt_route(
                         &p.route,
@@ -383,9 +371,7 @@ struct UploadRoute {
     route_blob: String,
     #[serde(rename = "wrappedRouteKey")]
     wrapped_route_key: String,
-    // Compact summary computed at upload time, so new rows arrive in
-    // the cloud summary-complete and the browser never has to fetch and
-    // decrypt the full blob just to render the drive list.
+    // Allows list rendering without fetching and decrypting the full route blob.
     #[serde(rename = "summaryCiphertext")]
     summary_ciphertext: String,
 }

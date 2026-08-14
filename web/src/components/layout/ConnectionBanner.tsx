@@ -9,8 +9,7 @@ export function ConnectionBanner() {
   const [visible, setVisible] = useState(false)
   const [displayState, setDisplayState] = useState<ConnectionState | "connected-flash">(state)
   const [dismissed, setDismissed] = useState(false)
-  // Transition bookkeeping only (never rendered) — a ref, so the effect
-  // doesn't re-run on update and cancel the connected-flash timer.
+  // A ref tracks transitions without restarting the connected-flash timer.
   const prevStateRef = useRef<ConnectionState>(state)
 
   useEffect(() => {
@@ -21,7 +20,6 @@ export function ConnectionBanner() {
     setDismissed(false)
 
     if (state === "connected" && wasDisconnected) {
-      // Show brief "Connected" flash
       setDisplayState("connected-flash")
       setVisible(true)
       const timer = setTimeout(() => setVisible(false), 3000)
@@ -34,9 +32,7 @@ export function ConnectionBanner() {
     }
   }, [state])
 
-  // Degraded mode outranks connection state and cannot be dismissed:
-  // the server is up but its database is not, so every data page is
-  // empty for a real reason the user must see.
+  // Database degradation outranks connectivity and cannot be dismissed.
   if (degraded) {
     return (
       <div className="mb-4 flex items-start gap-3 rounded-lg border border-red-500/30 bg-red-500/10 px-4 py-3 text-sm text-red-300">
@@ -58,7 +54,7 @@ export function ConnectionBanner() {
 
   if (!visible || dismissed) return null
 
-  // Check if Away Mode was recently enabled (stored in localStorage before connection dropped)
+  // Away Mode persists its deadline before the connection drops.
   const awayInfo = (displayState === "disconnected" || displayState === "reconnecting")
     ? getStoredAwayMode()
     : null

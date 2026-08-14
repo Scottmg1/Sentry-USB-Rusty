@@ -39,8 +39,7 @@ export default function CloudPairingSection({ compact = false }: Props) {
   const [confirmUnpair, setConfirmUnpair] = useState(false)
   const [retrying, setRetrying] = useState(false)
 
-  // Baseline of the current upload session (drives the progress bar) —
-  // state, not a ref, since it feeds rendering.
+  // Baseline used by the rendered session progress bar.
   const [sessionStart, setSessionStart] = useState<{ pending: number; uploaded: number } | null>(null)
 
   useEffect(() => {
@@ -73,9 +72,7 @@ export default function CloudPairingSection({ compact = false }: Props) {
 
     function scheduleNext(data: CloudStatus | null) {
       if (timer) clearTimeout(timer)
-      // Pairing handshake stays at 1s (interactive, short-lived); an
-      // upload backlog polls at 3s — backlogs run for minutes and the
-      // 1s cadence was a measurable load amplifier on the Pi.
+      // Pairing polls each second; long-running upload backlogs use three seconds.
       const pairing =
         data?.pairingState === "handshaking" ||
         data?.pairingState === "polling"
@@ -126,16 +123,11 @@ export default function CloudPairingSection({ compact = false }: Props) {
     try {
       await fetch("/api/cloud/pair/cancel", { method: "POST" })
     } catch {
-      // fire-and-forget; pairing UI resets regardless
+      // Cancellation is best effort; local pairing state still resets.
     }
   }
 
-  // Nudge the uploader to retry immediately. Used when `lastUploadError`
-  // is showing — the uploader is event-driven (fires at the end of each
-  // archive cycle), so a transient failure (server reload, network blip)
-  // can leave the queue stuck until the next clip finishes archiving.
-  // This button just calls `nudge()` on the uploader; the queued routes
-  // get another shot and the error string clears on success.
+  // Uploads normally retry after an archive; nudge retries a transient failure now.
   async function retryUpload() {
     if (retrying) return
     setRetrying(true)
@@ -146,9 +138,7 @@ export default function CloudPairingSection({ compact = false }: Props) {
     } catch (err) {
       setError(err instanceof Error ? err.message : "retry failed")
     } finally {
-      // Brief delay so the user sees the spinner — the actual upload
-      // completes async and the cloud_upload WS event will refetch
-      // status when it lands.
+      // Completion arrives asynchronously through the cloud_upload event.
       setTimeout(() => setRetrying(false), 800)
     }
   }
@@ -167,9 +157,7 @@ export default function CloudPairingSection({ compact = false }: Props) {
   const pairingState = status?.pairingState ?? "idle"
   const inFlight =
     pairingState === "handshaking" || pairingState === "polling"
-  // Compact "Mon DD, HH:MM" — the previous toLocaleString() ran ~23 chars
-  // (full date + seconds + AM/PM) which truncated to "…" in the 1/4-width
-  // stat box. Same precision a user needs (date + minute), no overflow.
+  // Keep timestamps to date-and-minute precision so they fit the stat box.
   const lastUploadDisplay = status?.lastUploadAt
     ? new Date(status.lastUploadAt).toLocaleString(undefined, {
         month: "short",

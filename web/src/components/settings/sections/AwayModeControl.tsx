@@ -37,8 +37,7 @@ interface Props {
 
 export function AwayModeControl({ onOpenWizard }: Props = {}) {
   const { status, enable, disable, setMode, config, updateConfig, saveError, useCurrentLocation } = useAwayMode()
-  // Undefined means the first status poll hasn't resolved (or an older
-  // backend) — assume configured/manual so the card doesn't flash.
+  // Avoid a disabled-state flash before the first compatible response.
   const apConfigured = status.ap_configured !== false
   const mode: AwayModeKind = status.mode ?? "manual"
   const [selectedDuration, setSelectedDuration] = useState(240)
@@ -48,18 +47,17 @@ export function AwayModeControl({ onOpenWizard }: Props = {}) {
   const [enabling, setEnabling] = useState(false)
   const [confirmOpen, setConfirmOpen] = useState(false)
   const [enablingBle, setEnablingBle] = useState(false)
-  // Secret menu: 5 taps on the card icon opens the Travel Mode dialog.
+  // Five icon taps open Travel Mode.
   const [secretOpen, setSecretOpen] = useState(false)
   const [travelOn, setTravelOn] = useState(false)
   const tapCount = useRef(0)
   const tapTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
 
-  // Reflect Travel Mode in the card badge even before the dialog is opened.
+  // Fetch Travel Mode for the card badge.
   useEffect(() => {
     api.getTravelMode().then((r) => setTravelOn(r.enabled)).catch(() => {})
   }, [])
 
-  // Clear the pending 5-tap reset timer on unmount.
   useEffect(
     () => () => {
       if (tapTimer.current) clearTimeout(tapTimer.current)
@@ -81,7 +79,7 @@ export function AwayModeControl({ onOpenWizard }: Props = {}) {
   }
 
   const isActive = status.state === "active"
-  // The AP is up when a manual timer is running, or auto mode says "away".
+  // The AP is up during a manual timer or an automatic away decision.
   const apUp = mode === "auto" ? status.ap_on === true : isActive
 
   function getCustomMinutes() {
@@ -116,8 +114,7 @@ export function AwayModeControl({ onOpenWizard }: Props = {}) {
   }
 
   function getProgress() {
-    // `== null` (not `!`) on remaining_sec: 0 is a real value (timer just
-    // hit zero → full bar), not "missing" — `!0` would snap the bar to empty.
+    // Zero remaining is a real timer value, not missing data.
     if (!status.enabled_at || !status.expires_at || status.remaining_sec == null) return 0
     const total =
       (new Date(status.expires_at).getTime() - new Date(status.enabled_at).getTime()) / 1000
@@ -218,8 +215,7 @@ export function AwayModeControl({ onOpenWizard }: Props = {}) {
             returns (so the Pi rejoins your home WiFi). Uses the car’s location over BLE.
           </p>
 
-          {/* BLE telemetry is the GPS source — Automatic can't see location
-              without it. Mirrors the keep-accessory dependency warning. */}
+          {/* Automatic mode requires the BLE GPS source. */}
           {status.ble_ready === false && (
             <div className="flex items-start gap-2 rounded-lg border border-amber-500/30 bg-amber-500/10 p-3">
               <WarningIcon className="mt-0.5 h-4 w-4 shrink-0 text-amber-400" />
@@ -406,10 +402,6 @@ export function AwayModeControl({ onOpenWizard }: Props = {}) {
         </>
       )}
 
-      {/* AP details — folded into the Away Mode card so users see the
-          control and the access-point address together. While the AP is
-          down, this is a one-line placeholder; while up, it shows the SSID
-          and IP to join from inside the car. */}
       <div className="space-y-1.5 border-t border-white/5 pt-3">
         <p className="text-xs font-medium text-slate-400">Access point</p>
         {apUp ? (
