@@ -14,7 +14,7 @@ use axum::Json;
 use axum::extract::State;
 use axum::http::StatusCode;
 use sentryusb_ble_health::{
-    DEFAULT_HEALTH_PATH, HealthInput, classify_health, read_at,
+    DEFAULT_HEALTH_PATH, HealthInput, HealthRecord, Severity, classify_health, read_at,
 };
 
 use crate::router::AppState;
@@ -570,6 +570,54 @@ fn health_is_configured(
     has_health_record: bool,
 ) -> bool {
     enabled && (paired_marker || last_authenticated_success_ts > 0 || has_health_record)
+}
+
+fn ble_health_allows_controls(
+    enabled: bool,
+    record: Option<HealthRecord>,
+    last_authenticated_success_ts: i64,
+    radio_owner: Option<&str>,
+    archiving: bool,
+    now_ts: i64,
+) -> bool {
+    enabled
+        && classify_health(&HealthInput {
+            record,
+            last_authenticated_success_ts,
+            radio_owner,
+            archiving,
+            now_ts,
+        })
+        .severity
+            == Severity::Green
+}
+
+/// Fail-closed server-side health gate for BLE vehicle controls. This uses
+/// the same durable fault record and authenticated-state freshness model as
+/// `/api/system/ble-connected`, rather than trusting browser state.
+pub(crate) fn charging_controls_health_is_green(
+    conn: &rusqlite::Connection,
+    now_ts: i64,
+) -> bool {
+    let probe_ts = LAST_BLE_SUCCESS_TS.load(Ordering::Relaxed);
+    let sampler_ts = authenticated_activity(conn, now_ts - 600).0;
+    let last_authenticated_success_ts = probe_ts.max(sampler_ts);
+    let record = match read_at(std::path::Path::new(DEFAULT_HEALTH_PATH)) {
+        Ok(record) => record,
+        Err(e) => {
+            tracing::warn!("could not read BLE health record for charging controls: {e}");
+            return false;
+        }
+    };
+    let radio_owner = read_radio_owner();
+    ble_health_allows_controls(
+        is_ble_enabled(),
+        record,
+        last_authenticated_success_ts,
+        radio_owner.as_deref(),
+        crate::drives_handler::is_archiving(),
+        now_ts,
+    )
 }
 
 pub async fn ble_connected(
@@ -1251,6 +1299,7 @@ pub async fn ble_install(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sentryusb_ble_health::{FaultKind, HealthRecord};
 
     #[test]
     fn body_controller_ping_does_not_count_as_authenticated_activity() {
@@ -1271,6 +1320,24 @@ mod tests {
         assert!(health_is_configured(true, true, 0, false));
         assert!(health_is_configured(true, false, 100, false));
         assert!(health_is_configured(true, false, 0, true));
+    }
+
+    #[test]
+    fn charging_controls_require_green_classified_health() {
+        assert!(ble_health_allows_controls(true, None, 1_000, None, false, 1_030));
+        assert!(!ble_health_allows_controls(true, None, 1_000, None, false, 1_060));
+        assert!(!ble_health_allows_controls(false, None, 1_000, None, false, 1_030));
+        assert!(!ble_health_allows_controls(
+            true,
+            Some(HealthRecord {
+                fault: FaultKind::RepairRequired,
+                since_ts: 1_020,
+            }),
+            1_030,
+            None,
+            false,
+            1_040,
+        ));
     }
 
     fn cfg(pairs: &[(&str, &str)]) -> sentryusb_config::SetupConfig {

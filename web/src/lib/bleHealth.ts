@@ -103,3 +103,19 @@ export function deriveVehicleStatusLabel(
   if (isDriving) return "Driving"
   return "Idle"
 }
+
+/** Vehicle-changing controls need both authenticated BLE health and the
+ * backend's stricter fresh charge-port/active-charge gate. */
+export function shouldShowChargingControls(
+  health: BleHealthPresentation,
+  controlsAvailable: boolean,
+  controlsValidUntilTs: number | null,
+  nowTs: number,
+): boolean {
+  return (
+    health.severity === "green" &&
+    controlsAvailable &&
+    controlsValidUntilTs !== null &&
+    nowTs <= controlsValidUntilTs
+  )
+}

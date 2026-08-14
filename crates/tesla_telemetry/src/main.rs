@@ -1223,6 +1223,9 @@ async fn tick(
                     sample.charge_energy_added_kwh = d.charge_energy_added_kwh;
                     sample.charge_limit_soc = d.charge_limit_soc;
                     sample.battery_range_mi = d.battery_range_mi;
+                    sample.charging_amps_set = d.charging_amps_set;
+                    sample.charge_current_request_max = d.charge_current_request_max;
+                    sample.charge_port_door_open = d.charge_port_door_open;
                     sample.charge_minutes_to_full = d.minutes_to_full_charge;
                     // DC fast charging = actively charging AND power above
                     // the AC Level 2 ceiling. Drives the 15s poll cadence so

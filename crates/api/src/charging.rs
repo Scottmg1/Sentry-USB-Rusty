@@ -17,6 +17,7 @@ use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use serde::{Deserialize, Serialize};
+use std::time::Duration;
 
 use crate::router::AppState;
 
@@ -60,6 +61,11 @@ pub(crate) fn invalidate_charging_list() {
 /// keeping the poll off a disk that an archive run has saturated.
 static LATEST_CHARGE_CACHE: crate::ttl_cache::StaleWhileRevalidate<(), Option<LatestCharge>> =
     crate::ttl_cache::StaleWhileRevalidate::new(std::time::Duration::from_secs(10));
+
+/// Charging controls are deliberately stricter than the long-lived
+/// charging banner: two normal 60-second charge polls is the most stale
+/// a sample may be before the server refuses a vehicle-changing action.
+const CHARGING_CONTROL_FRESH_SECS: i64 = 120;
 
 
 #[derive(Serialize)]
@@ -876,7 +882,8 @@ pub async fn single_charging(
 
 /// Live charge status for the dashboard banner. `charging` is false when
 /// the latest sample isn't an active charge or is stale (the car stopped
-/// being sampled); the other fields are present only while charging.
+/// being sampled). Charging metrics are present only while charging;
+/// control fields require a much fresher open-port or active-charge sample.
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct CurrentCharge {
@@ -890,6 +897,11 @@ struct CurrentCharge {
     energy_added_kwh: Option<f64>,
     minutes_to_full: Option<i64>,
     range_mi: Option<f64>,
+    charging_amps: Option<i64>,
+    max_charging_amps: Option<i64>,
+    charge_port_open: Option<bool>,
+    controls_available: bool,
+    controls_valid_until_ts: Option<i64>,
 }
 
 impl CurrentCharge {
@@ -905,6 +917,11 @@ impl CurrentCharge {
             energy_added_kwh: None,
             minutes_to_full: None,
             range_mi: None,
+            charging_amps: None,
+            max_charging_amps: None,
+            charge_port_open: None,
+            controls_available: false,
+            controls_valid_until_ts: None,
         }
     }
 
@@ -919,6 +936,8 @@ impl CurrentCharge {
             None => age <= 600 && is_charging(l.power_kw, l.rate_mph),
         };
         let soc = if age <= CHARGE_STALE_SECS { l.soc } else { None };
+        let controls_available = l.controls_available(now);
+        let controls_fresh = (0..=CHARGING_CONTROL_FRESH_SECS).contains(&age);
         Self {
             charging,
             soc,
@@ -938,6 +957,12 @@ impl CurrentCharge {
             } else {
                 l.range_mi.filter(|_| soc.is_some())
             },
+            charging_amps: l.charging_amps_set.filter(|_| controls_fresh),
+            max_charging_amps: l.charge_current_request_max.filter(|_| controls_fresh),
+            charge_port_open: l.charge_port_door_open.filter(|_| controls_fresh),
+            controls_available,
+            controls_valid_until_ts: controls_available
+                .then_some(l.ts + CHARGING_CONTROL_FRESH_SECS),
         }
     }
 }
@@ -956,6 +981,56 @@ struct LatestCharge {
     minutes_to_full: Option<i64>,
     range_mi: Option<f64>,
     charging_state: Option<String>,
+    charging_amps_set: Option<i64>,
+    charge_current_request_max: Option<i64>,
+    charge_port_door_open: Option<bool>,
+}
+
+impl LatestCharge {
+    fn controls_available(&self, now: i64) -> bool {
+        let age = now - self.ts;
+        let fresh = (0..=CHARGING_CONTROL_FRESH_SECS).contains(&age);
+        let active = phase_is_active(self.charging_state.as_deref()) == Some(true)
+            || (self.charging_state.is_none() && is_charging(self.power_kw, self.rate_mph));
+        fresh && (self.charge_port_door_open == Some(true) || active)
+    }
+}
+
+fn query_latest_charge(conn: &rusqlite::Connection) -> rusqlite::Result<Option<LatestCharge>> {
+    use rusqlite::OptionalExtension;
+    conn.query_row(
+        "SELECT ts, battery_pct, charge_limit_soc, charger_power_kw, \
+                charger_actual_current_a, charger_voltage_v, charge_rate_mph, \
+                charge_energy_added_kwh, charge_minutes_to_full, battery_range_mi, \
+                charging_state, charging_amps_set, charge_current_request_max, \
+                charge_port_door_open \
+         FROM telemetry_samples \
+         WHERE source = 'state' AND (charging_state IS NOT NULL \
+            OR charger_power_kw IS NOT NULL \
+            OR charge_rate_mph IS NOT NULL \
+            OR charge_port_door_open IS NOT NULL) \
+         ORDER BY ts DESC LIMIT 1",
+        [],
+        |r| {
+            Ok(LatestCharge {
+                ts: r.get(0)?,
+                soc: r.get(1)?,
+                limit_soc: r.get(2)?,
+                power_kw: r.get(3)?,
+                current_a: r.get(4)?,
+                voltage_v: r.get(5)?,
+                rate_mph: r.get(6)?,
+                energy_added_kwh: r.get(7)?,
+                minutes_to_full: r.get(8)?,
+                range_mi: r.get(9)?,
+                charging_state: r.get(10)?,
+                charging_amps_set: r.get(11)?,
+                charge_current_request_max: r.get(12)?,
+                charge_port_door_open: r.get::<_, Option<i64>>(13)?.map(|v| v != 0),
+            })
+        },
+    )
+    .optional()
 }
 
 /// GET /api/charging/current — is the car charging right now, with the
@@ -980,37 +1055,7 @@ pub async fn current_charging(
     let store = state.drives.store.clone();
     let latest = LATEST_CHARGE_CACHE
         .get((), move || {
-        use rusqlite::OptionalExtension;
-        store.with_read_conn(|conn| {
-            conn.query_row(
-                "SELECT ts, battery_pct, charge_limit_soc, charger_power_kw, \
-                        charger_actual_current_a, charger_voltage_v, charge_rate_mph, \
-                        charge_energy_added_kwh, charge_minutes_to_full, battery_range_mi, \
-                        charging_state \
-                 FROM telemetry_samples \
-                 WHERE charging_state IS NOT NULL \
-                    OR charger_power_kw IS NOT NULL \
-                    OR charge_rate_mph IS NOT NULL \
-                 ORDER BY ts DESC LIMIT 1",
-                [],
-                |r| {
-                    Ok(LatestCharge {
-                        ts: r.get(0)?,
-                        soc: r.get(1)?,
-                        limit_soc: r.get(2)?,
-                        power_kw: r.get(3)?,
-                        current_a: r.get(4)?,
-                        voltage_v: r.get(5)?,
-                        rate_mph: r.get(6)?,
-                        energy_added_kwh: r.get(7)?,
-                        minutes_to_full: r.get(8)?,
-                        range_mi: r.get(9)?,
-                        charging_state: r.get(10)?,
-                    })
-                },
-            )
-            .optional()
-        })
+        store.with_read_conn(query_latest_charge)
         // Err -> None: a failed read must not overwrite a good cached
         // row. Ok(None) -> Some(None): queried fine, nothing charging.
         .ok()
@@ -1024,6 +1069,114 @@ pub async fn current_charging(
         .unwrap_or_default();
     let cur = CurrentCharge::from_latest(latest, now);
     (StatusCode::OK, Json(serde_json::to_value(cur).unwrap()))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChargingActionRequest {
+    action: String,
+    value: Option<i64>,
+}
+
+fn charging_action_verb(
+    req: &ChargingActionRequest,
+    max_charging_amps: Option<i64>,
+) -> Result<String, String> {
+    match req.action.as_str() {
+        "start" => Ok("charge-start".into()),
+        "stop" => Ok("charge-stop".into()),
+        "setAmps" => {
+            let value = req.value.ok_or_else(|| "charging amps value is required".to_string())?;
+            let reported_max = max_charging_amps
+                .filter(|max| (1..=80).contains(max))
+                .ok_or_else(|| "vehicle did not report a safe charging-current maximum".to_string())?;
+            if !(1..=reported_max).contains(&value) {
+                return Err(format!("charging amps must be between 1 and {reported_max}"));
+            }
+            Ok(format!("set-charging-amps:{value}"))
+        }
+        "setLimit" => {
+            let value = req.value.ok_or_else(|| "charge limit value is required".to_string())?;
+            if !(50..=100).contains(&value) {
+                return Err("charge limit must be between 50 and 100".into());
+            }
+            Ok(format!("set-charge-limit:{value}"))
+        }
+        _ => Err("action must be start, stop, setAmps, or setLimit".into()),
+    }
+}
+
+/// POST /api/charging/action. The server repeats the UI's safety gate so
+/// a stale browser or hand-written request cannot operate the car after
+/// the Pi has lost power or the vehicle has gone offline.
+pub async fn charging_action(
+    State(state): State<AppState>,
+    Json(req): Json<ChargingActionRequest>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or_default();
+    let store = state.drives.store.clone();
+    let (latest, health_is_green) = match tokio::task::spawn_blocking(move || {
+        store.with_read_conn(|conn| -> rusqlite::Result<(Option<LatestCharge>, bool)> {
+            Ok((
+                query_latest_charge(conn)?,
+                crate::ble::charging_controls_health_is_green(conn, now),
+            ))
+        })
+    })
+    .await
+    {
+        Ok(Ok((Some(latest), health_is_green))) => (latest, health_is_green),
+        Ok(Ok((None, _))) => {
+            return crate::json_error(StatusCode::CONFLICT, "no charging telemetry is available");
+        }
+        Ok(Err(e)) => {
+            return crate::json_error(StatusCode::INTERNAL_SERVER_ERROR, &format!("charging telemetry read failed: {e}"));
+        }
+        Err(e) => {
+            return crate::json_error(StatusCode::INTERNAL_SERVER_ERROR, &format!("charging telemetry task failed: {e}"));
+        }
+    };
+    if !health_is_green {
+        return crate::json_error(
+            StatusCode::CONFLICT,
+            "charging controls require a healthy authenticated BLE connection",
+        );
+    }
+    if !latest.controls_available(now) {
+        return crate::json_error(
+            StatusCode::CONFLICT,
+            "charging controls require a fresh open charge port or active charge",
+        );
+    }
+    let verb = match charging_action_verb(&req, latest.charge_current_request_max) {
+        Ok(verb) => verb,
+        Err(message) => return crate::json_error(StatusCode::BAD_REQUEST, &message),
+    };
+
+    match sentryusb_shell::run_with_timeout(
+        Duration::from_secs(30),
+        "/root/bin/sentryusb-ble-action",
+        &[verb.as_str()],
+    )
+    .await
+    {
+        Ok(_) => {
+            LATEST_CHARGE_CACHE.clear();
+            let _ = sentryusb_shell::run(
+                "systemctl",
+                &["kill", "-s", "SIGUSR1", "sentryusb-telemetry"],
+            )
+            .await;
+            (StatusCode::OK, Json(serde_json::json!({ "ok": true })))
+        }
+        Err(e) => crate::json_error(
+            StatusCode::BAD_GATEWAY,
+            &format!("charging command failed: {e}"),
+        ),
+    }
 }
 
 #[derive(Deserialize)]
@@ -1436,13 +1589,22 @@ mod tests {
     #[test]
     fn current_charge_wire_shape_includes_live_electrical_details() {
         let value = serde_json::to_value(CurrentCharge::idle()).unwrap();
-        for key in ["currentA", "voltageV", "rateMph", "energyAddedKwh"] {
+        for key in [
+            "currentA",
+            "voltageV",
+            "rateMph",
+            "energyAddedKwh",
+            "chargingAmps",
+            "maxChargingAmps",
+            "chargePortOpen",
+        ] {
             assert_eq!(
                 value.get(key),
                 Some(&serde_json::Value::Null),
                 "idle current-charge response must include nullable {key}: {value}",
             );
         }
+        assert_eq!(value["controlsAvailable"], false);
     }
 
     #[test]
@@ -1459,6 +1621,9 @@ mod tests {
             minutes_to_full: Some(75),
             range_mi: Some(172.0),
             charging_state: Some("charging".into()),
+            charging_amps_set: Some(32),
+            charge_current_request_max: Some(48),
+            charge_port_door_open: Some(true),
         };
 
         let value = serde_json::to_value(CurrentCharge::from_latest(Some(latest), 1_060)).unwrap();
@@ -1467,6 +1632,11 @@ mod tests {
         assert_eq!(value["voltageV"], 240);
         assert_eq!(value["rateMph"], 28.5);
         assert_eq!(value["energyAddedKwh"], 12.3);
+        assert_eq!(value["chargingAmps"], 32);
+        assert_eq!(value["maxChargingAmps"], 48);
+        assert_eq!(value["chargePortOpen"], true);
+        assert_eq!(value["controlsAvailable"], true);
+        assert_eq!(value["controlsValidUntilTs"], 1_120);
     }
 
     #[test]
@@ -1483,10 +1653,93 @@ mod tests {
             minutes_to_full: Some(20),
             range_mi: Some(172.0),
             charging_state: Some("charging".into()),
+            charging_amps_set: Some(250),
+            charge_current_request_max: Some(250),
+            charge_port_door_open: Some(true),
         };
 
         let value = serde_json::to_value(CurrentCharge::from_latest(Some(latest), 1_060)).unwrap();
         assert_eq!(value["currentA"], 406);
+    }
+
+    #[test]
+    fn charging_controls_require_fresh_open_port_or_active_charge() {
+        let mut latest = LatestCharge {
+            ts: 1_000,
+            soc: Some(64.0),
+            limit_soc: Some(80),
+            power_kw: Some(0),
+            current_a: Some(0),
+            voltage_v: Some(240),
+            rate_mph: Some(0.0),
+            energy_added_kwh: Some(12.3),
+            minutes_to_full: None,
+            range_mi: Some(172.0),
+            charging_state: Some("stopped".into()),
+            charging_amps_set: Some(32),
+            charge_current_request_max: Some(48),
+            charge_port_door_open: Some(true),
+        };
+
+        let open_port = serde_json::to_value(CurrentCharge::from_latest(
+            Some(latest.clone()),
+            1_060,
+        ))
+        .unwrap();
+        assert_eq!(open_port["controlsAvailable"], true);
+
+        latest.charge_port_door_open = Some(false);
+        let closed = serde_json::to_value(CurrentCharge::from_latest(
+            Some(latest.clone()),
+            1_060,
+        ))
+        .unwrap();
+        assert_eq!(closed["controlsAvailable"], false);
+
+        latest.charging_state = Some("charging".into());
+        let stale = serde_json::to_value(CurrentCharge::from_latest(Some(latest), 1_121)).unwrap();
+        assert_eq!(stale["controlsAvailable"], false);
+        assert_eq!(stale["controlsValidUntilTs"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn charging_action_request_validates_ranges_and_reported_max() {
+        let verb = charging_action_verb(
+            &ChargingActionRequest {
+                action: "setAmps".into(),
+                value: Some(32),
+            },
+            Some(48),
+        )
+        .unwrap();
+        assert_eq!(verb, "set-charging-amps:32");
+        assert!(charging_action_verb(
+            &ChargingActionRequest {
+                action: "setAmps".into(),
+                value: Some(49),
+            },
+            Some(48),
+        )
+        .is_err());
+        assert_eq!(
+            charging_action_verb(
+                &ChargingActionRequest {
+                    action: "setLimit".into(),
+                    value: Some(80),
+                },
+                Some(48),
+            )
+            .unwrap(),
+            "set-charge-limit:80"
+        );
+        assert!(charging_action_verb(
+            &ChargingActionRequest {
+                action: "setLimit".into(),
+                value: Some(49),
+            },
+            Some(48),
+        )
+        .is_err());
     }
 
     // ── Cost + efficiency ──────────────────────────────────────────────

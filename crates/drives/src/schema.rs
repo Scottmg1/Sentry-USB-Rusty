@@ -92,7 +92,11 @@ use rusqlite::{params, Connection, OptionalExtension};
 /// NULL, which the summon detector reads as "unverifiable, not summon".
 /// No backfill: flags and per-run speeds can only come from
 /// re-extracting the MP4's SEI stream, not from stored deduped arrays.
-pub const CURRENT_SCHEMA_VERSION: i32 = 16;
+///
+/// v16 -> v17: persist the charge-port-open flag plus the selected and
+/// maximum charging current. These nullable fields gate and bound the
+/// dashboard's BLE charging controls using a fresh authenticated sample.
+pub const CURRENT_SCHEMA_VERSION: i32 = 17;
 
 /// v1 DDL. Each statement is idempotent (`IF NOT EXISTS`) so `migrate()`
 /// is safe on every startup. Column shapes and names match Go exactly â€”
@@ -377,6 +381,14 @@ pub const V13_TELEMETRY_MINUTES_COLUMN: &[(&str, &str)] = &[
 /// Additive + nullable.
 pub const V14_TELEMETRY_CHARGE_PHASE_COLUMN: &[(&str, &str)] = &[
     ("charging_state", "TEXT"),
+];
+
+/// v17 charging-control telemetry. `charge_port_door_open` is stored as
+/// SQLite 0/1; all three stay NULL when the vehicle omits the signal.
+pub const V17_TELEMETRY_CHARGING_CONTROL_COLUMNS: &[(&str, &str)] = &[
+    ("charging_amps_set", "INTEGER"),
+    ("charge_current_request_max", "INTEGER"),
+    ("charge_port_door_open", "INTEGER"),
 ];
 
 /// v10 per-clip location-name rollups on `routes`. Populated by
@@ -675,6 +687,7 @@ pub fn migrate(conn: &Connection) -> Result<()> {
         .chain(V12_TELEMETRY_GPS_COLUMNS.iter())
         .chain(V13_TELEMETRY_MINUTES_COLUMN.iter())
         .chain(V14_TELEMETRY_CHARGE_PHASE_COLUMN.iter())
+        .chain(V17_TELEMETRY_CHARGING_CONTROL_COLUMNS.iter())
     {
         if existing_tele.contains(*name) {
             continue;
@@ -884,7 +897,7 @@ mod tests {
         migrate(&conn).unwrap();
         assert_eq!(
             meta_get(&conn, "schema_version").unwrap().as_deref(),
-            Some("16"),
+            Some("17"),
         );
         assert!(meta_get(&conn, "created_at").unwrap().is_some());
     }
@@ -922,7 +935,7 @@ mod tests {
         }
         assert_eq!(
             meta_get(&conn, "schema_version").unwrap().as_deref(),
-            Some("16")
+            Some("17")
         );
     }
 
@@ -954,7 +967,7 @@ mod tests {
         }
         assert_eq!(
             meta_get(&conn, "schema_version").unwrap().as_deref(),
-            Some("16")
+            Some("17")
         );
     }
 
@@ -988,7 +1001,7 @@ mod tests {
         }
         assert_eq!(
             meta_get(&conn, "schema_version").unwrap().as_deref(),
-            Some("16")
+            Some("17")
         );
     }
 
@@ -1095,7 +1108,7 @@ mod tests {
         assert!(surviving_processed.starts_with("RecentClips/"));
         assert_eq!(
             meta_get(&conn, "schema_version").unwrap().as_deref(),
-            Some("16")
+            Some("17")
         );
     }
 
@@ -1146,7 +1159,7 @@ mod tests {
         assert_eq!(count_routes(&conn), 1, "fresh-DB seed must not run v5 cleanup");
         assert_eq!(
             meta_get(&conn, "schema_version").unwrap().as_deref(),
-            Some("16")
+            Some("17")
         );
     }
 
@@ -1199,7 +1212,7 @@ mod tests {
         assert_eq!(table_exists, 1, "v6 must create telemetry_samples");
         assert_eq!(
             meta_get(&conn, "schema_version").unwrap().as_deref(),
-            Some("16")
+            Some("17")
         );
     }
 
@@ -1236,7 +1249,7 @@ mod tests {
         }
         assert_eq!(
             meta_get(&conn, "schema_version").unwrap().as_deref(),
-            Some("16")
+            Some("17")
         );
     }
 
@@ -1274,7 +1287,29 @@ mod tests {
         }
         assert_eq!(
             meta_get(&conn, "schema_version").unwrap().as_deref(),
-            Some("16")
+            Some("17")
+        );
+    }
+
+    #[test]
+    fn migrate_adds_v17_charging_control_columns() {
+        let conn = open();
+        migrate(&conn).unwrap();
+
+        let cols = list_telemetry_columns(&conn).unwrap();
+        for name in [
+            "charging_amps_set",
+            "charge_current_request_max",
+            "charge_port_door_open",
+        ] {
+            assert!(
+                cols.contains(name),
+                "telemetry_samples.{name} missing after v17",
+            );
+        }
+        assert_eq!(
+            meta_get(&conn, "schema_version").unwrap().as_deref(),
+            Some("17")
         );
     }
 
@@ -1317,7 +1352,7 @@ mod tests {
         }
         assert_eq!(
             meta_get(&conn, "schema_version").unwrap().as_deref(),
-            Some("16")
+            Some("17")
         );
     }
 

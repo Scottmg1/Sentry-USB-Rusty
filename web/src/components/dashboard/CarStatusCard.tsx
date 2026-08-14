@@ -12,6 +12,7 @@ import {
   WarningIcon,
 } from "@/components/icons"
 import { BatteryLevelIcon } from "@/components/drives/BatteryLevelIcon"
+import { sendChargingAction } from "@/api/charging"
 import type { TireHistoryResponse } from "./TirePressureCard"
 import type { CurrentCharge } from "@/types/charging"
 import {
@@ -25,6 +26,7 @@ import {
 import {
   deriveVehicleStatusLabel,
   presentBleHealth,
+  shouldShowChargingControls,
   type BleHealth,
 } from "@/lib/bleHealth"
 
@@ -177,13 +179,11 @@ export function CarStatusCard({
   const [tiresOpen, setTiresOpen] = useState(false)
   const [batteryOpen, setBatteryOpen] = useState(false)
   // Now tick — drives the parked-duration counter forward without
-  // needing to re-render the whole dashboard. 1-minute cadence
-  // matches the granularity of the displayed value ("5h 31m") so
-  // updates aren't wasted. Date.now() lives in the state initialiser
-  // and the interval body, never in render itself (React 19 rule).
+  // Fifteen-second cadence also expires vehicle controls promptly when
+  // the browser cannot reach the Pi. Date.now() stays outside render.
   const [nowMs, setNowMs] = useState(() => Date.now())
   useEffect(() => {
-    const id = setInterval(() => setNowMs(Date.now()), 60_000)
+    const id = setInterval(() => setNowMs(Date.now()), 15_000)
     return () => clearInterval(id)
   }, [])
 
@@ -201,7 +201,16 @@ export function CarStatusCard({
     sample?.seconds_ago ?? null,
   )
   const showHealthWarning = healthPresentation.severity !== "green"
-  const charging = !!currentCharge?.charging
+  // A persisted charge phase may outlive the Pi's connection to the car.
+  // Only present it as live charging while authenticated BLE health is green.
+  const charging =
+    healthPresentation.severity === "green" && !!currentCharge?.charging
+  const showChargingControls = shouldShowChargingControls(
+    healthPresentation,
+    currentCharge?.controlsAvailable === true,
+    currentCharge?.controlsValidUntilTs ?? null,
+    Math.floor(nowMs / 1_000),
+  )
   const statusLabel = deriveVehicleStatusLabel(
     healthPresentation,
     isDriving,
@@ -239,7 +248,9 @@ export function CarStatusCard({
   const batterySoc = currentCharge?.soc ?? sample?.battery_pct
   const haveChargeDetail =
     currentCharge != null &&
-    (currentCharge.charging || currentCharge.rangeMi != null)
+    (currentCharge.charging ||
+      currentCharge.rangeMi != null ||
+      currentCharge.controlsAvailable)
 
   return (
     <div className="glass-card relative p-4">
@@ -398,6 +409,15 @@ export function CarStatusCard({
               <MiniStat label="Charge limit" value={`${currentCharge.limitSoc}%`} />
             )}
           </div>
+          {showChargingControls && (
+            <ChargingControls
+              key={`${currentCharge.charging}-${currentCharge.chargingAmps}-${currentCharge.maxChargingAmps}-${currentCharge.limitSoc}`}
+              charging={currentCharge.charging}
+              chargingAmps={currentCharge.chargingAmps}
+              maxChargingAmps={currentCharge.maxChargingAmps}
+              limitSoc={currentCharge.limitSoc}
+            />
+          )}
           <Link
             to="/charging"
             className="mt-3 inline-flex items-center gap-1 text-xs font-medium text-emerald-300 hover:text-emerald-200"
@@ -424,6 +444,153 @@ export function CarStatusCard({
           >
             <TirePressureCard data={tireHistory} chartOnly />
           </Suspense>
+        </div>
+      )}
+    </div>
+  )
+}
+
+interface ChargingControlsProps {
+  charging: boolean
+  chargingAmps: number | null
+  maxChargingAmps: number | null
+  limitSoc: number | null
+}
+
+function ChargingControls({
+  charging,
+  chargingAmps,
+  maxChargingAmps,
+  limitSoc,
+}: ChargingControlsProps) {
+  const safeMaxAmps =
+    maxChargingAmps != null && maxChargingAmps >= 1 && maxChargingAmps <= 80
+      ? Math.round(maxChargingAmps)
+      : null
+  const initialAmps =
+    chargingAmps == null || safeMaxAmps == null
+      ? null
+      : Math.max(1, Math.min(safeMaxAmps, Math.round(chargingAmps)))
+  const initialLimit =
+    limitSoc == null ? null : Math.max(50, Math.min(100, Math.round(limitSoc)))
+  const [amps, setAmps] = useState(initialAmps)
+  const [limit, setLimit] = useState(initialLimit)
+  const [pending, setPending] = useState<"toggle" | "amps" | "limit" | null>(null)
+  const [feedback, setFeedback] = useState<string | null>(null)
+  const [failed, setFailed] = useState(false)
+
+  async function send(
+    kind: "toggle" | "amps" | "limit",
+    request: Parameters<typeof sendChargingAction>[0],
+  ) {
+    setPending(kind)
+    setFeedback(null)
+    setFailed(false)
+    try {
+      await sendChargingAction(request)
+      setFeedback("Command sent. Waiting for fresh vehicle data.")
+    } catch (error) {
+      setFailed(true)
+      setFeedback(error instanceof Error ? error.message : "Charging command failed")
+    } finally {
+      setPending(null)
+    }
+  }
+
+  return (
+    <div className="mt-4 rounded-xl border border-emerald-400/20 bg-emerald-500/[0.06] p-3">
+      <div className="flex items-center justify-between gap-3">
+        <div>
+          <div className="text-[9px] font-semibold uppercase tracking-wider text-emerald-400/80">
+            Charging controls
+          </div>
+          <div className="mt-0.5 text-[11px] text-slate-400">
+            Available while the charge port is open or charging.
+          </div>
+        </div>
+        <button
+          type="button"
+          disabled={pending !== null}
+          onClick={() =>
+            void send("toggle", { action: charging ? "stop" : "start" })
+          }
+          className="shrink-0 rounded-lg border border-emerald-400/30 bg-emerald-500/15 px-3 py-1.5 text-xs font-semibold text-emerald-200 transition-colors hover:bg-emerald-500/25 disabled:cursor-wait disabled:opacity-50"
+        >
+          {pending === "toggle"
+            ? "Sending…"
+            : charging
+              ? "Stop charging"
+              : "Start charging"}
+        </button>
+      </div>
+
+      {amps != null && safeMaxAmps != null && (
+        <div className="mt-4">
+          <div className="flex items-center justify-between text-xs">
+            <label htmlFor="charging-amps" className="font-medium text-slate-300">
+              Charging current
+            </label>
+            <span className="font-semibold tabular-nums text-slate-100">{amps} A</span>
+          </div>
+          <div className="mt-2 flex items-center gap-3">
+            <input
+              id="charging-amps"
+              type="range"
+              min={1}
+              max={safeMaxAmps}
+              step={1}
+              value={amps}
+              disabled={pending !== null}
+              onChange={(event) => setAmps(Number(event.target.value))}
+              className="min-w-0 flex-1 accent-emerald-400"
+            />
+            <button
+              type="button"
+              disabled={pending !== null || amps === initialAmps}
+              onClick={() => void send("amps", { action: "setAmps", value: amps })}
+              className="rounded-lg border border-white/10 bg-white/[0.04] px-2.5 py-1 text-[11px] font-semibold text-slate-200 transition-colors hover:bg-white/[0.08] disabled:cursor-not-allowed disabled:opacity-40"
+            >
+              {pending === "amps" ? "Applying…" : "Apply"}
+            </button>
+          </div>
+        </div>
+      )}
+
+      {limit != null && (
+        <div className="mt-4">
+          <div className="flex items-center justify-between text-xs">
+            <label htmlFor="charge-limit" className="font-medium text-slate-300">
+              Charge limit
+            </label>
+            <span className="font-semibold tabular-nums text-slate-100">{limit}%</span>
+          </div>
+          <div className="mt-2 flex items-center gap-3">
+            <input
+              id="charge-limit"
+              type="range"
+              min={50}
+              max={100}
+              step={1}
+              value={limit}
+              disabled={pending !== null}
+              onChange={(event) => setLimit(Number(event.target.value))}
+              className="min-w-0 flex-1 accent-emerald-400"
+            />
+            <button
+              type="button"
+              disabled={pending !== null || limit === initialLimit}
+              onClick={() => void send("limit", { action: "setLimit", value: limit })}
+              className="rounded-lg border border-white/10 bg-white/[0.04] px-2.5 py-1 text-[11px] font-semibold text-slate-200 transition-colors hover:bg-white/[0.08] disabled:cursor-not-allowed disabled:opacity-40"
+            >
+              {pending === "limit" ? "Applying…" : "Apply"}
+            </button>
+          </div>
+        </div>
+      )}
+
+      {feedback && (
+        <div className={`mt-3 text-[11px] ${failed ? "text-rose-300" : "text-emerald-300"}`}>
+          {feedback}
         </div>
       )}
     </div>

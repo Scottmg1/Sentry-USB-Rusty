@@ -244,6 +244,7 @@ pub fn build_router(state: AppState) -> Router {
         // charge columns.
         .route("/api/charging", get(crate::charging::list_charging))
         .route("/api/charging/current", get(crate::charging::current_charging))
+        .route("/api/charging/action", post(crate::charging::charging_action))
         .route("/api/charging/tags", get(crate::charging::list_charge_tags))
         .route(
             "/api/charging/home-sessions",

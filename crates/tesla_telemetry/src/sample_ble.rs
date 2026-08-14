@@ -366,6 +366,10 @@ pub async fn sample_charge_ble(session: &PersistentSession) -> Result<ChargeResu
             let car_server::charge_state::OptionalChargingAmps::ChargingAmps(n) = v;
             *n
         }),
+        charge_current_request_max: charge.optional_charge_current_request_max.as_ref().map(|v| {
+            let car_server::charge_state::OptionalChargeCurrentRequestMax::ChargeCurrentRequestMax(n) = v;
+            *n
+        }),
         charge_rate_mph: charge.optional_charge_rate_mph_float.as_ref().map(|v| {
             let car_server::charge_state::OptionalChargeRateMphFloat::ChargeRateMphFloat(n) = v;
             *n
@@ -407,13 +411,14 @@ pub async fn sample_charge_ble(session: &PersistentSession) -> Result<ChargeResu
 pub fn log_charge_detail(c: &ChargeResult) {
     let d = &c.detail;
     info!(
-        "charge-detail [experimental]: amps={:?} power_kw={:?} volts={:?} amps_set={:?} \
+        "charge-detail [experimental]: amps={:?} power_kw={:?} volts={:?} amps_set={:?} amps_max={:?} \
          rate_mph={:?} added_kwh={:?} limit_soc={:?} mins_to_full={:?} range_mi={:?} \
          port_open={:?}",
         d.charger_actual_current_a,
         d.charger_power_kw,
         d.charger_voltage_v,
         d.charging_amps_set,
+        d.charge_current_request_max,
         d.charge_rate_mph,
         d.charge_energy_added_kwh,
         d.charge_limit_soc,

@@ -32,6 +32,10 @@
 //!   sentry-off         - turn Sentry Mode off
 //!   charge-port-open   - open the charge port
 //!   charge-port-close  - close the charge port
+//!   charge-start       - start charging
+//!   charge-stop        - stop charging
+//!   set-charging-amps:N - set charging current (1-80 A)
+//!   set-charge-limit:N  - set charge limit (50-100%)
 //!   keep-accessory-on  - turn Keep Accessory Power on
 //!   keep-accessory-off - turn Keep Accessory Power off
 //!   session-info       - pairing probe (see below)
@@ -94,7 +98,7 @@ async fn main() -> ExitCode {
         Some(v) => v,
         None => {
             eprintln!(
-                "usage: sentryusb-ble-action <wake|sentry-on|sentry-off|charge-port-open|charge-port-close|keep-accessory-on|keep-accessory-off|session-info|drive-state|pair|keygen>"
+                "usage: sentryusb-ble-action <wake|sentry-on|sentry-off|charge-port-open|charge-port-close|keep-accessory-on|keep-accessory-off|charge-start|charge-stop|set-charging-amps:N|set-charge-limit:N|session-info|drive-state|pair|keygen>"
             );
             return ExitCode::from(1);
         }
@@ -152,16 +156,10 @@ async fn main() -> ExitCode {
         }
     }
 
-    let action = match verb.as_str() {
-        "wake" => actions::wake_vehicle(),
-        "sentry-on" => actions::set_sentry_mode(true),
-        "sentry-off" => actions::set_sentry_mode(false),
-        "charge-port-open" => actions::charge_port_open(),
-        "charge-port-close" => actions::charge_port_close(),
-        "keep-accessory-on" => actions::set_keep_accessory_power(true),
-        "keep-accessory-off" => actions::set_keep_accessory_power(false),
-        other => {
-            eprintln!("unknown verb '{}'", other);
+    let action = match actions::parse_verb(verb.as_str()) {
+        Ok(action) => action,
+        Err(e) => {
+            eprintln!("{e}");
             return ExitCode::from(1);
         }
     };

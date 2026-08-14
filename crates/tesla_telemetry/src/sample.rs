@@ -218,6 +218,8 @@ pub struct ChargeDetail {
     pub charger_voltage_v: Option<i32>,
     /// Set/requested charging amps.
     pub charging_amps_set: Option<i32>,
+    /// Vehicle-reported maximum charging current, amps.
+    pub charge_current_request_max: Option<i32>,
     /// Charge rate, mi/hr added.
     pub charge_rate_mph: Option<f32>,
     /// Energy added this session, kWh.
@@ -330,6 +332,11 @@ pub struct Sample {
     pub charge_energy_added_kwh: Option<f32>,
     pub charge_limit_soc: Option<i32>,
     pub battery_range_mi: Option<f32>,
+    // Charging-control telemetry (v17). These values are used only from
+    // fresh state samples; stale persisted values never enable controls.
+    pub charging_amps_set: Option<i32>,
+    pub charge_current_request_max: Option<i32>,
+    pub charge_port_door_open: Option<bool>,
     // Estimated minutes to full charge (v13). Drives the dashboard
     // "charging" banner's time-to-full readout.
     pub charge_minutes_to_full: Option<i32>,

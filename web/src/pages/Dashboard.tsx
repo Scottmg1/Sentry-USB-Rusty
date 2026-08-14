@@ -262,13 +262,22 @@ export default function Dashboard() {
           }
           if (mounted) setBleHealthConfigured(Boolean(d.configured))
           if (mounted) setBleHealth(d.health ?? null)
+        } else if (mounted) {
+          setBleHealthConfigured(false)
+          setBleHealth(null)
         }
         if (sampleRes.ok) {
           const d = (await sampleRes.json()) as CarStatusSample
           if (mounted) setCarStatusSample(d)
+        } else if (mounted) {
+          setCarStatusSample(null)
         }
       } catch {
-        /* non-critical */
+        if (mounted) {
+          setBleHealthConfigured(false)
+          setBleHealth(null)
+          setCarStatusSample(null)
+        }
       }
     }
 
@@ -325,7 +334,7 @@ export default function Dashboard() {
         const c = await fetchCurrentCharge()
         if (mounted) setCurrentCharge(c)
       } catch {
-        /* non-critical */
+        if (mounted) setCurrentCharge(null)
       }
     }
 

@@ -63,8 +63,8 @@ export interface ChargeSessionDetail extends ChargeSessionSummary {
 }
 
 // Live charge status for the dashboard banner (/api/charging/current).
-// `charging` is false when the car isn't actively charging; the other
-// fields are present only while charging.
+// `charging` is false when the car isn't actively charging. Charge metrics
+// are present only while charging; controls need fresh open-port/charge data.
 export interface CurrentCharge {
   charging: boolean
   soc: number | null
@@ -76,4 +76,9 @@ export interface CurrentCharge {
   energyAddedKwh: number | null
   minutesToFull: number | null
   rangeMi: number | null
+  chargingAmps: number | null
+  maxChargingAmps: number | null
+  chargePortOpen: boolean | null
+  controlsAvailable: boolean
+  controlsValidUntilTs: number | null
 }

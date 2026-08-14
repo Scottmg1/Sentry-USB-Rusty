@@ -43,6 +43,8 @@
 //! Where `<verb>` is one of:
 //!   `wake`, `sentry-on`, `sentry-off`, `charge-port-open`,
 //!   `charge-port-close`, `keep-accessory-on`, `keep-accessory-off`,
+//!   `charge-start`, `charge-stop`, `set-charging-amps:<n>`,
+//!   `set-charge-limit:<n>`,
 //!   `session-info`, `drive-state`.
 //!
 //! Most verbs are fire-and-forget actions that reply `OK` / `ERR …`.
@@ -62,7 +64,7 @@
 
 use std::time::Duration;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use sentryusb_tesla_ble::actions::{self, ActionPayload};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
@@ -230,20 +232,7 @@ async fn process(stream: UnixStream, action_tx: mpsc::Sender<ActionRequest>) -> 
 /// Translate a wire verb string into the matching typed
 /// `ActionPayload` from `tesla_ble::actions`. Single source of truth
 /// for the verb→action mapping — also referenced (in spirit) by the
-/// CLI's argument parser.
+/// CLI's argument parser via `actions::parse_verb`.
 pub fn parse_verb(verb: &str) -> Result<ActionPayload> {
-    match verb {
-        "wake" => Ok(actions::wake_vehicle()),
-        "sentry-on" => Ok(actions::set_sentry_mode(true)),
-        "sentry-off" => Ok(actions::set_sentry_mode(false)),
-        "charge-port-open" => Ok(actions::charge_port_open()),
-        "charge-port-close" => Ok(actions::charge_port_close()),
-        "keep-accessory-on" => Ok(actions::set_keep_accessory_power(true)),
-        "keep-accessory-off" => Ok(actions::set_keep_accessory_power(false)),
-        other => bail!(
-            "unknown verb '{}' (expected: wake | sentry-on | sentry-off | \
-             charge-port-open | charge-port-close | keep-accessory-on | keep-accessory-off)",
-            other
-        ),
-    }
+    actions::parse_verb(verb)
 }

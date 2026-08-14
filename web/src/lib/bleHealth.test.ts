@@ -75,3 +75,33 @@ test("charging is shown only while BLE health is green", () => {
     "Telemetry idle",
   )
 })
+
+test("charging controls require both green BLE health and backend availability", () => {
+  const shouldShowChargingControls = (
+    bleHealthModule as typeof bleHealthModule & {
+      shouldShowChargingControls: (
+        health: ReturnType<typeof presentBleHealth>,
+        controlsAvailable: boolean,
+        controlsValidUntilTs: number | null,
+        nowTs: number,
+      ) => boolean
+    }
+  ).shouldShowChargingControls
+
+  assert.equal(
+    shouldShowChargingControls(presentBleHealth(undefined, 15), true, 1_120, 1_060),
+    true,
+  )
+  assert.equal(
+    shouldShowChargingControls(presentBleHealth(undefined, 600), true, 1_120, 1_060),
+    false,
+  )
+  assert.equal(
+    shouldShowChargingControls(presentBleHealth(undefined, 15), false, 1_120, 1_060),
+    false,
+  )
+  assert.equal(
+    shouldShowChargingControls(presentBleHealth(undefined, 15), true, 1_120, 1_121),
+    false,
+  )
+})

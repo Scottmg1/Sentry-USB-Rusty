@@ -26,6 +26,24 @@ export async function fetchCurrentCharge(): Promise<CurrentCharge> {
   return res.json()
 }
 
+export type ChargingActionRequest =
+  | { action: "start" | "stop" }
+  | { action: "setAmps" | "setLimit"; value: number }
+
+export async function sendChargingAction(
+  request: ChargingActionRequest,
+): Promise<void> {
+  const res = await fetch("/api/charging/action", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(request),
+  })
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({}))
+    throw new Error(body.error || `charging action: ${res.status}`)
+  }
+}
+
 /// Every charge tag in use (for the filter + per-tag rate editor).
 export async function fetchChargeTags(): Promise<string[]> {
   const res = await fetch("/api/charging/tags")

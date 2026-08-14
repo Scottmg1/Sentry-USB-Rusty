@@ -48,10 +48,12 @@ pub fn insert(conn: &Connection, s: &Sample) -> Result<()> {
           odometer_mi, location_name, \
           charger_power_kw, charger_actual_current_a, charger_voltage_v, \
           charge_rate_mph, charge_energy_added_kwh, charge_limit_soc, battery_range_mi, \
+          charging_amps_set, charge_current_request_max, charge_port_door_open, \
           latitude, longitude, \
           source, charge_minutes_to_full, charging_state) \
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, \
-                 ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24)",
+                 ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, \
+                 ?25, ?26, ?27)",
         params![
             s.ts,
             s.battery_pct,
@@ -72,6 +74,9 @@ pub fn insert(conn: &Connection, s: &Sample) -> Result<()> {
             s.charge_energy_added_kwh,
             s.charge_limit_soc,
             s.battery_range_mi,
+            s.charging_amps_set,
+            s.charge_current_request_max,
+            s.charge_port_door_open.map(|b| if b { 1_i64 } else { 0_i64 }),
             s.latitude,
             s.longitude,
             s.source,
@@ -118,6 +123,30 @@ mod tests {
             .query_row("SELECT count(*) FROM telemetry_samples", [], |row| row.get(0))
             .unwrap();
         assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn insert_persists_charging_control_telemetry() {
+        let conn = fresh_memory_db();
+        let s = Sample {
+            ts: 1_700_000_050,
+            charging_amps_set: Some(32),
+            charge_current_request_max: Some(48),
+            charge_port_door_open: Some(true),
+            source: "state".into(),
+            ..Sample::default()
+        };
+
+        insert(&conn, &s).unwrap();
+        let values: (Option<i64>, Option<i64>, Option<i64>) = conn
+            .query_row(
+                "SELECT charging_amps_set, charge_current_request_max, charge_port_door_open \
+                 FROM telemetry_samples WHERE ts = ?1",
+                [s.ts],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(values, (Some(32), Some(48), Some(1)));
     }
 
     #[test]
