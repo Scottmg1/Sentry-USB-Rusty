@@ -1846,8 +1846,21 @@ pub(crate) fn plan_clip_at_park_gaps(
         if end_idx > n_points {
             end_idx = n_points;
         }
+        // A non-empty frame span always keeps at least one point. Both
+        // fractions round to the same index when a segment is short in
+        // frames and GPS dedup left few points, which used to delete the
+        // segment outright — along with the flag/gear evidence Summon
+        // detection reads from it. Only the trailing segment escaped,
+        // rescued by the start_idx clamp above; leading and middle
+        // segments vanished, so whether a maneuver was detected depended
+        // on how much the car had moved. The frame bounds carry the real
+        // duration, so a one-point segment still measures its true
+        // length. Ported from Sentry-Drive's splitClipAtParkGaps.
         if end_idx <= start_idx {
-            continue;
+            end_idx = start_idx + 1;
+        }
+        if end_idx > n_points {
+            continue; // no points at all — nothing to slice
         }
 
         out.push(PlannedSeg {
@@ -5680,6 +5693,70 @@ mod tests {
             end_frame: end,
             total_frames: total,
         }
+    }
+
+    /// GearRun list from (gear, frames) pairs.
+    fn gr(pairs: &[(u8, u32)]) -> Vec<GearRun> {
+        pairs.iter().map(|&(gear, frames)| GearRun { gear, frames }).collect()
+    }
+
+    // ── Park splitting: short segments survive GPS deduplication ──
+    // Ported from Sentry-Drive's grouper.test.js. The frame→point
+    // mapping rounds both ends of a short segment onto the same index
+    // once dedup has thinned the points, which used to delete the
+    // segment outright — taking the flag/gear evidence Summon detection
+    // reads from it. Whether a maneuver was detected then depended on
+    // how much the car had moved.
+
+    #[test]
+    fn park_split_keeps_leading_and_middle_segments_at_any_point_density() {
+        // Four motion runs separated by park gaps. At six points the
+        // leading and middle 30-frame runs both collapse to a single
+        // index; only the trailing one was rescued, by the clamp that
+        // pulls start_idx back inside the array.
+        let runs = gr(&[
+            (1, 30),
+            (GEAR_PARK, 120),
+            (1, 420),
+            (GEAR_PARK, 120),
+            (1, 30),
+            (GEAR_PARK, 120),
+            (1, 960),
+        ]);
+
+        for n_points in [6usize, 100, 1800] {
+            let plan = plan_clip_at_park_gaps(&runs, n_points).expect("clip has park gaps");
+            let motion: Vec<&PlannedSeg> = plan.iter().filter(|s| !s.parked).collect();
+            assert_eq!(
+                motion.len(),
+                4,
+                "n={n_points}: every motion run must survive the point mapping"
+            );
+            for seg in &motion {
+                assert!(
+                    seg.range.end > seg.range.start,
+                    "n={n_points}: a motion segment must keep at least one point"
+                );
+                assert!(seg.range.end <= n_points, "n={n_points}: range stays in bounds");
+            }
+            // Offsets come from the FRAME bounds, so they do not move
+            // with the point count — a one-point segment still reports
+            // its true position in the clip.
+            let offsets: Vec<i64> = motion.iter().map(|s| s.offset_secs).collect();
+            assert_eq!(offsets, vec![0, 5, 23, 28], "n={n_points}");
+        }
+    }
+
+    #[test]
+    fn park_split_drops_segments_only_when_the_clip_has_no_points() {
+        // The one case that still skips: nothing to slice at all. The
+        // guard must not panic or produce an out-of-range slice.
+        let runs = gr(&[(1, 30), (GEAR_PARK, 120), (1, 960)]);
+        let plan = plan_clip_at_park_gaps(&runs, 0).expect("clip has a park gap");
+        assert!(
+            plan.iter().all(|s| s.parked),
+            "a point-less clip yields no motion segments to slice"
+        );
     }
 
     // Probe shape of 2026-07-15_20-49-54 (start clip): hazards through
