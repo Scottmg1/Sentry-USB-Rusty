@@ -12,7 +12,7 @@ use std::io::{Read, Seek, SeekFrom};
 use anyhow::{Context, Result};
 
 use crate::types::{
-    ExtractedGps, FlagRun, GearRun, GpsPoint, FLAG_ACCEL, FLAG_BLINKER_LEFT,
+    ApRun, ExtractedGps, FlagRun, GearRun, GpsPoint, FLAG_ACCEL, FLAG_BLINKER_LEFT,
     FLAG_BLINKER_RIGHT, FLAG_BRAKE,
 };
 
@@ -84,6 +84,14 @@ fn assemble_extracted(
     let raw_park_count = gears.iter().filter(|&&g| g == GEAR_PARK).count() as u32;
     let gear_runs = compute_gear_runs(&gears);
     let flag_runs = compute_flag_runs(&flags, Some(&speeds));
+    // MUST be computed here, from the pre-dedup `ap_states`. Running it
+    // after `dedup_consecutive` (or against the returned
+    // `autopilot_states`, which is that same array post-dedup) yields
+    // runs summing to the POINT count, which the summon detector then
+    // walks with frame-space bounds. Both tools reject such runs via the
+    // span check — silently — so a mis-ordered call looks exactly like
+    // an unported one.
+    let ap_runs = compute_ap_runs(&ap_states);
 
     // An all-zero IMU channel means the firmware doesn't emit fields
     // 14/15 — store nothing so consumers can distinguish "no channel"
@@ -114,6 +122,7 @@ fn assemble_extracted(
         raw_frame_count,
         gear_runs,
         flag_runs,
+        ap_runs,
         accel_x,
         accel_y,
     }
@@ -593,6 +602,35 @@ fn compute_gear_runs(gears: &[u8]) -> Vec<GearRun> {
     runs
 }
 
+/// RLE the per-frame autopilot states over RAW frame indices — the same
+/// frame space as gear runs. Mirrors Sentry-Drive's `computeApRuns`.
+///
+/// Feed this the PRE-DEDUP array. See the call site in
+/// `assemble_extracted` and [`crate::types::ApRun`] for why the deduped
+/// `autopilot_states` is the wrong source and fails silently.
+fn compute_ap_runs(ap_states: &[u8]) -> Vec<ApRun> {
+    if ap_states.is_empty() {
+        return Vec::new();
+    }
+
+    let mut runs = Vec::new();
+    let mut current_ap = ap_states[0];
+    let mut count: u32 = 1;
+
+    for &a in &ap_states[1..] {
+        if a == current_ap {
+            count += 1;
+        } else {
+            runs.push(ApRun { ap: current_ap, frames: count });
+            current_ap = a;
+            count = 1;
+        }
+    }
+    runs.push(ApRun { ap: current_ap, frames: count });
+
+    runs
+}
+
 /// RLE the per-frame SEI flag bytes (blinkers/brake/accel bits) over RAW
 /// frame indices — the same frame space as gear runs. Mirrors
 /// Sentry-Drive's `computeFlagRuns(flags, speeds)` (drive-calc.cjs).
@@ -662,6 +700,7 @@ impl ExtractedGps {
             raw_frame_count: 0,
             gear_runs: Vec::new(),
             flag_runs: Vec::new(),
+            ap_runs: Vec::new(),
             accel_x: Vec::new(),
             accel_y: Vec::new(),
         }
@@ -854,6 +893,76 @@ mod tests {
         // Dedup still applies to the point-domain arrays.
         assert_eq!(out.points.len(), moving);
         assert_eq!(out.gear_states.len(), moving);
+        // v21 autopilot RLE lives in the same raw frame space.
+        let ap_total: u32 = out.ap_runs.iter().map(|r| r.frames).sum();
+        assert_eq!(ap_total, out.raw_frame_count);
+    }
+
+    #[test]
+    fn ap_runs_are_raw_frame_space_not_deduped_point_space() {
+        // THE TRAP (Sentry-Drive docs/RUST-SUMMON-PORT.md): `ap_states`
+        // is the raw per-frame array on the way in and the deduped
+        // per-point array on the way out, one identifier apart. Runs
+        // built from the deduped one sum to the POINT count, get walked
+        // with frame-space bounds, and read the wrong frames — silently,
+        // because deduped and absent apRuns are indistinguishable to the
+        // span check.
+        //
+        // This clip is built so the two answers differ: the autopilot
+        // state CHANGES inside the tail of identical GPS fixes that
+        // dedup collapses. A point-space RLE could not see that
+        // transition at all.
+        let moving = 300usize; // distinct fixes
+        let stationary = 253usize; // identical fixes, collapsed by dedup
+        let n = moving + stationary;
+
+        let mut points: Vec<GpsPoint> = Vec::with_capacity(n);
+        for i in 0..moving {
+            points.push([37.0 + i as f64 * 1e-5, -122.0]);
+        }
+        for _ in 0..stationary {
+            points.push([37.0 + (moving - 1) as f64 * 1e-5, -122.0]);
+        }
+
+        // Off while parked at the start, FSD for the maneuver, Off again
+        // once stopped — the Off→FSD→Off shape newer hardware reports
+        // for a Summon. The trailing Off run begins INSIDE the collapsed
+        // stationary tail.
+        let mut ap_states = vec![AUTOPILOT_OFF; 40];
+        ap_states.resize(40 + 460, AUTOPILOT_FSD);
+        ap_states.resize(n, AUTOPILOT_OFF);
+        assert_eq!(ap_states.len(), n);
+
+        let out = assemble_extracted(
+            points,
+            vec![GEAR_DRIVE; n],
+            ap_states,
+            vec![1.5; n],
+            vec![0.0; n],
+            vec![0u8; n],
+            Vec::new(),
+            Vec::new(),
+        );
+
+        assert_eq!(out.raw_frame_count, n as u32);
+        assert_eq!(
+            out.ap_runs,
+            vec![
+                ApRun { ap: AUTOPILOT_OFF, frames: 40 },
+                ApRun { ap: AUTOPILOT_FSD, frames: 460 },
+                ApRun { ap: AUTOPILOT_OFF, frames: 53 },
+            ],
+        );
+        let ap_total: u32 = out.ap_runs.iter().map(|r| r.frames).sum();
+        assert_eq!(
+            ap_total, out.raw_frame_count,
+            "ap runs must span raw frames — the detector's span check rejects anything else"
+        );
+        // The distinguishing assertion: dedup really did shrink the
+        // point domain, so a point-space RLE would have summed to 300
+        // and silently passed a naive length check.
+        assert_eq!(out.autopilot_states.len(), moving);
+        assert_ne!(ap_total as usize, out.autopilot_states.len());
     }
 
     #[test]

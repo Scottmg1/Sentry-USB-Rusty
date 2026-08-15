@@ -26,9 +26,11 @@ use rusqlite::{params, Connection};
 use tracing::{debug, info, warn};
 
 use crate::aggregate::compute_route_aggregates;
-use crate::blob::{decode_f32s, decode_flag_runs, decode_gear_runs, decode_points, decode_u8s};
+use crate::blob::{
+    decode_ap_runs, decode_f32s, decode_flag_runs, decode_gear_runs, decode_points, decode_u8s,
+};
 use crate::db::normalize_path;
-use crate::types::{FlagRun, GearRun, GpsPoint, Route};
+use crate::types::{ApRun, FlagRun, GearRun, GpsPoint, Route};
 
 /// Minimum existing-route count before the shrink guard applies. Below
 /// this, allow any import — tiny DBs don't need corruption protection
@@ -484,6 +486,13 @@ fn insert_imported_route(
     // Absent flagRuns (pre-flags Sentry-Drive exports, Tessie imports)
     // stores NULL — the summon detector must see "no evidence", not an
     // empty-but-present run list.
+    // Absent apRuns (pre-v21 Drive exports, Tessie imports) stores NULL
+    // too — the Self Driving summon signature must see "no evidence".
+    let apb = if r.ap_runs.is_empty() {
+        None
+    } else {
+        crate::blob::encode_ap_runs(Some(&r.ap_runs))
+    };
     let fb = if r.flag_runs.is_empty() {
         None
     } else {
@@ -541,7 +550,7 @@ fn insert_imported_route(
             safety_aggr_turn_ms, safety_aggr_turn_events,
             safety_speeding_ms, safety_moving_ms, safety_manual_moving_ms,
             safety_brake_any_ms, safety_turn_any_ms,
-            accel_x_blob, accel_y_blob)
+            accel_x_blob, accel_y_blob, ap_runs_blob)
          VALUES(
             ?1, ?2, ?3, ?4, ?5,
             NULL, NULL, ?6, ?7, ?8,
@@ -558,7 +567,7 @@ fn insert_imported_route(
             ?50, ?51, ?52, ?53, ?54,
             ?55, ?56,
             ?57, ?58, ?59, ?60, ?61, ?62, ?63, ?64, ?65,
-            ?66, ?67)
+            ?66, ?67, ?68)
          ON CONFLICT(file) DO UPDATE SET
             date_dir            = excluded.date_dir,
             point_count         = excluded.point_count,
@@ -625,7 +634,8 @@ fn insert_imported_route(
             safety_brake_any_ms      = excluded.safety_brake_any_ms,
             safety_turn_any_ms       = excluded.safety_turn_any_ms,
             accel_x_blob        = COALESCE(excluded.accel_x_blob, accel_x_blob),
-            accel_y_blob        = COALESCE(excluded.accel_y_blob, accel_y_blob)",
+            accel_y_blob        = COALESCE(excluded.accel_y_blob, accel_y_blob),
+            ap_runs_blob        = COALESCE(excluded.ap_runs_blob, ap_runs_blob)",
         params![
             norm, r.date, r.points.len() as i64, r.raw_park_count as i64, r.raw_frame_count as i64,
             a.distance_m, first_lat, first_lon,
@@ -649,7 +659,7 @@ fn insert_imported_route(
             a.safety_aggr_turn_ms, a.safety_aggr_turn_events,
             a.safety_speeding_ms, a.safety_moving_ms, a.safety_manual_moving_ms,
             a.safety_brake_any_ms, a.safety_turn_any_ms,
-            axb, ayb,
+            axb, ayb, apb,
         ],
     )?;
     Ok(())
@@ -889,7 +899,8 @@ impl<'a> serde::Serialize for RouteStream<'a> {
                         tire_fl_psi, tire_fr_psi, tire_rl_psi, tire_rr_psi,
                         odometer_mi_start, odometer_mi_end,
                         location_name_start, location_name_end,
-                        flag_runs_blob, accel_x_blob, accel_y_blob
+                        flag_runs_blob, accel_x_blob, accel_y_blob,
+                        ap_runs_blob
                  FROM routes
                  ORDER BY file",
             )
@@ -1058,6 +1069,13 @@ impl<'a> serde::Serialize for RouteStream<'a> {
             let gear_runs: Vec<GearRun> = decode_gear_runs(rb.as_deref())
                 .map_err(|e| S::Error::custom(format!("decode gear_runs {}: {}", file, e)))?
                 .unwrap_or_default();
+            let apb: Option<Vec<u8>> = row.get(30).map_err(|e| {
+                *self.error.borrow_mut() = Some(e);
+                S::Error::custom("col ap_runs_blob")
+            })?;
+            let ap_runs: Vec<ApRun> = decode_ap_runs(apb.as_deref())
+                .map_err(|e| S::Error::custom(format!("decode ap_runs {}: {}", file, e)))?
+                .unwrap_or_default();
             let flag_runs: Vec<FlagRun> = decode_flag_runs(fb.as_deref())
                 .map_err(|e| S::Error::custom(format!("decode flag_runs {}: {}", file, e)))?
                 .unwrap_or_default();
@@ -1080,6 +1098,7 @@ impl<'a> serde::Serialize for RouteStream<'a> {
                 raw_frame_count,
                 gear_runs,
                 flag_runs,
+                ap_runs,
                 accel_x,
                 accel_y,
                 source,
@@ -1301,6 +1320,64 @@ mod streaming_export_tests {
         );
         // Absent stays absent for the second route — count the key.
         assert_eq!(out_str.matches(r#""flagRuns""#).count(), 1);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn ap_runs_round_trip_import_then_export() {
+        // The Tier-1 acceptance test from Sentry-Drive's
+        // docs/RUST-SUMMON-PORT.md: a Drive-authored drive-data.json
+        // carrying apRuns must import into SQLite and re-export
+        // byte-equal, and a route WITHOUT apRuns must stay ABSENT — not
+        // become an empty array. Absent and empty are indistinguishable
+        // to Drive (both fail its span check), so what this really
+        // guards is that a Rusty sync no longer ERASES the field.
+        let json = r#"{"processedFiles":["2026-08-15/2026-08-15_10-00-00-front.mp4","2026-08-15/2026-08-15_10-01-00-front.mp4"],"routes":[
+            {"file":"2026-08-15/2026-08-15_10-00-00-front.mp4","date":"2026-08-15","points":[[37.0,-122.0],[37.0001,-122.0]],"gearStates":"AQE=","autopilotStates":"AQE=","speeds":[1.5,2.7],"accelPositions":[0.0,0.0],"rawParkCount":40,"rawFrameCount":553,"gearRuns":[{"gear":0,"frames":40},{"gear":1,"frames":513}],"flagRuns":[{"flags":0,"frames":553,"maxMps":2.7}],"apRuns":[{"ap":0,"frames":40},{"ap":1,"frames":513}]},
+            {"file":"2026-08-15/2026-08-15_10-01-00-front.mp4","date":"2026-08-15","points":[[37.0,-122.0],[37.0001,-122.0]],"gearStates":"AQE=","autopilotStates":"AAA=","speeds":[1.5,2.7],"accelPositions":[0.0,0.0],"rawParkCount":0,"rawFrameCount":600,"gearRuns":[{"gear":1,"frames":600}]}
+        ],"driveTags":{}}"#;
+        let path = std::env::temp_dir().join(format!(
+            "sentryusb-apruns-roundtrip-{}.json",
+            std::process::id()
+        ));
+        std::fs::write(&path, json).unwrap();
+
+        let mut conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::schema::migrate(&conn).unwrap();
+        import_json(&mut conn, path.to_str().unwrap(), |_| {}).unwrap();
+
+        let mut out: Vec<u8> = Vec::new();
+        export_json(&conn, &mut out).unwrap();
+        let data: crate::types::StoreData = serde_json::from_slice(&out).unwrap();
+        assert_eq!(data.routes.len(), 2);
+        assert_eq!(
+            data.routes[0].ap_runs,
+            vec![
+                crate::types::ApRun { ap: 0, frames: 40 },
+                crate::types::ApRun { ap: 1, frames: 513 },
+            ],
+            "present apRuns survive byte-equal"
+        );
+        assert!(
+            data.routes[1].ap_runs.is_empty(),
+            "route without apRuns must stay unverifiable on the Self Driving path"
+        );
+        let out_str = String::from_utf8(out).unwrap();
+        assert!(
+            out_str.contains(r#""apRuns":[{"ap":0,"frames":40},{"ap":1,"frames":513}]"#),
+            "export: {out_str}"
+        );
+        // Absent stays absent — count the key, exactly like flagRuns.
+        assert_eq!(out_str.matches(r#""apRuns""#).count(), 1);
+
+        // The ap RLE is raw FRAME space: it must sum to rawFrameCount,
+        // not to the deduped point count (2 here). This is the trap the
+        // port doc calls out, and it is what makes the evidence usable.
+        assert_eq!(
+            data.routes[0].ap_runs.iter().map(|r| r.frames).sum::<u32>(),
+            data.routes[0].raw_frame_count,
+        );
 
         let _ = std::fs::remove_file(&path);
     }

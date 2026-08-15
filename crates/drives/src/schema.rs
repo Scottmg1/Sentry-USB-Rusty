@@ -119,7 +119,16 @@ use rusqlite::{params, Connection, OptionalExtension};
 /// blobs (pre-v20 extractions, firmware without the fields) fall back
 /// to the speed/GPS-derived estimates. No backfill: like flag_runs,
 /// the channel only exists by re-extracting the MP4's SEI stream.
-pub const CURRENT_SCHEMA_VERSION: i32 = 20;
+/// v20 -> v21: add `ap_runs_blob` (per-frame SEI autopilot-state RLE in
+/// RAW frame space, gear-run wire shape) to `routes`. Newer Tesla
+/// hardware reports a Summon maneuver as autopilot_state = FSD, which is
+/// the summon detector's second signature; the deduped `ap_states_blob`
+/// cannot serve because its runs index point space. Nullable — rows
+/// written before the channel existed stay absent, and absent must
+/// survive as absent (the detector reads it as "unverifiable on that
+/// path", never as "no autopilot"). No backfill: like `flag_runs_blob`,
+/// the channel only exists by re-extracting the MP4's SEI stream.
+pub const CURRENT_SCHEMA_VERSION: i32 = 21;
 
 /// v1 DDL. Each statement is idempotent (`IF NOT EXISTS`) so `migrate()`
 /// is safe on every startup. Column shapes and names match Go exactly â€”
@@ -468,6 +477,11 @@ pub const V20_ROUTE_IMU_COLUMNS: &[(&str, &str)] = &[
     ("accel_y_blob", "BLOB"),
 ];
 
+/// v21 summon Self-Driving-signature evidence on `routes` (see
+/// `CURRENT_SCHEMA_VERSION`). Same wire shape as `gear_runs_blob`:
+/// 1-byte autopilot state + LE i32 frames per run.
+pub const V21_ROUTE_AP_RUN_COLUMNS: &[(&str, &str)] = &[("ap_runs_blob", "BLOB")];
+
 /// v9 rollups on `routes`. Odometer start/end let the UI show a
 /// per-trip mileage delta that's more accurate than GPS distance
 /// (GPS over-estimates curves, drops in tunnels, can drift).
@@ -717,6 +731,7 @@ pub fn migrate(conn: &Connection) -> Result<()> {
         .chain(V18_ROUTE_SAFETY_COLUMNS.iter())
         .chain(V19_ROUTE_SAFETY_DENOM_COLUMNS.iter())
         .chain(V20_ROUTE_IMU_COLUMNS.iter())
+        .chain(V21_ROUTE_AP_RUN_COLUMNS.iter())
     {
         if existing.contains(*name) {
             continue;
@@ -948,7 +963,7 @@ mod tests {
         migrate(&conn).unwrap();
         assert_eq!(
             meta_get(&conn, "schema_version").unwrap().as_deref(),
-            Some("20"),
+            Some("21"),
         );
         assert!(meta_get(&conn, "created_at").unwrap().is_some());
     }
@@ -986,7 +1001,7 @@ mod tests {
         }
         assert_eq!(
             meta_get(&conn, "schema_version").unwrap().as_deref(),
-            Some("20")
+            Some("21")
         );
     }
 
@@ -1018,7 +1033,7 @@ mod tests {
         }
         assert_eq!(
             meta_get(&conn, "schema_version").unwrap().as_deref(),
-            Some("20")
+            Some("21")
         );
     }
 
@@ -1052,7 +1067,7 @@ mod tests {
         }
         assert_eq!(
             meta_get(&conn, "schema_version").unwrap().as_deref(),
-            Some("20")
+            Some("21")
         );
     }
 
@@ -1159,7 +1174,7 @@ mod tests {
         assert!(surviving_processed.starts_with("RecentClips/"));
         assert_eq!(
             meta_get(&conn, "schema_version").unwrap().as_deref(),
-            Some("20")
+            Some("21")
         );
     }
 
@@ -1210,7 +1225,7 @@ mod tests {
         assert_eq!(count_routes(&conn), 1, "fresh-DB seed must not run v5 cleanup");
         assert_eq!(
             meta_get(&conn, "schema_version").unwrap().as_deref(),
-            Some("20")
+            Some("21")
         );
     }
 
@@ -1263,7 +1278,7 @@ mod tests {
         assert_eq!(table_exists, 1, "v6 must create telemetry_samples");
         assert_eq!(
             meta_get(&conn, "schema_version").unwrap().as_deref(),
-            Some("20")
+            Some("21")
         );
     }
 
@@ -1300,7 +1315,7 @@ mod tests {
         }
         assert_eq!(
             meta_get(&conn, "schema_version").unwrap().as_deref(),
-            Some("20")
+            Some("21")
         );
     }
 
@@ -1338,7 +1353,7 @@ mod tests {
         }
         assert_eq!(
             meta_get(&conn, "schema_version").unwrap().as_deref(),
-            Some("20")
+            Some("21")
         );
     }
 
@@ -1360,7 +1375,7 @@ mod tests {
         }
         assert_eq!(
             meta_get(&conn, "schema_version").unwrap().as_deref(),
-            Some("20")
+            Some("21")
         );
     }
 
@@ -1433,7 +1448,7 @@ mod tests {
         assert_eq!(retained, (73.0, None, None, None));
         assert_eq!(
             meta_get(&conn, "schema_version").unwrap().as_deref(),
-            Some("20")
+            Some("21")
         );
     }
 
@@ -1472,7 +1487,7 @@ mod tests {
         }
         assert_eq!(
             meta_get(&conn, "schema_version").unwrap().as_deref(),
-            Some("20")
+            Some("21")
         );
     }
 
@@ -1512,7 +1527,7 @@ mod tests {
         }
         assert_eq!(
             meta_get(&conn, "schema_version").unwrap().as_deref(),
-            Some("20")
+            Some("21")
         );
     }
 
@@ -1553,7 +1568,67 @@ mod tests {
         }
         assert_eq!(
             meta_get(&conn, "schema_version").unwrap().as_deref(),
-            Some("20")
+            Some("21")
+        );
+    }
+
+    #[test]
+    fn migrate_from_v20_adds_v21_ap_runs_column() {
+        // A v20 DB (everything through the IMU channels) must gain
+        // ap_runs_blob — the summon Self Driving signature's evidence —
+        // with existing rows intact and the new column NULL, which is
+        // how "no autopilot evidence" has to read.
+        let conn = open();
+        for stmt in V1_SCHEMA {
+            conn.execute(stmt, []).unwrap();
+        }
+        for stmt in V6_NEW_TABLES {
+            conn.execute(stmt, []).unwrap();
+        }
+        for (name, typ) in V2_ROUTE_AGGREGATE_COLUMNS
+            .iter()
+            .chain(V3_ROUTE_CLOUD_COLUMNS.iter())
+            .chain(V4_ROUTE_TESSIE_COLUMNS.iter())
+            .chain(V6_ROUTE_TELEMETRY_COLUMNS.iter())
+            .chain(V7_ROUTE_TPMS_COLUMNS.iter())
+            .chain(V9_ROUTE_COLUMNS.iter())
+            .chain(V10_ROUTE_COLUMNS.iter())
+            .chain(V15_ROUTE_BOUNDARY_COLUMNS.iter())
+            .chain(V16_ROUTE_FLAG_COLUMNS.iter())
+            .chain(V18_ROUTE_SAFETY_COLUMNS.iter())
+            .chain(V19_ROUTE_SAFETY_DENOM_COLUMNS.iter())
+            .chain(V20_ROUTE_IMU_COLUMNS.iter())
+        {
+            conn.execute(&format!("ALTER TABLE routes ADD COLUMN {} {}", name, typ), [])
+                .unwrap();
+        }
+        conn.execute(
+            "INSERT INTO routes(file, date_dir, point_count, raw_park_count,
+                raw_frame_count, points_blob, gear_states_blob, ap_states_blob,
+                speeds_blob, accel_blob, updated_at)
+             VALUES('2026-08-15/clip-front.mp4', '2026-08-15', 2, 0, 1214,
+                x'00', x'00', x'00', x'00', x'00', 1)",
+            [],
+        )
+        .unwrap();
+        meta_set(&conn, "schema_version", "20").unwrap();
+
+        migrate(&conn).unwrap();
+
+        let cols = list_route_columns(&conn).unwrap();
+        for (name, _) in V21_ROUTE_AP_RUN_COLUMNS {
+            assert!(cols.contains(*name), "routes.{} missing after v21", name);
+        }
+        let (frames, ap): (i64, Option<Vec<u8>>) = conn
+            .query_row("SELECT raw_frame_count, ap_runs_blob FROM routes", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap();
+        assert_eq!(frames, 1214, "existing row survived the migration");
+        assert!(ap.is_none(), "pre-v21 rows read as absent, not empty");
+        assert_eq!(
+            meta_get(&conn, "schema_version").unwrap().as_deref(),
+            Some("21")
         );
     }
 
@@ -1596,7 +1671,7 @@ mod tests {
         }
         assert_eq!(
             meta_get(&conn, "schema_version").unwrap().as_deref(),
-            Some("20")
+            Some("21")
         );
     }
 

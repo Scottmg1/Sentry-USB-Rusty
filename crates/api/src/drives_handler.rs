@@ -246,6 +246,17 @@ fn single_drive_blocking(
                 drive.assisted_percent = s.assisted_percent;
                 // Summon classification requires summary segment bounds.
                 drive.summon = s.summon;
+                if s.summon {
+                    // Stats parity with Sentry-Drive: a detected Summon
+                    // emits no FSD events. Every numeric FSD/Autosteer/
+                    // TACC field is already zeroed by the overlay above
+                    // (the summary path zeroes them at the source), but
+                    // fsd_events comes from the full-BLOB walk and would
+                    // otherwise plot a phantom disengagement where the
+                    // car parked itself. The per-point fsd_states array
+                    // is deliberately KEPT as raw evidence.
+                    drive.fsd_events.clear();
+                }
             }
             (
                 StatusCode::OK,

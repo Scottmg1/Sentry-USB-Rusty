@@ -14,7 +14,7 @@
 
 use anyhow::{bail, Result};
 
-use crate::types::{FlagRun, GearRun, GpsPoint};
+use crate::types::{ApRun, FlagRun, GearRun, GpsPoint};
 
 // -----------------------------------------------------------------------------
 // Points: [f64; 2] per point (16 bytes)
@@ -141,6 +141,48 @@ pub fn decode_gear_runs(buf: Option<&[u8]>) -> Result<Option<Vec<GearRun>>> {
         let gear = buf[off];
         let frames = i32::from_le_bytes(buf[off + 1..off + 5].try_into().unwrap()) as u32;
         out.push(GearRun { gear, frames });
+    }
+    Ok(Some(out))
+}
+
+// -----------------------------------------------------------------------------
+// ApRuns: 1-byte autopilot state + 4-byte i32 frames per run
+//
+// Deliberately the GEAR-run wire shape, not the flag-run one: an ap run
+// carries no per-run speed, so stride 5 rather than 9.
+// -----------------------------------------------------------------------------
+
+const AP_RUN_STRIDE: usize = 5; // u8 + i32
+
+pub fn encode_ap_runs(runs: Option<&[ApRun]>) -> Option<Vec<u8>> {
+    let runs = runs?;
+    let mut buf = Vec::with_capacity(runs.len() * AP_RUN_STRIDE);
+    for r in runs {
+        buf.push(r.ap);
+        // Frames fits in i32; explicitly cast to stabilize the wire format
+        // across 32/64-bit builds (explicit int32 conversion).
+        let frames = r.frames as i32;
+        buf.extend_from_slice(&frames.to_le_bytes());
+    }
+    Some(buf)
+}
+
+pub fn decode_ap_runs(buf: Option<&[u8]>) -> Result<Option<Vec<ApRun>>> {
+    let Some(buf) = buf else { return Ok(None) };
+    if buf.len() % AP_RUN_STRIDE != 0 {
+        bail!(
+            "decode_ap_runs: length {} not a multiple of {}",
+            buf.len(),
+            AP_RUN_STRIDE
+        );
+    }
+    let n = buf.len() / AP_RUN_STRIDE;
+    let mut out = Vec::with_capacity(n);
+    for i in 0..n {
+        let off = i * AP_RUN_STRIDE;
+        let ap = buf[off];
+        let frames = i32::from_le_bytes(buf[off + 1..off + 5].try_into().unwrap()) as u32;
+        out.push(ApRun { ap, frames });
     }
     Ok(Some(out))
 }
@@ -289,6 +331,36 @@ mod tests {
         assert_eq!(buf.len(), runs.len() * FLAG_RUN_STRIDE);
         let back = decode_flag_runs(Some(&buf)).unwrap().unwrap();
         assert_eq!(back, runs);
+    }
+
+    #[test]
+    fn roundtrip_ap_runs() {
+        // Every autopilot state, including the Off runs that bracket a
+        // maneuver — the detector counts those toward the FSD share
+        // denominator, so they must survive. HW3 clips are a single
+        // all-Off run, which must round-trip just as faithfully.
+        let runs = vec![
+            ApRun { ap: 0, frames: 40 },
+            ApRun { ap: 1, frames: 513 },
+            ApRun { ap: 2, frames: 7 },
+            ApRun { ap: 3, frames: 1 },
+        ];
+        let buf = encode_ap_runs(Some(&runs)).unwrap();
+        assert_eq!(buf.len(), runs.len() * AP_RUN_STRIDE);
+        assert_eq!(AP_RUN_STRIDE, GEAR_RUN_STRIDE, "ap runs use the gear wire shape");
+        assert_eq!(decode_ap_runs(Some(&buf)).unwrap().unwrap(), runs);
+
+        let hw3 = vec![ApRun { ap: 0, frames: 1214 }];
+        let buf = encode_ap_runs(Some(&hw3)).unwrap();
+        assert_eq!(decode_ap_runs(Some(&buf)).unwrap().unwrap(), hw3);
+    }
+
+    #[test]
+    fn decode_ap_runs_rejects_misaligned_input() {
+        let buf = vec![0u8; 6];
+        assert!(decode_ap_runs(Some(&buf)).is_err());
+        assert!(encode_ap_runs(None).is_none());
+        assert!(decode_ap_runs(None).unwrap().is_none());
     }
 
     #[test]

@@ -31,7 +31,8 @@ use tracing::{info, warn};
 use crate::aggregate::compute_route_aggregates;
 use crate::backfill::backfill_route_aggregates;
 use crate::blob::{
-    decode_f32s, decode_flag_runs, decode_gear_runs, decode_points, decode_u8s, encode_f32s,
+    decode_ap_runs, decode_f32s, decode_flag_runs, decode_gear_runs, decode_points, decode_u8s,
+    encode_ap_runs, encode_f32s,
     encode_flag_runs, encode_gear_runs, encode_points, encode_u8s,
 };
 use crate::schema::{self, meta_get, meta_set};
@@ -793,6 +794,7 @@ impl DriveStore {
             raw_frame_count: gps.raw_frame_count,
             gear_runs: gps.gear_runs.clone(),
             flag_runs: gps.flag_runs.clone(),
+            ap_runs: gps.ap_runs.clone(),
             accel_x: gps.accel_x.clone(),
             accel_y: gps.accel_y.clone(),
             ..Default::default()
@@ -3118,6 +3120,14 @@ fn insert_or_update_route(
     } else {
         encode_flag_runs(Some(&r.flag_runs))
     };
+    // v21 autopilot runs: NULL-for-absent again. "No ap evidence" and
+    // "an empty run list" must stay distinguishable — the Self Driving
+    // summon signature reads absence as unverifiable.
+    let apb = if r.ap_runs.is_empty() {
+        None
+    } else {
+        encode_ap_runs(Some(&r.ap_runs))
+    };
     // v20 IMU accel channels: same NULL-for-absent rule — pre-IMU
     // firmware and old extractions must read as "no channel".
     let axb = if r.accel_x.is_empty() { None } else { encode_f32s(Some(&r.accel_x)) };
@@ -3163,7 +3173,7 @@ fn insert_or_update_route(
             safety_aggr_turn_ms, safety_aggr_turn_events,
             safety_speeding_ms, safety_moving_ms, safety_manual_moving_ms,
             safety_brake_any_ms, safety_turn_any_ms,
-            accel_x_blob, accel_y_blob)
+            accel_x_blob, accel_y_blob, ap_runs_blob)
          VALUES(
             ?1, ?2, ?3, ?4, ?5,
             NULL, NULL, ?6, ?7, ?8,
@@ -3181,7 +3191,7 @@ fn insert_or_update_route(
             ?55, ?56,
             ?57, ?58, ?59, ?60, ?61, ?62, ?63,
             ?64, ?65,
-            ?66, ?67)
+            ?66, ?67, ?68)
          ON CONFLICT(file) DO UPDATE SET
             date_dir            = excluded.date_dir,
             point_count         = excluded.point_count,
@@ -3248,7 +3258,8 @@ fn insert_or_update_route(
             safety_brake_any_ms      = excluded.safety_brake_any_ms,
             safety_turn_any_ms       = excluded.safety_turn_any_ms,
             accel_x_blob             = excluded.accel_x_blob,
-            accel_y_blob             = excluded.accel_y_blob",
+            accel_y_blob             = excluded.accel_y_blob,
+            ap_runs_blob             = excluded.ap_runs_blob",
         params![
             norm_file,
             &r.date,
@@ -3317,6 +3328,7 @@ fn insert_or_update_route(
             a.safety_turn_any_ms,
             axb,
             ayb,
+            apb,
         ],
     )?;
     Ok(())
@@ -3335,7 +3347,7 @@ fn select_all_routes(conn: &Connection) -> Result<Vec<Route>> {
                 tire_fl_psi, tire_fr_psi, tire_rl_psi, tire_rr_psi,
                 odometer_mi_start, odometer_mi_end,
                 location_name_start, location_name_end,
-                flag_runs_blob, accel_x_blob, accel_y_blob
+                flag_runs_blob, accel_x_blob, accel_y_blob, ap_runs_blob
          FROM routes
          ORDER BY file",
     )?;
@@ -3454,7 +3466,7 @@ fn select_routes_by_files(conn: &Connection, files: &[&str]) -> Result<Vec<Route
                 tire_fl_psi, tire_fr_psi, tire_rl_psi, tire_rr_psi,
                 odometer_mi_start, odometer_mi_end,
                 location_name_start, location_name_end,
-                flag_runs_blob, accel_x_blob, accel_y_blob
+                flag_runs_blob, accel_x_blob, accel_y_blob, ap_runs_blob
          FROM routes
          WHERE file IN ({})
          ORDER BY file",
@@ -3499,6 +3511,8 @@ type RouteRow = (
     // v20 IMU accel blobs (lateral, longitudinal).
     Option<Vec<u8>>,
     Option<Vec<u8>>,
+    // v21 ap_runs_blob — appended last, same rule.
+    Option<Vec<u8>>,
 );
 
 /// Shared row mapper for the two route SELECTs above. The column order
@@ -3535,6 +3549,7 @@ fn route_row_mapper(row: &rusqlite::Row<'_>) -> rusqlite::Result<RouteRow> {
         row.get::<_, Option<Vec<u8>>>(27)?,
         row.get::<_, Option<Vec<u8>>>(28)?,
         row.get::<_, Option<Vec<u8>>>(29)?,
+        row.get::<_, Option<Vec<u8>>>(30)?,
     ))
 }
 
@@ -3550,7 +3565,7 @@ fn build_route_from_row(r: RouteRow) -> Result<Route> {
         tire_fl_psi, tire_fr_psi, tire_rl_psi, tire_rr_psi,
         odometer_mi_start, odometer_mi_end,
         location_name_start, location_name_end,
-        fb, axb, ayb,
+        fb, axb, ayb, apb,
     ) = r;
     let points = decode_points(pb.as_deref())
         .with_context(|| format!("decode points {}", file))?
@@ -3569,6 +3584,9 @@ fn build_route_from_row(r: RouteRow) -> Result<Route> {
     let flag_runs = decode_flag_runs(fb.as_deref())
         .with_context(|| format!("decode flag_runs {}", file))?
         .unwrap_or_default();
+    let ap_runs = decode_ap_runs(apb.as_deref())
+        .with_context(|| format!("decode ap_runs {}", file))?
+        .unwrap_or_default();
     let accel_x = decode_f32s(axb.as_deref())
         .with_context(|| format!("decode accel_x {}", file))?
         .unwrap_or_default();
@@ -3578,7 +3596,7 @@ fn build_route_from_row(r: RouteRow) -> Result<Route> {
     Ok(Route {
         file, date, points, gear_states, autopilot_states,
         speeds, accel_positions, raw_park_count, raw_frame_count, gear_runs,
-        flag_runs, accel_x, accel_y,
+        flag_runs, ap_runs, accel_x, accel_y,
         source, external_signature, tessie_autopilot_percent,
         battery_pct_start, battery_pct_end,
         interior_temp_min, interior_temp_max, exterior_temp_avg,
@@ -3628,7 +3646,8 @@ fn select_route_summaries_where(
                 safety_hard_brake_ms, safety_hard_brake_events,
                 safety_aggr_turn_ms, safety_aggr_turn_events,
                 safety_speeding_ms, safety_moving_ms, safety_manual_moving_ms,
-                safety_brake_any_ms, safety_turn_any_ms
+                safety_brake_any_ms, safety_turn_any_ms,
+                ap_runs_blob
          FROM routes
          {where_sql}
          ORDER BY file",
@@ -3712,6 +3731,8 @@ fn select_route_summaries_where(
                 row.get::<_, Option<i64>>(53)?,
                 row.get::<_, Option<i64>>(54)?,
             ),
+            // v21 autopilot runs (summon Self Driving signature)
+            row.get::<_, Option<Vec<u8>>>(55)?,
         ))
     })?;
 
@@ -3765,6 +3786,7 @@ fn select_route_summaries_where(
                 safety_brake_any_ms,
                 safety_turn_any_ms,
             ),
+            apb,
         ) = r?;
 
         let gear_runs = decode_gear_runs(rb.as_deref())
@@ -3772,6 +3794,9 @@ fn select_route_summaries_where(
             .unwrap_or_default();
         let flag_runs = decode_flag_runs(fb.as_deref())
             .with_context(|| format!("decode flag_runs {}", file))?
+            .unwrap_or_default();
+        let ap_runs = decode_ap_runs(apb.as_deref())
+            .with_context(|| format!("decode ap_runs {}", file))?
             .unwrap_or_default();
 
         out.push(RouteSummary {
@@ -3781,6 +3806,7 @@ fn select_route_summaries_where(
             raw_frame_count,
             gear_runs,
             flag_runs,
+            ap_runs,
             aggregates: RouteAggregates {
                 distance_m: distance_m.unwrap_or(0.0),
                 max_speed_mps: max_speed_mps.unwrap_or(0.0),
@@ -4073,6 +4099,97 @@ mod tests {
                 assert_eq!(summaries[0].flag_runs, routes[0].flag_runs);
                 assert_eq!(summaries[0].aggregates.sei_speed_abs_max, Some(26.0));
             })
+            .unwrap();
+    }
+
+    #[test]
+    fn ap_runs_survive_every_db_read_path() {
+        // v21 ap_runs_blob is read back by THREE separate SQL paths with
+        // independent column lists and hand-written row-mapper indices:
+        // select_all_routes, select_routes_by_files, and the RouteSummary
+        // query the summon detector actually consumes. A column appended
+        // to one list without its index reaching the mapper reads the
+        // wrong column — or silently returns None — so all three are
+        // asserted here, plus the absent case that must stay absent.
+        use crate::types::{ApRun, ExtractedGps};
+        let store = DriveStore::open_memory().unwrap();
+        let ap_runs = vec![
+            ApRun { ap: 0, frames: 40 },
+            ApRun { ap: 1, frames: 513 },
+            ApRun { ap: 0, frames: 100 },
+        ];
+        let with_ap = ExtractedGps {
+            points: vec![[37.7749, -122.4194], [37.7750, -122.4195]],
+            gear_states: vec![4, 4],
+            autopilot_states: vec![1, 1],
+            speeds: vec![2.5, 2.6],
+            accel_positions: vec![0.0, 0.0],
+            raw_park_count: 140,
+            raw_frame_count: 653,
+            gear_runs: vec![GearRun { gear: 4, frames: 653 }],
+            flag_runs: vec![FlagRun { flags: 0, frames: 653, max_mps: Some(2.6) }],
+            ap_runs: ap_runs.clone(),
+            accel_x: Vec::new(),
+            accel_y: Vec::new(),
+        };
+        let mut without_ap = with_ap.clone();
+        without_ap.ap_runs = Vec::new();
+
+        store
+            .add_route_extracted("2026-08-15/a-front.mp4", "2026-08-15", &with_ap)
+            .unwrap();
+        store
+            .add_route_extracted("2026-08-15/b-front.mp4", "2026-08-15", &without_ap)
+            .unwrap();
+
+        // Path 1: full-table route decode.
+        let routes = store.get_routes().unwrap();
+        assert_eq!(routes.len(), 2);
+        assert_eq!(routes[0].ap_runs, ap_runs);
+        assert!(
+            routes[1].ap_runs.is_empty(),
+            "absent stays absent — never an empty-but-present run list"
+        );
+
+        // Path 2: the targeted by-files decode the detail page uses.
+        store
+            .with_routes_by_files(&["2026-08-15/a-front.mp4"], |rs| {
+                assert_eq!(rs.len(), 1);
+                assert_eq!(rs[0].ap_runs, ap_runs);
+            })
+            .unwrap();
+
+        // Path 3: the BLOB-free summary path the summon detector reads.
+        store
+            .with_route_summaries(|summaries| {
+                assert_eq!(summaries.len(), 2);
+                assert_eq!(summaries[0].ap_runs, ap_runs);
+                assert!(summaries[1].ap_runs.is_empty());
+                // Column-index drift check: neighbouring columns in the
+                // same SELECT must still land in the right fields.
+                assert_eq!(summaries[0].raw_frame_count, 653);
+                assert_eq!(summaries[0].flag_runs.len(), 1);
+                // Speeds are stored as f32, so this lands a few ULPs off
+                // 2.6 — the point is that the column is the RIGHT one.
+                let abs_max = summaries[0].aggregates.sei_speed_abs_max.unwrap();
+                assert!((abs_max - 2.6).abs() < 1e-6, "sei_speed_abs_max = {abs_max}");
+            })
+            .unwrap();
+
+        // Re-writing the row without ap evidence clears it (the upsert
+        // is authoritative), and re-writing WITH it restores it — the
+        // check-summon re-read depends on this.
+        store
+            .add_route_extracted("2026-08-15/a-front.mp4", "2026-08-15", &without_ap)
+            .unwrap();
+        store
+            .with_route_summaries(|s| assert!(s[0].ap_runs.is_empty()))
+            .unwrap();
+        store
+            .add_route_extracted("2026-08-15/a-front.mp4", "2026-08-15", &with_ap)
+            .unwrap();
+        store
+            .with_route_summaries(|s| assert_eq!(s[0].ap_runs, ap_runs))
             .unwrap();
     }
 
