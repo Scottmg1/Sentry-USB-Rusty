@@ -15,10 +15,10 @@ import {
   ReceiptLongIcon,
   SettingsIcon,
   ShieldIcon,
+  ShieldPersonIcon,
   SmartToyIcon,
   Terminal2Icon,
   TimerIcon,
-  VerifiedUserIcon,
   VideocamIcon,
   VolumeUpIcon,
   WifiIcon,
@@ -56,7 +56,7 @@ function buildNavItems(
       ? [
           item,
           { to: "/charging", icon: ChargerIcon, label: "Charging" },
-          { to: "/safety", icon: VerifiedUserIcon, label: "Safety Score" },
+          { to: "/safety", icon: ShieldPersonIcon, label: "Safety Score" },
         ]
       : [item],
   )

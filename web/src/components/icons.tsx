@@ -754,6 +754,13 @@ export const ShieldIcon = (props: SVGProps<SVGSVGElement>) => (
     </svg>
 )
 
+/** Material Symbols `shield_person`. */
+export const ShieldPersonIcon = (props: SVGProps<SVGSVGElement>) => (
+  <svg viewBox="0 -960 960 960" width="24" height="24" fill="currentColor" {...props}>
+      <path d="M382.5-489.5Q343-529 343-587t39.5-97.5Q422-724 480-724t97.5 39.5Q617-645 617-587t-39.5 97.5Q538-450 480-450t-97.5-39.5Zm153-42Q557-553 557-587t-21.5-55.5Q514-664 480-664t-55.5 21.5Q403-621 403-587t21.5 55.5Q446-510 480-510t55.5-21.5ZM480-81q-140-35-230-162.5T160-523v-238l320-120 320 120v238q0 152-90 279.5T480-81Zm0-399Zm0-337-260 98v196q0 63 17.5 120.5T287-296q46-25 93.5-37.5T480-346q52 0 99.5 12.5T673-296q32-49 49.5-106.5T740-523v-196l-260-98Zm-78 541q-39 10-77 30 32 35 71 61.5t84 41.5q45-15 84-41.5t71-61.5q-38-20-77-30t-78-10q-39 0-78 10Z"/>
+    </svg>
+)
+
 /** Material Symbols `shuffle` (was Lucide Shuffle). */
 export const ShuffleIcon = (props: SVGProps<SVGSVGElement>) => (
   <svg viewBox="0 -960 960 960" width="24" height="24" fill="currentColor" {...props}>

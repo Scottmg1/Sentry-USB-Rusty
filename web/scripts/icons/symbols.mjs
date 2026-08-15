@@ -108,6 +108,7 @@ export const SYMBOLS = [
   "settings",
   "settings_remote",
   "shield",
+  "shield_person",
   "shuffle",
   "skip_next",
   "skip_previous",
