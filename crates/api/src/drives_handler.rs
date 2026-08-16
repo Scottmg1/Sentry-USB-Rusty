@@ -244,6 +244,12 @@ fn single_drive_blocking(
                 drive.tacc_distance_km = s.tacc_distance_km;
                 drive.tacc_distance_mi = s.tacc_distance_mi;
                 drive.assisted_percent = s.assisted_percent;
+                // Duration too: the summary path sees the whole clip
+                // series and so knows each clip's real span, while this
+                // rebuild only fetched the drive's own clips and has to
+                // assume a nominal minute for the last one. Overlaying
+                // keeps the detail page's duration identical to the list.
+                drive.duration_ms = s.duration_ms;
                 // Summon classification requires summary segment bounds.
                 drive.summon = s.summon;
                 if s.summon {

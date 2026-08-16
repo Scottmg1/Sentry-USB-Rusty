@@ -664,6 +664,15 @@ pub struct SummonCheckOutcome {
 pub struct TimedRoute {
     pub route: Route,
     pub timestamp: chrono::NaiveDateTime,
+    /// How long this (sub-)clip actually lasts, in ms.
+    ///
+    /// Clips are nominally a minute, but a recording that stops early —
+    /// the last clip of a session, or one interrupted by an event —
+    /// keeps its frames and loses its duration. The next native clip's
+    /// start is the ground truth for when this one ended. Park-split
+    /// sub-segments carry their own fraction of the parent's span.
+    /// Defaults to the nominal minute when nothing bounds it.
+    pub clip_span_ms: i64,
 }
 
 /// Per-clip scalar summary computed once from a Route's BLOB-backed
