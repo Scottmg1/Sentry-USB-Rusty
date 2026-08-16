@@ -244,8 +244,25 @@ fn single_drive_blocking(
                 drive.tacc_distance_km = s.tacc_distance_km;
                 drive.tacc_distance_mi = s.tacc_distance_mi;
                 drive.assisted_percent = s.assisted_percent;
+                // Duration too: the summary path sees the whole clip
+                // series and so knows each clip's real span, while this
+                // rebuild only fetched the drive's own clips and has to
+                // assume a nominal minute for the last one. Overlaying
+                // keeps the detail page's duration identical to the list.
+                drive.duration_ms = s.duration_ms;
                 // Summon classification requires summary segment bounds.
                 drive.summon = s.summon;
+                if s.summon {
+                    // Stats parity with Sentry-Drive: a detected Summon
+                    // emits no FSD events. Every numeric FSD/Autosteer/
+                    // TACC field is already zeroed by the overlay above
+                    // (the summary path zeroes them at the source), but
+                    // fsd_events comes from the full-BLOB walk and would
+                    // otherwise plot a phantom disengagement where the
+                    // car parked itself. The per-point fsd_states array
+                    // is deliberately KEPT as raw evidence.
+                    drive.fsd_events.clear();
+                }
             }
             (
                 StatusCode::OK,

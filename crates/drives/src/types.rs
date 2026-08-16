@@ -127,6 +127,30 @@ pub struct FlagRun {
     pub max_mps: Option<f64>,
 }
 
+/// A contiguous run of a single per-frame autopilot state.
+///
+/// Carried per clip as `apRuns`: an RLE over RAW SEI frame indices —
+/// the same frame space as `gearRuns` and `flagRuns`, and like them
+/// computed BEFORE GPS point dedup. Newer Tesla hardware reports a
+/// Summon maneuver as [`AUTOPILOT_FSD`] for its duration, which is the
+/// summon detector's second (Self Driving) signature. HW3 leaves it Off
+/// throughout, so that hardware is detected by hazards alone — both
+/// signatures are load-bearing (see `grouper::detect_summon`).
+///
+/// THE TRAP (Sentry-Drive's docs/RUST-SUMMON-PORT.md): [`Route`] also
+/// carries `autopilot_states`, which is DEDUPED POINT space. Runs built
+/// from that sum to the point count instead of the frame count, are
+/// walked against frame-space segment bounds, and read the wrong frames
+/// — silently. `detect_summon` rejects runs that don't span
+/// `total_frames` precisely so a mis-sourced RLE fails closed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ApRun {
+    /// AUTOPILOT_* constant (0 Off, 1 FSD, 2 Autosteer, 3 TACC).
+    pub ap: u8,
+    pub frames: u32,
+}
+
 /// A single clip's extracted route data (stored in SQLite).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -153,6 +177,12 @@ pub struct Route {
     /// detector treats such drives as unverifiable, never as summon.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub flag_runs: Vec<FlagRun>,
+    /// Per-frame autopilot-state RLE in RAW frame space (see [`ApRun`]).
+    /// Absent on routes written before autopilot-run extraction existed;
+    /// the Self Driving summon signature then has nothing to judge and
+    /// the drive falls back to the hazard signature.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ap_runs: Vec<ApRun>,
     /// IMU linear acceleration per deduped point, m/s² (see
     /// [`ExtractedGps::accel_x`]). Empty on routes written before v20 or
     /// on firmware without the SEI IMU fields — the Safety Score falls
@@ -596,6 +626,9 @@ pub struct ExtractedGps {
     pub raw_frame_count: u32,
     pub gear_runs: Vec<GearRun>,
     pub flag_runs: Vec<FlagRun>,
+    /// Raw-frame autopilot-state RLE (see [`ApRun`]) — built from the
+    /// pre-dedup ap-state array, NOT from `autopilot_states` above.
+    pub ap_runs: Vec<ApRun>,
     /// IMU linear acceleration per deduped point, m/s² (SEI proto fields
     /// 14/15): X lateral (positive = rightward force), Y longitudinal
     /// (negative = deceleration). Peak-|value| per collapsed GPS run.
@@ -631,6 +664,15 @@ pub struct SummonCheckOutcome {
 pub struct TimedRoute {
     pub route: Route,
     pub timestamp: chrono::NaiveDateTime,
+    /// How long this (sub-)clip actually lasts, in ms.
+    ///
+    /// Clips are nominally a minute, but a recording that stops early —
+    /// the last clip of a session, or one interrupted by an event —
+    /// keeps its frames and loses its duration. The next native clip's
+    /// start is the ground truth for when this one ended. Park-split
+    /// sub-segments carry their own fraction of the parent's span.
+    /// Defaults to the nominal minute when nothing bounds it.
+    pub clip_span_ms: i64,
 }
 
 /// Per-clip scalar summary computed once from a Route's BLOB-backed
@@ -769,6 +811,10 @@ pub struct RouteSummary {
     /// written before flag extraction — those drives are summon-
     /// unverifiable by definition.
     pub flag_runs: Vec<FlagRun>,
+    /// Raw-frame autopilot-state RLE (see [`ApRun`]). Empty on rows
+    /// written before autopilot-run extraction — the Self Driving
+    /// signature cannot judge those drives.
+    pub ap_runs: Vec<ApRun>,
     pub aggregates: RouteAggregates,
     /// Provenance carried through for grouping: "sei" or "tessie".
     pub source: Option<String>,
