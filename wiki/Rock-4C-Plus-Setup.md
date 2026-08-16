@@ -1,6 +1,6 @@
 # Rock 4C+ Setup
 
-> **Tested with:** Armbian 26.8.0 Minimal, DietPi v10.5.2
+> **Tested with:** Armbian 26.11.0 Minimal, DietPi v10.5.2
 
 ## Sections
 
@@ -58,73 +58,7 @@ ssh root@<ip>
 
 ### 4. Run the installer
 
-Continue from [Getting Started: SSH in and install](Getting-Started#4-ssh-in-and-install) to run the Sentry USB installer. Return here after the installer finishes.
-
-### 5. Replace the dwc3 USB gadget overlay (required)
-
-The OTG port defaults to **host mode**. Sentry USB needs it in **peripheral mode** to present as a USB mass-storage device the Tesla can read. The installer created a minimal overlay — replace it with the full one below.
-
-> Run these steps as root (`sudo -i`).
-
-**Install dependencies:**
-
-```bash
-apt install -y device-tree-compiler
-```
-
-**Overwrite the overlay source:**
-
-```bash
-cat > /boot/overlay-user/sentryusb-dwc3-hs.dts << 'EOF'
-/dts-v1/;
-/plugin/;
-/ {
-    compatible = "rockchip,rk3399";
-    fragment@0 {
-        target = <&usbdrd_dwc3_0>;
-        __overlay__ {
-            dr_mode = "peripheral";
-            compatible = "snps,dwc3";
-            reg = <0x0 0xfe800000 0x0 0x100000>;
-            phys = <&tcphy0_usb3>;
-            phy-names = "usb3-phy";
-            phy_type = "utmi_wide";
-            snps,dis_enblslpm_quirk;
-            snps,dis-u2-freeclk-exists-quirk;
-            snps,dis_u2_susphy_quirk;
-            snps,dis-del-phy-power-chg-quirk;
-            snps,xhci-slow-suspend-quirk;
-        };
-    };
-};
-EOF
-```
-
-**Compile:**
-
-```bash
-dtc -@ -I dts -O dtb -o /boot/overlay-user/sentryusb-dwc3-hs.dtbo /boot/overlay-user/sentryusb-dwc3-hs.dts
-```
-
-> The `reg_format` and `avoid_default_addr_size` warnings from `dtc` are expected and harmless — the kernel inherits `#address-cells`/`#size-cells` from the base DTB at apply time.
-
-Verify that `/boot/dietpiEnv.txt` contains the overlay. Check that this line is present:
-
-```
-user_overlays=sentryusb-dwc3-hs
-```
-
-If it's missing or has a different value, edit `/boot/dietpiEnv.txt` and set `user_overlays=sentryusb-dwc3-hs`.
-
-### 6. Reboot and finish setup
-
-**Reboot:**
-
-```bash
-reboot
-```
-
-After reboot, continue from [Getting Started: Open the web UI](Getting-Started#5-open-the-web-ui) to finish setup in the web UI.
+Continue from [Getting Started: SSH in and install](Getting-Started#4-ssh-in-and-install) to run the Sentry USB installer. After the installer finishes, continue from [Getting Started: Open the web UI](Getting-Started#5-open-the-web-ui) to finish setup in the web UI.
 
 ## Armbian
 
