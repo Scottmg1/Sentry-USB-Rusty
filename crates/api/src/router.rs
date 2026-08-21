@@ -129,6 +129,10 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/system/check-update", post(crate::update::check_for_update))
         .route("/api/system/update-status", get(crate::update::get_update_status))
         .route("/api/system/block-devices", get(crate::devices::list_block_devices))
+        // Wi-Fi radio firmware (CYW43455 on the Pi 5)
+        .route("/api/system/wifi-firmware", get(crate::wifi_firmware::get_status))
+        .route("/api/system/wifi-firmware/install", post(crate::wifi_firmware::install))
+        .route("/api/system/wifi-firmware/rollback", post(crate::wifi_firmware::rollback))
         // Storage repair
         .route("/api/storage/health", get(crate::storage_repair::storage_health))
         .route("/api/storage/repair", post(crate::storage_repair::storage_repair))

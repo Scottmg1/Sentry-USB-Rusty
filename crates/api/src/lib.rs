@@ -33,6 +33,7 @@ pub mod keep_accessory;
 pub mod charging;
 pub mod storage_repair;
 pub mod profile;
+pub mod wifi_firmware;
 
 pub use auth::{AuthState, init_auth};
 pub use router::build_router;

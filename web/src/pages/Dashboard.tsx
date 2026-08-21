@@ -25,6 +25,8 @@ import { api } from "@/lib/api"
 import { useKeepAwake } from "@/hooks/useKeepAwake"
 import { useAwayMode } from "@/hooks/useAwayMode"
 import { useUpdateAvailable } from "@/hooks/useUpdateAvailable"
+import { useWifiFirmware } from "@/hooks/useWifiFirmware"
+import { WifiFirmwareModal } from "@/components/dashboard/WifiFirmwareModal"
 import { fetchCurrentCharge } from "@/api/charging"
 import type { CurrentCharge } from "@/types/charging"
 import type { PiStatus, DriveStats, StorageBreakdown } from "@/lib/api"
@@ -165,6 +167,8 @@ export default function Dashboard() {
   const archiveHistoryRef = useRef<ProgressSample[]>([])
   const processHistoryRef = useRef<ProgressSample[]>([])
   const updateInfo = useUpdateAvailable()
+  const wifiFirmware = useWifiFirmware()
+  const [wifiFwOpen, setWifiFwOpen] = useState(false)
   const { status: awayStatus } = useAwayMode()
   const { mode: keepAwakeMode } = useKeepAwake()
 
@@ -479,6 +483,30 @@ export default function Dashboard() {
       sub: rtcWarning,
     })
   }
+  if (wifiFirmware.show) {
+    // Stronger wording when the fault's fingerprint is actually in this
+    // device's kernel log, rather than a generic "you might hit this".
+    const seen = wifiFirmware.status?.symptom_detected
+    banners.push({
+      id: "wifi-firmware",
+      kind: "warn",
+      icon: <WifiIcon className="h-4 w-4" />,
+      title: seen
+        ? "Wi-Fi firmware issue detected"
+        : "Wi-Fi firmware update available",
+      sub: seen
+        ? "This Pi 5 hit the Wi-Fi fault that slows archiving and breaks Bluetooth keep-awake."
+        : "A newer Broadcom firmware fixes slow archiving and Bluetooth drop-outs on the Pi 5.",
+      action: (
+        <button
+          onClick={() => setWifiFwOpen(true)}
+          className="action-chip action-chip--accent shrink-0"
+        >
+          Review <ChevronRightIcon className="h-3.5 w-3.5" />
+        </button>
+      ),
+    })
+  }
   if (updateInfo.available) {
     banners.push({
       id: "update",
@@ -509,6 +537,18 @@ export default function Dashboard() {
       </div>
 
       <BannerStack banners={banners} />
+
+      {wifiFwOpen && wifiFirmware.status && (
+        <WifiFirmwareModal
+          status={wifiFirmware.status}
+          onClose={() => {
+            setWifiFwOpen(false)
+            // Closing without updating shouldn't nag on every dashboard visit.
+            if (!wifiFirmware.status?.up_to_date) wifiFirmware.dismiss()
+          }}
+          onRefresh={wifiFirmware.refresh}
+        />
+      )}
 
       <CloudStatusBar />
 
