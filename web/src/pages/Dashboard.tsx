@@ -483,6 +483,44 @@ export default function Dashboard() {
       sub: rtcWarning,
     })
   }
+  if (wifiFirmware.installing) {
+    // Progress has to be reachable even if the modal was closed, otherwise a
+    // user who dismissed it assumes the update finished.
+    banners.push({
+      id: "wifi-firmware-running",
+      kind: "info",
+      icon: <WifiIcon className="h-4 w-4" />,
+      title: `Updating Wi-Fi firmware… ${wifiFirmware.status?.install?.progress ?? 0}%`,
+      sub: wifiFirmware.status?.install?.message || "Working…",
+      action: (
+        <button
+          onClick={() => setWifiFwOpen(true)}
+          className="action-chip action-chip--accent shrink-0"
+        >
+          View <ChevronRightIcon className="h-3.5 w-3.5" />
+        </button>
+      ),
+    })
+  }
+  if (wifiFirmware.offerRevert) {
+    banners.push({
+      id: "wifi-firmware-revert",
+      kind: "info",
+      icon: <WifiIcon className="h-4 w-4" />,
+      title: `Wi-Fi firmware updated to ${wifiFirmware.status?.target_version ?? ""}`,
+      sub: "Reboot to finish. You can put the previous firmware back if anything looks wrong.",
+      action: (
+        <div className="flex shrink-0 gap-2">
+          <button onClick={() => setWifiFwOpen(true)} className="action-chip">
+            Revert
+          </button>
+          <button onClick={wifiFirmware.dismissRevert} className="action-chip">
+            Dismiss
+          </button>
+        </div>
+      ),
+    })
+  }
   if (wifiFirmware.show) {
     // Stronger wording when the fault's fingerprint is actually in this
     // device's kernel log, rather than a generic "you might hit this".

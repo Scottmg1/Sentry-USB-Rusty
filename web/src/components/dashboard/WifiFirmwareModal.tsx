@@ -62,9 +62,14 @@ export function WifiFirmwareModal({
   const [install, setInstall] = useState<InstallState>(status.install ?? IDLE)
   const [starting, setStarting] = useState(false)
   const [startError, setStartError] = useState("")
+  const [rebooting, setRebooting] = useState(false)
   const pollRef = useRef<number | null>(null)
 
-  const running = install.state === "running" || starting
+  // Trust the server's view as well as our local one: if the parent polled and
+  // found an install still in flight, this modal must stay locked even if our
+  // own copy of the state is momentarily stale.
+  const running =
+    install.state === "running" || starting || status.install?.state === "running"
   const finished =
     install.state === "success" ||
     install.state === "failed" ||
@@ -138,7 +143,10 @@ export function WifiFirmwareModal({
           <span>Wi-Fi firmware update</span>
         </span>
       }
-      onClose={onClose}
+      // Never let a click on the backdrop, Esc, or the close button dismiss
+      // this mid-install: the radio reload takes the page's own connection
+      // down, and a user who loses the progress view assumes it finished.
+      onClose={running ? () => {} : onClose}
       dismissable={!running}
       size="md"
       footer={
@@ -268,6 +276,28 @@ export function WifiFirmwareModal({
                 Do not power off the Pi. If this page stops responding for a moment, that is the
                 radio reloading — it will come back.
               </p>
+            )}
+
+            {install.state === "success" && (
+              // Reloading the radio in place can leave it transmitting well
+              // below normal until the chip is actually power-cycled, and that
+              // outcome varies run to run. A reboot is the reliable finish.
+              <div className="rounded-lg bg-amber-500/10 p-2.5 text-amber-300">
+                <p className="mb-2">
+                  Reboot to finish. Reloading the radio in place can leave Wi-Fi slower than
+                  normal until the Pi restarts.
+                </p>
+                <button
+                  onClick={() => {
+                    setRebooting(true)
+                    fetch("/api/system/reboot", { method: "POST" }).catch(() => {})
+                  }}
+                  disabled={rebooting}
+                  className="rounded-lg bg-amber-500/20 px-3 py-1.5 text-xs font-medium text-amber-300 hover:bg-amber-500/30 disabled:opacity-50"
+                >
+                  {rebooting ? "Rebooting…" : "Reboot now"}
+                </button>
+              </div>
             )}
 
             {install.state === "success" && status.can_rollback && (
