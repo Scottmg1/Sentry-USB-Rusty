@@ -34,6 +34,38 @@ then
   }
 fi
 
+# Free inodes on /mutable, or "" if it can't be read (dev containers).
+# Releasing a snapshot also deletes its /mutable/TeslaCam symlinks, so
+# snapshot eviction is what relieves inode pressure there too.
+function mutable_free_inodes {
+  stat --file-system --format=%d /mutable 2>/dev/null || true
+}
+
+# Inode-driven eviction requires /mutable mounted READ-WRITE, not just
+# mounted: on an ext4-error ro remount, release_snapshot.sh deletes the
+# snapshot first and then cannot remove its symlinks — permanent footage
+# loss with zero inode recovery. (A write-probe would be wrong here: an
+# inode-FULL filesystem also fails writes, and that is exactly the state
+# eviction is meant to fix — so check the mount option, not a write.)
+function mutable_rw_mounted {
+  local opts
+  opts=$(findmnt -no OPTIONS --mountpoint /mutable 2>/dev/null) || return 1
+  case ",$opts," in
+    *,rw,*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# Written when snapshot release stopped relieving inode pressure (the
+# stall guard below); holds the free-inode count at the moment of the
+# stall. tmpfs on purpose: /mutable itself may be inode-full and the
+# root filesystem is read-only. Cleared once free inodes rise above the
+# recorded value, i.e. something actually got freed. Without this
+# latch, archiveloop's 30-second freespacemanager retry would re-enter
+# and delete three more snapshots per attempt — draining the entire
+# snapshot store against pressure that snapshots cannot relieve.
+INODE_STALL_LATCH=/run/sentryusb_inode_stall
+
 function manage_free_space {
   # Try to make free space equal to 10 GB plus three percent of the total
   # available space. This should be enough to hold the next hour of
@@ -42,11 +74,65 @@ function manage_free_space {
   # space requirement, to delete old snapshots just before running out
   # of space and thus make better use of space
   local reserve="$1"
+
+  # /mutable inode headroom target: max(20000, table/20). Every
+  # retained clip costs one symlink inode in /mutable/TeslaCam, and the
+  # table (~121k at mkfs defaults on the stock partition) fills long
+  # before a multi-TB /backingfiles feels block-space pressure — the
+  # 2026-08-19 field failure ran 100% inode-full for a day: ln/state
+  # writes all ENOSPC'd while df -h showed 71% free. At the observed
+  # ~2.9k links/day, 20k free inodes is about a week of recovery
+  # headroom; the /20 term tracks that rather than growing with denser
+  # tables. rw-mount check: an unmounted /mutable would make stat
+  # measure the root filesystem, and a ro-remounted one turns eviction
+  # into pure footage loss (see mutable_rw_mounted). Matches
+  # archiveloop's freespacemanager and crates/usb_gadget/src/space.rs.
+  local ireserve=0
+  local ifree itotal
+  if mutable_rw_mounted
+  then
+    itotal=$(stat --file-system --format=%c /mutable 2>/dev/null || echo 0)
+    if [ "$itotal" -gt 0 ]
+    then
+      ireserve=$((itotal / 20))
+      if [ "$ireserve" -lt 20000 ]
+      then
+        ireserve=20000
+      fi
+    fi
+  fi
+
+  # Honor a previous stall verdict: resume inode-driven eviction only
+  # after free inodes actually rose above the latched value.
+  if [ "$ireserve" -gt 0 ] && [ -e "$INODE_STALL_LATCH" ]
+  then
+    local latched
+    latched=$(cat "$INODE_STALL_LATCH" 2>/dev/null || echo 0)
+    ifree=$(mutable_free_inodes)
+    if [ -n "$ifree" ] && [ "$ifree" -gt "$latched" ]
+    then
+      rm -f "$INODE_STALL_LATCH"
+    else
+      log "inode-driven eviction suspended (stalled at $latched free; see $INODE_STALL_LATCH)"
+      ireserve=0
+    fi
+  fi
+
+  # Consecutive releases that freed no /mutable inodes while the block
+  # target was already met. Snapshot eviction only helps inode pressure
+  # when the snapshot still owns symlinks; if something else ate the
+  # table, deleting more footage cannot fix it — stop instead.
+  local -i stale_releases=0
+
   while true
   do
     local freespace
     freespace=$(eval "$(stat --file-system --format="echo \$((%f*%S))" /backingfiles/cam_disk.bin)")
-    if [ "$freespace" -gt "$reserve" ]
+    ifree=$(mutable_free_inodes)
+    # Done when the byte target is met AND the inode target is met (or
+    # the inode policy is off: not mounted, unreadable, or latched).
+    if [ "$freespace" -gt "$reserve" ] && \
+       { [ "$ireserve" -eq 0 ] || [ -z "$ifree" ] || [ "$ifree" -gt "$ireserve" ]; }
     then
       exit 0
     fi
@@ -106,8 +192,31 @@ function manage_free_space {
       exit 1
     fi
     log "low space, deleting $oldest (oldest by snap.bin mtime)"
+    local ifree_before="$ifree"
     /root/bin/release_snapshot.sh "$oldest"
     rm -rf "$oldest"
+
+    # Stall guard: only meaningful when block space is already satisfied
+    # and we are evicting purely for /mutable inodes. Three snapshots in
+    # a row yielding zero freed inodes means the pressure isn't from
+    # clip symlinks; latch that verdict (so retrying callers don't drain
+    # the snapshot store three at a time) and bail.
+    if [ "$ireserve" -gt 0 ] && [ "$freespace" -gt "$reserve" ] && [ -n "$ifree_before" ]
+    then
+      ifree=$(mutable_free_inodes)
+      if [ -n "$ifree" ] && [ "$ifree" -le "$ifree_before" ]
+      then
+        stale_releases+=1
+        if [ "$stale_releases" -ge 3 ]
+        then
+          echo "$ifree" > "$INODE_STALL_LATCH" 2>/dev/null || true
+          log "inode pressure on /mutable not relieved by snapshot release ($ifree free of $itotal); something other than clip symlinks is consuming inodes"
+          exit 1
+        fi
+      else
+        stale_releases=0
+      fi
+    fi
   done
 }
 

@@ -15,6 +15,24 @@ use crate::SetupEmitter;
 const BACKINGFILES_MOUNT: &str = "/backingfiles";
 const MUTABLE_MOUNT: &str = "/mutable";
 
+/// Inode count for the mutable partition's ext4 table: ~1 inode per
+/// 20000 sectors (~10 MB) of backingfiles capacity, clamped to
+/// [bytes/16384, bytes/4096] of the mutable partition itself — never
+/// sparser than the mkfs default density, never more than ~6% of the
+/// partition spent on inode tables.
+///
+/// Every retained clip costs one symlink inode in /mutable/TeslaCam
+/// (the snapshot farm index), so the inode table — not the byte size —
+/// is what bounds retention. With mkfs defaults (~121k inodes) against
+/// a multi-TB backingfiles the table fills after ~5 weeks of driving:
+/// the 2026-08-19 field failure sat a full day at 100% inode usage with
+/// 71% of the bytes free, ENOSPC on every clip-index and state write.
+/// Matches the MUTABLE_INODES computation in
+/// setup/pi/create-backingfiles-partition.sh.
+fn mutable_inode_count(bf_sectors: u64, mutable_bytes: u64) -> u64 {
+    (bf_sectors / 20000).clamp(mutable_bytes / 16384, mutable_bytes / 4096)
+}
+
 /// Check if the backingfiles and mutable partitions already exist and are valid.
 pub async fn partitions_exist() -> bool {
     Path::new("/dev/disk/by-label/backingfiles").exists()
@@ -193,8 +211,27 @@ pub async fn setup_data_drive(env: &SetupEnv, emitter: &SetupEmitter) -> Result<
     let _ = sentryusb_shell::run("udevadm", &["settle", "--timeout=30"]).await;
 
     emitter.progress(&format!("Formatting mutable partition (ext4) on {}...", p1));
-    sentryusb_shell::run_with_timeout(op_timeout, "mkfs.ext4",
-        &["-F", "-L", "mutable", &p1]).await.context("mkfs.ext4 failed")?;
+    // Scale the inode table with the paired backingfiles capacity — see
+    // mutable_inode_count. Fall back to mkfs defaults if the partition
+    // size can't be read; a default table is degraded, not fatal.
+    let bf_sectors = sentryusb_shell::run("blockdev", &["--getsz", &p2]).await
+        .ok().and_then(|o| o.trim().parse::<u64>().ok());
+    let mut_sectors = sentryusb_shell::run("blockdev", &["--getsz", &p1]).await
+        .ok().and_then(|o| o.trim().parse::<u64>().ok());
+    let mutable_inodes = match (bf_sectors, mut_sectors) {
+        (Some(bf), Some(m)) if m > 0 => Some(mutable_inode_count(bf, m * 512)),
+        _ => None,
+    };
+    let inode_count;
+    let mkfs_args: Vec<&str> = match &mutable_inodes {
+        Some(n) => {
+            inode_count = n.to_string();
+            vec!["-F", "-N", &inode_count, "-L", "mutable", &p1]
+        }
+        None => vec!["-F", "-L", "mutable", &p1],
+    };
+    sentryusb_shell::run_with_timeout(op_timeout, "mkfs.ext4", &mkfs_args)
+        .await.context("mkfs.ext4 failed")?;
 
     emitter.progress(&format!("Formatting backingfiles partition (xfs) on {}...", p2));
     // -K: skip the default full-device TRIM (slow on large media, useless on a fresh partition).
@@ -331,8 +368,10 @@ pub async fn setup_sd_card(env: &SetupEnv, emitter: &SetupEmitter) -> Result<boo
         }
     }
 
-    // Calculate mutable inodes: ~1 per 20000 sectors of backingfiles
-    let mutable_inodes = bf_num_sectors / 20000;
+    // Calculate mutable inodes: ~1 per 20000 sectors of backingfiles,
+    // clamped to the 300 MiB (614400-sector) mutable partition's density
+    // bounds — see mutable_inode_count.
+    let mutable_inodes = mutable_inode_count(bf_num_sectors, 614400 * 512);
 
     // -K skips mkfs.xfs's default full-device TRIM. On a large, slow SD
     // card (1 TB on a Pi 3) discarding the backingfiles partition takes
@@ -608,6 +647,29 @@ async fn update_fstab() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Field sizes: an 8 TB T7 wants ~781k inodes but a 1.8 GiB mutable
+    /// partition caps at bytes/4096 ≈ 472k; a small SD's backingfiles
+    /// wants only ~22k but must never get a sparser table than mkfs
+    /// defaults (bytes/16384). The stock 300 MiB SD-layout partition
+    /// lands between its own bounds.
+    #[test]
+    fn mutable_inode_count_clamps_to_partition_density_bounds() {
+        let mib = 1024 * 1024;
+        let t7_8tb_sectors: u64 = 8_000_000_000_000 / 512;
+        let mutable_1g8 = 1843 * mib; // ~1.8 GiB
+        assert_eq!(mutable_inode_count(t7_8tb_sectors, mutable_1g8), mutable_1g8 / 4096);
+
+        let sd_226g_sectors: u64 = 226 * 1024 * mib as u64 / 512;
+        assert_eq!(mutable_inode_count(sd_226g_sectors, mutable_1g8), mutable_1g8 / 16384);
+
+        // 300 MiB mutable + 500 GB backingfiles: raw value survives.
+        let mutable_300m = 614400 * 512;
+        let bf_500g_sectors: u64 = 500_000_000_000 / 512;
+        let raw = bf_500g_sectors / 20000;
+        assert!(raw > mutable_300m / 16384 && raw < mutable_300m / 4096);
+        assert_eq!(mutable_inode_count(bf_500g_sectors, mutable_300m), raw);
+    }
 
     #[test]
     fn strip_partition_suffix_handles_sd_style() {

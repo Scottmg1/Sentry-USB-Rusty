@@ -2106,13 +2106,73 @@ function freespacemanager {
   threepctoftotalspace=$(eval "$(stat --file-system --format="echo \$((%b*%S/33))" /backingfiles/cam_disk.bin)")
   reserve=$((reserve+threepctoftotalspace))
 
+  # /mutable inode headroom threshold, mirroring manage_free_space.sh:
+  # each retained clip costs a symlink inode in /mutable/TeslaCam, and
+  # the inode table fills long before a multi-TB /backingfiles feels
+  # block pressure (2026-08-19 field failure: 100% inode-full while 71%
+  # of the bytes were free, ENOSPC on every ln/state write for a day).
+  # max(20000, table/20) ≈ a week of links of recovery headroom. Only
+  # armed while /mutable is rw-mounted — on a ro remount, releasing
+  # snapshots cannot delete their symlinks and is pure footage loss.
+  local imutable ireserve=0
+  if findmnt -no OPTIONS --mountpoint /mutable 2>/dev/null | grep -qE '(^|,)rw(,|$)'
+  then
+    imutable=$(stat --file-system --format=%c /mutable 2>/dev/null || echo 0)
+    if [ "$imutable" -gt 0 ]
+    then
+      ireserve=$((imutable / 20))
+      if [ "$ireserve" -lt 20000 ]
+      then
+        ireserve=20000
+      fi
+    fi
+  fi
+
+  # Throttle marker for the storage-pressure push alert (once per 24h).
+  local alert_marker=/run/sentryusb_storage_pressure_alerted
+
   while true
   do
-    local freespace
+    local freespace ifree pressure=""
     freespace=$(eval "$(stat --file-system --format="echo \$((%f*%S))" /backingfiles/cam_disk.bin)")
     if [ "$freespace" -lt "$reserve" ]
     then
-      /root/bin/manage_free_space.sh "$reserve" || sleep 30
+      pressure="free space low"
+    fi
+    if [ "$ireserve" -gt 0 ]
+    then
+      ifree=$(stat --file-system --format=%d /mutable 2>/dev/null || true)
+      if [ -n "$ifree" ] && [ "$ifree" -le "$ireserve" ]
+      then
+        pressure="${pressure:+$pressure, }clip index nearly full"
+      fi
+    fi
+    if [ -n "$pressure" ]
+    then
+      local relieved=true
+      /root/bin/manage_free_space.sh "$reserve" || relieved=false
+      # Alert when eviction failed outright, or when a standing inode
+      # stall latch means the manager is deliberately no longer trying
+      # (it exits 0 in that state, but the pressure is still real).
+      # Recording or archiving may stop soon and most users never open
+      # the dashboard — tell them directly, at most once a day. The
+      # 2026-08-19 inode exhaustion ran silently for a day precisely
+      # because nothing pushed.
+      if [ "$relieved" = "false" ] || [ -e /run/sentryusb_inode_stall ]
+      then
+        if [ ! -e "$alert_marker" ] || \
+           [ "$(( $(date +%s) - $(stat --format=%Y "$alert_marker" 2>/dev/null || echo 0) ))" -ge 86400 ]
+        then
+          touch "$alert_marker" 2>/dev/null || true
+          /root/bin/send-push-message "$NOTIFICATION_TITLE:" \
+            "Storage pressure ($pressure) could not be relieved automatically. Recording or archiving may stop — check the dashboard." \
+            warning storage_pressure 2>/dev/null || true
+        fi
+      fi
+      if [ "$relieved" = "false" ]
+      then
+        sleep 30
+      fi
     fi
     sleep 30
   done

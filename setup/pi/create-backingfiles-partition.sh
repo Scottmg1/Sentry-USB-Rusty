@@ -130,7 +130,27 @@ then
     log_progress "Formatting new partitions..."
     # Force creation of filesystems even if previous filesystem appears to exist
     log_progress "Formatting mutable partition (ext4) on $P1..."
-    mkfs.ext4 -F -L mutable "$P1"
+    # Scale the mutable inode table with the footage the backingfiles
+    # partition can retain: every retained clip costs one symlink inode
+    # in /mutable/TeslaCam, and mkfs defaults (~121k inodes on this 2GB
+    # partition) filled after ~5 weeks against a multi-TB drive
+    # (2026-08-19 field failure: 100% inode-full, day-long ENOSPC on
+    # clip indexing while 71% of the bytes were free). ~1 inode per
+    # 20000 sectors (~10MB) of backingfiles, clamped to [bytes/16384,
+    # bytes/4096] of the mutable partition itself — never sparser than
+    # the mkfs default, never more than ~6% table overhead. Matches
+    # mutable_inode_count in crates/setup/src/partition.rs.
+    MUTABLE_BYTES=$(( $(blockdev --getsz "$P1") * 512 ))
+    MUTABLE_INODES=$(( $(blockdev --getsz "$P2") / 20000 ))
+    if [ "$MUTABLE_INODES" -lt $(( MUTABLE_BYTES / 16384 )) ]
+    then
+      MUTABLE_INODES=$(( MUTABLE_BYTES / 16384 ))
+    fi
+    if [ "$MUTABLE_INODES" -gt $(( MUTABLE_BYTES / 4096 )) ]
+    then
+      MUTABLE_INODES=$(( MUTABLE_BYTES / 4096 ))
+    fi
+    mkfs.ext4 -F -N "$MUTABLE_INODES" -L mutable "$P1"
     log_progress "Formatting backingfiles partition (xfs) on $P2..."
     mkfs.xfs -f -K -m reflink=1 -L backingfiles "$P2"
     log_progress "Partition formatting complete."

@@ -6,6 +6,109 @@ use anyhow::Result;
 use tracing::{info, warn};
 
 const BACKINGFILES: &str = "/backingfiles";
+const MUTABLE: &str = "/mutable";
+
+/// /mutable inode-headroom target: `max(20000, table/20)`.
+///
+/// Every retained clip costs one symlink inode in /mutable/TeslaCam
+/// (the snapshot farm index), and the stock partition's table (~121k at
+/// mkfs.ext4 defaults) fills long before a multi-TB /backingfiles feels
+/// block-space pressure. The 2026-08-19 field failure ran a full day at
+/// 100% inode usage with 71% of the bytes free: every ln and state-file
+/// write ENOSPC'd, so new clips were never indexed, mapped, or archived
+/// while notifications (network-only) kept working. At the observed
+/// ~2.9k links/day the 20k floor is about a week of recovery headroom;
+/// the /20 term tracks that need rather than growing with denser inode
+/// tables. Matches manage_free_space.sh and archiveloop.
+const INODE_RESERVE_FLOOR: u64 = 20_000;
+const INODE_RESERVE_DIVISOR: u64 = 20;
+
+/// How many consecutive snapshot releases may fail to free any /mutable
+/// inodes (with the block target already met) before we conclude the
+/// inode pressure is not from clip symlinks and stop evicting footage.
+const MAX_STALE_INODE_RELEASES: u32 = 3;
+
+/// Written when the stall guard trips; holds the free-inode count at
+/// the stall. tmpfs on purpose: /mutable itself may be inode-full and
+/// the root filesystem is read-only. Shared with manage_free_space.sh.
+/// Without it, a 30-second retrying caller would re-enter and delete
+/// three more snapshots per attempt against pressure snapshots cannot
+/// relieve.
+const INODE_STALL_LATCH: &str = "/run/sentryusb_inode_stall";
+
+fn inode_reserve(total_inodes: u64) -> u64 {
+    (total_inodes / INODE_RESERVE_DIVISOR).max(INODE_RESERVE_FLOOR)
+}
+
+/// Whether /mutable is mounted read-write. Inode-driven eviction is
+/// only safe then: unmounted, `stat /mutable` measures the root
+/// filesystem; ro-remounted (ext4 error), release_snapshot deletes the
+/// snapshot but cannot remove its symlinks — permanent footage loss
+/// with zero inode recovery. (A write-probe would be wrong: an
+/// inode-FULL filesystem also fails writes, and that is exactly the
+/// state eviction exists to fix — so check the mount option.)
+fn mutable_rw_mounted() -> bool {
+    let Ok(mounts) = std::fs::read_to_string("/proc/mounts") else {
+        return false;
+    };
+    mounts.lines().any(|line| {
+        let mut fields = line.split_whitespace();
+        let _dev = fields.next();
+        if fields.next() != Some("/mutable") {
+            return false;
+        }
+        let _fstype = fields.next();
+        fields
+            .next()
+            .is_some_and(|opts| opts.split(',').any(|o| o == "rw"))
+    })
+}
+
+/// Consecutive-zero-gain counter behind the stall guard — see
+/// [`INODE_STALL_LATCH`]. Counts only successful releases; any release
+/// that actually freed /mutable inodes (or ran under block pressure,
+/// where eviction is always legitimate) resets it.
+struct StallGuard {
+    consecutive: u32,
+}
+
+impl StallGuard {
+    fn new() -> Self {
+        Self { consecutive: 0 }
+    }
+
+    /// Record one successful release; returns true when the guard trips.
+    fn record(
+        &mut self,
+        block_target_met: bool,
+        inodes_before: Option<u64>,
+        inodes_after: Option<u64>,
+    ) -> bool {
+        if !block_target_met {
+            self.consecutive = 0;
+            return false;
+        }
+        match (inodes_before, inodes_after) {
+            (Some(before), Some(after)) if after <= before => {
+                self.consecutive += 1;
+                self.consecutive >= MAX_STALE_INODE_RELEASES
+            }
+            _ => {
+                self.consecutive = 0;
+                false
+            }
+        }
+    }
+}
+
+/// Both eviction targets: block free space on /backingfiles at or above
+/// the reserve, and /mutable free inodes strictly above the inode
+/// reserve (`None` = /mutable unreadable, e.g. dev containers — treat
+/// as satisfied rather than evicting on unknown data; matches the bash
+/// script skipping the check when stat fails).
+fn targets_met(free: u64, reserve: u64, free_inodes: Option<u64>, ireserve: u64) -> bool {
+    free >= reserve && free_inodes.map_or(true, |f| f > ireserve)
+}
 
 /// Headroom for one recording cycle and the next snapshot's COW growth.
 const FIXED_RESERVE_BYTES: u64 = 10 * 1024 * 1024 * 1024; // 10 GiB
@@ -76,20 +179,56 @@ pub async fn manage_free_space(reserve_bytes: Option<u64>) -> Result<()> {
         );
     }
 
+    // /mutable inode headroom — see INODE_RESERVE_DIVISOR. Anything
+    // that makes the inode data untrustworthy or eviction unsafe (not
+    // rw-mounted, unreadable stats, a standing stall latch) disables
+    // the inode policy only: block-space eviction must keep working.
+    let mutable_inodes = if mutable_rw_mounted() { get_inodes(MUTABLE).ok() } else { None };
+    let mut ireserve = mutable_inodes.map_or(0, |(t, _)| inode_reserve(t));
+    let mut free_inodes = mutable_inodes.map(|(_, f)| f);
+
+    // Honor a previous stall verdict: resume inode-driven eviction only
+    // after free inodes actually rose above the latched value.
+    if let Some(latched) = read_stall_latch() {
+        match free_inodes {
+            Some(now) if now > latched => {
+                let _ = std::fs::remove_file(INODE_STALL_LATCH);
+            }
+            _ => {
+                if free_inodes.is_some() {
+                    info!(
+                        "inode-driven eviction suspended (stalled at {} free; see {})",
+                        latched, INODE_STALL_LATCH
+                    );
+                }
+                ireserve = 0;
+                free_inodes = None;
+            }
+        }
+    }
+
     info!(
-        "Disk space: {} free / {} total bytes; reserve={} (source={}, formula=10GiB+total/33)",
-        free, total, reserve, source
+        "Disk space: {} free / {} total bytes; reserve={} (source={}, formula=10GiB+total/33); \
+         /mutable inodes free={:?} reserve={}",
+        free, total, reserve, source, free_inodes, ireserve
     );
 
-    // Equality satisfies the target; do not evict a snapshot at the boundary.
-    if free >= reserve {
+    // Byte equality satisfies the target; do not evict a snapshot at the boundary.
+    if targets_met(free, reserve, free_inodes, ireserve) {
         return Ok(());
     }
 
-    info!("Free space below reserve ({} bytes), releasing old snapshots...", reserve);
+    if free < reserve {
+        info!("Free space below reserve ({} bytes), releasing old snapshots...", reserve);
+    } else {
+        info!(
+            "/mutable free inodes {:?} at or below reserve {}, releasing old snapshots...",
+            free_inodes, ireserve
+        );
+    }
 
     // Slot numbering can restart after a reflash, so release by mtime age.
-    let mut snapshots = super::snapshot::list_snapshots_by_age();
+    let snapshots = super::snapshot::list_snapshots_by_age();
     if snapshots.is_empty() {
         anyhow::bail!(
             "low space for new snapshots, but no snapshots exist — \
@@ -108,19 +247,49 @@ pub async fn manage_free_space(reserve_bytes: Option<u64>) -> Result<()> {
         );
     }
 
+    // Release oldest snapshots first until both targets are met.
     let mut recovered = false;
+    let mut guard = StallGuard::new();
+    let inode_policy_on = ireserve > 0;
     for snap in &snapshots {
+        let inodes_before =
+            if inode_policy_on { get_inodes(MUTABLE).ok().map(|(_, f)| f) } else { None };
         if let Err(e) = super::snapshot::release_snapshot_locked(snap).await {
             warn!("Failed to release {}: {}", snap, e);
             continue;
         }
 
         let (_, new_free) = get_space(BACKINGFILES)?;
-        info!("After releasing {}: {} bytes free (reserve {})", snap, new_free, reserve);
+        let new_free_inodes =
+            if inode_policy_on { get_inodes(MUTABLE).ok().map(|(_, f)| f) } else { None };
+        info!(
+            "After releasing {}: {} bytes free (reserve {}); /mutable inodes free={:?} (reserve {})",
+            snap, new_free, reserve, new_free_inodes, ireserve
+        );
 
-        if new_free >= reserve {
+        if targets_met(new_free, reserve, new_free_inodes, ireserve) {
             recovered = true;
             break;
+        }
+
+        // Stall guard, mirroring manage_free_space.sh: releasing a
+        // snapshot only relieves /mutable inode pressure when it still
+        // owns clip symlinks there. If the block target is already met
+        // and several releases in a row free no inodes, the table is
+        // being eaten by something else — latch that verdict (so
+        // retrying callers don't drain the snapshot store three at a
+        // time) and stop.
+        if inode_policy_on && guard.record(new_free >= reserve, inodes_before, new_free_inodes) {
+            if let Some(f) = new_free_inodes {
+                let _ = std::fs::write(INODE_STALL_LATCH, f.to_string());
+            }
+            anyhow::bail!(
+                "inode pressure on /mutable ({:?} free, reserve {}) not relieved by \
+                 releasing snapshots — something other than clip symlinks is \
+                 consuming inodes",
+                new_free_inodes,
+                ireserve
+            );
         }
     }
     if !recovered {
@@ -166,11 +335,120 @@ fn get_space(path: &str) -> Result<(u64, u64)> {
     ))
 }
 
+/// Free-inode count recorded by a previous stall, if any.
+fn read_stall_latch() -> Option<u64> {
+    std::fs::read_to_string(INODE_STALL_LATCH).ok()?.trim().parse().ok()
+}
+
+/// Get total and free inode counts for a filesystem.
+///
+/// Same fail-closed parsing as [`get_space`]: malformed stat output is
+/// an error, not (0, 0) — a zero total would silently disable the
+/// inode-headroom policy at the call site.
+fn get_inodes(path: &str) -> Result<(u64, u64)> {
+    let output = std::process::Command::new("stat")
+        .args(["--file-system", "--format=%c %d", path])
+        .output()?;
+
+    if !output.status.success() {
+        anyhow::bail!("stat failed for {}", path);
+    }
+
+    let s = String::from_utf8_lossy(&output.stdout);
+    let parts: Vec<&str> = s.trim().split_whitespace().collect();
+    if parts.len() < 2 {
+        anyhow::bail!("unexpected stat output for {}: {:?}", path, s.trim());
+    }
+    let total = parts[0]
+        .parse::<u64>()
+        .map_err(|e| anyhow::anyhow!("bad inode total in stat output for {}: {}", path, e))?;
+    let free = parts[1]
+        .parse::<u64>()
+        .map_err(|e| anyhow::anyhow!("bad free inode count in stat output for {}: {}", path, e))?;
+    if total == 0 {
+        anyhow::bail!("stat reported zero inode capacity for {}", path);
+    }
+    Ok((total, free))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     const GIB: u64 = 1024 * 1024 * 1024;
+
+    /// The 2026-08-19 field failure in numbers: the stock /mutable
+    /// partition has 120,960 inodes at mkfs.ext4 defaults, and clip
+    /// symlinks consumed all of them while 71% of the bytes were free.
+    /// The 20k floor (≈ a week of links at ~2.9k/day) governs small
+    /// tables; the /20 term takes over only on denser ones, so the
+    /// reserve tracks recovery time instead of table size.
+    #[test]
+    fn inode_reserve_is_floored_at_a_week_of_links() {
+        assert_eq!(inode_reserve(120_960), 20_000); // stock table: floor wins
+        assert_eq!(inode_reserve(472_000), 23_600); // dense table: /20 wins
+        assert_eq!(inode_reserve(0), 20_000);
+    }
+
+    /// Zero-gain releases only count against the guard while the block
+    /// target is met (inode-only eviction); block-pressure releases and
+    /// any release that actually freed inodes reset it.
+    #[test]
+    fn stall_guard_trips_after_three_zero_gain_releases() {
+        let mut g = StallGuard::new();
+        assert!(!g.record(true, Some(100), Some(100)));
+        assert!(!g.record(true, Some(100), Some(100)));
+        assert!(g.record(true, Some(100), Some(100)));
+    }
+
+    #[test]
+    fn stall_guard_resets_on_progress_or_block_pressure() {
+        let mut g = StallGuard::new();
+        assert!(!g.record(true, Some(100), Some(100)));
+        assert!(!g.record(true, Some(100), Some(100)));
+        // Progress: the release freed inodes.
+        assert!(!g.record(true, Some(100), Some(5_000)));
+        assert!(!g.record(true, Some(100), Some(100)));
+        // Block pressure: eviction is legitimate regardless of inodes.
+        assert!(!g.record(false, Some(100), Some(100)));
+        assert!(!g.record(true, Some(100), Some(100)));
+        assert!(!g.record(true, Some(100), Some(100)));
+        assert!(g.record(true, Some(100), Some(100)));
+    }
+
+    /// Unreadable inode counts must not accumulate toward a trip.
+    #[test]
+    fn stall_guard_ignores_unreadable_inode_counts() {
+        let mut g = StallGuard::new();
+        for _ in 0..5 {
+            assert!(!g.record(true, None, None));
+            assert!(!g.record(true, Some(100), None));
+        }
+    }
+
+    /// Byte target met but inode target not: eviction must continue —
+    /// this is exactly the state the 2026-08-19 incident sat in for a
+    /// day (block-space policy satisfied, index unusable).
+    #[test]
+    fn targets_not_met_when_inodes_low_despite_free_bytes() {
+        assert!(!targets_met(100 * GIB, 10 * GIB, Some(5_000), 20_160));
+    }
+
+    /// Both satisfied → done. Inodes use strict `>` (bash `-gt` parity).
+    #[test]
+    fn targets_met_needs_inodes_strictly_above_reserve() {
+        assert!(targets_met(100 * GIB, 10 * GIB, Some(20_161), 20_160));
+        assert!(!targets_met(100 * GIB, 10 * GIB, Some(20_160), 20_160));
+    }
+
+    /// Unreadable /mutable (dev containers) disables the inode check
+    /// rather than blocking block-space eviction — and must never make
+    /// a low-bytes state look satisfied.
+    #[test]
+    fn targets_ignore_inodes_when_mutable_unreadable() {
+        assert!(targets_met(100 * GIB, 10 * GIB, None, 0));
+        assert!(!targets_met(GIB, 10 * GIB, None, 0));
+    }
 
     /// The monotonic slot protects a new snapshot from a rolled-back clock.
     #[test]
