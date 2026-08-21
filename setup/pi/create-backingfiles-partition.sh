@@ -140,17 +140,28 @@ then
     # bytes/4096] of the mutable partition itself — never sparser than
     # the mkfs default, never more than ~6% table overhead. Matches
     # mutable_inode_count in crates/setup/src/partition.rs.
-    MUTABLE_BYTES=$(( $(blockdev --getsz "$P1") * 512 ))
-    MUTABLE_INODES=$(( $(blockdev --getsz "$P2") / 20000 ))
-    if [ "$MUTABLE_INODES" -lt $(( MUTABLE_BYTES / 16384 )) ]
+    # Fall back to mkfs defaults if either size can't be read — a
+    # default inode table is degraded, not a reason to abort the
+    # install (mirrors the Rust path's fallback in partition.rs).
+    MUTABLE_SECTORS=$(blockdev --getsz "$P1" 2>/dev/null || echo 0)
+    BF_SECTORS=$(blockdev --getsz "$P2" 2>/dev/null || echo 0)
+    if [ "$MUTABLE_SECTORS" -gt 0 ] && [ "$BF_SECTORS" -gt 0 ]
     then
-      MUTABLE_INODES=$(( MUTABLE_BYTES / 16384 ))
+      MUTABLE_BYTES=$(( MUTABLE_SECTORS * 512 ))
+      MUTABLE_INODES=$(( BF_SECTORS / 20000 ))
+      if [ "$MUTABLE_INODES" -lt $(( MUTABLE_BYTES / 16384 )) ]
+      then
+        MUTABLE_INODES=$(( MUTABLE_BYTES / 16384 ))
+      fi
+      if [ "$MUTABLE_INODES" -gt $(( MUTABLE_BYTES / 4096 )) ]
+      then
+        MUTABLE_INODES=$(( MUTABLE_BYTES / 4096 ))
+      fi
+      mkfs.ext4 -F -N "$MUTABLE_INODES" -L mutable "$P1"
+    else
+      log_progress "WARNING: could not size partitions for inode scaling; using mkfs defaults"
+      mkfs.ext4 -F -L mutable "$P1"
     fi
-    if [ "$MUTABLE_INODES" -gt $(( MUTABLE_BYTES / 4096 )) ]
-    then
-      MUTABLE_INODES=$(( MUTABLE_BYTES / 4096 ))
-    fi
-    mkfs.ext4 -F -N "$MUTABLE_INODES" -L mutable "$P1"
     log_progress "Formatting backingfiles partition (xfs) on $P2..."
     mkfs.xfs -f -K -m reflink=1 -L backingfiles "$P2"
     log_progress "Partition formatting complete."
