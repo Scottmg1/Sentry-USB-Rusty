@@ -151,7 +151,13 @@ pub async fn health_check(State(_s): State<AppState>) -> (StatusCode, Json<serde
     // ROOT filesystem and false-pass; read-only, clip indexing is just
     // as dead as inode-full. The item always renders — an unreadable
     // state is a finding, not a reason to omit the row.
-    let mutable_rw: Option<bool> = std::fs::read_to_string("/proc/mounts").ok().map(|m| {
+    // One read for both states — two reads would race a mount
+    // transition between them into an inconsistent verdict.
+    let mounts = std::fs::read_to_string("/proc/mounts").ok();
+    let mutable_mounted = mounts
+        .as_deref()
+        .map(|m| m.lines().any(|l| l.split_whitespace().nth(1) == Some("/mutable")));
+    let mutable_rw: Option<bool> = mounts.as_deref().map(|m| {
         m.lines().any(|line| {
             let mut f = line.split_whitespace();
             let _dev = f.next();
@@ -159,9 +165,6 @@ pub async fn health_check(State(_s): State<AppState>) -> (StatusCode, Json<serde
                 && f.nth(1).is_some_and(|opts| opts.split(',').any(|o| o == "rw"))
         })
     });
-    let mutable_mounted = std::fs::read_to_string("/proc/mounts")
-        .ok()
-        .map(|m| m.lines().any(|l| l.split_whitespace().nth(1) == Some("/mutable")));
     match (mutable_mounted, mutable_rw) {
         (Some(false), _) => st.push(item(
             "Clip index capacity",
