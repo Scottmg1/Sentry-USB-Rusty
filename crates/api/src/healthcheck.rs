@@ -146,14 +146,60 @@ pub async fn health_check(State(_s): State<AppState>) -> (StatusCode, Json<serde
     // write ENOSPC'd for a day while byte space looked fine, so drive
     // mapping and archiving stalled silently. Threshold mirrors the
     // max(20000, table/20) reserve the eviction policy maintains
-    // (manage_free_space.sh / space.rs).
-    if let Ok(out) = sentryusb_shell::run(
-        "stat", &["--file-system", "--format=%d %c", "/mutable/."],
-    ).await {
-        let parts: Vec<&str> = out.trim().split_whitespace().collect();
-        if parts.len() >= 2 {
-            if let (Ok(free), Ok(total)) = (parts[0].parse::<u64>(), parts[1].parse::<u64>()) {
-                if total > 0 {
+    // (manage_free_space.sh / space.rs). Gated on the same rw-mount
+    // test as eviction: unmounted, `stat /mutable/.` would measure the
+    // ROOT filesystem and false-pass; read-only, clip indexing is just
+    // as dead as inode-full. The item always renders — an unreadable
+    // state is a finding, not a reason to omit the row.
+    let mutable_rw: Option<bool> = std::fs::read_to_string("/proc/mounts").ok().map(|m| {
+        m.lines().any(|line| {
+            let mut f = line.split_whitespace();
+            let _dev = f.next();
+            f.next() == Some("/mutable")
+                && f.nth(1).is_some_and(|opts| opts.split(',').any(|o| o == "rw"))
+        })
+    });
+    let mutable_mounted = std::fs::read_to_string("/proc/mounts")
+        .ok()
+        .map(|m| m.lines().any(|l| l.split_whitespace().nth(1) == Some("/mutable")));
+    match (mutable_mounted, mutable_rw) {
+        (Some(false), _) => st.push(item(
+            "Clip index capacity",
+            "fail",
+            Some("/mutable is not mounted — clips cannot be indexed, mapped, or archived".to_string()),
+        )),
+        (Some(true), Some(false)) => st.push(item(
+            "Clip index capacity",
+            "fail",
+            Some("/mutable is mounted read-only — clips cannot be indexed until it is rw again (filesystem error?)".to_string()),
+        )),
+        (None, _) => st.push(item(
+            "Clip index capacity",
+            "warn",
+            Some("cannot read /proc/mounts to verify /mutable".to_string()),
+        )),
+        (Some(true), _) => {
+            let stat_out = sentryusb_shell::run(
+                "stat", &["--file-system", "--format=%d %c", "/mutable/."],
+            ).await;
+            let parsed = stat_out.ok().and_then(|out| {
+                let parts: Vec<u64> = out
+                    .trim()
+                    .split_whitespace()
+                    .filter_map(|p| p.parse().ok())
+                    .collect();
+                match parts[..] {
+                    [free, total] if total > 0 => Some((free, total)),
+                    _ => None,
+                }
+            });
+            match parsed {
+                None => st.push(item(
+                    "Clip index capacity",
+                    "warn",
+                    Some("inode statistics unavailable for /mutable".to_string()),
+                )),
+                Some((free, total)) => {
                     let reserve = (total / 20).max(20_000);
                     let counts = format!("{} of {} inodes free", free, total);
                     if free == 0 {
