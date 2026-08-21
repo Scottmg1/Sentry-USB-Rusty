@@ -141,6 +141,59 @@ pub async fn health_check(State(_s): State<AppState>) -> (StatusCode, Json<serde
         Some(p) => st.push(item("Backingfiles free space", "pass", Some(format!("{:.1}% free", p)))),
         None => st.push(item("Backingfiles free space", "warn", Some("partition not mounted".to_string()))),
     }
+    // Clip-index inode headroom on /mutable. The 2026-08-19 field
+    // failure was inode exhaustion here: every clip symlink and state
+    // write ENOSPC'd for a day while byte space looked fine, so drive
+    // mapping and archiving stalled silently. Threshold mirrors the
+    // max(20000, table/20) reserve the eviction policy maintains
+    // (manage_free_space.sh / space.rs).
+    if let Ok(out) = sentryusb_shell::run(
+        "stat", &["--file-system", "--format=%d %c", "/mutable/."],
+    ).await {
+        let parts: Vec<&str> = out.trim().split_whitespace().collect();
+        if parts.len() >= 2 {
+            if let (Ok(free), Ok(total)) = (parts[0].parse::<u64>(), parts[1].parse::<u64>()) {
+                if total > 0 {
+                    let reserve = (total / 20).max(20_000);
+                    let counts = format!("{} of {} inodes free", free, total);
+                    if free == 0 {
+                        st.push(item("Clip index capacity", "fail", Some(format!(
+                            "{} — index is full; new clips cannot be indexed, mapped, or archived",
+                            counts
+                        ))));
+                    } else if free <= reserve {
+                        st.push(item("Clip index capacity", "warn", Some(format!(
+                            "{} — below the {} reserve; automatic cleanup should be releasing old snapshots",
+                            counts, reserve
+                        ))));
+                    } else {
+                        st.push(item("Clip index capacity", "pass", Some(counts)));
+                    }
+                }
+            }
+        }
+    }
+    // Automatic storage cleanup state. The stall latch means eviction
+    // ran and gave up: releasing snapshots stopped freeing clip-index
+    // inodes, so something other than clip links is eating the table.
+    // That is the "tried automatically, needs a human" state — same
+    // contract as storage auto-repair.
+    if std::path::Path::new("/run/sentryusb_inode_stall").exists() {
+        let latched = std::fs::read_to_string("/run/sentryusb_inode_stall")
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .map(|v| format!(" (latched at {} free)", v))
+            .unwrap_or_default();
+        st.push(item("Automatic storage cleanup", "fail", Some(format!(
+            "stalled: releasing snapshots no longer frees clip-index inodes{} — \
+             manual intervention needed: find what is consuming /mutable inodes, \
+             then delete /run/sentryusb_inode_stall (or reboot) to re-arm cleanup",
+            latched
+        ))));
+    } else {
+        st.push(item("Automatic storage cleanup", "pass", None));
+    }
     // Check optional disk images only when configured.
     let user_wants = |size_key: &str| -> bool {
         // Empty or a zero numeric prefix disables the image.
