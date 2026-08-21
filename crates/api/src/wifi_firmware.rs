@@ -10,11 +10,20 @@
 //! `max tx seq number error`, after which the radio stays associated with a
 //! strong signal and normal receive speed while transmit collapses — and
 //! Bluetooth dies with it, because the two share one antenna through the
-//! chip's coexistence arbiter. Worse, reloading the *old* firmware only gets
-//! transmit back to a fraction of normal: measured on a Pi 5 archiving over
-//! Wi-Fi, 7.45.265 stayed at ~40 Mbit/s across two reloads on a device that
-//! had been sustaining ~190 Mbit/s, while loading 7.45.286 restored full speed
-//! immediately.
+//! chip's coexistence arbiter.
+//!
+//! Note this updater only touches the *Wi-Fi* image. The Bluetooth core of the
+//! same package runs its own separate patch (`BCM4345C0.hcd`, from the
+//! `bluez-firmware` package, loaded over UART) and is left alone. BLE can still
+//! benefit indirectly, because it shares the antenna with the WLAN core.
+//!
+//! Reloading the radio in place is not a reliable finish: it re-probes the chip
+//! over SDIO without power-cycling it, and can leave transmit far below normal.
+//! Measured on a Pi 5, a fresh boot sustains ~220 Mbit/s while a bus reset can
+//! land at ~40 Mbit/s with idle gateway latency inflated from 4 ms to a 43 ms
+//! average, at full PHY rate with zero errors or retries — roughly 11% airtime
+//! efficiency, which is what unaggregated traffic looks like. The outcome
+//! varies run to run, so the UI asks for a reboot after a successful install.
 //!
 //! Infineon's own changelog for this build (FMAC v2024_1115 release notes,
 //! section 2.3.6) lists no new features and four bug fixes, the first two of
@@ -24,10 +33,11 @@
 //!   * Fix for low throughput issue noticed with SoftAP and STA concurrency
 //!   * Fix for memory loss issue noticed during WPA3 SAE-FT roam scenarios
 //! The compiled-in feature lists of 7.45.265 and 7.45.286 are byte-identical,
-//! so this is purely bug fixes within the same feature set. Note that none of
-//! them claims to fix the SDIO CMD53 errors that *trigger* the wedge, so the
-//! trigger may well remain; what 7.45.286 demonstrably fixes is the device
-//! being stuck at low throughput afterwards.
+//! so this is purely bug fixes within the same feature set. None of them claims
+//! to fix the SDIO CMD53 errors that *trigger* the wedge, so whether the wedge
+//! still recurs on 7.45.286 is untested and needs sustained real-world use to
+//! answer. What is established is that 7.45.286 installs and rolls back cleanly
+//! and performs on par with the stock image (207-212 vs 221-231 Mbit/s).
 //!
 //! The install is deliberately survivable. Reloading the radio drops Wi-Fi for
 //! ~20 s, which kills the very HTTP connection that started the install, so
@@ -93,6 +103,14 @@ impl Default for InstallState {
             updated_at: 0,
         }
     }
+}
+
+/// Wall-clock time the kernel booted, from `/proc/stat`'s `btime`.
+fn boot_time() -> Option<i64> {
+    let s = std::fs::read_to_string("/proc/stat").ok()?;
+    s.lines()
+        .find_map(|l| l.strip_prefix("btime "))
+        .and_then(|v| v.trim().parse::<i64>().ok())
 }
 
 fn read_state() -> InstallState {
@@ -293,6 +311,14 @@ pub async fn get_status(State(_s): State<AppState>) -> (StatusCode, Json<serde_j
 
     let on_target =
         installed.as_deref() == Some(TARGET_VERSION) || running.as_deref() == Some(TARGET_VERSION);
+
+    // A successful install only still needs a reboot if it happened during the
+    // *current* boot. Reloading the radio in place can leave it transmitting
+    // well below normal, but once the machine has been restarted since, the
+    // job is finished and nagging about it would be wrong.
+    let st = read_state();
+    let reboot_pending =
+        st.state == "success" && boot_time().map(|b| st.updated_at > b).unwrap_or(false);
     // Eligible only where the work can actually be done: a supported board
     // whose firmware file resolved, not already on the newer build.
     let eligible = supported && fw_path.is_some() && !on_target;
@@ -310,8 +336,9 @@ pub async fn get_status(State(_s): State<AppState>) -> (StatusCode, Json<serde_j
             "symptom_detected": symptom.is_some(),
             "symptom_detail": symptom,
             "can_rollback": Path::new(&format!("{}/stock.bin", BACKUP_DIR)).exists(),
+            "reboot_pending": reboot_pending,
             "pinned": fw_path.as_deref().map(is_pinned).unwrap_or(false),
-            "install": read_state(),
+            "install": st,
         })),
     )
 }

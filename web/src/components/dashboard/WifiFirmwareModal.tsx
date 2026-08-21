@@ -21,6 +21,8 @@ export interface WifiFirmwareStatus {
   symptom_detected: boolean
   symptom_detail: string | null
   can_rollback: boolean
+  /** A successful install this boot that hasn't been finished with a restart. */
+  reboot_pending: boolean
   /** Held in place with dpkg-divert so an apt upgrade can't revert it. */
   pinned: boolean
   install: InstallState
@@ -278,7 +280,7 @@ export function WifiFirmwareModal({
               </p>
             )}
 
-            {install.state === "success" && (
+            {install.state === "success" && status.reboot_pending && (
               // Reloading the radio in place can leave it transmitting well
               // below normal until the chip is actually power-cycled, and that
               // outcome varies run to run. A reboot is the reliable finish.

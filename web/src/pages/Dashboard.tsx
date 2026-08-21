@@ -508,11 +508,14 @@ export default function Dashboard() {
       kind: "info",
       icon: <WifiIcon className="h-4 w-4" />,
       title: `Wi-Fi firmware updated to ${wifiFirmware.status?.target_version ?? ""}`,
-      sub: "Reboot to finish. You can put the previous firmware back if anything looks wrong.",
+      // Only ask for a restart while one is genuinely outstanding.
+      sub: wifiFirmware.status?.reboot_pending
+        ? "Reboot to finish. Reloading the radio in place can leave Wi-Fi slower than normal until the Pi restarts."
+        : "You can put the previous firmware back if anything looks wrong.",
       action: (
         <div className="flex shrink-0 gap-2">
           <button onClick={() => setWifiFwOpen(true)} className="action-chip">
-            Revert
+            {wifiFirmware.status?.reboot_pending ? "Finish" : "Revert"}
           </button>
           <button onClick={wifiFirmware.dismissRevert} className="action-chip">
             Dismiss
