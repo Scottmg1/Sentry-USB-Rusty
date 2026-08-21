@@ -495,8 +495,8 @@ export default function Dashboard() {
         ? "Wi-Fi firmware issue detected"
         : "Wi-Fi firmware update available",
       sub: seen
-        ? "This Pi 5 hit the Wi-Fi fault that slows archiving and breaks Bluetooth keep-awake."
-        : "A newer Broadcom firmware fixes slow archiving and Bluetooth drop-outs on the Pi 5.",
+        ? "This Pi hit the Wi-Fi fault that slows archiving and breaks Bluetooth keep-awake."
+        : "A newer Broadcom firmware fixes slow archiving and Bluetooth drop-outs.",
       action: (
         <button
           onClick={() => setWifiFwOpen(true)}
@@ -541,11 +541,7 @@ export default function Dashboard() {
       {wifiFwOpen && wifiFirmware.status && (
         <WifiFirmwareModal
           status={wifiFirmware.status}
-          onClose={() => {
-            setWifiFwOpen(false)
-            // Closing without updating shouldn't nag on every dashboard visit.
-            if (!wifiFirmware.status?.up_to_date) wifiFirmware.dismiss()
-          }}
+          onClose={() => setWifiFwOpen(false)}
           onRefresh={wifiFirmware.refresh}
         />
       )}

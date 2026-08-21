@@ -189,11 +189,12 @@ export function WifiFirmwareModal({
         {install.state === "idle" && (
           <>
             <p>
-              Your Pi 5 is running the Wi-Fi firmware that ships with Raspberry Pi OS
+              Your {status.model || "Pi"} is running the Wi-Fi firmware that ships with
+              Raspberry Pi OS
               (<span className="text-slate-300">{status.running_version ?? "unknown"}</span>).
               A newer build from Infineon
-              (<span className="text-slate-300">{status.target_version}</span>) fixes a fault we
-              have seen on the Pi 5 during long archive transfers.
+              (<span className="text-slate-300">{status.target_version}</span>) fixes a fault
+              seen during long archive transfers.
             </p>
 
             <div className="rounded-lg bg-slate-500/10 p-2.5">

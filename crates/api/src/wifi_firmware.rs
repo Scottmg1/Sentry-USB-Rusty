@@ -5,7 +5,7 @@
 //! cannot redistribute because it sits under a licence Infineon explicitly did
 //! not upstream to linux-firmware.git.
 //!
-//! Why we offer it: on a Pi 5 the older firmware can wedge mid-archive. The
+//! Why we offer it: on a Pi 5 or Pi 4B the older firmware can wedge mid-archive. The
 //! kernel logs a burst of `CMD53 sg block write failed -84` plus
 //! `max tx seq number error`, after which the radio stays associated with a
 //! strong signal and normal receive speed while transmit collapses — and
@@ -15,6 +15,19 @@
 //! Wi-Fi, 7.45.265 stayed at ~40 Mbit/s across two reloads on a device that
 //! had been sustaining ~190 Mbit/s, while loading 7.45.286 restored full speed
 //! immediately.
+//!
+//! Infineon's own changelog for this build (FMAC v2024_1115 release notes,
+//! section 2.3.6) lists no new features and four bug fixes, the first two of
+//! which line up with what was measured here:
+//!   * Fix for low throughput issue noticed with 5 Ghz
+//!   * Fix for low Rx PER
+//!   * Fix for low throughput issue noticed with SoftAP and STA concurrency
+//!   * Fix for memory loss issue noticed during WPA3 SAE-FT roam scenarios
+//! The compiled-in feature lists of 7.45.265 and 7.45.286 are byte-identical,
+//! so this is purely bug fixes within the same feature set. Note that none of
+//! them claims to fix the SDIO CMD53 errors that *trigger* the wedge, so the
+//! trigger may well remain; what 7.45.286 demonstrably fixes is the device
+//! being stuck at low throughput afterwards.
 //!
 //! The install is deliberately survivable. Reloading the radio drops Wi-Fi for
 //! ~20 s, which kills the very HTTP connection that started the install, so
@@ -51,6 +64,8 @@ const FW_SIZE: u64 = 616_233;
 /// The symlink the driver follows. The real file it lands on varies by distro,
 /// so it is always resolved rather than assumed.
 const FW_LINK: &str = "/usr/lib/firmware/brcm/brcmfmac43455-sdio.bin";
+/// Same path without the extension, for building the board-specific variant.
+const FW_BASE: &str = "/usr/lib/firmware/brcm/brcmfmac43455-sdio";
 const BACKUP_DIR: &str = "/mutable/wifi-firmware";
 const STATE_FILE: &str = "/mutable/wifi-firmware/state.json";
 
@@ -125,15 +140,43 @@ fn board_model() -> String {
     String::new()
 }
 
-/// Only the Pi 5 is offered this. The Pi 3B+/4/CM4 carry the same CYW43455,
-/// but the failure and the fix have only been characterised on a Pi 5, so they
-/// are left alone until that changes.
-fn is_pi5() -> bool {
-    board_model().to_lowercase().contains("raspberry pi 5")
+/// Boards this is offered on. The Pi 5 and the Pi 4 Model B load the *same*
+/// CYW43455 image, so the fix applies identically to both — the public reports
+/// of this failure (raspberrypi/linux#4161 and #4552) are in fact Pi 4B.
+///
+/// Deliberately excluded: the Pi 400 ships its own board-specific 43455 image
+/// rather than the shared one, and the Pi 3B / Zero W (43430) and Zero 2 W
+/// (43436) are different chips entirely. The match is on "4 model b" rather
+/// than "raspberry pi 4" precisely so it cannot catch a Pi 400.
+fn board_supported() -> bool {
+    let m = board_model().to_lowercase();
+    m.contains("raspberry pi 5") || m.contains("raspberry pi 4 model b")
 }
 
-/// Resolve the symlink chain to the file the driver actually loads.
+/// First entry of the device-tree `compatible` list, e.g. `raspberrypi,5-model-b`.
+fn dt_compatible_first() -> Option<String> {
+    let raw = std::fs::read_to_string("/proc/device-tree/compatible").ok()?;
+    raw.split('\0')
+        .next()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// Resolve the file the driver actually loads. brcmfmac asks for a
+/// board-specific name first (`…-sdio.raspberrypi,5-model-b.bin`, built from
+/// the device-tree `compatible`) and only then the generic one, so resolve in
+/// that same order: on a board that ships its own image, writing the generic
+/// file would silently do nothing.
 fn resolve_fw_path() -> Option<PathBuf> {
+    if let Some(board) = dt_compatible_first() {
+        let specific = format!("{}.{}.bin", FW_BASE, board);
+        if let Some(p) = std::fs::canonicalize(&specific)
+            .ok()
+            .filter(|p| p.is_file())
+        {
+            return Some(p);
+        }
+    }
     std::fs::canonicalize(FW_LINK).ok().filter(|p| p.is_file())
 }
 
@@ -242,7 +285,7 @@ async fn symptom_detected() -> Option<String> {
 /// GET /api/system/wifi-firmware
 pub async fn get_status(State(_s): State<AppState>) -> (StatusCode, Json<serde_json::Value>) {
     let model = board_model();
-    let pi5 = is_pi5();
+    let supported = board_supported();
     let fw_path = resolve_fw_path();
     let installed = fw_path.as_deref().and_then(version_in_blob);
     let running = running_version().await;
@@ -250,15 +293,15 @@ pub async fn get_status(State(_s): State<AppState>) -> (StatusCode, Json<serde_j
 
     let on_target =
         installed.as_deref() == Some(TARGET_VERSION) || running.as_deref() == Some(TARGET_VERSION);
-    // Eligible only where the work can actually be done: a Pi 5 whose firmware
-    // file resolved, not already on the newer build.
-    let eligible = pi5 && fw_path.is_some() && !on_target;
+    // Eligible only where the work can actually be done: a supported board
+    // whose firmware file resolved, not already on the newer build.
+    let eligible = supported && fw_path.is_some() && !on_target;
 
     (
         StatusCode::OK,
         Json(serde_json::json!({
             "eligible": eligible,
-            "supported_board": pi5,
+            "supported_board": supported,
             "model": model,
             "running_version": running,
             "installed_version": installed,
@@ -277,10 +320,10 @@ pub async fn get_status(State(_s): State<AppState>) -> (StatusCode, Json<serde_j
 
 /// POST /api/system/wifi-firmware/install
 pub async fn install(State(s): State<AppState>) -> (StatusCode, Json<serde_json::Value>) {
-    if !is_pi5() {
+    if !board_supported() {
         return crate::json_error(
             StatusCode::BAD_REQUEST,
-            "This update only applies to the Raspberry Pi 5.",
+            "This update only applies to the Raspberry Pi 5 and Pi 4 Model B.",
         );
     }
     let Some(fw_path) = resolve_fw_path() else {
