@@ -2275,22 +2275,20 @@ set_sys_param /sys/devices/system/cpu/cpufreq/policy0/scaling_governor CPU_GOVER
 # snapshots, no free-space/inode management, and no gadget watchdog.
 # Wait for the disk instead; when it is present at boot (the normal
 # case) the workers start immediately, exactly as before.
-if ! has_cam_disk
-then
-  log "cam disk not present yet; snapshot/space/watchdog workers will start when it appears"
-fi
-(
+#
+# Supervise, don't just spawn: these workers are infinite loops, so any
+# exit is abnormal (OOM kill, crash). Losing freespacemanager silently
+# would re-open the very failure it watches for — links accumulating
+# until /mutable is inode-full with the service still "active". Restart
+# the trio together; the 10s pause keeps a crash-looping worker from
+# spinning the CPU.
+function camdiskworkers {
   echo -n camdiskworkers > /proc/self/comm
   until has_cam_disk
   do
     sleep 10
   done
-  # Supervise, don't just spawn: these are infinite loops, so any exit
-  # is abnormal (OOM kill, crash). Losing freespacemanager silently
-  # would re-open the very failure it watches for — links accumulating
-  # until /mutable is inode-full with the service still "active".
-  # Restart the trio together; the 10s pause keeps a crash-looping
-  # worker from spinning the CPU.
+  local snap_pid fsm_pid gsw_pid
   while true
   do
     snapshotloop &
@@ -2299,13 +2297,22 @@ fi
     fsm_pid=$!
     gadget_stall_watchdog &
     gsw_pid=$!
-    wait -n
+    # `|| true` is load-bearing: the script runs under -e, and wait -n
+    # returns the dead worker's nonzero status — without the guard the
+    # supervisor itself dies before it can log, reap, or restart.
+    wait -n || true
     log "cam-disk worker exited unexpectedly; restarting snapshot/space/watchdog workers"
     kill "$snap_pid" "$fsm_pid" "$gsw_pid" 2>/dev/null || true
     wait 2>/dev/null || true
     sleep 10
   done
-) &
+}
+
+if ! has_cam_disk
+then
+  log "cam disk not present yet; snapshot/space/watchdog workers will start when it appears"
+fi
+camdiskworkers &
 logrotator &
 wifichecker &
 timesyncloop &
