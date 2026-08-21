@@ -2106,34 +2106,37 @@ function freespacemanager {
   threepctoftotalspace=$(eval "$(stat --file-system --format="echo \$((%b*%S/33))" /backingfiles/cam_disk.bin)")
   reserve=$((reserve+threepctoftotalspace))
 
-  # /mutable inode headroom threshold, mirroring manage_free_space.sh:
-  # each retained clip costs a symlink inode in /mutable/TeslaCam, and
-  # the inode table fills long before a multi-TB /backingfiles feels
-  # block pressure (2026-08-19 field failure: 100% inode-full while 71%
-  # of the bytes were free, ENOSPC on every ln/state write for a day).
-  # max(20000, table/20) ≈ a week of links of recovery headroom. Only
-  # armed while /mutable is rw-mounted — on a ro remount, releasing
-  # snapshots cannot delete their symlinks and is pure footage loss.
-  local imutable ireserve=0
-  if findmnt -no OPTIONS --mountpoint /mutable 2>/dev/null | grep -qE '(^|,)rw(,|$)'
-  then
-    imutable=$(stat --file-system --format=%c /mutable 2>/dev/null || echo 0)
-    if [ "$imutable" -gt 0 ]
-    then
-      ireserve=$((imutable / 20))
-      if [ "$ireserve" -lt 20000 ]
-      then
-        ireserve=20000
-      fi
-    fi
-  fi
-
   # Throttle marker for the storage-pressure push alert (once per 24h).
   local alert_marker=/run/sentryusb_storage_pressure_alerted
+  local imutable ireserve ifree
 
   while true
   do
-    local freespace ifree pressure=""
+    # /mutable inode headroom threshold, mirroring manage_free_space.sh:
+    # each retained clip costs a symlink inode in /mutable/TeslaCam, and
+    # the inode table fills long before a multi-TB /backingfiles feels
+    # block pressure (2026-08-19 field failure: 100% inode-full while
+    # 71% of the bytes were free, ENOSPC on every ln/state write for a
+    # day). max(20000, table/20) ≈ a week of links of recovery headroom.
+    # Recomputed every cycle, not once at startup: /mutable can mount
+    # after the service starts, and the rw requirement can change — on a
+    # ro remount, releasing snapshots cannot delete their symlinks and
+    # is pure footage loss, so the inode policy disarms.
+    ireserve=0
+    if findmnt -no OPTIONS --mountpoint /mutable 2>/dev/null | grep -qE '(^|,)rw(,|$)'
+    then
+      imutable=$(stat --file-system --format=%c /mutable 2>/dev/null || echo 0)
+      if [ "$imutable" -gt 0 ]
+      then
+        ireserve=$((imutable / 20))
+        if [ "$ireserve" -lt 20000 ]
+        then
+          ireserve=20000
+        fi
+      fi
+    fi
+
+    local freespace pressure=""
     freespace=$(eval "$(stat --file-system --format="echo \$((%f*%S))" /backingfiles/cam_disk.bin)")
     if [ "$freespace" -lt "$reserve" ]
     then
@@ -2266,12 +2269,43 @@ set_sys_param /sys/devices/system/cpu/cpufreq/policy0/scaling_governor CPU_GOVER
 
 /root/bin/temperature_monitor &
 
-if has_cam_disk
+# The cam-disk workers used to be spawned only when cam_disk.bin existed
+# at startup, so a late SSD enumeration (slow USB bridge, transient
+# "SSD not found") left the service "active" for the whole boot with no
+# snapshots, no free-space/inode management, and no gadget watchdog.
+# Wait for the disk instead; when it is present at boot (the normal
+# case) the workers start immediately, exactly as before.
+if ! has_cam_disk
 then
-  snapshotloop &
-  freespacemanager &
-  gadget_stall_watchdog &
+  log "cam disk not present yet; snapshot/space/watchdog workers will start when it appears"
 fi
+(
+  echo -n camdiskworkers > /proc/self/comm
+  until has_cam_disk
+  do
+    sleep 10
+  done
+  # Supervise, don't just spawn: these are infinite loops, so any exit
+  # is abnormal (OOM kill, crash). Losing freespacemanager silently
+  # would re-open the very failure it watches for — links accumulating
+  # until /mutable is inode-full with the service still "active".
+  # Restart the trio together; the 10s pause keeps a crash-looping
+  # worker from spinning the CPU.
+  while true
+  do
+    snapshotloop &
+    snap_pid=$!
+    freespacemanager &
+    fsm_pid=$!
+    gadget_stall_watchdog &
+    gsw_pid=$!
+    wait -n
+    log "cam-disk worker exited unexpectedly; restarting snapshot/space/watchdog workers"
+    kill "$snap_pid" "$fsm_pid" "$gsw_pid" 2>/dev/null || true
+    wait 2>/dev/null || true
+    sleep 10
+  done
+) &
 logrotator &
 wifichecker &
 timesyncloop &
