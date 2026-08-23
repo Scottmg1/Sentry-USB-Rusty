@@ -1,0 +1,17 @@
+[package]
+name = "sentryusb-clock"
+version = "0.1.0"
+edition = "2024"
+
+# Single implementation of "correct the system clock" for the whole workspace.
+#
+# Boards without an RTC (every Pi before 5, and a Pi 5 with no battery
+# fitted) come back from a power cut with the clock at the filesystem
+# timestamp, so anything that reaches a trustworthy wall-clock time —
+# BLE telemetry from the car, an HTTP `Date` header during the update
+# check — funnels through here rather than calling `clock_settime`
+# itself.
+
+[dependencies]
+libc = "0.2"
+tracing = { workspace = true }

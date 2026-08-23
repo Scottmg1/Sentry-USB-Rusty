@@ -4,6 +4,7 @@ members = [
     "crates/sentryusb",
     "crates/ble_health",
     "crates/config",
+    "crates/clock",
     "crates/vehicle_profile",
     "crates/shell",
     "crates/ws",

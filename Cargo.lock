@@ -2619,6 +2619,7 @@ dependencies = [
  "ring",
  "rusqlite",
  "sentryusb-ble-health",
+ "sentryusb-clock",
  "sentryusb-cloud-uploader",
  "sentryusb-config",
  "sentryusb-drives",
@@ -2646,6 +2647,14 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+]
+
+[[package]]
+name = "sentryusb-clock"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "tracing",
 ]
 
 [[package]]
@@ -2795,9 +2804,9 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "chrono",
- "libc",
  "prost-types",
  "rusqlite",
+ "sentryusb-clock",
  "sentryusb-config",
  "sentryusb-drives",
  "sentryusb-shell",

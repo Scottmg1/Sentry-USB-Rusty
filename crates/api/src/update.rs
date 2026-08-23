@@ -856,11 +856,135 @@ fn read_current_version() -> String {
         .unwrap_or_else(|_| env!("CARGO_PKG_VERSION").to_string())
 }
 
+/// Plain-HTTP endpoints used only for their `Date` response header.
+///
+/// The update source comes first; the connectivity endpoints are the
+/// fallback for networks that block GitHub. These stay on `http://` on
+/// purpose — a board whose clock reads 1970 cannot complete a TLS
+/// handshake, because every server certificate looks not-yet-valid, so
+/// an HTTPS time probe would fail exactly when it is needed.
+const HTTP_DATE_SOURCES: [&str; 3] = [
+    "http://api.github.com/",
+    "http://cp.cloudflare.com/generate_204",
+    "http://connectivitycheck.gstatic.com/generate_204",
+];
+
+/// Parses an HTTP `Date` header (RFC 9110 IMF-fixdate) into epoch
+/// milliseconds. Obsolete RFC 2822 spellings are accepted as a fallback.
+pub(crate) fn parse_http_date_ms(value: &str) -> Option<i64> {
+    let v = value.trim();
+    if let Ok(naive) = chrono::NaiveDateTime::parse_from_str(v, "%a, %d %b %Y %H:%M:%S GMT") {
+        return Some(naive.and_utc().timestamp_millis());
+    }
+    chrono::DateTime::parse_from_rfc2822(v)
+        .ok()
+        .map(|dt| dt.timestamp_millis())
+}
+
+/// Reads the wall clock from the first responsive `Date` header.
+async fn fetch_http_date_ms() -> Option<i64> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        // A 301 to https still carries the header we want, and following
+        // it would need the TLS handshake we are trying to avoid.
+        .redirect(reqwest::redirect::Policy::none())
+        .user_agent(concat!("sentryusb-updater/", env!("CARGO_PKG_VERSION")))
+        .build()
+        .ok()?;
+
+    for url in HTTP_DATE_SOURCES {
+        let resp = match client.get(url).send().await {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::debug!("[clock] date probe {} failed: {}", url, e);
+                continue;
+            }
+        };
+        let Some(raw) = resp
+            .headers()
+            .get(reqwest::header::DATE)
+            .and_then(|v| v.to_str().ok())
+        else {
+            tracing::debug!("[clock] date probe {} returned no Date header", url);
+            continue;
+        };
+        match parse_http_date_ms(raw) {
+            Some(ms) => {
+                tracing::debug!("[clock] date probe {} returned {:?}", url, raw);
+                return Some(ms);
+            }
+            None => tracing::debug!("[clock] date probe {} sent unparseable Date {:?}", url, raw),
+        }
+    }
+    None
+}
+
+/// Best-effort clock correction for boards with no RTC.
+///
+/// Pi 4 and earlier have no RTC at all, and a Pi 5 only exposes one with
+/// a battery fitted, so after a power cut fake-hwclock restores the time
+/// of the last clean shutdown — plausible-looking but arbitrarily stale.
+/// The update check is a moment we are already expected to be online, so
+/// it is the natural place to take a real wall clock from the network.
+///
+/// Never propagates failure: a wrong clock degrades the update check, but
+/// a failed time probe must not.
+async fn sync_clock_for_rtcless_board() {
+    // Skip the HTTP Date probe only when NTP already synced, or when
+    // a real RTC is present *and* the wall clock looks credible.
+    // A /dev/rtc* node with an epoch clock still needs the probe.
+    if (sentryusb_clock::has_rtc() && sentryusb_clock::clock_is_credible())
+        || sentryusb_clock::ntp_synced()
+    {
+        return;
+    }
+
+    // Prefer the Pi's normal NTP path (systemd-timesyncd) before any HTTP.
+    let _ = sentryusb_shell::run_with_timeout(
+        std::time::Duration::from_secs(3),
+        "timedatectl",
+        &["set-ntp", "true"],
+    )
+    .await;
+    let _ = sentryusb_shell::run_with_timeout(
+        std::time::Duration::from_secs(3),
+        "systemctl",
+        &["start", "systemd-timesyncd"],
+    )
+    .await;
+    for _ in 0..6 {
+        // Only the timesyncd marker ends the wait. `clock_is_credible` is
+        // already true whenever fake-hwclock restored a stale-but-plausible
+        // time, which is the exact case the HTTP fallback below exists for.
+        if sentryusb_clock::ntp_synced() {
+            tracing::info!("[clock] clock became credible via NTP before update-check");
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+
+    let Some(ms) = fetch_http_date_ms().await else {
+        tracing::debug!("[clock] no HTTP date source reachable; leaving clock alone");
+        return;
+    };
+    // `maybe_set_clock_ms` owns both guards from here: it rejects an
+    // implausible year outright, and leaves drift under five minutes to
+    // NTP. The header is only second-granular, which is far inside that
+    // threshold, so no transit compensation is worth applying.
+    if sentryusb_clock::maybe_set_clock_ms(ms, "http date") {
+        tracing::info!("[clock] system time set from HTTP date on an RTC-less board");
+    }
+}
+
 /// Checks GitHub releases and returns both legacy and current response fields.
 pub async fn check_for_update(
     State(_s): State<AppState>,
     Query(params): Query<HashMap<String, String>>,
 ) -> (StatusCode, Json<serde_json::Value>) {
+    // Runs before the GitHub call: TLS to api.github.com fails outright
+    // while the clock is unset, and `checked_at` below would be wrong.
+    sync_clock_for_rtcless_board().await;
+
     let current = read_current_version();
     let can_update = !current.is_empty() && current != "dev";
 
@@ -987,6 +1111,17 @@ async fn fetch_releases() -> Result<Vec<ReleaseInfo>, String> {
             format!("GitHub API request failed: {}", e)
         }
     })?;
+
+    // Best-effort: apply GitHub's Date after TLS succeeded (stale fake-hwclock).
+    if let Some(raw) = resp
+        .headers()
+        .get(reqwest::header::DATE)
+        .and_then(|v| v.to_str().ok())
+    {
+        if let Some(ms) = parse_http_date_ms(raw) {
+            let _ = sentryusb_clock::maybe_set_clock_ms(ms, "github-date");
+        }
+    }
 
     let status = resp.status();
     if !status.is_success() {
@@ -1148,5 +1283,40 @@ pub async fn get_update_status(State(_s): State<AppState>) -> (StatusCode, Json<
                 "checked_at": "",
             })),
         ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_imf_fixdate_from_github() {
+        // The exact spelling GitHub and Cloudflare send.
+        let ms = parse_http_date_ms("Sun, 23 Aug 2026 14:05:09 GMT").unwrap();
+        assert_eq!(ms, 1_787_493_909_000);
+    }
+
+    #[test]
+    fn parses_obsolete_rfc2822_offset_form() {
+        let ms = parse_http_date_ms("Sun, 23 Aug 2026 14:05:09 +0000").unwrap();
+        assert_eq!(ms, 1_787_493_909_000);
+    }
+
+    #[test]
+    fn rejects_unparseable_date_headers() {
+        assert!(parse_http_date_ms("").is_none());
+        assert!(parse_http_date_ms("not a date").is_none());
+        // Unix `date` output, which is not an HTTP-date.
+        assert!(parse_http_date_ms("Sun Aug 23 14:05:09 UTC 2026").is_none());
+    }
+
+    #[test]
+    fn parsed_dates_pass_the_clock_plausibility_gate() {
+        let good = parse_http_date_ms("Sun, 23 Aug 2026 14:05:09 GMT").unwrap();
+        assert!(sentryusb_clock::is_plausible_ms(good));
+        // A server stuck at the epoch must never be allowed to set the clock.
+        let bad = parse_http_date_ms("Thu, 01 Jan 1970 00:00:00 GMT").unwrap();
+        assert!(!sentryusb_clock::is_plausible_ms(bad));
     }
 }

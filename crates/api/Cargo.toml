@@ -26,6 +26,7 @@ tokio-util = { version = "0.7", features = ["io"] }
 rusqlite = { version = "0.40", features = ["bundled", "chrono", "blob"] }
 
 sentryusb-config = { path = "../config", package = "sentryusb-config" }
+sentryusb-clock = { path = "../clock", package = "sentryusb-clock" }
 sentryusb-vehicle-profile = { path = "../vehicle_profile", package = "sentryusb-vehicle-profile" }
 sentryusb-shell = { path = "../shell", package = "sentryusb-shell" }
 sentryusb-ws = { path = "../ws", package = "sentryusb-ws" }

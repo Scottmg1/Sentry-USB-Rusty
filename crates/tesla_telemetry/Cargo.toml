@@ -27,10 +27,10 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 
 rusqlite = { version = "0.40", features = ["bundled"] }
-libc = "0.2"
 chrono = { workspace = true }
 
 sentryusb-config = { path = "../config", package = "sentryusb-config" }
+sentryusb-clock = { path = "../clock", package = "sentryusb-clock" }
 sentryusb-shell = { path = "../shell", package = "sentryusb-shell" }
 sentryusb-drives = { path = "../drives", package = "sentryusb-drives" }
 sentryusb-tesla-ble = { path = "../tesla_ble", package = "sentryusb-tesla-ble" }

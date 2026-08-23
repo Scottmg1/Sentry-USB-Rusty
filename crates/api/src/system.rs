@@ -517,16 +517,9 @@ pub async fn get_rtc_status(State(_s): State<AppState>) -> impl IntoResponse {
 pub async fn get_clock_status(
     State(_s): State<AppState>,
 ) -> impl IntoResponse {
-    let ntp_synced =
-        std::path::Path::new("/run/systemd/timesync/synchronized").exists();
-    let secs = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    // 2025-01-01 00:00:00 UTC = 1735689600.
-    let year_looks_recent = secs > 1_735_689_600;
-    let synced = ntp_synced || year_looks_recent;
-    let has_rtc = std::path::Path::new("/dev/rtc0").exists();
+    let ntp_synced = sentryusb_clock::ntp_synced();
+    let synced = sentryusb_clock::clock_is_credible();
+    let has_rtc = sentryusb_clock::has_rtc();
 
     // A short cache preserves visible NTP transitions while reducing polling.
     (

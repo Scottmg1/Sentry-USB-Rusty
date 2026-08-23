@@ -1552,20 +1552,9 @@ async fn wait_for_clock_sync(timeout: Duration) {
 ///      code was written; rules out the typical 1970 / 2000 / 2014
 ///      fallback values that show up on a Pi without RTC)
 fn clock_is_sane() -> bool {
-    // systemd-timesyncd marker — touched the moment a successful NTP
-    // exchange happens, persists across reboots if the rootfs is
-    // writable.
-    if std::path::Path::new("/run/systemd/timesync/synchronized").exists() {
-        return true;
-    }
-    // Year sanity check — a Pi with an RTC battery will pass this
-    // immediately on boot even before NTP runs.
-    let secs = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    // 2025-01-01 00:00:00 UTC = 1735689600.
-    secs > 1_735_689_600
+    // The systemd-timesyncd marker, or a year sanity check that a Pi
+    // with an RTC battery passes on boot even before NTP runs.
+    sentryusb_clock::clock_is_credible()
 }
 
 /// Helper: feed a successful response's metadata into the clock-sync
