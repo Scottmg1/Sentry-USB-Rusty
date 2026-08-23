@@ -871,7 +871,7 @@ const HTTP_DATE_SOURCES: [&str; 3] = [
 
 /// Parses an HTTP `Date` header (RFC 9110 IMF-fixdate) into epoch
 /// milliseconds. Obsolete RFC 2822 spellings are accepted as a fallback.
-pub(crate) fn parse_http_date_ms(value: &str) -> Option<i64> {
+fn parse_http_date_ms(value: &str) -> Option<i64> {
     let v = value.trim();
     if let Ok(naive) = chrono::NaiveDateTime::parse_from_str(v, "%a, %d %b %Y %H:%M:%S GMT") {
         return Some(naive.and_utc().timestamp_millis());
@@ -879,6 +879,22 @@ pub(crate) fn parse_http_date_ms(value: &str) -> Option<i64> {
     chrono::DateTime::parse_from_rfc2822(v)
         .ok()
         .map(|dt| dt.timestamp_millis())
+}
+
+/// Hands a `Date` response header to the clock crate. Best effort: an
+/// absent, unparseable or implausible header just leaves the clock alone.
+fn apply_http_date(value: Option<&str>, source: &str) {
+    let Some(raw) = value else {
+        return;
+    };
+    match parse_http_date_ms(raw) {
+        Some(ms) => {
+            if sentryusb_clock::maybe_set_clock_from_network(ms, source) {
+                tracing::info!("[clock] system time set from the {source} Date header");
+            }
+        }
+        None => tracing::debug!("[clock] unparseable Date header from {source}: {raw:?}"),
+    }
 }
 
 /// Reads the wall clock from the first responsive `Date` header.
@@ -930,12 +946,9 @@ async fn fetch_http_date_ms() -> Option<i64> {
 /// Never propagates failure: a wrong clock degrades the update check, but
 /// a failed time probe must not.
 async fn sync_clock_for_rtcless_board() {
-    // Skip the HTTP Date probe only when NTP already synced, or when
-    // a real RTC is present *and* the wall clock looks credible.
-    // A /dev/rtc* node with an epoch clock still needs the probe.
-    if (sentryusb_clock::has_rtc() && sentryusb_clock::clock_is_credible())
-        || sentryusb_clock::ntp_synced()
-    {
+    // A synced NTP client or a battery-backed RTC holding a credible time
+    // already owns the clock; a /dev/rtc* node sitting at the epoch does not.
+    if !sentryusb_clock::needs_network_time() {
         return;
     }
 
@@ -1111,16 +1124,13 @@ async fn fetch_releases() -> Result<Vec<ReleaseInfo>, String> {
         }
     })?;
 
-    // Best-effort: apply GitHub's Date after TLS succeeded (stale fake-hwclock).
-    if let Some(raw) = resp
-        .headers()
-        .get(reqwest::header::DATE)
-        .and_then(|v| v.to_str().ok())
-    {
-        if let Some(ms) = parse_http_date_ms(raw) {
-            let _ = sentryusb_clock::maybe_set_clock_from_network(ms, "github-date");
-        }
-    }
+    // Once TLS succeeded, GitHub's own Date is the best wall clock this path
+    // sees. It still helps a board whose time was stale but not so stale that
+    // the certificate looked invalid.
+    apply_http_date(
+        resp.headers().get(reqwest::header::DATE).and_then(|v| v.to_str().ok()),
+        "github-date",
+    );
 
     let status = resp.status();
     if !status.is_success() {

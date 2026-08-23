@@ -79,13 +79,30 @@ pub fn is_plausible_ms(unix_ms: i64) -> bool {
     (PLAUSIBLE_EPOCH_FLOOR_MS..PLAUSIBLE_EPOCH_CEILING_MS).contains(&unix_ms)
 }
 
-/// Network / update-check path: skip when a battery-backed RTC already
-/// holds a credible time, or when NTP is already synced. Vehicle BLE
-/// must still be able to correct a drifted RTC; that path calls
-/// [`maybe_set_clock_ms`] directly so only the five-minute threshold
+/// Whether a network time source is worth consulting at all.
+///
+/// NTP owns the clock once it has synchronised, and a battery-backed RTC
+/// that seeded a credible time at boot needs no help either. An RTC node
+/// that exists but left the clock at the epoch is not healthy, so it does
+/// not count. Public so a caller can skip the network round-trips, not
+/// just the resulting step.
+pub fn needs_network_time() -> bool {
+    decide_needs_network_time(ntp_synced(), has_rtc(), clock_is_credible())
+}
+
+/// Split out from [`needs_network_time`] so the policy can be tested
+/// without a real `/dev` or `/run`.
+fn decide_needs_network_time(ntp_synced: bool, has_rtc: bool, clock_is_credible: bool) -> bool {
+    !ntp_synced && !(has_rtc && clock_is_credible)
+}
+
+/// Network / update-check path: skips a board whose clock is already
+/// looked after, per [`needs_network_time`]. Vehicle BLE must still be
+/// able to correct a drifted RTC, so that path calls
+/// [`maybe_set_clock_ms`] directly and only the five-minute threshold
 /// applies.
 pub fn maybe_set_clock_from_network(unix_ms: i64, source: &str) -> bool {
-    if (has_rtc() && clock_is_credible()) || ntp_synced() {
+    if !needs_network_time() {
         return false;
     }
     maybe_set_clock_ms(unix_ms, source)
@@ -99,9 +116,7 @@ pub fn maybe_set_clock_from_network(unix_ms: i64, source: &str) -> bool {
 /// every call site is best-effort.
 pub fn maybe_set_clock_ms(unix_ms: i64, source: &str) -> bool {
     if !is_plausible_ms(unix_ms) {
-        warn!(
-            "refusing to set clock from {source}: {unix_ms}ms is outside the plausible window"
-        );
+        warn!("refusing to set clock from {source}: {unix_ms}ms is outside the plausible window");
         return false;
     }
 
@@ -185,6 +200,31 @@ mod tests {
         // 2026-08-23.
         assert!(is_plausible_ms(1_787_443_200_000));
         assert!(!is_plausible_ms(PLAUSIBLE_EPOCH_CEILING_MS));
+    }
+
+    #[test]
+    fn healthy_ntp_or_rtc_needs_no_network_time() {
+        // NTP has stepped the clock; nothing else may interfere.
+        assert!(!decide_needs_network_time(true, false, true));
+        assert!(!decide_needs_network_time(true, true, true));
+        // Battery-backed RTC seeded a credible time at boot.
+        assert!(!decide_needs_network_time(false, true, true));
+    }
+
+    #[test]
+    fn rtcless_and_stuck_boards_want_network_time() {
+        // Pi 4: no RTC, fake-hwclock restored a stale but plausible time.
+        assert!(decide_needs_network_time(false, false, true));
+        // Same board, clock still sitting at the epoch.
+        assert!(decide_needs_network_time(false, false, false));
+        // RTC node present but it left the clock at the epoch: not healthy.
+        assert!(decide_needs_network_time(false, true, false));
+    }
+
+    #[test]
+    fn implausible_sources_are_refused_before_any_syscall() {
+        assert!(!maybe_set_clock_ms(0, "test"));
+        assert!(!maybe_set_clock_ms(PLAUSIBLE_EPOCH_FLOOR_MS - 1, "test"));
     }
 
     #[test]
