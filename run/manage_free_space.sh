@@ -66,6 +66,24 @@ function mutable_rw_mounted {
 # snapshot store against pressure that snapshots cannot relieve.
 INODE_STALL_LATCH=/run/sentryusb_inode_stall
 
+# Give up on inode-driven eviction and stop the retry treadmill.
+#
+# Called from the branches that cannot release anything. When the BLOCK
+# target is already met, the only thing driving eviction is inode
+# pressure, and no further attempt can help: latch the verdict so
+# archiveloop's 30s retry stops re-entering (shipped v3.20.x logged the
+# same warning every 60 seconds indefinitely) and so the health check
+# can surface it. Also keeps the advice honest: "use a larger storage
+# medium or reduce CAM_SIZE" is wrong for inode pressure — neither adds
+# inodes to an existing filesystem.
+function halt_inode_eviction () {
+  local ifree_now
+  ifree_now=$(mutable_free_inodes)
+  echo "${ifree_now:-0}" > "$INODE_STALL_LATCH" 2>/dev/null || true
+  log "Clip index (/mutable inodes) is low but no snapshot can be released to relieve it."
+  log "Snapshot cleanup cannot add inodes to an existing filesystem; reformatting /mutable is the only way to enlarge the clip index. Not retrying automatically."
+}
+
 function manage_free_space {
   # Try to make free space equal to 10 GB plus three percent of the total
   # available space. This should be enough to hold the next hour of
@@ -98,6 +116,27 @@ function manage_free_space {
       if [ "$ireserve" -lt 20000 ]
       then
         ireserve=20000
+      fi
+      # Cap the target at a quarter of the table so it is always
+      # REACHABLE. Single-disk installs size /mutable's inode table from
+      # the data area (backingfiles_sectors/20000), so a 128GB card has
+      # ~11.8k inodes TOTAL — less than the 20k floor. Shipped
+      # v3.20.0-v3.20.8 demanded 20k free from that table, which no
+      # amount of eviction can reach: cleanup deleted every releasable
+      # snapshot and then failed on a 60-second loop forever. Two users
+      # lost 23 and 45 snapshots of real footage. Leaves the 120,960 and
+      # 472,000 tables byte-identical to the value that fixed the
+      # original 2026-08-19 incident.
+      if [ "$ireserve" -gt $((itotal / 4)) ]
+      then
+        ireserve=$((itotal / 4))
+      fi
+      # Defence in depth: never evict toward a target the filesystem
+      # cannot satisfy, whatever a future edit to the formula does.
+      if [ "$ireserve" -ge "$itotal" ]
+      then
+        log "inode reserve $ireserve >= /mutable inode table $itotal — target unreachable, disabling inode-driven eviction"
+        ireserve=0
       fi
     fi
   fi
@@ -156,6 +195,11 @@ function manage_free_space {
     )
     if [ -z "$candidates" ]
     then
+      if [ "$freespace" -gt "$reserve" ]
+      then
+        halt_inode_eviction
+        exit 1
+      fi
       log "Warning: low space for new snapshots, but no snapshots exist."
       log "Please use a larger storage medium or reduce CAM_SIZE"
       exit 1
@@ -163,6 +207,11 @@ function manage_free_space {
     # if there's only one snapshot then we likely just took it, so don't immediately delete it
     if [ "$(printf '%s\n' "$candidates" | wc -l)" -lt 2 ]
     then
+      if [ "$freespace" -gt "$reserve" ]
+      then
+        halt_inode_eviction
+        exit 1
+      fi
       # there's only one snapshot and yet we're low on space
       log "Warning: low space for new snapshots, but only one snapshot exists."
       log "Please use a larger storage medium or reduce CAM_SIZE"
@@ -188,6 +237,11 @@ function manage_free_space {
              | grep -v "/${highest}\$" | grep -v "/${newest}\$" | head -1)
     if [ -z "$oldest" ]
     then
+      if [ "$freespace" -gt "$reserve" ]
+      then
+        halt_inode_eviction
+        exit 1
+      fi
       log "unable to select oldest snapshot (only protected snapshots remain)"
       exit 1
     fi

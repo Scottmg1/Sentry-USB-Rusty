@@ -8,7 +8,7 @@ use tracing::{info, warn};
 const BACKINGFILES: &str = "/backingfiles";
 const MUTABLE: &str = "/mutable";
 
-/// /mutable inode-headroom target: `max(20000, table/20)`.
+/// /mutable inode-headroom target: `min(max(20000, table/20), table/4)`.
 ///
 /// Every retained clip costs one symlink inode in /mutable/TeslaCam
 /// (the snapshot farm index), and the stock partition's table (~121k at
@@ -17,11 +17,24 @@ const MUTABLE: &str = "/mutable";
 /// 100% inode usage with 71% of the bytes free: every ln and state-file
 /// write ENOSPC'd, so new clips were never indexed, mapped, or archived
 /// while notifications (network-only) kept working. At the observed
-/// ~2.9k links/day the 20k floor is about a week of recovery headroom;
-/// the /20 term tracks that need rather than growing with denser inode
-/// tables. Matches manage_free_space.sh and archiveloop.
+/// ~2.9k links/day the 20k floor is about a week of recovery headroom.
+///
+/// The CAP is what keeps the target reachable, and it is not optional.
+/// Single-disk installs give /mutable a fixed 300 MiB partition whose
+/// inode table is sized from the data area (`backingfiles_sectors /
+/// 20000`), so a 128 GB card has ~11.8k inodes TOTAL — less than the
+/// floor. Shipped v3.20.0-v3.20.8 demanded 20k free from that table,
+/// which no amount of eviction can reach, so cleanup deleted every
+/// releasable snapshot and then failed on a 60-second loop forever.
+/// Two users lost 23 and 45 snapshots of real footage that way.
+/// Capping at a quarter of the table keeps the target satisfiable on
+/// every geometry while leaving 120,960 and 472,000 byte-identical to
+/// the value that fixed the original incident. Matches
+/// manage_free_space.sh, archiveloop, and healthcheck.rs.
 const INODE_RESERVE_FLOOR: u64 = 20_000;
 const INODE_RESERVE_DIVISOR: u64 = 20;
+/// Never demand more than `table / INODE_RESERVE_CAP_DIVISOR` free.
+const INODE_RESERVE_CAP_DIVISOR: u64 = 4;
 
 /// How many consecutive snapshot releases may fail to free any /mutable
 /// inodes (with the block target already met) before we conclude the
@@ -37,7 +50,9 @@ const MAX_STALE_INODE_RELEASES: u32 = 3;
 const INODE_STALL_LATCH: &str = "/run/sentryusb_inode_stall";
 
 fn inode_reserve(total_inodes: u64) -> u64 {
-    (total_inodes / INODE_RESERVE_DIVISOR).max(INODE_RESERVE_FLOOR)
+    (total_inodes / INODE_RESERVE_DIVISOR)
+        .max(INODE_RESERVE_FLOOR)
+        .min(total_inodes / INODE_RESERVE_CAP_DIVISOR)
 }
 
 /// Whether /mutable is mounted read-write. Inode-driven eviction is
@@ -186,6 +201,24 @@ pub async fn manage_free_space(reserve_bytes: Option<u64>) -> Result<()> {
     let mutable_inodes = if mutable_rw_mounted() { get_inodes(MUTABLE).ok() } else { None };
     let mut ireserve = mutable_inodes.map_or(0, |(t, _)| inode_reserve(t));
     let mut free_inodes = mutable_inodes.map(|(_, f)| f);
+
+    // Defence in depth against an unreachable inode target. `inode_reserve`
+    // caps at a quarter of the table so this cannot fire today, but a future
+    // edit to the formula must never again be able to demand more free inodes
+    // than the filesystem physically has: that is what made shipped v3.20.x
+    // delete every releasable snapshot on single-disk installs and then fail
+    // forever. Disable the inode policy instead of evicting toward a target
+    // no amount of deletion can reach; block-space eviction is unaffected.
+    if let Some((total_inodes, _)) = mutable_inodes {
+        if ireserve >= total_inodes {
+            warn!(
+                "inode reserve {} >= /mutable inode table {} — target unreachable,                  disabling inode-driven eviction (no snapshots will be released for inodes)",
+                ireserve, total_inodes
+            );
+            ireserve = 0;
+            free_inodes = None;
+        }
+    }
 
     // Honor a previous stall verdict: resume inode-driven eviction only
     // after free inodes actually rose above the latched value.
@@ -387,7 +420,56 @@ mod tests {
     fn inode_reserve_is_floored_at_a_week_of_links() {
         assert_eq!(inode_reserve(120_960), 20_000); // stock table: floor wins
         assert_eq!(inode_reserve(472_000), 23_600); // dense table: /20 wins
-        assert_eq!(inode_reserve(0), 20_000);
+        assert_eq!(inode_reserve(0), 0);
+    }
+
+    /// THE v3.20.x REGRESSION. Single-disk installs size /mutable's inode
+    /// table from the data area, so real cards carry far fewer inodes than
+    /// the 20k floor: a 128 GB card measures 11,856 total. Shipped v3.20.0
+    /// demanded 20,000 FREE from that table, which no amount of eviction can
+    /// reach, so cleanup deleted every releasable snapshot and then failed on
+    /// a 60-second loop forever (two users lost 23 and 45 snapshots).
+    ///
+    /// The invariant that matters is not any particular number: the reserve
+    /// must always be strictly reachable on the table it is measured on.
+    #[test]
+    fn inode_reserve_is_always_reachable_on_real_geometries() {
+        // Measured on affected hardware / reproduced with mkfs.ext4.
+        for &total in &[11_856_u64, 19_200, 22_000, 24_000, 73_488, 120_960, 131_072, 472_000] {
+            let r = inode_reserve(total);
+            assert!(
+                r < total,
+                "reserve {} must be reachable on a {}-inode table",
+                r,
+                total
+            );
+            // Reachable is not enough: an empty filesystem must comfortably
+            // satisfy it, or the device evicts from the moment it boots.
+            assert!(
+                r <= total / 4,
+                "reserve {} exceeds a quarter of the {}-inode table",
+                r,
+                total
+            );
+        }
+    }
+
+    /// The cap must not disturb the geometries the original 2026-08-19 fix
+    /// was calibrated against — a hotfix for small tables must not quietly
+    /// weaken the large-table protection that motivated the feature.
+    #[test]
+    fn inode_reserve_unchanged_on_large_tables() {
+        assert_eq!(inode_reserve(120_960), 20_000);
+        assert_eq!(inode_reserve(131_072), 20_000);
+        assert_eq!(inode_reserve(472_000), 23_600);
+    }
+
+    /// Small tables get a proportional, satisfiable target instead of the
+    /// impossible flat floor.
+    #[test]
+    fn inode_reserve_scales_down_on_small_tables() {
+        assert_eq!(inode_reserve(11_856), 2_964); // 128 GB single-disk card
+        assert_eq!(inode_reserve(19_200), 4_800); // 300 MiB mkfs default
     }
 
     /// Zero-gain releases only count against the guard while the block

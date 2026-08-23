@@ -269,6 +269,23 @@ BACKINGFILES_NUM_SECTORS=$((FIRST_MUTABLE_SECTOR - FIRST_BACKINGFILES_SECTOR))
 # out to about 1 inode for every 20000 sectors in /backingfiles.
 NUM_MUTABLE_INODES=$((BACKINGFILES_NUM_SECTORS / 20000))
 
+# Clamp to the mutable partition's own density bounds, matching the
+# DATA_DRIVE branch above and mutable_inode_count() in
+# crates/setup/src/partition.rs. Without this, a 128GB card produced a
+# ~11.8k-inode table for the fixed 300 MiB partition (1 inode per ~25KB
+# of partition) — far sparser than the mkfs default and small enough
+# that shipped v3.20.0-v3.20.8 could not satisfy its own inode reserve.
+# This path was missed when the other three formatters were clamped.
+MUTABLE_BYTES=$((614400 * 512))
+if [ "$NUM_MUTABLE_INODES" -lt $((MUTABLE_BYTES / 16384)) ]
+then
+  NUM_MUTABLE_INODES=$((MUTABLE_BYTES / 16384))
+fi
+if [ "$NUM_MUTABLE_INODES" -gt $((MUTABLE_BYTES / 4096)) ]
+then
+  NUM_MUTABLE_INODES=$((MUTABLE_BYTES / 4096))
+fi
+
 ORIGINAL_DISK_IDENTIFIER=$( fdisk -l "${BOOT_DISK}" | grep -e "^Disk identifier" | sed "s/Disk identifier: 0x//" )
 
 log_progress "Modifying partition table for backing files partition..."

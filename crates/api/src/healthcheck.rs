@@ -203,7 +203,13 @@ pub async fn health_check(State(_s): State<AppState>) -> (StatusCode, Json<serde
                     Some("inode statistics unavailable for /mutable".to_string()),
                 )),
                 Some((free, total)) => {
-                    let reserve = (total / 20).max(20_000);
+                    // min(max(20000, total/20), total/4) — must match
+                    // manage_free_space.sh, archiveloop and space.rs.
+                    // The cap keeps the target reachable on single-disk
+                    // installs (~11.8k inode tables), where the bare 20k
+                    // floor made this row warn forever and drove eviction
+                    // to delete every releasable snapshot.
+                    let reserve = (total / 20).max(20_000).min(total / 4);
                     let counts = format!("{} of {} inodes free", free, total);
                     if free == 0 {
                         st.push(item("Clip index capacity", "fail", Some(format!(

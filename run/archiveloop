@@ -2133,6 +2133,19 @@ function freespacemanager {
         then
           ireserve=20000
         fi
+        # Cap at a quarter of the table so the target is REACHABLE:
+        # single-disk installs have ~11.8k inodes total on /mutable,
+        # below the 20k floor, and shipped v3.20.0-v3.20.8 therefore
+        # evicted every releasable snapshot toward a target no amount of
+        # deletion could reach. Mirrors manage_free_space.sh/space.rs.
+        if [ "$ireserve" -gt $((imutable / 4)) ]
+        then
+          ireserve=$((imutable / 4))
+        fi
+        if [ "$ireserve" -ge "$imutable" ]
+        then
+          ireserve=0
+        fi
       fi
     fi
 
@@ -2142,18 +2155,33 @@ function freespacemanager {
     then
       pressure="free space low"
     fi
+    local inode_stalled=false
     if [ "$ireserve" -gt 0 ]
     then
       ifree=$(stat --file-system --format=%d /mutable 2>/dev/null || true)
       if [ -n "$ifree" ] && [ "$ifree" -le "$ireserve" ]
       then
-        pressure="${pressure:+$pressure, }clip index nearly full"
+        if [ -e /run/sentryusb_inode_stall ]
+        then
+          # Cleanup already concluded it cannot relieve this. Re-invoking
+          # it every 30s would only re-log the same suspension line
+          # forever (the shipped build's 60-second treadmill in a
+          # different form), so stop calling and let the throttled alert
+          # below carry the news. The manager clears the latch itself
+          # once free inodes actually rise.
+          inode_stalled=true
+        else
+          pressure="${pressure:+$pressure, }clip index nearly full"
+        fi
       fi
     fi
-    if [ -n "$pressure" ]
+    if [ -n "$pressure" ] || [ "$inode_stalled" = "true" ]
     then
       local relieved=true
-      /root/bin/manage_free_space.sh "$reserve" || relieved=false
+      if [ -n "$pressure" ]
+      then
+        /root/bin/manage_free_space.sh "$reserve" || relieved=false
+      fi
       # Alert when eviction failed outright, or when a standing inode
       # stall latch means the manager is deliberately no longer trying
       # (it exits 0 in that state, but the pressure is still real).
@@ -2167,8 +2195,12 @@ function freespacemanager {
            [ "$(( $(date +%s) - $(stat --format=%Y "$alert_marker" 2>/dev/null || echo 0) ))" -ge 86400 ]
         then
           touch "$alert_marker" 2>/dev/null || true
+          # `pressure` is empty when the only issue is an already-latched
+          # clip index, so name that explicitly rather than sending
+          # "Storage pressure ()".
+          local what="${pressure:-clip index nearly full}"
           /root/bin/send-push-message "${NOTIFICATION_TITLE:-SentryUSB}:" \
-            "Storage pressure ($pressure) could not be relieved automatically. Recording or archiving may stop — check the dashboard." \
+            "Storage pressure ($what) could not be relieved automatically. Recording or archiving may stop — check the dashboard." \
             warning storage_pressure 2>/dev/null || true
         fi
       fi
