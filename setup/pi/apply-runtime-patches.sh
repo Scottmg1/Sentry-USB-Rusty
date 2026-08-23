@@ -1509,7 +1509,7 @@ run_patch() {
 # floor in each installed script. Idempotent via the cap marker, and the
 # result is syntax-checked before it is allowed to replace the original.
 apply_inode_reserve_cap() {
-    local patched=0 f
+    local patched=0 failed=0 f awk_rc
     for f in /root/bin/manage_free_space.sh /root/bin/archiveloop; do
         [ -f "$f" ] || continue
         if grep -q 'sentryusb space manage' "$f"; then
@@ -1553,15 +1553,33 @@ apply_inode_reserve_cap() {
             }
           }
         ' TOTVAR="$(basename "$f" | grep -q archiveloop && echo imutable || echo itotal)" "$f" > "$f.new"
-        if bash -n "$f.new" 2>/dev/null && grep -q 'INODE_RESERVE_CAP_APPLIED' "$f.new"; then
-            chmod --reference="$f" "$f.new" 2>/dev/null || chmod +x "$f.new"
-            mv "$f.new" "$f"
-            log "inode-reserve-cap: patched $f"
-            patched=1
-        else
+        awk_rc=$?
+        # Every step is checked: this patch exists to stop active data
+        # loss, so reporting success while the destructive legacy manager
+        # is still installed is the one outcome we must never produce.
+        # A failure here returns nonzero so run_patch counts it and the
+        # updater surfaces it, rather than rebooting on a false success.
+        if [ "$awk_rc" -ne 0 ]; then
             rm -f "$f.new"
-            warn "inode-reserve-cap: generated $f failed syntax check — left untouched"
+            warn "inode-reserve-cap: awk failed (rc=$awk_rc) on $f — left untouched"
+            failed=1
+            continue
         fi
+        if ! bash -n "$f.new" 2>/dev/null || ! grep -q 'INODE_RESERVE_CAP_APPLIED' "$f.new"; then
+            rm -f "$f.new"
+            warn "inode-reserve-cap: generated $f failed verification — left untouched"
+            failed=1
+            continue
+        fi
+        chmod --reference="$f" "$f.new" 2>/dev/null || chmod +x "$f.new"
+        if ! mv "$f.new" "$f"; then
+            rm -f "$f.new"
+            warn "inode-reserve-cap: could not replace $f — left untouched"
+            failed=1
+            continue
+        fi
+        log "inode-reserve-cap: patched $f"
+        patched=1
     done
     if [ "$patched" = "1" ]; then
         # The running archiveloop still holds the old floor in memory; the
@@ -1569,6 +1587,7 @@ apply_inode_reserve_cap() {
         # so no snapshot can be deleted for inode pressure either way.
         log "inode-reserve-cap: installed scripts now cap the inode reserve"
     fi
+    [ "$failed" = "0" ]
 }
 
 apply_malloc_arena_cap() {
