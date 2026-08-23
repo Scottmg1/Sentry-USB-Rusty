@@ -117,7 +117,7 @@ function manage_free_space {
       then
         ireserve=20000
       fi
-      # Cap the target at a quarter of the table so it is always
+      # INODE_RESERVE_CAP_APPLIED. Cap the target at a quarter of the table so it is always
       # REACHABLE. Single-disk installs size /mutable's inode table from
       # the data area (backingfiles_sectors/20000), so a 128GB card has
       # ~11.8k inodes TOTAL — less than the 20k floor. Shipped

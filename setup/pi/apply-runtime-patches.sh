@@ -1592,6 +1592,12 @@ apply_malloc_arena_cap() {
 
 # ── Run all patches ─────────────────────────────────────────────────────
 
+# FIRST: this one prevents active data loss on single-disk installs
+# running v3.20.0-v3.20.8, and the updater bounds this whole script
+# with a 30s timeout. A patch that starves behind slower ones would
+# let the device reboot onto the uncapped scripts and keep deleting
+# snapshots. It is two small awk passes, so it costs nothing here.
+run_patch apply_inode_reserve_cap
 run_patch apply_ble_nonfatal_adv
 run_patch apply_ble_adv_helper
 run_patch apply_eatt_disable
@@ -1606,7 +1612,6 @@ run_patch apply_mounted_archive_watchdog
 run_patch apply_snapshot_eviction_by_age
 run_patch apply_snapshot_slot_pick_hardening
 run_patch apply_malloc_arena_cap
-run_patch apply_inode_reserve_cap
 
 # Future patches that must survive an OTA update get appended here. Each
 # one self-checks board / precondition / marker so the whole script stays

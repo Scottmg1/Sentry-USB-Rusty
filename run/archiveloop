@@ -2133,7 +2133,7 @@ function freespacemanager {
         then
           ireserve=20000
         fi
-        # Cap at a quarter of the table so the target is REACHABLE:
+        # INODE_RESERVE_CAP_APPLIED. Cap at a quarter of the table so the target is REACHABLE:
         # single-disk installs have ~11.8k inodes total on /mutable,
         # below the 20k floor, and shipped v3.20.0-v3.20.8 therefore
         # evicted every releasable snapshot toward a target no amount of
