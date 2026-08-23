@@ -2161,14 +2161,19 @@ function freespacemanager {
       ifree=$(stat --file-system --format=%d /mutable 2>/dev/null || true)
       if [ -n "$ifree" ] && [ "$ifree" -le "$ireserve" ]
       then
-        if [ -e /run/sentryusb_inode_stall ]
+        if [ -e /run/sentryusb_inode_stall ] &&            [ "$ifree" -le "$(cat /run/sentryusb_inode_stall 2>/dev/null || echo 0)" ]
         then
-          # Cleanup already concluded it cannot relieve this. Re-invoking
-          # it every 30s would only re-log the same suspension line
-          # forever (the shipped build's 60-second treadmill in a
-          # different form), so stop calling and let the throttled alert
-          # below carry the news. The manager clears the latch itself
-          # once free inodes actually rise.
+          # Cleanup already concluded it cannot relieve this, and free
+          # inodes have not risen since. Re-invoking it every 30s would
+          # only re-log the same suspension line forever (the shipped
+          # build's 60-second treadmill in a different form), so stop
+          # calling and let the throttled alert below carry the news.
+          #
+          # The freed-inode comparison is what lets recovery happen: once
+          # counts rise above the latched value we DO invoke the manager
+          # again, and it clears the latch. Skipping unconditionally
+          # would strand the latch (and the red health row) until reboot,
+          # because only the manager ever clears it.
           inode_stalled=true
         else
           pressure="${pressure:+$pressure, }clip index nearly full"

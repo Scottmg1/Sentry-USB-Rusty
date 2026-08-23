@@ -1490,6 +1490,87 @@ run_patch() {
 # but units written by older setups never had it — glibc then defaults to
 # 8 * cores arenas, whose free lists hold RSS after clip-ingest bursts on
 # exactly the low-RAM boards that can least afford it.
+# ── Inode-reserve cap (v3.20.9 hotfix) ────────────────────────────────
+#
+# v3.20.0-v3.20.8 asked eviction to keep max(20000, table/20) inodes free
+# on /mutable. Single-disk installs size that table from the data area
+# (backingfiles_sectors/20000), so a 128GB card has ~11.8k inodes TOTAL
+# and the target is unreachable: cleanup deleted every releasable
+# snapshot and then failed on a 60-second loop forever. Two users lost
+# 23 and 45 snapshots of footage.
+#
+# The binary carries the fix for thin Rust wrappers, and the post-boot
+# migration eventually refreshes /root/bin from the repo tarball, but
+# migration is asynchronous and network-dependent: the device would boot
+# once more running the OLD full-bash scripts and could destroy whatever
+# snapshots remain within seconds. This patch runs BEFORE that reboot.
+#
+# Surgical, not a whole-file replace: insert the cap right after the
+# floor in each installed script. Idempotent via the cap marker, and the
+# result is syntax-checked before it is allowed to replace the original.
+apply_inode_reserve_cap() {
+    local patched=0 f
+    for f in /root/bin/manage_free_space.sh /root/bin/archiveloop; do
+        [ -f "$f" ] || continue
+        if grep -q 'sentryusb space manage' "$f"; then
+            log "inode-reserve-cap: $f is a thin Rust wrapper — binary carries the fix"
+            continue
+        fi
+        if grep -q 'INODE_RESERVE_CAP_APPLIED' "$f"; then
+            log "inode-reserve-cap: $f already patched"
+            continue
+        fi
+        # Only the shipped v3.20.x shape is recognised; anything else is
+        # a local fork and is left strictly alone.
+        if ! grep -qE '^[[:space:]]*ireserve=20000$' "$f"; then
+            log "inode-reserve-cap: $f has no v3.20.x inode floor — nothing to do"
+            continue
+        fi
+        [ -x /root/bin/remountfs_rw ] && /root/bin/remountfs_rw >/dev/null 2>&1 || true
+        # After the line that closes the floor's `fi`, add the cap. awk
+        # keeps indentation consistent with the surrounding block.
+        awk '
+          BEGIN { done = 0 }
+          {
+            print
+            if (!done && $0 ~ /^[[:space:]]*ireserve=20000$/) {
+              floor_indent = $0; sub(/[^ ].*$/, "", floor_indent)
+              base = substr(floor_indent, 1, length(floor_indent) - 2)
+              getline nextline
+              print nextline                       # the closing fi
+              print base "# INODE_RESERVE_CAP_APPLIED: the floor above can exceed the"
+              print base "# whole inode table on single-disk installs (~11.8k), making"
+              print base "# the target unreachable and draining the snapshot store."
+              print base "if [ \"$" TOTVAR "\" -gt 0 ] && [ \"$ireserve\" -gt $((" TOTVAR " / 4)) ]"
+              print base "then"
+              print base "  ireserve=$((" TOTVAR " / 4))"
+              print base "fi"
+              print base "if [ \"$ireserve\" -ge \"$" TOTVAR "\" ]"
+              print base "then"
+              print base "  ireserve=0"
+              print base "fi"
+              done = 1
+            }
+          }
+        ' TOTVAR="$(basename "$f" | grep -q archiveloop && echo imutable || echo itotal)" "$f" > "$f.new"
+        if bash -n "$f.new" 2>/dev/null && grep -q 'INODE_RESERVE_CAP_APPLIED' "$f.new"; then
+            chmod --reference="$f" "$f.new" 2>/dev/null || chmod +x "$f.new"
+            mv "$f.new" "$f"
+            log "inode-reserve-cap: patched $f"
+            patched=1
+        else
+            rm -f "$f.new"
+            warn "inode-reserve-cap: generated $f failed syntax check — left untouched"
+        fi
+    done
+    if [ "$patched" = "1" ]; then
+        # The running archiveloop still holds the old floor in memory; the
+        # patched manage_free_space.sh it shells out to now exits cleanly,
+        # so no snapshot can be deleted for inode pressure either way.
+        log "inode-reserve-cap: installed scripts now cap the inode reserve"
+    fi
+}
+
 apply_malloc_arena_cap() {
     local unit=/etc/systemd/system/sentryusb.service
     [ -f "$unit" ] || { log "malloc-arena: no server unit — skipping"; return 0; }
@@ -1525,6 +1606,7 @@ run_patch apply_mounted_archive_watchdog
 run_patch apply_snapshot_eviction_by_age
 run_patch apply_snapshot_slot_pick_hardening
 run_patch apply_malloc_arena_cap
+run_patch apply_inode_reserve_cap
 
 # Future patches that must survive an OTA update get appended here. Each
 # one self-checks board / precondition / marker so the whole script stays

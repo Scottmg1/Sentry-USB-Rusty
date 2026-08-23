@@ -168,6 +168,23 @@ fn releasable(mut in_age_order: Vec<String>) -> Vec<String> {
     in_age_order
 }
 
+/// Give up on inode-driven eviction and latch the verdict.
+///
+/// Parity with `halt_inode_eviction` in manage_free_space.sh. Called from the
+/// terminal branches when nothing can be released and the BLOCK target is
+/// already met, so inode pressure is the only thing driving eviction and no
+/// further attempt can help. Latching stops the caller re-entering every 30
+/// seconds, and keeps the advice honest: the CAM_SIZE remedy is for block
+/// pressure and cannot add inodes to an existing filesystem.
+fn halt_inode_eviction(free_inodes: Option<u64>) {
+    let _ = std::fs::write(INODE_STALL_LATCH, free_inodes.unwrap_or(0).to_string());
+    warn!(
+        "clip index (/mutable inodes) is low but no snapshot can be released to \
+         relieve it; cleanup cannot add inodes to an existing filesystem. \
+         Not retrying automatically."
+    );
+}
+
 /// Release old snapshots until `free >= reserve`.
 ///
 /// `reserve_bytes` is the caller's target (archiveloop forwards its
@@ -263,6 +280,10 @@ pub async fn manage_free_space(reserve_bytes: Option<u64>) -> Result<()> {
     // Slot numbering can restart after a reflash, so release by mtime age.
     let snapshots = super::snapshot::list_snapshots_by_age();
     if snapshots.is_empty() {
+        if free >= reserve {
+            halt_inode_eviction(free_inodes);
+            anyhow::bail!("clip index low but no snapshots exist to release");
+        }
         anyhow::bail!(
             "low space for new snapshots, but no snapshots exist — \
              use a larger storage medium or reduce CAM_SIZE"
@@ -273,6 +294,14 @@ pub async fn manage_free_space(reserve_bytes: Option<u64>) -> Result<()> {
     let total_snaps = snapshots.len();
     let snapshots = releasable(snapshots);
     if snapshots.is_empty() {
+        if free >= reserve {
+            halt_inode_eviction(free_inodes);
+            anyhow::bail!(
+                "clip index low but the only {} snapshot(s) present are the \
+                 protected newest/highest",
+                total_snaps
+            );
+        }
         anyhow::bail!(
             "low space for new snapshots, but the only {} snapshot(s) present are the \
              protected newest/highest — use a larger storage medium or reduce CAM_SIZE",
