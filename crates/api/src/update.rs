@@ -967,11 +967,10 @@ async fn sync_clock_for_rtcless_board() {
         tracing::debug!("[clock] no HTTP date source reachable; leaving clock alone");
         return;
     };
-    // `maybe_set_clock_ms` owns both guards from here: it rejects an
-    // implausible year outright, and leaves drift under five minutes to
-    // NTP. The header is only second-granular, which is far inside that
-    // threshold, so no transit compensation is worth applying.
-    if sentryusb_clock::maybe_set_clock_ms(ms, "http date") {
+    // Network path: skip a credible RTC, then the shared setter's
+    // plausibility window and 5-min threshold. Vehicle BLE does not
+    // use this wrapper.
+    if sentryusb_clock::maybe_set_clock_from_network(ms, "http date") {
         tracing::info!("[clock] system time set from HTTP date on an RTC-less board");
     }
 }
@@ -1119,7 +1118,7 @@ async fn fetch_releases() -> Result<Vec<ReleaseInfo>, String> {
         .and_then(|v| v.to_str().ok())
     {
         if let Some(ms) = parse_http_date_ms(raw) {
-            let _ = sentryusb_clock::maybe_set_clock_ms(ms, "github-date");
+            let _ = sentryusb_clock::maybe_set_clock_from_network(ms, "github-date");
         }
     }
 

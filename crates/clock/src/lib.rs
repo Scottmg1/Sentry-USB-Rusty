@@ -79,6 +79,18 @@ pub fn is_plausible_ms(unix_ms: i64) -> bool {
     (PLAUSIBLE_EPOCH_FLOOR_MS..PLAUSIBLE_EPOCH_CEILING_MS).contains(&unix_ms)
 }
 
+/// Network / update-check path: skip when a battery-backed RTC already
+/// holds a credible time, or when NTP is already synced. Vehicle BLE
+/// must still be able to correct a drifted RTC; that path calls
+/// [`maybe_set_clock_ms`] directly so only the five-minute threshold
+/// applies.
+pub fn maybe_set_clock_from_network(unix_ms: i64, source: &str) -> bool {
+    if (has_rtc() && clock_is_credible()) || ntp_synced() {
+        return false;
+    }
+    maybe_set_clock_ms(unix_ms, source)
+}
+
 /// Steps `CLOCK_REALTIME` to `unix_ms` when the local clock is more than
 /// [`ADJUSTMENT_THRESHOLD_MS`] away, and returns whether it moved.
 ///
@@ -86,12 +98,6 @@ pub fn is_plausible_ms(unix_ms: i64) -> bool {
 /// as `false`, never as a panic or an error the caller has to handle:
 /// every call site is best-effort.
 pub fn maybe_set_clock_ms(unix_ms: i64, source: &str) -> bool {
-    // Update-check (and other callers) must not fight a battery-backed RTC
-    // that already holds a credible time. Non-RTC boards, and RTC boards
-    // still sitting at fake-hwclock / epoch, remain eligible.
-    if has_rtc() && clock_is_credible() {
-        return false;
-    }
     if !is_plausible_ms(unix_ms) {
         warn!(
             "refusing to set clock from {source}: {unix_ms}ms is outside the plausible window"
