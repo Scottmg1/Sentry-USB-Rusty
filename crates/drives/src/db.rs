@@ -26,7 +26,7 @@ fn mark_mutable_dirty(conn: &Connection, kind: &str, key: &str) -> rusqlite::Res
         params![kind, key, now_ms],
     )
 }
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::aggregate::compute_route_aggregates;
 use crate::backfill::backfill_route_aggregates;
@@ -59,6 +59,9 @@ pub const DEFAULT_JSON_MIRROR_PATH: &str = "/backingfiles/drive-data.json";
 pub const LEGACY_JSON_PATH: &str = "/root/drive-data.json";
 
 /// Archive-side JSON copy for CIFS/NFS mounts.
+/// The archive share mount point. `ARCHIVE_DATA_PATH` sits directly
+/// under it, so this is what must be a live mount before we may write.
+pub const ARCHIVE_MOUNT: &str = "/mnt/archive";
 pub const ARCHIVE_DATA_PATH: &str = "/mnt/archive/drive-data.json";
 
 /// Meta-table key: `route_count` at the last successful archive sync.
@@ -1876,24 +1879,37 @@ impl DriveStore {
     /// routes mapped while away from the archive (snapshotloop with
     /// DRIVE_MAP_WHILE_AWAY) are shipped on the next mounted cycle.
     pub fn sync_to_archive(&self) -> Result<()> {
-        if !Path::new("/mnt/archive").exists() {
+        // Strict mount-point test, not a substring scan of /proc/mounts.
+        // This is only the cheap early-out; sync_to_path re-checks around
+        // the copy itself, which is where the real race lives.
+        if !is_mount_point(ARCHIVE_MOUNT) {
+            debug!("[drives] {} not mounted; skipping archive sync", ARCHIVE_MOUNT);
             return Ok(());
         }
-        if let Ok(mounts) = std::fs::read_to_string("/proc/mounts") {
-            if !mounts.contains("/mnt/archive") {
-                return Ok(());
-            }
-        }
 
-        self.sync_to_archive_at(
+        self.sync_to_archive_guarded(
             DEFAULT_JSON_MIRROR_PATH,
             ARCHIVE_DATA_PATH,
             syncguard::DEFAULT_CACHE_PATH,
+            Some(ARCHIVE_MOUNT),
         )
     }
 
     /// Path-parameterized core of [`sync_to_archive`] (testable off-Pi).
+    #[cfg(test)]
     fn sync_to_archive_at(&self, mirror: &str, archive: &str, cache: &str) -> Result<()> {
+        self.sync_to_archive_guarded(mirror, archive, cache, None)
+    }
+
+    /// As [`sync_to_archive_at`], with an optional live-mount requirement
+    /// for the destination (production passes `ARCHIVE_MOUNT`).
+    fn sync_to_archive_guarded(
+        &self,
+        mirror: &str,
+        archive: &str,
+        cache: &str,
+        mount_guard: Option<&str>,
+    ) -> Result<()> {
         // Reflash recovery first: an empty store with an archive copy means
         // the Pi (or its backing drive) was wiped — pull the backup down for
         // the next-boot importer instead of pushing an empty export over it.
@@ -1957,7 +1973,7 @@ impl DriveStore {
         }
 
         self.export_json_to_file(mirror)?;
-        sync_to_path(mirror, archive, cache)?;
+        sync_to_path(mirror, archive, cache, mount_guard)?;
 
         let conn = self.conn.lock().unwrap();
         schema::meta_set(&conn, ARCHIVE_SYNC_ROUTE_COUNT_KEY, &routes_now.to_string())?;
@@ -3975,7 +3991,68 @@ fn rename_or_copy(src: &str, dst: &str) -> Result<()> {
 }
 
 /// Atomic sync of `src` → `dst` with size-guard gated by `cache_path`.
-fn sync_to_path(src: &str, dst: &str, cache_path: &str) -> Result<()> {
+/// Is `path` an actual mount point right now?
+///
+/// Two independent checks, because a lazy unmount (`umount -l`, which
+/// `disconnect-archive.sh` uses) detaches the mount from the namespace
+/// while the old inode may briefly linger:
+///
+/// 1. An EXACT `/proc/mounts` field match. The previous code used
+///    `mounts.contains("/mnt/archive")`, which also matched a substring
+///    of any other mount line and could report a mount that was gone.
+/// 2. A `st_dev` comparison against the parent directory. A real mount
+///    point sits on a different device than the directory containing it.
+///
+/// Fails CLOSED: if neither check can be performed, the caller must treat
+/// the destination as unmounted and refuse to write.
+fn is_mount_point(path: &str) -> bool {
+    let in_proc_mounts = std::fs::read_to_string("/proc/mounts")
+        .map(|m| {
+            m.lines().any(|line| {
+                let mut f = line.split_whitespace();
+                let _dev = f.next();
+                f.next() == Some(path)
+            })
+        })
+        .unwrap_or(false);
+    if !in_proc_mounts {
+        return false;
+    }
+    // st_dev cross-check. If the metadata cannot be read the mount is not
+    // usable for a copy anyway, so treat that as "not mounted".
+    use std::os::unix::fs::MetadataExt;
+    let Ok(here) = std::fs::metadata(path) else {
+        return false;
+    };
+    match Path::new(path).parent().map(std::fs::metadata) {
+        Some(Ok(parent)) => here.dev() != parent.dev(),
+        // No parent (path is "/") or unreadable parent: the /proc/mounts
+        // match above already stands on its own.
+        _ => true,
+    }
+}
+
+///
+/// `mount_guard` names a path that MUST be a live mount point for the
+/// whole copy — `Some("/mnt/archive")` in production, `None` in tests
+/// that sync into a temp dir.
+///
+/// Why the guard exists: the export above takes seconds on a 30 MB+
+/// mirror, and archiveloop force-lazy unmounts the share as soon as it
+/// believes processing finished. If the mount disappears mid-copy, the
+/// destination path resolves to the ordinary directory UNDERNEATH the
+/// former mount, and `create_dir_all` would happily manufacture it. The
+/// copy then "succeeds" onto the Pi's own disk, the size-guard cache and
+/// the archive_sync_* baselines advance, and the NAS silently keeps a
+/// stale copy forever. That is exactly what a field device did: a
+/// 32,379,543-byte shadow file under an unmounted /mnt/archive, matching
+/// the cache byte-for-byte, while the NAS still held an older export.
+fn sync_to_path(
+    src: &str,
+    dst: &str,
+    cache_path: &str,
+    mount_guard: Option<&str>,
+) -> Result<()> {
     let src_meta = std::fs::metadata(src)?;
     let new_size = src_meta.len() as i64;
 
@@ -3985,8 +4062,27 @@ fn sync_to_path(src: &str, dst: &str, cache_path: &str) -> Result<()> {
         return Err(e.into());
     }
 
+    // Fail closed BEFORE touching the destination.
+    if let Some(mount) = mount_guard {
+        if !is_mount_point(mount) {
+            anyhow::bail!(
+                "sync_to_path: {} is not mounted — refusing to write {} onto the local disk",
+                mount,
+                dst
+            );
+        }
+    }
+
     if let Some(dir) = Path::new(dst).parent() {
         if !dir.as_os_str().is_empty() && dir != Path::new("/") {
+            // Never conjure a destination that is supposed to be a mount:
+            // creating it is what let the shadow write happen.
+            if mount_guard.is_some() && !dir.exists() {
+                anyhow::bail!(
+                    "sync_to_path: destination directory {} does not exist under a live mount — refusing to create it",
+                    dir.display()
+                );
+            }
             std::fs::create_dir_all(dir)?;
         }
     }
@@ -4007,6 +4103,21 @@ fn sync_to_path(src: &str, dst: &str, cache_path: &str) -> Result<()> {
     if let Err(e) = rename_or_copy(&tmp, dst) {
         let _ = std::fs::remove_file(&tmp);
         return Err(e);
+    }
+
+    // Re-verify AFTER the copy: the mount can vanish between the entry
+    // check and here, and a copy that landed on the local disk must not
+    // advance the cache or the archive_sync_* baselines — leaving them
+    // untouched is what makes the next cycle retry instead of believing
+    // the archive is current.
+    if let Some(mount) = mount_guard {
+        if !is_mount_point(mount) {
+            let _ = std::fs::remove_file(dst);
+            anyhow::bail!(
+                "sync_to_path: {} disappeared during the copy — discarded the write and left                  the sync baselines untouched so the next cycle retries",
+                mount
+            );
+        }
     }
 
     if let Err(e) = write_sync_cache(cache_path, new_size) {
@@ -4049,6 +4160,87 @@ fn now_unix() -> i64 {
 
 #[cfg(test)]
 mod tests {
+
+    // -- archive mount-guard regression (2026-08-26 field incident) --------
+    //
+    // A field device silently stopped updating its NAS copy for a day. The
+    // export succeeded, the copy "succeeded", the size-guard cache advanced
+    // — and the bytes had gone to a directory on the Pi's own disk that the
+    // NFS mount normally hides. archiveloop force-lazy unmounts the share as
+    // soon as it thinks processing is done, and the multi-second export can
+    // outlive that, so the destination stopped being a mount mid-flight.
+    // create_dir_all then manufactured the mountpoint locally.
+
+    /// The destination directory must NOT be conjured into existence when a
+    /// live mount was required. This is the exact write that produced the
+    /// 32,379,543-byte shadow file under the unmounted /mnt/archive.
+    #[test]
+    fn sync_to_path_refuses_to_create_a_missing_mount_destination() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("mirror.json");
+        std::fs::write(&src, b"payload").unwrap();
+        let cache = dir.path().join("cache");
+        // A destination under a path that is definitely not a mount point.
+        let dst = dir.path().join("not-a-mount").join("drive-data.json");
+
+        let err = sync_to_path(
+            src.to_str().unwrap(),
+            dst.to_str().unwrap(),
+            cache.to_str().unwrap(),
+            Some(dir.path().join("not-a-mount").to_str().unwrap()),
+        )
+        .unwrap_err();
+
+        assert!(
+            err.to_string().contains("not mounted"),
+            "expected a not-mounted refusal, got: {}",
+            err
+        );
+        assert!(!dst.exists(), "no file may be written when the mount is absent");
+        assert!(
+            !cache.exists(),
+            "the size-guard cache must not advance on a refused sync"
+        );
+    }
+
+    /// With no guard (the test/rsync shape) behaviour is unchanged, so the
+    /// fix cannot regress the paths that legitimately sync into a plain dir.
+    #[test]
+    fn sync_to_path_without_a_guard_still_syncs() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("mirror.json");
+        std::fs::write(&src, b"payload").unwrap();
+        let cache = dir.path().join("cache");
+        let dst = dir.path().join("archive").join("drive-data.json");
+
+        sync_to_path(
+            src.to_str().unwrap(),
+            dst.to_str().unwrap(),
+            cache.to_str().unwrap(),
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(std::fs::read(&dst).unwrap(), b"payload");
+        assert!(cache.exists(), "an unguarded sync still records its baseline");
+    }
+
+    /// A path that is not a mount point must never be reported as one. The
+    /// old check was `mounts.contains("/mnt/archive")`, which matched any
+    /// substring in /proc/mounts.
+    #[test]
+    fn is_mount_point_rejects_plain_directories() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(!is_mount_point(dir.path().to_str().unwrap()));
+        assert!(!is_mount_point("/definitely/not/mounted/anywhere"));
+    }
+
+    /// Sanity: root IS a mount point, so the check isn't simply always false.
+    #[test]
+    fn is_mount_point_accepts_root() {
+        assert!(is_mount_point("/"));
+    }
+
     use super::*;
 
     #[test]
