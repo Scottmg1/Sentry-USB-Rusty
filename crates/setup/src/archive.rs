@@ -215,12 +215,24 @@ fn validate_sentry_case(env: &SetupEnv) -> Result<()> {
     Ok(())
 }
 
-/// Installs BlueZ and generates a native BLE keypair when absent.
+/// Whether both Tesla BLE key files are valid and belong to the same pair.
+pub fn tesla_ble_keypair_is_valid() -> bool {
+    sentryusb_tesla_ble::keys::load_keypair(std::path::Path::new("/root/.ble")).is_ok()
+}
+
+static TESLA_BLE_INSTALL_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// Installs BlueZ and generates or repairs a native BLE keypair when needed.
 pub async fn install_tesla_ble_binaries<F>(progress: F) -> Result<()>
 where
     F: Fn(&str),
 {
-    if std::path::Path::new("/root/.ble/key_private.pem").exists() {
+    // Serialise API/setup callers before package installation as well as key
+    // publication. The on-disk flock in tesla_ble also covers other processes.
+    let _guard = TESLA_BLE_INSTALL_LOCK.lock().await;
+    let key_dir = std::path::Path::new("/root/.ble");
+    let private_key = key_dir.join("key_private.pem");
+    if tesla_ble_keypair_is_valid() {
         return Ok(());
     }
 
@@ -249,10 +261,15 @@ where
         }
     }
 
-    // New keys use PKCS#8; the loader retains SEC1 compatibility.
-    if !std::path::Path::new("/root/.ble/key_private.pem").exists() {
-        let dir = std::path::Path::new("/root/.ble");
-        sentryusb_tesla_ble::keys::generate_keypair(dir)
+    // A valid private key is authoritative. Repair a missing/malformed public
+    // half without rotating a key that may already be paired; never overwrite
+    // an invalid existing private key without explicit operator action.
+    if private_key.exists() {
+        sentryusb_tesla_ble::keys::ensure_keypair_files(key_dir)
+            .context("validating or repairing Tesla BLE keypair")?;
+        progress("Repaired Tesla BLE public key from the existing private key.");
+    } else {
+        sentryusb_tesla_ble::keys::generate_keypair(key_dir)
             .context("generating Tesla BLE keypair")?;
         std::fs::write("/root/.ble/key_pending_pairing", "")?;
         progress("Generated Tesla BLE keys. Pairing required via web UI.");
@@ -275,7 +292,7 @@ pub async fn configure_tesla_ble(env: &SetupEnv, emitter: &SetupEmitter) -> Resu
     }
 
     // Native action binaries ship with the image; only the keypair is durable.
-    if std::path::Path::new("/root/.ble/key_private.pem").exists() {
+    if tesla_ble_keypair_is_valid() {
         return Ok(false);
     }
 

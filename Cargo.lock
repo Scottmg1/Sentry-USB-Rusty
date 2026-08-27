@@ -2772,6 +2772,7 @@ dependencies = [
  "btleplug",
  "futures",
  "hex",
+ "libc",
  "p256",
  "pem",
  "prost",

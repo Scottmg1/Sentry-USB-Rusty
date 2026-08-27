@@ -274,17 +274,37 @@ async fn try_via_ipc(verb: &str) -> Result<(), IpcError> {
 /// `keygen` verb. Generates the P-256 BLE keypair under /root/.ble
 /// (PKCS#8 private + SPKI public PEM) via the native generator — the
 /// drop-in replacement for `tesla-keygen … create`. Idempotent and
-/// safe: if a private key already exists it is left untouched (never
-/// clobber a key that may already be paired with the car) and we exit 0.
+/// safe: a valid pair is left untouched, a missing/malformed public key is
+/// derived again from the existing private key, and an invalid private key is
+/// never clobbered automatically.
 /// Marks the keys freshly generated so the UI knows pairing is pending.
 ///
 /// Exit codes: 0 keys present/created, 2 filesystem/keygen error.
 fn run_keygen() -> ExitCode {
     let dir = Path::new("/root/.ble");
-    if dir.join("key_private.pem").exists() {
-        info!("keygen: keypair already present at {} — leaving it untouched", dir.display());
+    if sentryusb_tesla_ble::keys::load_keypair(dir).is_ok() {
+        info!(
+            "keygen: keypair already present at {} — leaving it untouched",
+            dir.display()
+        );
         println!("OK");
         return ExitCode::SUCCESS;
+    }
+    if dir.join("key_private.pem").exists() {
+        return match sentryusb_tesla_ble::keys::ensure_keypair_files(dir) {
+            Ok(_) => {
+                info!(
+                    "keygen: repaired public key from existing private key at {}",
+                    dir.display()
+                );
+                println!("OK");
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                error!("keygen: existing private key is invalid; refusing to overwrite it: {e:#}");
+                ExitCode::from(2)
+            }
+        };
     }
     if let Err(e) = std::fs::create_dir_all(dir) {
         error!("keygen: creating {}: {e:#}", dir.display());
