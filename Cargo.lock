@@ -2626,6 +2626,7 @@ dependencies = [
  "sentryusb-notify",
  "sentryusb-setup",
  "sentryusb-shell",
+ "sentryusb-tesla-ble",
  "sentryusb-vehicle-profile",
  "sentryusb-ws",
  "serde",

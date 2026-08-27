@@ -171,6 +171,22 @@ pub async fn ble_pair(State(s): State<AppState>, _body: String) -> (StatusCode, 
                      the car (and move other paired phones away), make sure the car is awake \
                      and within a few metres, then retry pairing."
                         .to_string()
+                } else if lower.contains("is empty (0 bytes)")
+                    || lower.contains("malformedframing")
+                    || lower.contains("parsing pem envelope")
+                {
+                    // A truncated/empty key file. Previously this fell through
+                    // to the raw `detail`, so the UI showed the bare upstream
+                    // string "parsing PEM envelope: malformedframing", which
+                    // tells a user nothing. Pairing cannot proceed until the
+                    // key is rebuilt, and rebuilding invalidates any existing
+                    // enrolment, so say both things.
+                    "The BLE key file is empty or corrupt — key generation was interrupted \
+                     (most often by a power cut or a read-only filesystem). Regenerate the \
+                     key from Settings, or on the Pi run: sentryusb-ble-action keygen. \
+                     You will then need to pair with the car again — hold your NFC key card \
+                     against the card reader when the car prompts you."
+                        .to_string()
                 } else {
                     detail
                 };

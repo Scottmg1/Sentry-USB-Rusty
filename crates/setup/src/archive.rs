@@ -235,6 +235,7 @@ where
     if tesla_ble_keypair_is_valid() {
         return Ok(());
     }
+    let had_usable_private_key = sentryusb_tesla_ble::keys::key_is_usable(&private_key);
 
     // Persist keys on read-only-root installations.
     let _ = std::process::Command::new("bash")
@@ -261,16 +262,11 @@ where
         }
     }
 
-    // A valid private key is authoritative. Repair a missing/malformed public
-    // half without rotating a key that may already be paired; never overwrite
-    // an invalid existing private key without explicit operator action.
-    if private_key.exists() {
-        sentryusb_tesla_ble::keys::ensure_keypair_files(key_dir)
-            .context("validating or repairing Tesla BLE keypair")?;
+    sentryusb_tesla_ble::keys::regenerate_keypair(key_dir)
+        .context("generating or repairing Tesla BLE keypair")?;
+    if had_usable_private_key {
         progress("Repaired Tesla BLE public key from the existing private key.");
     } else {
-        sentryusb_tesla_ble::keys::generate_keypair(key_dir)
-            .context("generating Tesla BLE keypair")?;
         std::fs::write("/root/.ble/key_pending_pairing", "")?;
         progress("Generated Tesla BLE keys. Pairing required via web UI.");
     }

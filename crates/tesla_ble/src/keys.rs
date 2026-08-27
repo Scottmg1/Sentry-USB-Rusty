@@ -80,6 +80,18 @@ fn load_regular_private_key(path: &Path) -> Result<KeyPair> {
     KeyPair::load(path).context("loading Tesla BLE private key")
 }
 
+/// Is there a usable private key at `path`?
+///
+/// Prefer this over `Path::exists()` for every "do we need to generate a
+/// key?" decision. A bare existence test caused an unrecoverable deadlock:
+/// an interrupted keygen leaves a 0-byte `key_private.pem`, which "exists"
+/// but cannot be parsed, so pairing failed forever while every guard
+/// happily reported the key was already installed. This actually parses
+/// the key, so empty, truncated and corrupt files all read as unusable.
+pub fn key_is_usable(path: &Path) -> bool {
+    load_regular_private_key(path).is_ok()
+}
+
 struct KeyDirectoryLock {
     file: File,
 }
@@ -213,22 +225,33 @@ pub fn ensure_keypair_files(dir: &Path) -> Result<KeyPair> {
 ///   * `<dir>/key_private.pem` — PKCS#8 PEM, 0600. (`KeyPair::load` also
 ///     accepts the SEC1 PEM that older tesla-keygen installs use.)
 ///   * `<dir>/key_public.pem` — SPKI PEM, 0644 (what the pair flow reads).
-pub fn generate_keypair(dir: &Path) -> Result<KeyPair> {
+fn generate_keypair_locked(dir: &Path, replace_unusable: bool) -> Result<KeyPair> {
     use p256::elliptic_curve::rand_core::OsRng;
     use p256::pkcs8::EncodePublicKey;
 
-    std::fs::create_dir_all(dir).with_context(|| format!("creating key dir {}", dir.display()))?;
-    let _lock = KeyDirectoryLock::acquire(dir)?;
-
     let priv_path = dir.join("key_private.pem");
     let pub_path = dir.join("key_public.pem");
-    if std::fs::symlink_metadata(&priv_path).is_ok() {
-        return load_keypair(dir).with_context(|| {
-            format!(
-                "existing Tesla BLE private key {} is invalid or incomplete; refusing to overwrite it",
+    match std::fs::symlink_metadata(&priv_path) {
+        Ok(metadata) if !metadata.file_type().is_file() => {
+            bail!(
+                "existing Tesla BLE private key path {} is not a regular file; refusing to overwrite it",
                 priv_path.display()
-            )
-        });
+            );
+        }
+        Ok(_) if !replace_unusable => {
+            return load_keypair(dir).with_context(|| {
+                format!(
+                    "existing Tesla BLE private key {} is invalid or incomplete; refusing to overwrite it",
+                    priv_path.display()
+                )
+            });
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("reading private key metadata {}", priv_path.display()));
+        }
     }
 
     let secret = SecretKey::random(&mut OsRng);
@@ -270,6 +293,32 @@ pub fn generate_keypair(dir: &Path) -> Result<KeyPair> {
     sync_key_directory(dir)?;
 
     load_keypair(dir).context("validating published Tesla BLE keypair")
+}
+
+pub fn generate_keypair(dir: &Path) -> Result<KeyPair> {
+    std::fs::create_dir_all(dir).with_context(|| format!("creating key dir {}", dir.display()))?;
+    let _lock = KeyDirectoryLock::acquire(dir)?;
+    generate_keypair_locked(dir, false)
+}
+
+/// Explicitly make the directory contain one usable keypair. A valid private
+/// key is preserved and its public half is repaired; an unusable regular
+/// private-key file is atomically replaced. Symlinks and other non-files are
+/// always rejected.
+pub fn regenerate_keypair(dir: &Path) -> Result<KeyPair> {
+    std::fs::create_dir_all(dir).with_context(|| format!("creating key dir {}", dir.display()))?;
+    let _lock = KeyDirectoryLock::acquire(dir)?;
+
+    let priv_path = dir.join("key_private.pem");
+    if let Ok(keypair) = load_regular_private_key(&priv_path) {
+        if load_keypair(dir).is_ok() {
+            return Ok(keypair);
+        }
+        publish_public_key(dir, &keypair)?;
+        return load_keypair(dir).context("validating repaired Tesla BLE keypair");
+    }
+
+    generate_keypair_locked(dir, true)
 }
 
 /// Hand-parse SEC1 ECPrivateKey DER to extract the 32-byte scalar.
@@ -437,6 +486,32 @@ mod tests {
         assert_eq!(std::fs::read(&priv_path).unwrap(), b"broken-private-key");
     }
 
+    #[test]
+    fn explicit_regeneration_replaces_empty_key_files() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("key_private.pem"), b"").unwrap();
+        std::fs::write(dir.path().join("key_public.pem"), b"").unwrap();
+
+        regenerate_keypair(dir.path()).unwrap();
+
+        assert!(key_is_usable(&dir.path().join("key_private.pem")));
+        load_keypair(dir.path()).unwrap();
+    }
+
+    #[test]
+    fn explicit_regeneration_repairs_public_key_without_rotation() {
+        let dir = tempfile::tempdir().unwrap();
+        generate_keypair(dir.path()).unwrap();
+        let priv_path = dir.path().join("key_private.pem");
+        let private_before = std::fs::read(&priv_path).unwrap();
+        std::fs::write(dir.path().join("key_public.pem"), b"broken-public-key").unwrap();
+
+        regenerate_keypair(dir.path()).unwrap();
+
+        assert_eq!(std::fs::read(priv_path).unwrap(), private_before);
+        load_keypair(dir.path()).unwrap();
+    }
+
     #[cfg(unix)]
     #[test]
     fn generated_key_files_have_safe_modes_and_no_staging_remnants() {
@@ -484,6 +559,7 @@ mod tests {
 
         assert!(load_keypair(install.path()).is_err());
         assert!(ensure_keypair_files(install.path()).is_err());
+        assert!(regenerate_keypair(install.path()).is_err());
         assert!(install.path().join("key_private.pem").is_symlink());
     }
 

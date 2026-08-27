@@ -20,8 +20,16 @@ After=sentryusb.service
 # no longer a tesla-control dependency. Listing each path separately
 # means `systemctl status` says exactly which one is missing rather than
 # spawning and crashing at ExecStart.
+#
+# The key uses ConditionFileNotEmpty=, NOT ConditionPathExists=: an
+# interrupted keygen leaves a 0-byte key_private.pem, which satisfies
+# "exists". The unit then started, bound its IPC socket, reported
+# `active (running)`, and failed every single pair request with
+# "parsing PEM envelope: malformedframing" — the confusing case where
+# systemctl says healthy but nothing works. Refusing to start on an
+# empty key surfaces the real problem in `systemctl status`.
 ConditionPathExists=/root/bin/sentryusb-tesla-telemetry
-ConditionPathExists=/root/.ble/key_private.pem
+ConditionFileNotEmpty=/root/.ble/key_private.pem
 # Match sentryusb-ble.service's burst limits so a flaky boot doesn't
 # burn through the systemd restart budget.
 StartLimitBurst=20

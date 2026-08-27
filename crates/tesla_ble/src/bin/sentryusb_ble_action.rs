@@ -275,47 +275,62 @@ async fn try_via_ipc(verb: &str) -> Result<(), IpcError> {
 /// (PKCS#8 private + SPKI public PEM) via the native generator — the
 /// drop-in replacement for `tesla-keygen … create`. Idempotent and
 /// safe: a valid pair is left untouched, a missing/malformed public key is
-/// derived again from the existing private key, and an invalid private key is
-/// never clobbered automatically.
+/// derived again from the existing private key, and this explicit command
+/// atomically replaces an unusable regular private-key file.
 /// Marks the keys freshly generated so the UI knows pairing is pending.
 ///
 /// Exit codes: 0 keys present/created, 2 filesystem/keygen error.
 fn run_keygen() -> ExitCode {
     let dir = Path::new("/root/.ble");
+    let priv_path = dir.join("key_private.pem");
+
     if sentryusb_tesla_ble::keys::load_keypair(dir).is_ok() {
         info!(
-            "keygen: keypair already present at {} — leaving it untouched",
+            "keygen: valid keypair already present at {} — leaving it untouched",
             dir.display()
         );
         println!("OK");
         return ExitCode::SUCCESS;
     }
-    if dir.join("key_private.pem").exists() {
-        return match sentryusb_tesla_ble::keys::ensure_keypair_files(dir) {
-            Ok(_) => {
-                info!(
-                    "keygen: repaired public key from existing private key at {}",
-                    dir.display()
-                );
-                println!("OK");
-                ExitCode::SUCCESS
-            }
-            Err(e) => {
-                error!("keygen: existing private key is invalid; refusing to overwrite it: {e:#}");
-                ExitCode::from(2)
-            }
-        };
+
+    let had_usable_private_key = sentryusb_tesla_ble::keys::key_is_usable(&priv_path);
+    if had_usable_private_key {
+        warn!(
+            "keygen: public key at {} is missing or invalid — repairing it from the existing private key",
+            dir.display()
+        );
+    } else if priv_path.exists() {
+        warn!(
+            "keygen: existing key at {} is unusable — regenerating. The car must be re-paired afterwards.",
+            priv_path.display()
+        );
     }
+
+    // Persist keys on read-only-root installations. Without this, keygen
+    // hits EROFS mid-write; that is precisely what produces the 0-byte
+    // key this function now has to recover from. Mirrors the remount in
+    // crates/setup/src/archive.rs before its own generate_keypair call.
+    let _ = std::process::Command::new("bash")
+        .args(["-c", "/root/bin/remountfs_rw"])
+        .status();
+
     if let Err(e) = std::fs::create_dir_all(dir) {
         error!("keygen: creating {}: {e:#}", dir.display());
         return ExitCode::from(2);
     }
-    match sentryusb_tesla_ble::keys::generate_keypair(dir) {
+    match sentryusb_tesla_ble::keys::regenerate_keypair(dir) {
         Ok(_) => {
-            // Mark not-yet-paired so the web UI doesn't falsely show
-            // "BLE Paired" on a fresh keypair (matches the wizard).
-            let _ = std::fs::write(dir.join("key_pending_pairing"), "");
-            info!("keygen: generated BLE keypair under {}", dir.display());
+            if !had_usable_private_key {
+                // Mark not-yet-paired so the web UI doesn't falsely show
+                // "BLE Paired" after a new private key is published.
+                if let Err(e) = std::fs::write(dir.join("key_pending_pairing"), "") {
+                    error!("keygen: writing pairing marker: {e:#}");
+                    return ExitCode::from(2);
+                }
+                info!("keygen: generated BLE keypair under {}", dir.display());
+            } else {
+                info!("keygen: repaired BLE public key under {}", dir.display());
+            }
             println!("OK");
             ExitCode::SUCCESS
         }
