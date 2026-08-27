@@ -321,12 +321,6 @@ fn run_keygen() -> ExitCode {
     match sentryusb_tesla_ble::keys::regenerate_keypair(dir) {
         Ok(_) => {
             if !had_usable_private_key {
-                // Mark not-yet-paired so the web UI doesn't falsely show
-                // "BLE Paired" after a new private key is published.
-                if let Err(e) = std::fs::write(dir.join("key_pending_pairing"), "") {
-                    error!("keygen: writing pairing marker: {e:#}");
-                    return ExitCode::from(2);
-                }
                 info!("keygen: generated BLE keypair under {}", dir.display());
             } else {
                 info!("keygen: repaired BLE public key under {}", dir.display());

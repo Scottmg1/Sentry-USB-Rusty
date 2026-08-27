@@ -267,7 +267,6 @@ where
     if had_usable_private_key {
         progress("Repaired Tesla BLE public key from the existing private key.");
     } else {
-        std::fs::write("/root/.ble/key_pending_pairing", "")?;
         progress("Generated Tesla BLE keys. Pairing required via web UI.");
     }
 

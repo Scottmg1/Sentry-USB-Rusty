@@ -303,8 +303,9 @@ pub fn generate_keypair(dir: &Path) -> Result<KeyPair> {
 
 /// Explicitly make the directory contain one usable keypair. A valid private
 /// key is preserved and its public half is repaired; an unusable regular
-/// private-key file is atomically replaced. Symlinks and other non-files are
-/// always rejected.
+/// private-key file is atomically replaced. Private-key replacement also
+/// clears the stale paired marker and marks pairing as pending. Symlinks and
+/// other non-files are always rejected.
 pub fn regenerate_keypair(dir: &Path) -> Result<KeyPair> {
     std::fs::create_dir_all(dir).with_context(|| format!("creating key dir {}", dir.display()))?;
     let _lock = KeyDirectoryLock::acquire(dir)?;
@@ -318,7 +319,40 @@ pub fn regenerate_keypair(dir: &Path) -> Result<KeyPair> {
         return load_keypair(dir).context("validating repaired Tesla BLE keypair");
     }
 
-    generate_keypair_locked(dir, true)
+    // Validate the replacement target before changing pairing state. A
+    // symlink or directory is rejected without touching an existing marker.
+    match std::fs::symlink_metadata(&priv_path) {
+        Ok(metadata) if !metadata.file_type().is_file() => {
+            bail!(
+                "existing Tesla BLE private key path {} is not a regular file; refusing to overwrite it",
+                priv_path.display()
+            );
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("reading private key metadata {}", priv_path.display()));
+        }
+    }
+
+    // An unusable private key cannot authenticate an existing enrolment. Clear
+    // the durable paired state before publishing its replacement so no failure
+    // path can leave the new key falsely reported as paired.
+    let paired_path = dir.join("paired");
+    if let Err(error) = std::fs::remove_file(&paired_path)
+        && error.kind() != std::io::ErrorKind::NotFound
+    {
+        return Err(error)
+            .with_context(|| format!("clearing stale paired marker {}", paired_path.display()));
+    }
+
+    let keypair = generate_keypair_locked(dir, true)?;
+    let pending_path = dir.join("key_pending_pairing");
+    std::fs::write(&pending_path, "")
+        .with_context(|| format!("writing pairing marker {}", pending_path.display()))?;
+    sync_key_directory(dir)?;
+    Ok(keypair)
 }
 
 /// Hand-parse SEC1 ECPrivateKey DER to extract the 32-byte scalar.
@@ -491,11 +525,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("key_private.pem"), b"").unwrap();
         std::fs::write(dir.path().join("key_public.pem"), b"").unwrap();
+        std::fs::write(dir.path().join("paired"), b"1").unwrap();
 
         regenerate_keypair(dir.path()).unwrap();
 
         assert!(key_is_usable(&dir.path().join("key_private.pem")));
         load_keypair(dir.path()).unwrap();
+        assert!(!dir.path().join("paired").exists());
+        assert!(dir.path().join("key_pending_pairing").exists());
     }
 
     #[test]
@@ -505,11 +542,32 @@ mod tests {
         let priv_path = dir.path().join("key_private.pem");
         let private_before = std::fs::read(&priv_path).unwrap();
         std::fs::write(dir.path().join("key_public.pem"), b"broken-public-key").unwrap();
+        std::fs::write(dir.path().join("paired"), b"1").unwrap();
 
         regenerate_keypair(dir.path()).unwrap();
 
         assert_eq!(std::fs::read(priv_path).unwrap(), private_before);
         load_keypair(dir.path()).unwrap();
+        assert!(dir.path().join("paired").exists());
+        assert!(!dir.path().join("key_pending_pairing").exists());
+    }
+
+    #[test]
+    fn explicit_regeneration_fails_if_paired_marker_cannot_be_cleared() {
+        let dir = tempfile::tempdir().unwrap();
+        let priv_path = dir.path().join("key_private.pem");
+        std::fs::write(&priv_path, b"").unwrap();
+        std::fs::write(dir.path().join("key_public.pem"), b"").unwrap();
+        std::fs::create_dir(dir.path().join("paired")).unwrap();
+
+        let error = match regenerate_keypair(dir.path()) {
+            Ok(_) => panic!("regeneration should fail when the paired marker cannot be removed"),
+            Err(error) => error,
+        };
+
+        assert!(error.to_string().contains("clearing stale paired marker"));
+        assert_eq!(std::fs::read(priv_path).unwrap(), b"");
+        assert!(!dir.path().join("key_pending_pairing").exists());
     }
 
     #[cfg(unix)]
@@ -559,8 +617,10 @@ mod tests {
 
         assert!(load_keypair(install.path()).is_err());
         assert!(ensure_keypair_files(install.path()).is_err());
+        std::fs::write(install.path().join("paired"), b"1").unwrap();
         assert!(regenerate_keypair(install.path()).is_err());
         assert!(install.path().join("key_private.pem").is_symlink());
+        assert!(install.path().join("paired").exists());
     }
 
     #[test]
