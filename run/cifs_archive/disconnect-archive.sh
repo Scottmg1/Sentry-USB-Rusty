@@ -5,7 +5,7 @@
 # mounted, but the mount is inoperable and any attempt to access it
 # results in a "host is down" message.
 
-# Must match ARCHIVE_MOUNT_LOCK_PATH in crates/api/src/archive_mount_lock.rs
+# Must match ARCHIVE_MOUNT_LOCK_PATH in crates/drives/src/archive_mount_lock.rs
 # and connect-archive.sh.
 ARCHIVE_MOUNT_LOCK=/tmp/sentryusb_archive_mount.lock
 

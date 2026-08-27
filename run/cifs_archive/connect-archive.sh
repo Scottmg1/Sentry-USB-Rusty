@@ -1,6 +1,6 @@
 #!/bin/bash -eu
 
-# Must match ARCHIVE_MOUNT_LOCK_PATH in crates/api/src/archive_mount_lock.rs
+# Must match ARCHIVE_MOUNT_LOCK_PATH in crates/drives/src/archive_mount_lock.rs
 # and disconnect-archive.sh.
 ARCHIVE_MOUNT_LOCK=/tmp/sentryusb_archive_mount.lock
 

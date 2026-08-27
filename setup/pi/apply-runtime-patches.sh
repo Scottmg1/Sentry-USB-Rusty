@@ -432,7 +432,7 @@ RuntimeWatchdogSec=15'
 #
 # The API's backup path and archiveloop now coordinate /mnt/archive
 # ownership via a shared flock (/tmp/sentryusb_archive_mount.lock — see
-# crates/api/src/archive_mount_lock.rs). The lock-aware connect/
+# crates/drives/src/archive_mount_lock.rs). The lock-aware connect/
 # disconnect-archive.sh only land on disk at setup-wizard time
 # (crates/setup/src/archive.rs bakes them into the binary), so existing
 # CIFS/NFS installs need this refresh or archiveloop keeps running the
@@ -462,7 +462,7 @@ apply_archive_mount_lock_scripts() {
     cat > /root/bin/connect-archive.sh.new <<'CONNECT_EOF'
 #!/bin/bash -eu
 
-# Must match ARCHIVE_MOUNT_LOCK_PATH in crates/api/src/archive_mount_lock.rs
+# Must match ARCHIVE_MOUNT_LOCK_PATH in crates/drives/src/archive_mount_lock.rs
 # and disconnect-archive.sh.
 ARCHIVE_MOUNT_LOCK=/tmp/sentryusb_archive_mount.lock
 
@@ -504,7 +504,7 @@ CONNECT_EOF
 # mounted, but the mount is inoperable and any attempt to access it
 # results in a "host is down" message.
 
-# Must match ARCHIVE_MOUNT_LOCK_PATH in crates/api/src/archive_mount_lock.rs
+# Must match ARCHIVE_MOUNT_LOCK_PATH in crates/drives/src/archive_mount_lock.rs
 # and connect-archive.sh.
 ARCHIVE_MOUNT_LOCK=/tmp/sentryusb_archive_mount.lock
 
