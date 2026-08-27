@@ -13,9 +13,12 @@
 # Or with a local binary:
 #   bash install-pi.sh /path/to/sentryusb-binary
 
+set -Eeuo pipefail
+
 REPO="${REPO:-Sentry-Six/Sentry-USB-Rusty}"
-INSTALL_DIR="/opt/sentryusb"
+INSTALL_DIR="${SENTRYUSB_INSTALL_DIR:-/opt/sentryusb}"
 BINARY_NAME="sentryusb"
+REMOUNT_HELPER="${SENTRYUSB_REMOUNT_HELPER:-/root/bin/remountfs_rw}"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -28,9 +31,116 @@ ok()    { echo -e "${GREEN}[OK]${NC} $1"; }
 warn()  { echo -e "${YELLOW}[WARN]${NC} $1"; }
 error_exit() { echo -e "${RED}[ERROR]${NC} $1"; exit 1; }
 
+mount_is_writable() {
+    local mountpoint="$1"
+    local options
+
+    options=$(findmnt -no OPTIONS "$mountpoint" 2>/dev/null) || return 1
+    case ",$options," in
+        *,rw,*) return 0 ;;
+        *)      return 1 ;;
+    esac
+}
+
+ensure_install_filesystems_writable() {
+    ROOT_WAS_READONLY=0
+    BOOT_WAS_READONLY=0
+    BOOT_MOUNT=""
+
+    for candidate in /boot/firmware /boot; do
+        if findmnt -no TARGET "$candidate" >/dev/null 2>&1; then
+            BOOT_MOUNT="$candidate"
+            break
+        fi
+    done
+
+    mount_is_writable / || ROOT_WAS_READONLY=1
+    if [ -n "$BOOT_MOUNT" ] && ! mount_is_writable "$BOOT_MOUNT"; then
+        BOOT_WAS_READONLY=1
+    fi
+
+    if [ "$ROOT_WAS_READONLY" = 1 ] || [ "$BOOT_WAS_READONLY" = 1 ]; then
+        info "Existing read-only SentryUSB install detected; preparing filesystems..."
+        if [ -x "$REMOUNT_HELPER" ]; then
+            "$REMOUNT_HELPER" >/dev/null 2>&1 || true
+        fi
+    fi
+
+    if ! mount_is_writable /; then
+        mount -o remount,rw / >/dev/null 2>&1 \
+            || error_exit "Root filesystem is read-only and could not be remounted read-write."
+    fi
+    mount_is_writable / \
+        || error_exit "Root filesystem is still read-only after the remount attempt."
+
+    if [ -n "$BOOT_MOUNT" ] && ! mount_is_writable "$BOOT_MOUNT"; then
+        mount -o remount,rw "$BOOT_MOUNT" >/dev/null 2>&1 \
+            || error_exit "$BOOT_MOUNT is read-only and could not be remounted read-write."
+    fi
+    if [ -n "$BOOT_MOUNT" ]; then
+        mount_is_writable "$BOOT_MOUNT" \
+            || error_exit "$BOOT_MOUNT is still read-only after the remount attempt."
+    fi
+}
+
+install_release_asset() {
+    local name="$1"
+    local suffix="$2"
+    local download_url="https://github.com/${REPO}/releases/download/${RELEASE_TAG}/${name}-${suffix}"
+    local destination="${INSTALL_DIR}/${name}-${suffix}"
+    local staged="${INSTALL_DIR}/.${name}-${suffix}.new"
+    local attempt
+
+    for attempt in $(seq 1 5); do
+        rm -f "$staged"
+        if curl -fsSL "$download_url" -o "$staged" 2>/dev/null \
+            && [ -s "$staged" ] \
+            && chmod +x "$staged" \
+            && mv -f "$staged" "$destination" \
+            && [ -x "$destination" ]; then
+            ok "Downloaded $name-$suffix"
+            return 0
+        fi
+        rm -f "$staged"
+        warn "Install of $name-$suffix failed (attempt $attempt/5), retrying..."
+        sleep 3
+    done
+
+    error_exit "Failed to install $name-$suffix after 5 attempts"
+}
+
+install_release_bundle() {
+    local suffix
+    local name
+
+    for suffix in $SUFFIXES; do
+        install_release_asset "$BINARY_NAME" "$suffix"
+    done
+    for suffix in $SUFFIXES; do
+        for name in sentryusb-tesla-telemetry sentryusb-ble-action; do
+            install_release_asset "$name" "$suffix"
+        done
+    done
+}
+
+readonly_reinstall_exit_notice() {
+    local exit_status="${1:-0}"
+
+    if [ "${ROOT_WAS_READONLY:-0}" = 1 ] || [ "${BOOT_WAS_READONLY:-0}" = 1 ]; then
+        if [ "$exit_status" -ne 0 ]; then
+            warn "The installation failed after remounting a read-only SentryUSB. Reboot now to restore the read-only mounts."
+        else
+            warn "This was a read-only SentryUSB reinstall. Reboot now to restore the read-only mounts."
+        fi
+    fi
+}
+
 if [[ $EUID -ne 0 ]]; then
     error_exit "This script must be run as root. Try: sudo -i"
 fi
+
+trap 'readonly_reinstall_exit_notice "$?"' EXIT
+ensure_install_filesystems_writable
 
 # Backward-compat: the Go install.sh accepted `norootshrink` as its
 # first arg to skip the root-partition shrink step (used when an
@@ -118,42 +228,33 @@ if [ -n "${1:-}" ] && [ -f "${1:-}" ]; then
         cp "$1" "$INSTALL_DIR/$BINARY_NAME-$sfx"
         chmod +x "$INSTALL_DIR/$BINARY_NAME-$sfx"
     done
-    ok "Local binary staged under $(echo $SUFFIXES | tr ' ' '\n' | wc -l) variant(s)"
+    ok "Local binary staged under $(echo "$SUFFIXES" | tr ' ' '\n' | wc -l) variant(s)"
 else
     info "Downloading SentryUSB binary variants from GitHub..."
-
-    for sfx in $SUFFIXES; do
-        DOWNLOAD_URL="https://github.com/${REPO}/releases/latest/download/${BINARY_NAME}-${sfx}"
-        TMP="/tmp/${BINARY_NAME}-${sfx}.new"
-        success=false
-        for attempt in $(seq 1 5); do
-            if curl -fsSL "$DOWNLOAD_URL" -o "$TMP" 2>/dev/null; then
-                chmod +x "$TMP"
-                mv "$TMP" "$INSTALL_DIR/$BINARY_NAME-$sfx"
-                ok "Downloaded $BINARY_NAME-$sfx"
-                success=true
-                break
-            fi
-            warn "Download of $sfx failed (attempt $attempt/5), retrying..."
-            sleep 3
-        done
-        if [ "$success" != true ]; then
-            error_exit "Failed to download $BINARY_NAME-$sfx after 5 attempts"
-        fi
-    done
 
     RELEASE_TAG=$(curl -fsSL --max-time 10 \
         "https://api.github.com/repos/${REPO}/releases/latest" 2>/dev/null \
         | grep '"tag_name"' | head -1 \
         | sed 's/.*"tag_name": *"\([^"]*\)".*/\1/' || true)
-    if [ -n "${RELEASE_TAG:-}" ]; then
-        echo "$RELEASE_TAG" > "$INSTALL_DIR/version"
-        ok "Version: $RELEASE_TAG"
+    if [ -z "${RELEASE_TAG:-}" ]; then
+        RELEASE_URL=$(curl -fsSL --max-time 10 -o /dev/null -w '%{url_effective}' \
+            "https://github.com/${REPO}/releases/latest" 2>/dev/null || true)
+        RELEASE_TAG="${RELEASE_URL##*/}"
     fi
+    [ -n "${RELEASE_TAG:-}" ] && [ "$RELEASE_TAG" != latest ] \
+        || error_exit "Could not resolve the latest SentryUSB release tag"
+
+    install_release_bundle
+    echo "$RELEASE_TAG" > "$INSTALL_DIR/version"
+    ok "Version: $RELEASE_TAG"
 fi
 
+# Keep scripts and services on the same source tag as the release binaries.
+# Local-binary development installs intentionally follow main.
+SOURCE_REF="${RELEASE_TAG:-main}"
+
 # ── Picker script (selects the right binary at every service start) ──
-PICKER_URL="https://raw.githubusercontent.com/${REPO}/main/pi-gen-sources/00-sentryusb-tweaks/files/sentryusb-pick-binary"
+PICKER_URL="https://raw.githubusercontent.com/${REPO}/${SOURCE_REF}/pi-gen-sources/00-sentryusb-tweaks/files/sentryusb-pick-binary"
 PICKER_DST="/usr/local/bin/sentryusb-pick-binary"
 PICKER_LOCAL_FALLBACK="$(dirname "${1:-/dev/null}")/sentryusb-pick-binary"
 if [ -f "$PICKER_LOCAL_FALLBACK" ]; then
@@ -220,7 +321,7 @@ ok "sentryusb.service installed and enabled"
 # ── Step 3b: BLE daemon (Python) ───────────────────────────────────
 
 info "Installing SentryUSB BLE daemon..."
-BLE_REPO_URL="https://raw.githubusercontent.com/${REPO}/main/server/ble"
+BLE_REPO_URL="https://raw.githubusercontent.com/${REPO}/${SOURCE_REF}/server/ble"
 # Install at /root/bin/ — matches both the vendored service unit's
 # hardcoded ExecStart path AND what pi-gen 00-run.sh installs, so the
 # binary is reachable whether the user came via image-flash or
@@ -289,7 +390,7 @@ ok "Gadget shims installed at /root/bin/{enable,disable}_gadget.sh"
 # pi-gen image build deploys it as part of the image; install-pi.sh users never
 # get it, so sentryusb-archive.service fails fast with "envsetup.sh: No such
 # file or directory" and respawns until systemd gives up.
-if curl -fsSL "https://raw.githubusercontent.com/${REPO}/main/setup/pi/envsetup.sh" \
+if curl -fsSL "https://raw.githubusercontent.com/${REPO}/${SOURCE_REF}/setup/pi/envsetup.sh" \
        -o /root/bin/envsetup.sh 2>/dev/null; then
     chmod +x /root/bin/envsetup.sh
     ok "envsetup.sh installed (archiveloop runtime config)"
@@ -334,7 +435,7 @@ fi
 # Rust binary's update.rs invokes after every binary swap so install-time
 # fixes — BLE non-fatal-adv on BCM4345C0 (4C+), EATT disable on all
 # boards, etc. — heal automatically on update instead of silently rotting.
-PATCHES_URL="https://raw.githubusercontent.com/${REPO}/main/setup/pi/apply-runtime-patches.sh"
+PATCHES_URL="https://raw.githubusercontent.com/${REPO}/${SOURCE_REF}/setup/pi/apply-runtime-patches.sh"
 PATCHES_DST="/usr/local/bin/sentryusb-apply-runtime-patches"
 PATCHES_LOCAL="$(dirname "${1:-/dev/null}")/setup/pi/apply-runtime-patches.sh"
 if [ -f "$PATCHES_LOCAL" ]; then
@@ -503,7 +604,11 @@ DTS
              BCM4345C0.raspberrypi,4-compute-module.hcd; do
         [ -e "$BRCM/$c" ] && { HCD="$c"; break; }
     done
-    [ -z "$HCD" ] && HCD=$(cd "$BRCM" 2>/dev/null && ls BCM4345C0*.hcd 2>/dev/null | grep -vE 'radxa,rock-4c-plus|raspberrypi' | head -1)
+    [ -z "$HCD" ] && HCD=$(find "$BRCM" -maxdepth 1 -type f \
+        -name 'BCM4345C0*.hcd' \
+        ! -name '*radxa,rock-4c-plus*' \
+        ! -name '*raspberrypi*' \
+        -print -quit 2>/dev/null)
     if [ -n "$HCD" ] && [ -e "$BRCM/$HCD" ]; then
         ln -sf "$HCD" "$BRCM/BCM4345C0.radxa,rock-4c-plus.hcd"
         ln -sf "$HCD" "$BRCM/BCM4345C0.hcd"
@@ -554,7 +659,7 @@ fi
 # natively-working r03 from the 4C+ (identical bluetoothd binary). Staging is
 # inert — the helper self-stands-down on boards the manifest qualifies native.
 info "Installing BLE advertising selector + helper..."
-BLE_ADV_BASE_URL="https://raw.githubusercontent.com/${REPO}/main/setup/pi"
+BLE_ADV_BASE_URL="https://raw.githubusercontent.com/${REPO}/${SOURCE_REF}/setup/pi"
 LOCAL_PI_DIR="$(dirname "${1:-/dev/null}")/setup/pi"
 fetch_file() {
     # $1 = filename, $2 = destination, $3 = mode (default 644). Local repo first, then URL.
@@ -603,7 +708,7 @@ if [ ! -f /root/sentryusb.conf ]; then
     # returned the Go-era sample OR fell back to the tiny offline stub
     # below — both of which left the "raw config editor" in the web UI
     # showing only a handful of keys instead of the full documented set.
-    SAMPLE_URL="https://raw.githubusercontent.com/${REPO}/main/pi-gen-sources/00-sentryusb-tweaks/files/sentryusb.conf.sample"
+    SAMPLE_URL="https://raw.githubusercontent.com/${REPO}/${SOURCE_REF}/pi-gen-sources/00-sentryusb-tweaks/files/sentryusb.conf.sample"
     if curl -fsSL --max-time 15 "$SAMPLE_URL" -o /root/sentryusb.conf; then
         ok "Sample config downloaded to /root/sentryusb.conf"
     else
@@ -671,7 +776,7 @@ fi
 # Advertise IPv4 only: a AAAA answer for .local sends Windows/Chrome to the
 # Pi's rotating SLAAC address (slow, stale) and triggers Chrome Private
 # Network Access "CORS" blocks on the plain-http UI. Device IPv6 untouched.
-AVAHI_V4_URL="https://raw.githubusercontent.com/${REPO}/main/setup/pi/avahi-ipv4-only.sh"
+AVAHI_V4_URL="https://raw.githubusercontent.com/${REPO}/${SOURCE_REF}/setup/pi/avahi-ipv4-only.sh"
 if curl -fsSL --max-time 15 "$AVAHI_V4_URL" -o /tmp/avahi-ipv4-only.sh 2>/dev/null; then
     bash /tmp/avahi-ipv4-only.sh >/dev/null 2>&1 || warn "could not apply IPv4-only mDNS config"
     rm -f /tmp/avahi-ipv4-only.sh

@@ -47,7 +47,7 @@ pub async fn run_startup_migration() {
         MIGRATE_REPO, script_ref
     );
 
-    let script = build_migration_script(&tarball_url);
+    let script = build_migration_script(&tarball_url, &script_ref);
 
     // Retry up to 3 times with exponential backoff. The script itself
     // fails fast on `curl: Could not resolve host: github.com` when DNS
@@ -140,7 +140,12 @@ pub async fn run_startup_migration() {
     // Don't write marker — retry on next boot.
 }
 
-fn build_migration_script(tarball_url: &str) -> String {
+fn build_migration_script(tarball_url: &str, release_ref: &str) -> String {
+    let helper_release_base = if release_ref == MIGRATE_BRANCH {
+        format!("https://github.com/{MIGRATE_REPO}/releases/latest/download")
+    } else {
+        format!("https://github.com/{MIGRATE_REPO}/releases/download/{release_ref}")
+    };
     format!(
         r#"set -e
 
@@ -428,20 +433,31 @@ if [ -f "$TMPDIR/server/ble/sentryusb-telemetry.service" ]; then
   fi
   if [ -n "$_suffix" ]; then
     for _name in sentryusb-tesla-telemetry sentryusb-ble-action; do
-      # Symlink already in place → the picker owns it now; skip.
-      if [ -L "/root/bin/$_name" ]; then
+      _dest="/opt/sentryusb/$_name-$_suffix"
+      _link="/root/bin/$_name"
+      # Skip only a healthy link to the expected executable. A dangling
+      # symlink satisfies -L but execve returns ENOENT; older code skipped it
+      # forever and still wrote the per-version migration marker.
+      if [ -L "$_link" ] \
+        && [ "$(readlink "$_link" 2>/dev/null || true)" = "$_dest" ] \
+        && [ -x "$_link" ] \
+        && [ -x "$_dest" ]; then
         continue
       fi
-      _url="https://github.com/{repo}/releases/latest/download/$_name-$_suffix"
-      if curl -sfI --max-time 10 "$_url" >/dev/null 2>&1; then
-        mkdir -p /root/bin /opt/sentryusb
-        if curl -fsSL --max-time 120 "$_url" -o "/tmp/$_name.migrate" 2>/dev/null; then
-          chmod +x "/tmp/$_name.migrate"
-          mv "/tmp/$_name.migrate" "/opt/sentryusb/$_name-$_suffix"
-          ln -sfn "/opt/sentryusb/$_name-$_suffix" "/root/bin/$_name"
-          echo "migrate: installed $_name-$_suffix and linked /root/bin/$_name"
-        fi
-      fi
+      _url="{helper_release_base}/$_name-$_suffix"
+      _staged="/opt/sentryusb/.$_name.migrate.new"
+      mkdir -p /root/bin /opt/sentryusb
+      rm -f "$_staged"
+      # Stage on the destination filesystem so the final rename is atomic.
+      # Any failure aborts the migration, so Rust does not write .migrated-*;
+      # the next boot can retry instead of preserving a half-install.
+      curl -fsSL --max-time 120 "$_url" -o "$_staged"
+      [ -s "$_staged" ]
+      chmod +x "$_staged"
+      mv -f "$_staged" "$_dest"
+      ln -sfn "$_dest" "$_link"
+      [ -x "$_link" ]
+      echo "migrate: installed $_name-$_suffix and linked $_link"
     done
   fi
 
@@ -494,6 +510,7 @@ rm -f /root/bin/tesla-control /root/bin/tesla-keygen \
 "#,
         tarball_url = tarball_url,
         repo = MIGRATE_REPO,
+        helper_release_base = helper_release_base,
         branch = MIGRATE_BRANCH
     )
 }
@@ -509,6 +526,7 @@ mod tests {
     fn migration_script_parses() {
         let script = build_migration_script(
             "https://github.com/Sentry-Six/Sentry-USB-Rusty/archive/v0.0.0.tar.gz",
+            "v0.0.0",
         );
         // Placeholders must all have been substituted.
         assert!(!script.contains("{repo}"), "unsubstituted {{repo}}");
@@ -525,5 +543,45 @@ mod tests {
             .status()
             .expect("bash not available");
         assert!(status.success(), "bash -n rejected the migration script");
+    }
+
+    #[test]
+    fn migration_script_repairs_dangling_aux_links() {
+        let script = build_migration_script(
+            "https://github.com/Sentry-Six/Sentry-USB-Rusty/archive/v0.0.0.tar.gz",
+            "v0.0.0",
+        );
+
+        assert!(
+            script.contains("&& [ -x \"$_link\" ]") && script.contains("&& [ -x \"$_dest\" ]"),
+            "auxiliary migration must not treat a dangling symlink as healthy"
+        );
+        assert!(
+            script.contains("_staged=\"/opt/sentryusb/.$_name.migrate.new\""),
+            "auxiliary downloads must be staged on the destination filesystem"
+        );
+        assert!(
+            script.contains("[ -x \"$_link\" ]\n      echo \"migrate: installed"),
+            "migration must verify the published executable before succeeding"
+        );
+    }
+
+    #[test]
+    fn migration_downloads_helpers_from_the_installed_release() {
+        let script = build_migration_script(
+            "https://github.com/Sentry-Six/Sentry-USB-Rusty/archive/v0.0.0.tar.gz",
+            "v0.0.0",
+        );
+
+        assert!(
+            script.contains(
+                "https://github.com/Sentry-Six/Sentry-USB-Rusty/releases/download/v0.0.0/$_name-$_suffix"
+            ),
+            "migration must keep auxiliary binaries on the installed release"
+        );
+        assert!(
+            !script.contains("releases/latest/download/$_name-$_suffix"),
+            "a migration for an exact version must not install latest helpers"
+        );
     }
 }

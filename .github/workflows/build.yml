@@ -307,6 +307,10 @@ jobs:
           echo '<!DOCTYPE html><html><body>test</body></html>' > crates/sentryusb/static/index.html
       - name: Run tests
         run: cargo test --workspace
+      - name: Run installer safety regressions
+        run: |
+          bash test/install-pi-safety.test.sh
+          bash test/sentryusb-pick-binary.test.sh
 
   lint-web:
     name: Lint web
