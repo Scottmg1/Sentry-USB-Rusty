@@ -385,9 +385,6 @@ pub async fn process_files(
     State(state): State<AppState>,
     Query(q): Query<ProcessQuery>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    if state.drives.processor.is_running() {
-        return crate::json_error(StatusCode::CONFLICT, "processing already in progress");
-    }
     if state.drives.importing.load(Ordering::SeqCst) {
         return crate::json_error(
             StatusCode::CONFLICT,
@@ -401,6 +398,16 @@ pub async fn process_files(
             "archive is currently running — please wait until it finishes",
         );
     }
+    // Claim the processor BEFORE responding. Checking is_running() here and
+    // letting the spawned task claim it later leaves a window where the
+    // caller has been told "started" but the flag is still false —
+    // post-archive-process.sh polls immediately and reads that as "already
+    // done", which let archiveloop unmount /mnt/archive out from under a
+    // live pass. The cheap rejections above run first so no early return
+    // can leave a reservation dangling.
+    if !state.drives.processor.try_reserve() {
+        return crate::json_error(StatusCode::CONFLICT, "processing already in progress");
+    }
 
     let processor = state.drives.processor.clone();
     tokio::spawn(async move {
@@ -408,7 +415,7 @@ pub async fn process_files(
             register_keep_awake_want("processor");
             start_keep_awake("Drive Processing");
         }
-        let result = processor.process_new().await;
+        let result = processor.process_new_reserved().await;
         if !post_archive {
             release_keep_awake_want("processor");
             stop_keep_awake();

@@ -272,7 +272,38 @@ impl Processor {
     }
 
     pub async fn get_status(&self) -> ProcessingStatus {
-        self.status.lock().await.clone()
+        let mut status = self.status.lock().await.clone();
+        // Report the AUTHORITATIVE flag. `status.running` is written well
+        // into do_process — after the directory scan and the processed-set
+        // membership work — while `self.running` is set before any of that.
+        // post-archive-process.sh polls this endpoint and treats the first
+        // `"running": false` as completion, so the gap let archiveloop
+        // force-lazy unmount /mnt/archive while a pass was still scanning
+        // or exporting. The archive-side drive-data.json then silently
+        // stopped updating (2026-08-26 field incident).
+        status.running = status.running || self.is_running();
+        status
+    }
+
+    /// Reserve the processor synchronously, returning false if a pass is
+    /// already running.
+    ///
+    /// The HTTP handler must claim the processor BEFORE it returns, not
+    /// inside the task it spawns: between the response and the task
+    /// actually starting, `is_running()` is still false, and a caller that
+    /// polls immediately (as the post-archive script does) would read that
+    /// as "already finished".
+    pub fn try_reserve(&self) -> bool {
+        !self.running.swap(true, Ordering::SeqCst)
+    }
+
+    /// Run a new-clip pass using a reservation already taken by
+    /// [`try_reserve`]. Always releases the reservation, including on the
+    /// error path, so a failure cannot wedge the processor.
+    pub async fn process_new_reserved(&self) -> Result<()> {
+        let result = self.do_process(false).await;
+        self.running.store(false, Ordering::SeqCst);
+        result
     }
 
     /// Start processing new (unprocessed) clip files.
@@ -1083,4 +1114,68 @@ mod tests {
         assert!(!is_event_folder("savedclips"));
         assert!(!is_event_folder("SAVEDCLIPS"));
     }
+
+    // -- archive-unmount race regression (2026-08-26 field incident) -------
+    //
+    // post-archive-process.sh polls /api/drives/status and treats the first
+    // `"running": false` as completion; archiveloop then force-lazy unmounts
+    // /mnt/archive. If the status can read false while a pass is live, the
+    // share is pulled out from under the running export and the archive-side
+    // drive-data.json silently stops updating.
+
+    /// A reservation must be visible through get_status() IMMEDIATELY —
+    /// before any scanning work sets the status struct's own late flag.
+    /// This is the window the HTTP handler leaves open when it responds
+    /// "started" and lets the spawned task claim the processor later.
+    #[tokio::test]
+    async fn reserved_processor_reports_running_before_any_work() {
+        let root = tempfile::TempDir::new().unwrap();
+        let clip_dir = root.path().join("TeslaCam");
+        std::fs::create_dir_all(clip_dir.join("RecentClips")).unwrap();
+        let store = Arc::new(crate::db::DriveStore::open_memory().unwrap());
+        let processor = Processor::with_clip_dir_for_test(
+            store.clone(),
+            clip_dir.to_string_lossy().to_string(),
+        );
+
+        assert!(!processor.get_status().await.running, "idle before reserving");
+
+        assert!(processor.try_reserve(), "first reservation must succeed");
+        assert!(
+            processor.get_status().await.running,
+            "a reserved processor must report running even though no pass has              started and the status struct's own flag is still false"
+        );
+
+        // A second claim is refused while the first is outstanding.
+        assert!(!processor.try_reserve(), "double reservation must be refused");
+
+        processor.process_new_reserved().await.unwrap();
+        assert!(
+            !processor.get_status().await.running,
+            "the reservation must clear once the pass completes"
+        );
+    }
+
+    /// The reservation must be released even when the pass errors, or the
+    /// processor would wedge and every later request would 409 forever.
+    #[tokio::test]
+    async fn reservation_clears_even_when_the_pass_fails() {
+        let root = tempfile::TempDir::new().unwrap();
+        // No clip dir at all -> do_process hits a missing directory.
+        let clip_dir = root.path().join("nonexistent");
+        let store = Arc::new(crate::db::DriveStore::open_memory().unwrap());
+        let processor = Processor::with_clip_dir_for_test(
+            store.clone(),
+            clip_dir.to_string_lossy().to_string(),
+        );
+
+        assert!(processor.try_reserve());
+        let _ = processor.process_new_reserved().await;
+        assert!(
+            !processor.get_status().await.running,
+            "a failed pass must still release the processor"
+        );
+        assert!(processor.try_reserve(), "processor must be claimable again");
+    }
+
 }
