@@ -26,6 +26,7 @@ fn mark_mutable_dirty(conn: &Connection, kind: &str, key: &str) -> rusqlite::Res
         params![kind, key, now_ms],
     )
 }
+use crate::archive_mount_lock;
 use tracing::{debug, info, warn};
 
 use crate::aggregate::compute_route_aggregates;
@@ -1879,9 +1880,24 @@ impl DriveStore {
     /// routes mapped while away from the archive (snapshotloop with
     /// DRIVE_MAP_WHILE_AWAY) are shipped on the next mounted cycle.
     pub fn sync_to_archive(&self) -> Result<()> {
-        // Strict mount-point test, not a substring scan of /proc/mounts.
-        // This is only the cheap early-out; sync_to_path re-checks around
-        // the copy itself, which is where the real race lives.
+        // Take OWNERSHIP of the mount for the whole transaction, not just a
+        // check. archiveloop and the backup API already coordinate through
+        // this flock; without joining it, before/after mount tests are pure
+        // TOCTOU — the share can be unmounted after the first check and
+        // remounted before the second, so the copy lands underneath the
+        // mount while both checks pass and the baselines advance against a
+        // NAS that never received the bytes.
+        //
+        // Held across the mount test, the export, the copy and the cache
+        // and archive_sync_* updates. A timeout is an error, not a skip:
+        // returning Err leaves every baseline untouched so the next cycle
+        // retries, which is the safe direction.
+        let _mount_guard = archive_mount_lock::acquire(std::time::Duration::from_secs(60))
+            .map_err(|e| {
+                anyhow::anyhow!("could not take the archive mount lock for drive-data sync: {e}")
+            })?;
+
+        // Cheap early-out once we own the mount.
         if !is_mount_point(ARCHIVE_MOUNT) {
             debug!("[drives] {} not mounted; skipping archive sync", ARCHIVE_MOUNT);
             return Ok(());
@@ -4112,9 +4128,16 @@ fn sync_to_path(
     // the archive is current.
     if let Some(mount) = mount_guard {
         if !is_mount_point(mount) {
-            let _ = std::fs::remove_file(dst);
+            // Deliberately do NOT unlink dst here. Once the mount is gone
+            // the pathname is ambiguous: if anything remounted the share
+            // between this check and the unlink, we would delete the real
+            // NAS copy — turning a stale backup into no backup at all.
+            // Leaving the stray file costs a little local disk and is
+            // cleaned up by the operator; deleting the wrong one is not
+            // recoverable. Baselines stay untouched either way, so the
+            // next cycle retries.
             anyhow::bail!(
-                "sync_to_path: {} disappeared during the copy — discarded the write and left                  the sync baselines untouched so the next cycle retries",
+                "sync_to_path: {} was not mounted for the whole copy — not recording a                  successful sync; the next cycle will retry",
                 mount
             );
         }

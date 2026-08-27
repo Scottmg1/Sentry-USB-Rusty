@@ -1161,8 +1161,11 @@ mod tests {
     #[tokio::test]
     async fn reservation_clears_even_when_the_pass_fails() {
         let root = tempfile::TempDir::new().unwrap();
-        // No clip dir at all -> do_process hits a missing directory.
-        let clip_dir = root.path().join("nonexistent");
+        // A REGULAR FILE where the clip directory should be: a merely
+        // missing directory returns Ok(()), so it would not exercise the
+        // error path at all.
+        let clip_dir = root.path().join("not-a-directory");
+        std::fs::write(&clip_dir, b"x").unwrap();
         let store = Arc::new(crate::db::DriveStore::open_memory().unwrap());
         let processor = Processor::with_clip_dir_for_test(
             store.clone(),
@@ -1170,7 +1173,8 @@ mod tests {
         );
 
         assert!(processor.try_reserve());
-        let _ = processor.process_new_reserved().await;
+        let result = processor.process_new_reserved().await;
+        assert!(result.is_err(), "the pass must actually fail for this test to mean anything");
         assert!(
             !processor.get_status().await.running,
             "a failed pass must still release the processor"

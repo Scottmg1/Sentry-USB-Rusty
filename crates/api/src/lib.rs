@@ -15,7 +15,10 @@ pub mod travel_mode;
 pub mod notifications;
 pub mod notification_center;
 pub mod setup;
-pub mod archive_mount_lock;
+/// Moved into `sentryusb-drives` so the drive-data archive sync can take
+/// the same ownership lock as archiveloop and the backup API. Re-exported
+/// here so existing call sites keep working.
+pub use sentryusb_drives::archive_mount_lock;
 pub mod backup;
 pub mod update;
 pub mod support;

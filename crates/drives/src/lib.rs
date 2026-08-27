@@ -1,3 +1,4 @@
+pub mod archive_mount_lock;
 pub mod aggregate;
 pub mod aggregate_telemetry;
 pub mod backfill;
