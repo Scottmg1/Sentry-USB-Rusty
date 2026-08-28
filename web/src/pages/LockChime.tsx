@@ -782,61 +782,65 @@ function MyLibraryTab({ volume }: { volume: number }) {
                         <p className="text-xs text-slate-500">{formatSize(sound.size)}</p>
                       </div>
 
-                      {isActive && !lockNeedsReapply && (
-                        <span className="shrink-0 flex items-center gap-1 rounded-full bg-violet-500/20 px-2 py-0.5 text-xs font-medium text-violet-300">
-                          <CheckCircleIcon className="h-3 w-3" />
-                          Lock
-                        </span>
-                      )}
+                      <div className="flex w-[4.75rem] shrink-0 justify-center">
+                        {isActive && !lockNeedsReapply && (
+                          <span className="flex shrink-0 items-center gap-1 rounded-full bg-violet-500/20 px-2 py-0.5 text-xs font-medium text-violet-300">
+                            <CheckCircleIcon className="h-3 w-3" />
+                            Lock
+                          </span>
+                        )}
 
-                      {isAssActive && !assNeedsReapply && (
-                        <span className="shrink-0 flex items-center gap-1 rounded-full bg-emerald-500/20 px-2 py-0.5 text-xs font-medium text-emerald-300">
-                          <CheckCircleIcon className="h-3 w-3" />
-                          ASS
-                        </span>
-                      )}
+                        {lockNeedsReapply && (
+                          <button
+                            onClick={() => handleActivate(sound.name, "lock")}
+                            disabled={savingVolume || isActivatingLock || isDeleting}
+                            className="flex shrink-0 items-center gap-1 rounded-lg border border-amber-500/40 px-3 py-1.5 text-xs font-medium text-amber-300 transition-colors hover:bg-amber-500/10 disabled:opacity-50"
+                          >
+                            <WarningIcon className="h-3 w-3" />
+                            {isActivatingLock ? "Applying..." : "Apply Lock"}
+                          </button>
+                        )}
 
-                      {lockNeedsReapply && (
-                        <button
-                          onClick={() => handleActivate(sound.name, "lock")}
-                          disabled={savingVolume || isActivatingLock || isDeleting}
-                          className="shrink-0 flex items-center gap-1 rounded-lg border border-amber-500/40 px-3 py-1.5 text-xs font-medium text-amber-300 transition-colors hover:bg-amber-500/10 disabled:opacity-50"
-                        >
-                          <WarningIcon className="h-3 w-3" />
-                          {isActivatingLock ? "Applying..." : "Apply Lock"}
-                        </button>
-                      )}
+                        {!isActive && (
+                          <button
+                            onClick={() => handleActivate(sound.name, "lock")}
+                            disabled={isActivatingLock || isDeleting}
+                            className="shrink-0 rounded-lg border border-white/10 px-3 py-1.5 text-xs text-slate-400 transition-colors hover:border-violet-500/40 hover:text-violet-300 disabled:opacity-50"
+                          >
+                            {isActivatingLock ? "Setting..." : "Set Lock"}
+                          </button>
+                        )}
+                      </div>
 
-                      {assNeedsReapply && (
-                        <button
-                          onClick={() => handleActivate(sound.name, "summon")}
-                          disabled={savingVolume || isActivatingAss || isDeleting}
-                          className="shrink-0 flex items-center gap-1 rounded-lg border border-amber-500/40 px-3 py-1.5 text-xs font-medium text-amber-300 transition-colors hover:bg-amber-500/10 disabled:opacity-50"
-                        >
-                          <WarningIcon className="h-3 w-3" />
-                          {isActivatingAss ? "Applying..." : "Apply ASS"}
-                        </button>
-                      )}
+                      <div className="flex w-[4.75rem] shrink-0 justify-center">
+                        {isAssActive && !assNeedsReapply && (
+                          <span className="flex shrink-0 items-center gap-1 rounded-full bg-emerald-500/20 px-2 py-0.5 text-xs font-medium text-emerald-300">
+                            <CheckCircleIcon className="h-3 w-3" />
+                            ASS
+                          </span>
+                        )}
 
-                      {!isActive && (
-                        <button
-                          onClick={() => handleActivate(sound.name, "lock")}
-                          disabled={isActivatingLock || isDeleting}
-                          className="shrink-0 rounded-lg border border-white/10 px-3 py-1.5 text-xs text-slate-400 transition-colors hover:border-violet-500/40 hover:text-violet-300 disabled:opacity-50"
-                        >
-                          {isActivatingLock ? "Setting..." : "Set Lock"}
-                        </button>
-                      )}
+                        {assNeedsReapply && (
+                          <button
+                            onClick={() => handleActivate(sound.name, "summon")}
+                            disabled={savingVolume || isActivatingAss || isDeleting}
+                            className="flex shrink-0 items-center gap-1 rounded-lg border border-amber-500/40 px-3 py-1.5 text-xs font-medium text-amber-300 transition-colors hover:bg-amber-500/10 disabled:opacity-50"
+                          >
+                            <WarningIcon className="h-3 w-3" />
+                            {isActivatingAss ? "Applying..." : "Apply ASS"}
+                          </button>
+                        )}
 
-                      {!isAssActive && (
-                        <button
-                          onClick={() => handleActivate(sound.name, "summon")}
-                          disabled={isActivatingAss || isDeleting}
-                          className="shrink-0 rounded-lg border border-white/10 px-3 py-1.5 text-xs text-slate-400 transition-colors hover:border-emerald-500/40 hover:text-emerald-300 disabled:opacity-50"
-                        >
-                          {isActivatingAss ? "Setting..." : "Set ASS"}
-                        </button>
-                      )}
+                        {!isAssActive && (
+                          <button
+                            onClick={() => handleActivate(sound.name, "summon")}
+                            disabled={isActivatingAss || isDeleting}
+                            className="shrink-0 rounded-lg border border-white/10 px-3 py-1.5 text-xs text-slate-400 transition-colors hover:border-emerald-500/40 hover:text-emerald-300 disabled:opacity-50"
+                          >
+                            {isActivatingAss ? "Setting..." : "Set ASS"}
+                          </button>
+                        )}
+                      </div>
 
                       <button
                         onClick={() => setVolumeOpen(volumeOpen === sound.name ? null : sound.name)}
