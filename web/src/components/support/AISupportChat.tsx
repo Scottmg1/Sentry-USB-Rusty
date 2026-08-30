@@ -897,7 +897,7 @@ function FileConsentCard({
         </div>
       </div>
       <dl className="grid gap-x-3 gap-y-1 border-y border-white/[0.06] bg-black/10 px-3 py-2 text-[10px] sm:grid-cols-[100px_1fr]">
-        <dt className="text-slate-500">File</dt><dd className="break-all text-slate-300">{request.fileName} · includes recent archiveloop.log · max {formatBytes(Math.min(request.maxBytes, LOCAL_DIAGNOSTIC_HARD_LIMIT))}</dd>
+        <dt className="text-slate-500">File</dt><dd className="break-all text-slate-300">{request.fileName} · includes BLE telemetry and recent archiveloop.log · max {formatBytes(Math.min(request.maxBytes, LOCAL_DIAGNOSTIC_HARD_LIMIT))}</dd>
         <dt className="text-slate-500">Destination</dt><dd className="text-slate-300">api.sentry-six.com · Sentry Six support servers</dd>
         <dt className="text-slate-500">AI processing</dt><dd className="text-slate-300">May be processed by Ollama Cloud for this answer</dd>
         <dt className="text-slate-500">Retention</dt><dd className="text-slate-300">Deleted within 7 days</dd>
