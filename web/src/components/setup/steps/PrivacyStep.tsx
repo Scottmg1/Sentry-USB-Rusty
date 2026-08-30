@@ -84,7 +84,7 @@ export function PrivacyStep(_props: StepProps) {
           />
           <FlowRow
             when="When you use AI Support & Help"
-            what="Messages, product/software version, the Pi connection's public IP for abuse prevention + only diagnostics you explicitly approve"
+            what="Messages, product/software version, SBC model, selected non-secret support settings, the Pi connection's public IP for abuse prevention + only diagnostics you explicitly approve"
             why="Generate product-specific troubleshooting help"
             note="Online AI: messages are processed by Ollama Cloud and stored redacted on Sentry Six servers for up to 90 days after the last activity; maintainers may review them. Approved diagnostics are retained for 7 days."
           />

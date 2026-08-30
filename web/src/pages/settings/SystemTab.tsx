@@ -311,7 +311,7 @@ function PrivacyCards() {
           />
           <FlowRow
             when="AI Support & Help (when used)"
-            what="Messages, product/software version, the Pi connection's public IP for abuse prevention + diagnostics you explicitly approve"
+            what="Messages, product/software version, SBC model, selected non-secret support settings, the Pi connection's public IP for abuse prevention + diagnostics you explicitly approve"
             note="Ollama Cloud processes messages. Redacted chats stay on Sentry Six servers up to 90 days after the last activity and may be reviewed; approved diagnostics stay 7 days."
           />
           <FlowRow

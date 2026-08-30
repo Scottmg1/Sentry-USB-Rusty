@@ -33,9 +33,13 @@ const MODE_OPTIONS: { value: AwayModeKind; label: string }[] = [
 interface Props {
   /** Re-launches the Setup Wizard so the user can configure the AP. */
   onOpenWizard?: () => void
+  /** Opens the otherwise hidden Travel Mode dialog for a reviewed support deep-link. */
+  openTravelMode?: boolean
+  /** Consumes the support deep-link after the user closes the dialog. */
+  onTravelModeClose?: () => void
 }
 
-export function AwayModeControl({ onOpenWizard }: Props = {}) {
+export function AwayModeControl({ onOpenWizard, openTravelMode = false, onTravelModeClose }: Props = {}) {
   const { status, enable, disable, setMode, config, updateConfig, saveError, useCurrentLocation } = useAwayMode()
   // Avoid a disabled-state flash before the first compatible response.
   const apConfigured = status.ap_configured !== false
@@ -48,7 +52,7 @@ export function AwayModeControl({ onOpenWizard }: Props = {}) {
   const [confirmOpen, setConfirmOpen] = useState(false)
   const [enablingBle, setEnablingBle] = useState(false)
   // Five icon taps open Travel Mode.
-  const [secretOpen, setSecretOpen] = useState(false)
+  const [secretOpen, setSecretOpen] = useState(openTravelMode)
   const [travelOn, setTravelOn] = useState(false)
   const tapCount = useRef(0)
   const tapTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
@@ -432,7 +436,10 @@ export function AwayModeControl({ onOpenWizard }: Props = {}) {
 
       {secretOpen && (
         <TravelModeDialog
-          onClose={() => setSecretOpen(false)}
+          onClose={() => {
+            setSecretOpen(false)
+            onTravelModeClose?.()
+          }}
           onChange={setTravelOn}
         />
       )}

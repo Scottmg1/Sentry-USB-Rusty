@@ -143,9 +143,12 @@ device-derived identifier ever leaves your Pi.
   onward connection to the public API uses HTTPS.
 - **Sent when you start a conversation:** The text you enter, a random
   conversation/request identifier, the displayed disclosure version,
-  the installed Sentry USB software version, and the fixed product ID
-  `sentry-usb-rusty`. The Pi does **not** send a hardware fingerprint,
-  Pi login credential, or knowledge for Dash USB or another product.
+  the installed Sentry USB software version, SBC model, a bounded non-secret
+  support snapshot, and the fixed product ID `sentry-usb-rusty`. The snapshot
+  contains Dashcam Size, Travel Mode flags, archive category toggles, and
+  whether Wraps and Lock Chimes are enabled. The Pi does **not** send archive
+  destinations, network names, usernames, passwords, tokens, a hardware
+  fingerprint, Pi login credential, or knowledge for another product.
 - **AI processing:** Relevant conversation content is processed by
   Ollama Cloud to generate a response. Ollama states that Cloud prompts
   and responses are processed transiently, are not retained beyond the

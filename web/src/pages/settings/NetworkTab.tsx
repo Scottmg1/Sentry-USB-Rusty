@@ -14,9 +14,11 @@ interface Props {
   /** Forwarded to AwayModeControl so its disabled-state CTA can re-launch
    *  the Setup Wizard. */
   onOpenWizard?: () => void
+  openTravelMode?: boolean
+  onTravelModeClose?: () => void
 }
 
-export function NetworkTab({ status, onOpenWizard }: Props) {
+export function NetworkTab({ status, onOpenWizard, openTravelMode, onTravelModeClose }: Props) {
   const wifiConnected = !!status?.wifi_ssid
   const ethConnected =
     !!status?.ether_speed && status.ether_speed !== "Unknown!"
@@ -89,7 +91,11 @@ export function NetworkTab({ status, onOpenWizard }: Props) {
 
       {/* Remote access */}
       <SectionErrorBoundary>
-        <AwayModeControl onOpenWizard={onOpenWizard} />
+        <AwayModeControl
+          onOpenWizard={onOpenWizard}
+          openTravelMode={openTravelMode}
+          onTravelModeClose={onTravelModeClose}
+        />
       </SectionErrorBoundary>
       <SectionErrorBoundary>
         <CloudPairingSection />

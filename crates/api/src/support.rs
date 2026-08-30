@@ -23,7 +23,7 @@ use crate::router::AppState;
 
 const SUPPORT_API: &str = "https://api.sentry-six.com";
 const AI_PRODUCT_ID: &str = "sentry-usb-rusty";
-const AI_DISCLOSURE_VERSION: &str = "rusty-ai-support-2026-08-30";
+const AI_DISCLOSURE_VERSION: &str = "rusty-ai-support-2026-08-30-device-context";
 const AI_FILE_CONSENT_VERSION: &str = "diagnostic-upload-v1";
 const AI_MAX_MESSAGE_CHARS: usize = 5_000;
 const AI_MAX_RESPONSE_BYTES: usize = 1024 * 1024;
@@ -49,6 +49,90 @@ fn installed_client_version() -> String {
     } else {
         UNKNOWN_VERSION.to_string()
     }
+}
+
+fn config_flag(
+    active: &sentryusb_config::SetupConfig,
+    commented: &sentryusb_config::SetupConfig,
+    key: &str,
+    default: bool,
+) -> bool {
+    sentryusb_config::get_config_value(active, commented, key)
+        .map(|value| matches!(value.trim().to_ascii_lowercase().as_str(), "yes" | "true" | "1"))
+        .unwrap_or(default)
+}
+
+fn dashcam_size_gb(
+    active: &sentryusb_config::SetupConfig,
+    commented: &sentryusb_config::SetupConfig,
+) -> Option<f64> {
+    let raw = sentryusb_config::get_config_value(active, commented, "CAM_SIZE")?;
+    let normalized = raw.trim().to_ascii_uppercase();
+    let number = normalized
+        .strip_suffix("GB")
+        .or_else(|| normalized.strip_suffix('G'))
+        .unwrap_or(&normalized)
+        .trim()
+        .parse::<f64>()
+        .ok()?;
+    (number.is_finite() && (0.0..=4096.0).contains(&number)).then_some(number)
+}
+
+fn preference_enabled(
+    prefs: &serde_json::Map<String, serde_json::Value>,
+    key: &str,
+) -> bool {
+    match prefs.get(key) {
+        Some(serde_json::Value::Bool(value)) => *value,
+        Some(serde_json::Value::String(value)) => !matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "disabled" | "false" | "0" | "no"
+        ),
+        _ => true,
+    }
+}
+
+fn safe_device_context_from(
+    active: &sentryusb_config::SetupConfig,
+    commented: &sentryusb_config::SetupConfig,
+    prefs: &serde_json::Map<String, serde_json::Value>,
+    board_model: &str,
+) -> serde_json::Value {
+    let clean_board: String = board_model
+        .chars()
+        .filter(|character| !character.is_control())
+        .take(128)
+        .collect();
+    serde_json::json!({
+        "boardModel": if clean_board.trim().is_empty() { "unknown" } else { clean_board.trim() },
+        "dashcamSizeGb": dashcam_size_gb(active, commented),
+        "travelMode": {
+            "enabled": config_flag(active, commented, "TRAVEL_MODE_ENABLED", false),
+            "halfSnapshots": config_flag(active, commented, "TRAVEL_MODE_HALF_SNAPSHOTS", false),
+            "fastRetry": config_flag(active, commented, "TRAVEL_MODE_FAST_RETRY", false),
+        },
+        "archive": {
+            "savedClips": config_flag(active, commented, "ARCHIVE_SAVEDCLIPS", true),
+            "sentryClips": config_flag(active, commented, "ARCHIVE_SENTRYCLIPS", true),
+            "recentClips": config_flag(active, commented, "ARCHIVE_RECENTCLIPS", true),
+            "trackModeClips": config_flag(active, commented, "ARCHIVE_TRACKMODECLIPS", true),
+        },
+        "community": {
+            "wrapsEnabled": preference_enabled(prefs, "community_wraps_enabled"),
+            "lockChimesEnabled": preference_enabled(prefs, "community_chimes_enabled"),
+        },
+    })
+}
+
+fn safe_device_context() -> serde_json::Value {
+    let (active, commented) = sentryusb_config::parse_file(sentryusb_config::find_config_path())
+        .unwrap_or_default();
+    safe_device_context_from(
+        &active,
+        &commented,
+        &crate::preferences::load_prefs(),
+        &crate::status::get_sbc_model(),
+    )
 }
 
 fn ai_http_client() -> &'static reqwest::Client {
@@ -429,6 +513,7 @@ fn normalize_ai_json(raw: &[u8], kind: AiJsonKind) -> Result<Vec<u8>, Response> 
                 "clientVersion".into(),
                 serde_json::Value::String(installed_client_version()),
             );
+            normalized.insert("deviceContext".into(), safe_device_context());
         }
         AiJsonKind::Message => {
             let content = required_string(object, "content")?;
@@ -735,7 +820,7 @@ mod tests {
     use super::{
         AI_DISCLOSURE_VERSION, AI_PRODUCT_ID, AiJsonKind, forward_ai_headers,
         installed_client_version, is_trusted_local_host, is_uuid, normalize_ai_json,
-        validate_ai_browser_request,
+        safe_device_context_from, validate_ai_browser_request,
     };
     use axum::http::{HeaderMap, HeaderValue};
 
@@ -785,7 +870,7 @@ mod tests {
             "message":"help",
             "clientMessageId":"client-018f42a0-7f52-7b3c-9a11-0123456789ab",
             "disclosureAccepted":true,
-            "disclosureVersion":"rusty-ai-support-2026-08-30",
+            "disclosureVersion":"rusty-ai-support-2026-08-30-device-context",
             "productId":"dash-usb",
             "product_id":"sentry-usb",
             "productSlug":"other-product"
@@ -796,6 +881,7 @@ mod tests {
             serde_json::from_slice(&normalized).expect("normalized JSON");
         assert_eq!(value["productId"], AI_PRODUCT_ID);
         assert_eq!(value["clientVersion"], installed_client_version());
+        assert!(value["deviceContext"].is_object());
         assert!(value.get("product_id").is_none());
         assert!(value.get("productSlug").is_none());
     }
@@ -806,7 +892,7 @@ mod tests {
             "message":"help",
             "clientMessageId":"client-018f42a0-7f52-7b3c-9a11-0123456789ab",
             "disclosureAccepted":true,
-            "disclosureVersion":"rusty-ai-support-2026-08-30",
+            "disclosureVersion":"rusty-ai-support-2026-08-30-device-context",
             "clientVersion":"v999.0.0"
         }"#;
         assert!(normalize_ai_json(raw, AiJsonKind::CreateConversation).is_err());
@@ -818,6 +904,31 @@ mod tests {
         assert!(WEB_SUPPORT_SOURCE.contains(&format!(
             "SUPPORT_DISCLOSURE_VERSION = \"{AI_DISCLOSURE_VERSION}\""
         )));
+    }
+
+    #[test]
+    fn safe_context_exposes_only_bounded_non_secret_support_fields() {
+        let active = sentryusb_config::SetupConfig::from([
+            ("CAM_SIZE".to_string(), "48".to_string()),
+            ("ARCHIVE_RECENTCLIPS".to_string(), "false".to_string()),
+            ("TRAVEL_MODE_ENABLED".to_string(), "yes".to_string()),
+            ("ARCHIVE_SERVER".to_string(), "private-nas.local".to_string()),
+            ("SHARE_PASSWORD".to_string(), "secret".to_string()),
+        ]);
+        let commented = sentryusb_config::SetupConfig::new();
+        let prefs = serde_json::Map::from_iter([
+            ("community_wraps_enabled".to_string(), serde_json::json!("enabled")),
+            ("community_chimes_enabled".to_string(), serde_json::json!("disabled")),
+        ]);
+        let context = safe_device_context_from(&active, &commented, &prefs, "Orange Pi Example\0");
+        assert_eq!(context["boardModel"], "Orange Pi Example");
+        assert_eq!(context["dashcamSizeGb"], 48.0);
+        assert_eq!(context["travelMode"]["enabled"], true);
+        assert_eq!(context["archive"]["recentClips"], false);
+        assert_eq!(context["community"]["lockChimesEnabled"], false);
+        let serialized = context.to_string();
+        assert!(!serialized.contains("private-nas"));
+        assert!(!serialized.contains("secret"));
     }
 
     #[test]

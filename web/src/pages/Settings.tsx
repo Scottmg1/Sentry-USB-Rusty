@@ -73,6 +73,7 @@ export default function Settings() {
   >(undefined)
   const [wizardInitialStep, setWizardInitialStep] = useState<string | undefined>(undefined)
   const handledWizardDeepLink = useRef<string | null>(null)
+  const travelModeDeepLink = params.get("travel") === "1"
   const [rawConfigOpen, setRawConfigOpen] = useState(false)
   const [rawConfig, setRawConfig] = useState<Record<string, RawConfigEntry> | null>(null)
   const [healthOpen, setHealthOpen] = useState(false)
@@ -217,6 +218,12 @@ export default function Settings() {
     setParams(next, { replace: true })
   }, [requestedWizardStep, params, setParams])
 
+  function handleTravelModeClose() {
+    const next = new URLSearchParams(params)
+    next.delete("travel")
+    setParams(next, { replace: true })
+  }
+
   const actions: ActionChipProps[] = [
     {
       icon: CachedIcon,
@@ -280,7 +287,12 @@ export default function Settings() {
       <Suspense fallback={<TabFallback />}>
         {activeTab === "Device" && <DeviceTab onOpenWizard={() => { void handleOpenWizard() }} />}
         {activeTab === "Car & Network" && (
-          <NetworkTab status={status} onOpenWizard={() => { void handleOpenWizard() }} />
+          <NetworkTab
+            status={status}
+            onOpenWizard={() => { void handleOpenWizard() }}
+            openTravelMode={travelModeDeepLink}
+            onTravelModeClose={handleTravelModeClose}
+          />
         )}
         {activeTab === "Notifications & Community" && <NotificationsTab />}
         {activeTab === "System" && (

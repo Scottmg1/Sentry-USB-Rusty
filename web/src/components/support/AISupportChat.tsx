@@ -89,6 +89,7 @@ const LOCAL_UI_ACTIONS: Record<string, {
   "open-safety-score": { kind: "navigate", label: "Open Safety Score", path: "/safety" },
   "open-fsd-analytics": { kind: "navigate", label: "Open FSD Analytics", path: "/fsd" },
   "open-community": { kind: "navigate", label: "Open Community", path: "/community" },
+  "open-lock-chimes": { kind: "navigate", label: "Open Lock Chimes", path: "/community?view=chimes" },
   "open-notifications": { kind: "navigate", label: "Open Notifications", path: "/notifications" },
   "open-terminal": { kind: "navigate", label: "Open Terminal", path: "/terminal" },
   "open-archiveloop-log": {
@@ -106,6 +107,9 @@ const LOCAL_UI_ACTIONS: Record<string, {
   },
   "open-car-network-settings": {
     kind: "navigate", label: "Open Car & Network settings", path: "/settings?tab=Car+%26+Network",
+  },
+  "open-travel-mode": {
+    kind: "navigate", label: "Open Travel Mode", path: "/settings?tab=Car+%26+Network&travel=1",
   },
   "open-notifications-settings": {
     kind: "navigate", label: "Open Notifications & Community", path: "/settings?tab=Notifications+%26+Community",
@@ -866,7 +870,7 @@ function DisclosureGate({ onAcknowledge }: { onAcknowledge: () => void }) {
         </span>
         <h2 className="mt-3 text-base font-semibold text-slate-100">Before you chat</h2>
         <p className="mt-2 text-xs leading-relaxed text-slate-400">
-          This is an online AI assistant. Messages, product/version context, and the Pi connection's public IP for abuse prevention are sent to Sentry Six; relevant content is processed by Ollama Cloud. Redacted chats may be kept for up to 90 days after the last activity and reviewed by authorized maintainers.
+          This is an online AI assistant. Messages, product/version context, SBC model, selected non-secret support settings, and the Pi connection's public IP for abuse prevention are sent to Sentry Six; relevant content is processed by Ollama Cloud. The support settings are limited to Dashcam Size, Travel Mode flags, archive category toggles, and whether Wraps and Lock Chimes are enabled. Redacted chats may be kept for up to 90 days after the last activity and reviewed by authorized maintainers.
         </p>
         <p className="mt-2 text-xs leading-relaxed text-slate-500">
           AI can be wrong and cannot approve refunds or commitments. Do not share secrets, and use a trusted local network because your browser may connect to the Pi over HTTP.
