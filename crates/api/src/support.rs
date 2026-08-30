@@ -23,7 +23,7 @@ use crate::router::AppState;
 
 const SUPPORT_API: &str = "https://api.sentry-six.com";
 const AI_PRODUCT_ID: &str = "sentry-usb-rusty";
-const AI_DISCLOSURE_VERSION: &str = "rusty-ai-support-2026-08-06";
+const AI_DISCLOSURE_VERSION: &str = "rusty-ai-support-2026-08-30";
 const AI_FILE_CONSENT_VERSION: &str = "diagnostic-upload-v1";
 const AI_MAX_MESSAGE_CHARS: usize = 5_000;
 const AI_MAX_RESPONSE_BYTES: usize = 1024 * 1024;
@@ -733,8 +733,9 @@ pub async fn upload_ai_file(
 #[cfg(test)]
 mod tests {
     use super::{
-        AI_PRODUCT_ID, AiJsonKind, forward_ai_headers, installed_client_version,
-        is_trusted_local_host, is_uuid, normalize_ai_json, validate_ai_browser_request,
+        AI_DISCLOSURE_VERSION, AI_PRODUCT_ID, AiJsonKind, forward_ai_headers,
+        installed_client_version, is_trusted_local_host, is_uuid, normalize_ai_json,
+        validate_ai_browser_request,
     };
     use axum::http::{HeaderMap, HeaderValue};
 
@@ -784,7 +785,7 @@ mod tests {
             "message":"help",
             "clientMessageId":"client-018f42a0-7f52-7b3c-9a11-0123456789ab",
             "disclosureAccepted":true,
-            "disclosureVersion":"rusty-ai-support-2026-08-06",
+            "disclosureVersion":"rusty-ai-support-2026-08-30",
             "productId":"dash-usb",
             "product_id":"sentry-usb",
             "productSlug":"other-product"
@@ -805,10 +806,18 @@ mod tests {
             "message":"help",
             "clientMessageId":"client-018f42a0-7f52-7b3c-9a11-0123456789ab",
             "disclosureAccepted":true,
-            "disclosureVersion":"rusty-ai-support-2026-08-06",
+            "disclosureVersion":"rusty-ai-support-2026-08-30",
             "clientVersion":"v999.0.0"
         }"#;
         assert!(normalize_ai_json(raw, AiJsonKind::CreateConversation).is_err());
+    }
+
+    #[test]
+    fn web_and_pi_proxy_require_the_same_disclosure_version() {
+        const WEB_SUPPORT_SOURCE: &str = include_str!("../../../web/src/api/support.ts");
+        assert!(WEB_SUPPORT_SOURCE.contains(&format!(
+            "SUPPORT_DISCLOSURE_VERSION = \"{AI_DISCLOSURE_VERSION}\""
+        )));
     }
 
     #[test]
