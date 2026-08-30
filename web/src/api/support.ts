@@ -1,4 +1,4 @@
-export const SUPPORT_DISCLOSURE_VERSION = "rusty-ai-support-2026-08-06"
+export const SUPPORT_DISCLOSURE_VERSION = "rusty-ai-support-2026-08-30"
 export const DIAGNOSTIC_CONSENT_VERSION = "diagnostic-upload-v1"
 
 const SUPPORT_API = "/api/support/ai"
@@ -16,8 +16,15 @@ export interface SupportFileRequest {
   retentionDays: number
 }
 
+export interface SupportUiAction {
+  id: string
+  kind: "navigate" | "setting" | "operation"
+  label: string
+}
+
 export interface SupportMessageActions {
   fileRequests?: SupportFileRequest[]
+  uiActions?: SupportUiAction[]
   suggestDiscord?: boolean
 }
 

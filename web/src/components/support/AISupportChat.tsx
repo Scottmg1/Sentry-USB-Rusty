@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react"
+import { useNavigate } from "react-router-dom"
 import {
   CachedIcon,
   CheckIcon,
@@ -28,6 +29,7 @@ import type {
   SupportFileRequest,
   SupportMessage,
   SupportTransport,
+  SupportUiAction,
 } from "@/api/support"
 
 const DISCORD_URL = "https://discord.gg/9QZEzVwdnt"
@@ -63,6 +65,136 @@ interface FileDecisionViewState {
   phase: FileDecisionPhase
   detail?: string
   retryDecision?: "approved" | "denied"
+}
+
+type UiActionViewState = {
+  phase: "idle" | "working" | "success" | "error"
+  detail?: string
+  requiresReboot?: boolean
+}
+
+const LOCAL_UI_ACTIONS: Record<string, {
+  kind: "navigate" | "setting" | "operation"
+  label: string
+  path?: string
+  endpoint?: string
+  confirmation?: string
+}> = {
+  "open-dashboard": { kind: "navigate", label: "Open Dashboard", path: "/" },
+  "open-viewer": { kind: "navigate", label: "Open Viewer", path: "/viewer" },
+  "open-files": { kind: "navigate", label: "Open Files", path: "/files" },
+  "open-snapshots": { kind: "navigate", label: "Open Snapshots", path: "/snapshots" },
+  "open-drives": { kind: "navigate", label: "Open Drives", path: "/drives" },
+  "open-charging": { kind: "navigate", label: "Open Charging", path: "/charging" },
+  "open-safety-score": { kind: "navigate", label: "Open Safety Score", path: "/safety" },
+  "open-fsd-analytics": { kind: "navigate", label: "Open FSD Analytics", path: "/fsd" },
+  "open-community": { kind: "navigate", label: "Open Community", path: "/community" },
+  "open-notifications": { kind: "navigate", label: "Open Notifications", path: "/notifications" },
+  "open-terminal": { kind: "navigate", label: "Open Terminal", path: "/terminal" },
+  "open-archiveloop-log": {
+    kind: "navigate", label: "Open Archiveloop log", path: "/logs?tab=archiveloop",
+  },
+  "open-bluetooth-log": {
+    kind: "navigate", label: "Open Bluetooth log", path: "/logs?tab=bluetooth",
+  },
+  "open-setup-log": { kind: "navigate", label: "Open Setup log", path: "/logs?tab=setup" },
+  "open-diagnostics-log": {
+    kind: "navigate", label: "Open Diagnostics", path: "/logs?tab=diagnostics",
+  },
+  "open-device-settings": {
+    kind: "navigate", label: "Open Device settings", path: "/settings?tab=Device",
+  },
+  "open-car-network-settings": {
+    kind: "navigate", label: "Open Car & Network settings", path: "/settings?tab=Car+%26+Network",
+  },
+  "open-notifications-settings": {
+    kind: "navigate", label: "Open Notifications & Community", path: "/settings?tab=Notifications+%26+Community",
+  },
+  "open-system-settings": {
+    kind: "navigate", label: "Open System settings", path: "/settings?tab=System",
+  },
+  "open-archive-settings": {
+    kind: "navigate", label: "Open Archive settings", path: "/settings?tab=System&wizard=archive",
+  },
+  "open-welcome-setup": {
+    kind: "navigate", label: "Open Setup Wizard welcome", path: "/settings?tab=System&wizard=welcome",
+  },
+  "open-privacy-setup": {
+    kind: "navigate", label: "Open Privacy setup", path: "/settings?tab=System&wizard=privacy",
+  },
+  "open-network-setup": {
+    kind: "navigate", label: "Open Network setup", path: "/settings?tab=System&wizard=network",
+  },
+  "open-storage-setup": {
+    kind: "navigate", label: "Open Storage setup", path: "/settings?tab=System&wizard=storage",
+  },
+  "open-community-setup": {
+    kind: "navigate", label: "Open Community setup", path: "/settings?tab=System&wizard=community",
+  },
+  "open-keep-awake-setup": {
+    kind: "navigate", label: "Open Keep Awake setup", path: "/settings?tab=System&wizard=keepawake",
+  },
+  "open-notifications-setup": {
+    kind: "navigate", label: "Open Notifications setup", path: "/settings?tab=System&wizard=notifications",
+  },
+  "open-security-setup": {
+    kind: "navigate", label: "Open Security setup", path: "/settings?tab=System&wizard=security",
+  },
+  "open-advanced-setup": {
+    kind: "navigate", label: "Open Advanced setup", path: "/settings?tab=System&wizard=advanced",
+  },
+  "open-review-setup": {
+    kind: "navigate", label: "Open Setup review", path: "/settings?tab=System&wizard=review",
+  },
+  "run-archive-sync": {
+    kind: "operation",
+    label: "Run Archive Sync",
+    endpoint: "/api/system/trigger-sync",
+    confirmation: "Trigger Archive Sync now? This starts a local archive cycle using your current archive configuration.",
+  },
+  "set-archive-sentry-without-recent": {
+    kind: "setting",
+    label: "Use Sentry Clips, not Recent Clips",
+    confirmation:
+      "Enable Sentry Clips archiving and disable Recent Clips archiving? Saved Clips and Track Mode will stay unchanged. The configuration will be saved locally and requires a Pi restart before the archive service uses it.",
+  },
+  "enable-archive-saved": {
+    kind: "setting", label: "Enable Saved Clips archiving",
+    confirmation: "Enable Saved Clips archiving? Other archive categories will stay unchanged. The saved configuration requires a Pi restart.",
+  },
+  "disable-archive-saved": {
+    kind: "setting", label: "Disable Saved Clips archiving",
+    confirmation: "Disable Saved Clips archiving? Other archive categories will stay unchanged. The saved configuration requires a Pi restart.",
+  },
+  "enable-archive-sentry": {
+    kind: "setting", label: "Enable Sentry Clips archiving",
+    confirmation: "Enable Sentry Clips archiving? Other archive categories will stay unchanged. The saved configuration requires a Pi restart.",
+  },
+  "disable-archive-sentry": {
+    kind: "setting", label: "Disable Sentry Clips archiving",
+    confirmation: "Disable Sentry Clips archiving? Other archive categories will stay unchanged. The saved configuration requires a Pi restart.",
+  },
+  "enable-archive-recent": {
+    kind: "setting", label: "Enable Recent Clips archiving",
+    confirmation: "Enable Recent Clips archiving? Other archive categories will stay unchanged. The saved configuration requires a Pi restart.",
+  },
+  "disable-archive-recent": {
+    kind: "setting", label: "Disable Recent Clips archiving",
+    confirmation: "Disable Recent Clips archiving? Other archive categories will stay unchanged. The saved configuration requires a Pi restart.",
+  },
+  "enable-archive-track-mode": {
+    kind: "setting", label: "Enable Track Mode archiving",
+    confirmation: "Enable Track Mode archiving? Other archive categories will stay unchanged. The saved configuration requires a Pi restart.",
+  },
+  "disable-archive-track-mode": {
+    kind: "setting", label: "Disable Track Mode archiving",
+    confirmation: "Disable Track Mode archiving? Other archive categories will stay unchanged. The saved configuration requires a Pi restart.",
+  },
+}
+
+function localUiAction(action: SupportUiAction) {
+  const local = LOCAL_UI_ACTIONS[action.id]
+  return local && local.kind === action.kind ? local : null
 }
 
 function readStoredConversation(storageKey: string | null): StoredConversationState | null {
@@ -179,6 +311,7 @@ export function AISupportChat({
   transport,
   storageKey = DEFAULT_STORAGE_KEY,
 }: AISupportChatProps) {
+  const navigate = useNavigate()
   const normalizedStorageKey = storageKey ?? null
   const [initialStored] = useState(() => readStoredConversation(normalizedStorageKey))
   const [conversation, setConversation] = useState<SupportConversation | null>(() =>
@@ -201,6 +334,7 @@ export function AISupportChat({
   )
   const [error, setError] = useState<string | null>(null)
   const [fileDecisions, setFileDecisions] = useState<Record<string, FileDecisionViewState>>({})
+  const [uiActionStates, setUiActionStates] = useState<Record<string, UiActionViewState>>({})
   const messagesEndRef = useRef<HTMLDivElement>(null)
   const pendingSendRef = useRef<{ content: string; clientMessageId: string } | null>(null)
 
@@ -392,6 +526,7 @@ export function AISupportChat({
       setConversationStatus("idle")
       setLoadingConversation(false)
       setFileDecisions({})
+      setUiActionStates({})
       pendingSendRef.current = null
       setRequiresDisclosureReset(false)
       setDisclosureAccepted(false)
@@ -413,6 +548,7 @@ export function AISupportChat({
       setConversationStatus("idle")
       setLoadingConversation(false)
       setFileDecisions({})
+      setUiActionStates({})
       pendingSendRef.current = null
       setRequiresDisclosureReset(false)
       setDisclosureAccepted(false)
@@ -425,6 +561,7 @@ export function AISupportChat({
         setConversationStatus("idle")
         setLoadingConversation(false)
         setFileDecisions({})
+        setUiActionStates({})
         pendingSendRef.current = null
         setRequiresDisclosureReset(false)
         setDisclosureAccepted(false)
@@ -446,6 +583,7 @@ export function AISupportChat({
     setConversationStatus("idle")
     setLoadingConversation(false)
     setFileDecisions({})
+    setUiActionStates({})
     pendingSendRef.current = null
     setRequiresDisclosureReset(false)
     setDisclosureAccepted(false)
@@ -537,6 +675,59 @@ export function AISupportChat({
     }
   }, [conversation, normalizedStorageKey, transport])
 
+  const handleUiAction = useCallback(async (
+    messageId: string,
+    action: SupportUiAction,
+  ) => {
+    const local = localUiAction(action)
+    const key = `${messageId}:${action.id}`
+    if (!local) {
+      setUiActionStates((current) => ({
+        ...current,
+        [key]: { phase: "error", detail: "This action is not available in this Sentry USB version." },
+      }))
+      return
+    }
+    if (local.kind === "navigate" && local.path) {
+      navigate(local.path)
+      return
+    }
+    if (!["setting", "operation"].includes(local.kind) || !local.confirmation || !window.confirm(local.confirmation)) return
+
+    setUiActionStates((current) => ({ ...current, [key]: { phase: "working" } }))
+    try {
+      const endpoint = local.kind === "setting"
+        ? `/api/support/local-actions/${encodeURIComponent(action.id)}`
+        : local.endpoint
+      if (!endpoint) throw new Error("This local action has no approved endpoint")
+      const response = await fetch(endpoint, {
+        method: "POST",
+      })
+      const data = await response.json().catch(() => null) as {
+        summary?: string
+        error?: string
+        requiresReboot?: boolean
+      } | null
+      if (!response.ok) throw new Error(data?.error || `Action failed (${response.status})`)
+      setUiActionStates((current) => ({
+        ...current,
+        [key]: {
+          phase: "success",
+          detail: data?.summary || (local.kind === "operation" ? "Archive Sync triggered." : "Setting applied."),
+          requiresReboot: data?.requiresReboot === true,
+        },
+      }))
+    } catch (error) {
+      setUiActionStates((current) => ({
+        ...current,
+        [key]: {
+          phase: "error",
+          detail: errorMessage(error, local.kind === "operation" ? "The action did not run." : "The setting was not applied."),
+        },
+      }))
+    }
+  }, [navigate])
+
   const fileOperationInProgress = Object.values(fileDecisions).some(
     (state) => state.phase === "approving" || state.phase === "denying",
   )
@@ -547,7 +738,7 @@ export function AISupportChat({
     || requiresDisclosureReset
 
   return (
-    <div className="flex h-[calc(100vh-120px)] min-h-[620px] flex-col md:h-[calc(100vh-96px)]">
+    <div className="ai-chat flex h-[calc(100vh-120px)] min-h-[620px] flex-col md:h-[calc(100vh-96px)]">
       <header className="flex flex-wrap items-center justify-between gap-3">
         <div className="flex min-w-0 items-center gap-3">
           <div className="halo-accent flex h-9 w-9 shrink-0 items-center justify-center rounded-xl">
@@ -568,7 +759,7 @@ export function AISupportChat({
         </div>
       </header>
 
-      <section className="glass-card mt-3 flex min-h-0 flex-1 flex-col overflow-hidden" aria-label="AI support conversation">
+      <section className="ai-chat-shell glass-card mt-3 flex min-h-0 flex-1 flex-col overflow-hidden" aria-label="AI support conversation">
         {conversation && requiresDisclosureReset ? (
           <DisclosureRefreshGate
             deleting={deletingStaleConversation}
@@ -599,6 +790,8 @@ export function AISupportChat({
                     message={message}
                     fileDecisions={fileDecisions}
                     onFileDecision={handleFileDecision}
+                    uiActionStates={uiActionStates}
+                    onUiAction={handleUiAction}
                   />
                 ))
               )}
@@ -607,7 +800,7 @@ export function AISupportChat({
               <div ref={messagesEndRef} />
             </div>
 
-            <div className="shrink-0 border-t border-white/5 bg-black/10 px-3 py-3 sm:px-4">
+            <div className="ai-chat-composer shrink-0 border-t border-white/5 bg-black/10 px-3 py-3 sm:px-4">
               {error && (
                 <div className="mb-2 flex items-start gap-2 rounded-lg border border-rose-400/20 bg-rose-500/[0.07] px-3 py-2 text-xs text-rose-200" role="alert">
                   <ErrorIcon className="mt-0.5 h-3.5 w-3.5 shrink-0" />
@@ -680,6 +873,9 @@ function DisclosureGate({ onAcknowledge }: { onAcknowledge: () => void }) {
         </p>
         <p className="mt-2 text-xs leading-relaxed text-slate-500">
           Files require separate approval. Discord is optional and this chat is never transferred there automatically.
+        </p>
+        <p className="mt-2 text-xs leading-relaxed text-slate-500">
+          AI may offer local navigation or reviewed setting buttons. Nothing changes unless you click; settings show a separate confirmation and may require a confirmed Pi restart.
         </p>
         <button
           type="button"
@@ -771,7 +967,7 @@ function EmptyConversation({ onSuggestion }: { onSuggestion: (message: string) =
       </div>
       <h2 className="text-base font-semibold text-slate-200">What can I help with?</h2>
       <p className="mt-1 max-w-lg text-xs leading-relaxed text-slate-500">
-        This assistant is limited to Sentry USB Rusty help. It can explain setup, features, diagnostics, and common troubleshooting steps.
+        This assistant is limited to Sentry USB Rusty help. It can explain setup and features, inspect approved diagnostics with your permission, and offer reviewed local navigation or setting actions.
       </p>
       <div className="mt-4 flex max-w-2xl flex-wrap justify-center gap-2">
         {suggestions.map((suggestion) => (
@@ -793,10 +989,14 @@ function MessageBubble({
   message,
   fileDecisions,
   onFileDecision,
+  uiActionStates,
+  onUiAction,
 }: {
   message: SupportMessage
   fileDecisions: Record<string, FileDecisionViewState>
   onFileDecision: (reference: FileRequestReference, decision: "approved" | "denied") => Promise<void>
+  uiActionStates: Record<string, UiActionViewState>
+  onUiAction: (messageId: string, action: SupportUiAction) => Promise<void>
 }) {
   if (message.role === "system") {
     return (
@@ -810,19 +1010,19 @@ function MessageBubble({
 
   const isUser = message.role === "user"
   return (
-    <article className={cn("mb-4 flex items-end gap-2", isUser ? "justify-end" : "justify-start")}>
+    <article className={cn("ai-message-enter mb-4 flex items-end gap-2", isUser ? "justify-end" : "justify-start")}>
       {!isUser && (
-        <div className="halo-accent flex h-8 w-8 shrink-0 items-center justify-center rounded-xl" aria-hidden="true">
+        <div className="ai-assistant-avatar halo-accent flex h-8 w-8 shrink-0 items-center justify-center rounded-xl" aria-hidden="true">
           <SmartToyIcon className="h-4 w-4" />
         </div>
       )}
       <div className={cn("max-w-[88%] sm:max-w-[76%]", !isUser && "min-w-0")}>
         {!isUser && <p className="mb-1 text-[10px] font-semibold uppercase tracking-wider text-blue-400">Sentry AI</p>}
         <div className={cn(
-          "rounded-2xl px-3.5 py-2.5",
+          "rounded-2xl px-3.5 py-2.5 transition-colors duration-300",
           isUser
-            ? "rounded-br-md bg-blue-500/20 text-slate-100 ring-1 ring-blue-400/10"
-            : "rounded-bl-md border border-white/[0.07] bg-white/[0.04] text-slate-300",
+            ? "ai-bubble-user rounded-br-md text-slate-100"
+            : "ai-bubble-assistant rounded-bl-md text-slate-300",
         )}>
           {isUser
             ? <p className="whitespace-pre-wrap break-words text-sm leading-relaxed">{message.content}</p>
@@ -843,19 +1043,126 @@ function MessageBubble({
           )
         })}
 
+        {message.actions?.uiActions?.map((action) => {
+          const key = `${message.id}:${action.id}`
+          return (
+            <UiActionCard
+              key={key}
+              action={action}
+              state={uiActionStates[key] ?? { phase: "idle" }}
+              onActivate={() => onUiAction(message.id, action)}
+            />
+          )
+        })}
+
         {message.actions?.suggestDiscord && <DiscordSuggestion />}
       </div>
     </article>
   )
 }
 
+function UiActionCard({
+  action,
+  state,
+  onActivate,
+}: {
+  action: SupportUiAction
+  state: UiActionViewState
+  onActivate: () => Promise<void>
+}) {
+  const local = localUiAction(action)
+  const isSetting = local?.kind === "setting"
+  const isOperation = local?.kind === "operation"
+  const [rebootArmed, setRebootArmed] = useState(false)
+  const [rebooting, setRebooting] = useState(false)
+  const [rebootError, setRebootError] = useState<string | null>(null)
+
+  async function handleReboot() {
+    if (!rebootArmed) {
+      setRebootArmed(true)
+      window.setTimeout(() => setRebootArmed(false), 10000)
+      return
+    }
+    setRebooting(true)
+    setRebootError(null)
+    try {
+      const response = await fetch("/api/system/reboot", { method: "POST" })
+      if (!response.ok) throw new Error(`Restart failed (${response.status})`)
+    } catch (error) {
+      setRebooting(false)
+      setRebootArmed(false)
+      setRebootError(errorMessage(error, "The Pi could not be restarted."))
+    }
+  }
+  return (
+    <section className={cn(
+      "ai-permission-card mt-2.5 rounded-xl px-3 py-2.5",
+      isSetting ? "ai-permission-setting" : isOperation ? "ai-permission-operation" : "ai-permission-navigation",
+    )}>
+      <p className={cn(
+        "text-xs font-semibold",
+        isSetting ? "text-violet-200" : isOperation ? "text-teal-200" : "text-sky-200",
+      )}>
+        {isSetting ? "Suggested setting change" : isOperation ? "Suggested local action" : "Open this setting"}
+      </p>
+      <p className="mt-0.5 text-[11px] text-slate-400">{local?.label || "Unsupported action"}</p>
+      {state.phase === "success" ? (
+        <div className="mt-2 space-y-2">
+          <p className="flex items-start gap-2 text-xs text-emerald-300" role="status">
+            <TaskIcon className="mt-0.5 h-3.5 w-3.5 shrink-0" />{state.detail}
+          </p>
+          {state.requiresReboot && (
+            <button
+              type="button"
+              disabled={rebooting}
+              onClick={() => { void handleReboot() }}
+              className="inline-flex items-center gap-1.5 rounded-lg border border-amber-400/20 bg-amber-500/10 px-3 py-1.5 text-xs font-medium text-amber-200 hover:bg-amber-500/20 disabled:opacity-50"
+            >
+              {rebooting && <ProgressActivityIcon className="h-3.5 w-3.5 animate-spin" />}
+              {rebooting ? "Restarting…" : rebootArmed ? "Confirm Restart" : "Restart Pi"}
+            </button>
+          )}
+          {rebootError && <p className="text-xs text-rose-300" role="alert">{rebootError}</p>}
+        </div>
+      ) : state.phase === "error" ? (
+        <p className="mt-2 flex items-start gap-2 text-xs text-rose-300" role="alert">
+          <ErrorIcon className="mt-0.5 h-3.5 w-3.5 shrink-0" />{state.detail}
+        </p>
+      ) : (
+        <button
+          type="button"
+          disabled={!local || state.phase === "working"}
+          onClick={() => { void onActivate() }}
+          className={cn(
+            "mt-2 inline-flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-xs font-medium transition-colors disabled:cursor-not-allowed disabled:opacity-50",
+            isSetting
+              ? "bg-violet-500/15 text-violet-200 hover:bg-violet-500/25"
+              : isOperation
+                ? "bg-teal-500/15 text-teal-200 hover:bg-teal-500/25"
+                : "bg-sky-500/15 text-sky-200 hover:bg-sky-500/25",
+          )}
+        >
+          {state.phase === "working" ? (
+            <ProgressActivityIcon className="h-3.5 w-3.5 animate-spin" />
+          ) : isSetting || isOperation ? (
+            <CheckIcon className="h-3.5 w-3.5" />
+          ) : (
+            <OpenInNewIcon className="h-3.5 w-3.5" />
+          )}
+          {state.phase === "working" ? (isOperation ? "Running…" : "Applying…") : local?.label || "Unavailable"}
+        </button>
+      )}
+    </section>
+  )
+}
+
 function TypingBubble() {
   return (
-    <div className="mb-4 flex items-end gap-2" role="status" aria-live="polite" aria-label="Sentry AI is preparing a response">
-      <div className="halo-accent flex h-8 w-8 shrink-0 items-center justify-center rounded-xl" aria-hidden="true">
+    <div className="ai-message-enter mb-4 flex items-end gap-2" role="status" aria-live="polite" aria-label="Sentry AI is preparing a response">
+      <div className="ai-assistant-avatar halo-accent flex h-8 w-8 shrink-0 items-center justify-center rounded-xl" aria-hidden="true">
         <SmartToyIcon className="h-4 w-4" />
       </div>
-      <div className="rounded-2xl rounded-bl-md border border-white/[0.07] bg-white/[0.04] px-4 py-3" aria-hidden="true">
+      <div className="ai-bubble-assistant ai-typing-shimmer rounded-2xl rounded-bl-md px-4 py-3" aria-hidden="true">
         <div className="flex items-center gap-1.5">
           {[0, 1, 2].map((dot) => (
             <span
@@ -885,7 +1192,7 @@ function FileConsentCard({
   const working = state.phase === "approving" || state.phase === "denying"
 
   return (
-    <section className="mt-2.5 overflow-hidden rounded-xl border border-amber-400/20 bg-amber-500/[0.055]" aria-label={`File access request for ${request.label}`}>
+    <section className="ai-permission-card ai-permission-file mt-2.5 overflow-hidden rounded-xl" aria-label={`File access request for ${request.label}`}>
       <div className="flex items-start gap-2.5 px-3 py-2.5">
         <span className="halo-amber flex h-8 w-8 shrink-0 items-center justify-center rounded-lg">
           <EncryptedIcon className="h-4 w-4" />

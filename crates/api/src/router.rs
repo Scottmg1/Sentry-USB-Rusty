@@ -169,6 +169,12 @@ pub fn build_router(state: AppState) -> Router {
             "/api/support/ai/conversations/{id}/files",
             post(crate::support::upload_ai_file).layer(DefaultBodyLimit::max(3 * 1024 * 1024)),
         )
+        // Local actions are independently allowlisted on the Pi and require
+        // an explicit click in the authenticated web UI.
+        .route(
+            "/api/support/local-actions/{id}",
+            post(crate::ai_local_actions::apply_local_action),
+        )
         // Lock chime
         .route("/api/lockchime/list", get(crate::lock_chime::list))
         .route("/api/lockchime/upload", post(crate::lock_chime::upload))

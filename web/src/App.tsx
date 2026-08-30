@@ -24,6 +24,9 @@ const ChargeSessionDetail = lazy(() => import("@/pages/ChargeSessionDetail"))
 const PreviewCharging = import.meta.env.DEV
   ? lazy(() => import("@/pages/PreviewCharging"))
   : null
+const PreviewSupport = import.meta.env.DEV
+  ? lazy(() => import("@/pages/PreviewSupport"))
+  : null
 const Support = lazy(() => import("@/pages/Support"))
 const Terminal = lazy(() => import("@/pages/Terminal"))
 const FSDAnalytics = lazy(() => import("@/pages/FSDAnalytics"))
@@ -306,6 +309,9 @@ function AppContent() {
           </Route>
           {import.meta.env.DEV && PreviewCharging && (
             <Route path="/preview/charging" element={<PreviewCharging />} />
+          )}
+          {import.meta.env.DEV && PreviewSupport && (
+            <Route path="/preview/support" element={<PreviewSupport />} />
           )}
         </Routes>
       </Suspense>

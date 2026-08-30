@@ -279,13 +279,17 @@ const steps: StepDef[] = [
 
 interface SetupWizardProps {
   initialData?: SetupFormData
+  initialStepId?: string
   onClose: () => void
 }
 
 type SetupPhase = "wizard" | "applying" | "running" | "rebooting" | "finalizing" | "complete" | "error"
 
-export function SetupWizard({ initialData, onClose }: SetupWizardProps) {
-  const [currentStep, setCurrentStep] = useState(0)
+export function SetupWizard({ initialData, initialStepId, onClose }: SetupWizardProps) {
+  const [currentStep, setCurrentStep] = useState(() => {
+    const requested = steps.findIndex((step) => step.id === initialStepId)
+    return requested >= 0 ? requested : 0
+  })
   // Defaults for fields that appear pre-selected in the UI but may not exist
   // in the config file yet. Without this, untouched defaults never get saved.
   const defaults: SetupFormData = {

@@ -125,6 +125,116 @@ body {
   -webkit-font-smoothing: antialiased;
 }
 
+/* ── Sentry AI conversation motion + semantic action colours ───── */
+@keyframes ai-message-in {
+  from { opacity: 0; transform: translateY(10px) scale(0.985); filter: blur(3px); }
+  to { opacity: 1; transform: translateY(0) scale(1); filter: blur(0); }
+}
+
+@keyframes ai-avatar-breathe {
+  0%, 100% { box-shadow: 0 0 0 0 color-mix(in srgb, var(--color-accent) 0%, transparent); }
+  50% { box-shadow: 0 0 0 5px color-mix(in srgb, var(--color-accent) 9%, transparent); }
+}
+
+@keyframes ai-shimmer {
+  from { background-position: 180% 0; }
+  to { background-position: -80% 0; }
+}
+
+.ai-chat-shell {
+  position: relative;
+  isolation: isolate;
+  background:
+    radial-gradient(700px 360px at 8% 0%, color-mix(in srgb, var(--color-accent) 8%, transparent), transparent 70%),
+    radial-gradient(620px 320px at 100% 100%, rgb(139 92 246 / 0.06), transparent 72%),
+    linear-gradient(180deg, rgb(255 255 255 / 0.025), rgb(255 255 255 / 0.008));
+}
+
+.ai-chat-shell::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  z-index: -1;
+  pointer-events: none;
+  opacity: 0.16;
+  background-image: radial-gradient(circle at center, rgb(255 255 255 / 0.2) 0.6px, transparent 0.7px);
+  background-size: 18px 18px;
+  mask-image: linear-gradient(to bottom, black, transparent 78%);
+}
+
+.ai-message-enter { animation: ai-message-in 360ms cubic-bezier(0.2, 0.8, 0.2, 1) both; }
+.ai-assistant-avatar { animation: ai-avatar-breathe 3.4s ease-in-out infinite; }
+
+.ai-bubble-user {
+  border: 1px solid color-mix(in srgb, var(--color-accent) 24%, transparent);
+  background: linear-gradient(145deg,
+    color-mix(in srgb, var(--color-accent) 24%, transparent),
+    color-mix(in srgb, var(--color-accent) 11%, transparent));
+  box-shadow: inset 0 1px 0 rgb(255 255 255 / 0.08), 0 8px 24px rgb(0 0 0 / 0.16);
+}
+
+.ai-bubble-assistant {
+  border: 1px solid rgb(255 255 255 / 0.085);
+  background: linear-gradient(145deg, rgb(255 255 255 / 0.065), rgb(255 255 255 / 0.025));
+  box-shadow: inset 0 1px 0 rgb(255 255 255 / 0.055), 0 8px 24px rgb(0 0 0 / 0.14);
+  backdrop-filter: blur(12px);
+}
+
+.ai-typing-shimmer {
+  background-image: linear-gradient(110deg,
+    rgb(255 255 255 / 0.035) 20%,
+    color-mix(in srgb, var(--color-accent) 12%, transparent) 42%,
+    rgb(255 255 255 / 0.035) 64%);
+  background-size: 220% 100%;
+  animation: ai-shimmer 2.2s linear infinite;
+}
+
+.ai-chat-composer {
+  background: linear-gradient(180deg, rgb(7 9 12 / 0.58), rgb(7 9 12 / 0.82));
+  backdrop-filter: blur(18px) saturate(150%);
+}
+
+.ai-permission-card {
+  position: relative;
+  overflow: hidden;
+  box-shadow: inset 0 1px 0 rgb(255 255 255 / 0.055), 0 10px 26px rgb(0 0 0 / 0.16);
+  animation: ai-message-in 380ms 60ms cubic-bezier(0.2, 0.8, 0.2, 1) both;
+}
+
+.ai-permission-card::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  background: linear-gradient(115deg, transparent 35%, rgb(255 255 255 / 0.035), transparent 65%);
+}
+
+.ai-permission-file {
+  border: 1px solid rgb(251 191 36 / 0.22);
+  background: linear-gradient(145deg, rgb(245 158 11 / 0.09), rgb(245 158 11 / 0.025));
+}
+.ai-permission-navigation {
+  border: 1px solid rgb(56 189 248 / 0.22);
+  background: linear-gradient(145deg, rgb(14 165 233 / 0.10), rgb(14 165 233 / 0.025));
+}
+.ai-permission-setting {
+  border: 1px solid rgb(167 139 250 / 0.24);
+  background: linear-gradient(145deg, rgb(139 92 246 / 0.11), rgb(139 92 246 / 0.025));
+}
+.ai-permission-operation {
+  border: 1px solid rgb(45 212 191 / 0.24);
+  background: linear-gradient(145deg, rgb(20 184 166 / 0.11), rgb(20 184 166 / 0.025));
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .ai-message-enter,
+  .ai-assistant-avatar,
+  .ai-typing-shimmer,
+  .ai-permission-card {
+    animation: none !important;
+  }
+}
+
 /* Headings use Inter (matching SentryCloud) */
 h1, h2, h3, h4, h5, h6 {
   font-family: "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;

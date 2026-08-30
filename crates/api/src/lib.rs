@@ -1,4 +1,5 @@
 pub mod auth;
+pub mod ai_local_actions;
 pub mod ble;
 pub mod degraded;
 pub mod ble_debug;

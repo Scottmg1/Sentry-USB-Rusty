@@ -1,4 +1,5 @@
 import { useState, useEffect, useRef, useCallback, useMemo, type ReactNode } from "react"
+import { useSearchParams } from "react-router-dom"
 import {
   ArrowDownwardIcon,
   CachedIcon,
@@ -280,7 +281,10 @@ function FormattedLog({ content }: { content: string }) {
 }
 
 export default function Logs() {
-  const [activeTab, setActiveTab] = useState("archiveloop")
+  const [searchParams, setSearchParams] = useSearchParams()
+  const requestedTab = searchParams.get("tab")
+  const initialTab = logTabs.some((tab) => tab.id === requestedTab) ? requestedTab as string : "archiveloop"
+  const [activeTab, setActiveTabState] = useState(initialTab)
   const [content, setContent] = useState<string>("Loading...")
   const [loading, setLoading] = useState(false)
   const [showScrollBtn, setShowScrollBtn] = useState(false)
@@ -288,6 +292,13 @@ export default function Logs() {
   const followRef = useRef(true)
 
   const activeLog = logTabs.find((t) => t.id === activeTab)!
+
+  function setActiveTab(tab: string) {
+    setActiveTabState(tab)
+    const next = new URLSearchParams(searchParams)
+    next.set("tab", tab)
+    setSearchParams(next, { replace: true })
+  }
 
   // Format archiveloop and setup logs (same timestamp format).
   // Diagnostics is a structured system-info dump — keep it raw.

@@ -1,4 +1,4 @@
-import { useEffect, useState, lazy, Suspense } from "react"
+import { useEffect, useRef, useState, lazy, Suspense } from "react"
 import { useSearchParams } from "react-router-dom"
 import {
   CachedIcon,
@@ -71,6 +71,8 @@ export default function Settings() {
   const [wizardInitialData, setWizardInitialData] = useState<
     Record<string, string> | undefined
   >(undefined)
+  const [wizardInitialStep, setWizardInitialStep] = useState<string | undefined>(undefined)
+  const handledWizardDeepLink = useRef<string | null>(null)
   const [rawConfigOpen, setRawConfigOpen] = useState(false)
   const [rawConfig, setRawConfig] = useState<Record<string, RawConfigEntry> | null>(null)
   const [healthOpen, setHealthOpen] = useState(false)
@@ -186,7 +188,8 @@ export default function Settings() {
     }
   }
 
-  async function handleOpenWizard() {
+  async function handleOpenWizard(initialStepId?: string) {
+    setWizardInitialStep(initialStepId)
     try {
       const res = await fetch("/api/setup/config")
       if (res.ok) {
@@ -203,6 +206,16 @@ export default function Settings() {
     }
     setWizardOpen(true)
   }
+
+  const requestedWizardStep = params.get("wizard")
+  useEffect(() => {
+    if (!requestedWizardStep || handledWizardDeepLink.current === requestedWizardStep) return
+    handledWizardDeepLink.current = requestedWizardStep
+    void handleOpenWizard(requestedWizardStep)
+    const next = new URLSearchParams(params)
+    next.delete("wizard")
+    setParams(next, { replace: true })
+  }, [requestedWizardStep, params, setParams])
 
   const actions: ActionChipProps[] = [
     {
@@ -265,15 +278,15 @@ export default function Settings() {
       <TabBar tabs={TABS} active={activeTab} onSelect={setTab} scrollable={isMobile} />
 
       <Suspense fallback={<TabFallback />}>
-        {activeTab === "Device" && <DeviceTab onOpenWizard={handleOpenWizard} />}
+        {activeTab === "Device" && <DeviceTab onOpenWizard={() => { void handleOpenWizard() }} />}
         {activeTab === "Car & Network" && (
-          <NetworkTab status={status} onOpenWizard={handleOpenWizard} />
+          <NetworkTab status={status} onOpenWizard={() => { void handleOpenWizard() }} />
         )}
         {activeTab === "Notifications & Community" && <NotificationsTab />}
         {activeTab === "System" && (
           <SystemTab
             onOpenRawConfig={handleOpenRawConfig}
-            onOpenWizard={handleOpenWizard}
+            onOpenWizard={() => { void handleOpenWizard() }}
             version={version}
             hostname={hostname}
           />
@@ -286,9 +299,11 @@ export default function Settings() {
         <Suspense fallback={null}>
           <SetupWizard
             initialData={wizardInitialData}
+            initialStepId={wizardInitialStep}
             onClose={() => {
               setWizardOpen(false)
               setWizardInitialData(undefined)
+              setWizardInitialStep(undefined)
             }}
           />
         </Suspense>
