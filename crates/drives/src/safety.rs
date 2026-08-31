@@ -80,48 +80,27 @@ pub const BRAKE_GATE_AFTER_MS: f64 = 500.0;
 pub const NIGHT_START_HOUR: u32 = 22;
 pub const NIGHT_END_HOUR: u32 = 4;
 
-/// A drive (or window) below either floor gets no score — a single brake
-/// tap in a driveway shuffle is noise, not behavior.
-pub const MIN_SCORED_MOVING_MS: i64 = 60_000;
-pub const MIN_SCORED_MILES: f64 = 0.5;
+pub const MODEL_ID: &str = "tesla-v2.2-estimate-1";
+pub const MODEL_LABEL: &str = "Tesla v2.2 Estimate";
+pub const MIN_SCORED_MILES: f64 = 0.1;
+pub const MIN_COMPATIBLE_IMU_COVERAGE: f64 = 0.90;
 
-// Score formula: score = 100 − Σ weight_i · curve(rate_i / cap_i), where
-// curve(x) = min(x,1)^CURVE_GAMMA. Caps are the rate at which a factor's
-// full weight is charged; the sub-linear gamma makes the first
-// occurrences cost the most, mirroring the shape of Tesla's factors.
+// Tesla v2.2 PCF constants, captured from Tesla's published documentation
+// on 2025-04-07:
+// https://web.archive.org/web/20250407164856/https://www.tesla.com/support/insurance/safety-score#version-2.2
+const PCF_BASE: f64 = 0.57198191;
+const PCF_HARD_BRAKE: f64 = 1.23599110;
+const PCF_AGGR_TURN: f64 = 1.01219290;
+const PCF_NIGHT: f64 = 1.03231810;
+const PCF_SPEEDING: f64 = 1.02439511;
+const SCORE_INTERCEPT: f64 = 122.15240383;
+const SCORE_SLOPE: f64 = 38.72920381;
 
-/// Factor weights (sum = 100). Braking dominates and turning is light,
-/// matching the ~3:1 impact ratio in Tesla's published v1 PCF model —
-/// and turning is also our noisiest derived metric.
-pub const WEIGHT_HARD_BRAKE: f64 = 45.0;
-pub const WEIGHT_AGGR_TURN: f64 = 15.0;
-pub const WEIGHT_SPEEDING: f64 = 25.0;
-pub const WEIGHT_NIGHT: f64 = 15.0;
-
-/// Rate caps at which a factor saturates. Braking/turning are Tesla's
-/// own published caps for the SAME conditional ratios (v2.2: hard
-/// braking capped at 5.2% of braking time; aggressive turning at 17.1%
-/// of turning time). Speeding/night are ours (absolute proportions).
-pub const CAP_HARD_BRAKE: f64 = 0.052;
-pub const CAP_AGGR_TURN: f64 = 0.171;
-pub const CAP_SPEEDING: f64 = 0.05;
-pub const CAP_NIGHT: f64 = 0.30;
-
-/// Conditional-ratio denominator floor, ms. A short drive may contain
-/// seconds of >0.1g braking; one hard stop would then read as a huge
-/// ratio. Flooring the denominator at one minute blends toward the
-/// absolute rate exactly when the conditional one is under-sampled.
-pub const MIN_RATE_DENOM_MS: i64 = 60_000;
-
-/// Sub-linear penalty exponent.
-pub const CURVE_GAMMA: f64 = 0.6;
-
-/// FSD relief: behavior penalties (braking, turning) are scaled by
-/// `1 − FSD_RELIEF_MAX · fsd_share`. Events under FSD/Autopilot never
-/// count at all; this additionally credits high assisted share on the
-/// remaining manual-driving penalties — capped at half so a wild manual
-/// driver can't hide behind FSD mileage.
-pub const FSD_RELIEF_MAX: f64 = 0.5;
+/// Published Tesla v2.2 caps, in percentage points.
+pub const CAP_HARD_BRAKE_PCT: f64 = 5.2;
+pub const CAP_AGGR_TURN_PCT: f64 = 13.2;
+pub const CAP_SPEEDING_PCT: f64 = 10.0;
+pub const CAP_NIGHT_PCT: f64 = 14.2;
 
 /// Late-night risk weight per local wall-clock hour, mirroring Tesla's
 /// v2 change ("impact reduced earlier in the night and increased later").
@@ -407,6 +386,7 @@ pub struct SafetyTotals {
     /// Night miles scaled by [`night_weight`] — the penalty input.
     pub night_weighted_mi: f64,
     pub moving_ms: i64,
+    pub imu_moving_ms: i64,
     pub manual_moving_ms: i64,
     pub hard_brake_ms: i64,
     pub hard_brake_events: i32,
@@ -429,58 +409,86 @@ pub struct SafetyScore {
     pub aggr_turn_pct: f64,
     pub speeding_pct: f64,
     pub night_pct: f64,
-    /// Points charged per factor (after FSD relief where it applies).
+    /// Leave-one-factor-out estimated score impacts. The multiplicative
+    /// PCF means these values are intentionally non-additive.
     pub hard_brake_penalty: f64,
     pub aggr_turn_penalty: f64,
     pub speeding_penalty: f64,
     pub night_penalty: f64,
-    /// Assisted share of miles (0–100) and the behavior-penalty relief
-    /// fraction it granted (0–50, percent knocked off those penalties).
+    /// Assisted share remains informational. v2.2 applies no blanket
+    /// relief, so `fsd_relief_pct` is retained for wire compatibility as 0.
     pub fsd_share_pct: f64,
     pub fsd_relief_pct: f64,
 }
 
-fn curve(rate: f64, cap: f64) -> f64 {
-    (rate / cap).clamp(0.0, 1.0).powf(CURVE_GAMMA)
+fn score_from_percentages(hard_brake: f64, aggr_turn: f64, night: f64, speeding: f64) -> f64 {
+    let pcf = PCF_BASE
+        * PCF_HARD_BRAKE.powf(hard_brake.clamp(0.0, CAP_HARD_BRAKE_PCT))
+        * PCF_AGGR_TURN.powf(aggr_turn.clamp(0.0, CAP_AGGR_TURN_PCT))
+        * PCF_NIGHT.powf(night.clamp(0.0, CAP_NIGHT_PCT))
+        * PCF_SPEEDING.powf(speeding.clamp(0.0, CAP_SPEEDING_PCT));
+    (SCORE_INTERCEPT - SCORE_SLOPE * pcf).clamp(0.0, 100.0)
 }
 
 /// `None` when the window is too small to score (see MIN_SCORED_*) or
 /// carries no safety data at all.
 pub fn compute_safety_score(t: &SafetyTotals) -> Option<SafetyScore> {
-    if t.moving_ms < MIN_SCORED_MOVING_MS || t.distance_mi < MIN_SCORED_MILES {
+    if t.moving_ms <= 0 || t.distance_mi < MIN_SCORED_MILES {
         return None;
     }
-    // Conditional ratios (Tesla-style): harsh time relative to time spent
-    // braking/turning at all, with a floored denominator so a single stop
-    // in an under-sampled window can't read as a saturated ratio.
-    let hb_rate =
-        t.hard_brake_ms as f64 / (t.brake_any_ms.max(MIN_RATE_DENOM_MS)) as f64;
-    let at_rate = t.aggr_turn_ms as f64 / (t.turn_any_ms.max(MIN_RATE_DENOM_MS)) as f64;
-    let sp_rate = t.speeding_ms as f64 / t.moving_ms as f64;
-    let ln_rate = (t.night_mi / t.distance_mi).clamp(0.0, 1.0);
-    let ln_weighted_rate = (t.night_weighted_mi / t.distance_mi).clamp(0.0, 1.0);
+    let coverage = t.imu_moving_ms as f64 / t.moving_ms as f64;
+    if coverage < MIN_COMPATIBLE_IMU_COVERAGE {
+        return None;
+    }
+
+    let hb_pct = if t.brake_any_ms > 0 {
+        100.0 * t.hard_brake_ms as f64 / t.brake_any_ms as f64
+    } else {
+        0.0
+    };
+    let at_pct = if t.turn_any_ms > 0 {
+        100.0 * t.aggr_turn_ms as f64 / t.turn_any_ms as f64
+    } else {
+        0.0
+    };
+    let sp_pct = 100.0 * t.speeding_ms as f64 / t.moving_ms as f64;
+    let ln_display_pct = 100.0 * (t.night_mi / t.distance_mi).clamp(0.0, 1.0);
+    let ln_pct = 100.0 * (t.night_weighted_mi / t.distance_mi).clamp(0.0, 1.0);
     let fsd_share = (t.assisted_mi / t.distance_mi).clamp(0.0, 1.0);
-    let relief = 1.0 - FSD_RELIEF_MAX * fsd_share;
 
-    let hb_pen = WEIGHT_HARD_BRAKE * curve(hb_rate, CAP_HARD_BRAKE) * relief;
-    let at_pen = WEIGHT_AGGR_TURN * curve(at_rate, CAP_AGGR_TURN) * relief;
-    let sp_pen = WEIGHT_SPEEDING * curve(sp_rate, CAP_SPEEDING);
-    let ln_pen = WEIGHT_NIGHT * curve(ln_weighted_rate, CAP_NIGHT);
+    let score = score_from_percentages(hb_pct, at_pct, ln_pct, sp_pct);
+    let hb_impact = score_from_percentages(0.0, at_pct, ln_pct, sp_pct) - score;
+    let at_impact = score_from_percentages(hb_pct, 0.0, ln_pct, sp_pct) - score;
+    let sp_impact = score_from_percentages(hb_pct, at_pct, ln_pct, 0.0) - score;
+    let ln_impact = score_from_percentages(hb_pct, at_pct, 0.0, sp_pct) - score;
 
-    let score = (100.0 - hb_pen - at_pen - sp_pen - ln_pen).clamp(0.0, 100.0);
     Some(SafetyScore {
         score: calc::round1(score),
-        hard_brake_pct: calc::round1(hb_rate * 100.0),
-        aggr_turn_pct: calc::round1(at_rate * 100.0),
-        speeding_pct: calc::round1(sp_rate * 100.0),
-        night_pct: calc::round1(ln_rate * 100.0),
-        hard_brake_penalty: calc::round1(hb_pen),
-        aggr_turn_penalty: calc::round1(at_pen),
-        speeding_penalty: calc::round1(sp_pen),
-        night_penalty: calc::round1(ln_pen),
+        hard_brake_pct: calc::round1(hb_pct),
+        aggr_turn_pct: calc::round1(at_pct),
+        speeding_pct: calc::round1(sp_pct),
+        night_pct: calc::round1(ln_display_pct),
+        hard_brake_penalty: calc::round1(hb_impact),
+        aggr_turn_penalty: calc::round1(at_impact),
+        speeding_penalty: calc::round1(sp_impact),
+        night_penalty: calc::round1(ln_impact),
         fsd_share_pct: calc::round1(fsd_share * 100.0),
-        fsd_relief_pct: calc::round1(FSD_RELIEF_MAX * fsd_share * 100.0),
+        fsd_relief_pct: 0.0,
     })
+}
+
+/// Mileage-weight eligible local-day scores. Empty and zero-mile inputs
+/// deliberately return `None` instead of inventing a clean period.
+pub fn mileage_weighted_score(days: &[(f64, f64)]) -> Option<f64> {
+    let total_miles: f64 = days.iter().map(|(_, miles)| miles.max(0.0)).sum();
+    if total_miles <= 0.0 {
+        return None;
+    }
+    let weighted: f64 = days
+        .iter()
+        .map(|(score, miles)| score.clamp(0.0, 100.0) * miles.max(0.0))
+        .sum();
+    Some(calc::round1(weighted / total_miles))
 }
 
 /// True when the local wall-clock hour falls in the late-night window.
@@ -696,9 +704,59 @@ mod tests {
         SafetyTotals {
             distance_mi: 100.0,
             moving_ms: 4 * 3_600_000,
+            imu_moving_ms: 4 * 3_600_000,
             manual_moving_ms: 4 * 3_600_000,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn published_v22_pcf_maps_one_percent_hard_braking_to_94_8() {
+        let mut t = base_totals();
+        t.brake_any_ms = 100_000;
+        t.hard_brake_ms = 1_000;
+        assert_eq!(compute_safety_score(&t).unwrap().score, 94.8);
+    }
+
+    #[test]
+    fn fsd_share_is_informational_and_never_discounts_the_score() {
+        let mut manual_totals = base_totals();
+        manual_totals.brake_any_ms = 100_000;
+        manual_totals.hard_brake_ms = 1_000;
+        let manual = compute_safety_score(&manual_totals).unwrap();
+
+        let mut assisted_totals = manual_totals;
+        assisted_totals.assisted_mi = 80.0;
+        let assisted = compute_safety_score(&assisted_totals).unwrap();
+        assert_eq!(assisted.score, manual.score);
+        assert_eq!(assisted.hard_brake_penalty, manual.hard_brake_penalty);
+        assert_eq!(assisted.fsd_share_pct, 80.0);
+        assert_eq!(assisted.fsd_relief_pct, 0.0);
+    }
+
+    #[test]
+    fn tesla_trip_floor_accepts_one_tenth_mile() {
+        let mut t = base_totals();
+        t.distance_mi = 0.1;
+        assert!(compute_safety_score(&t).is_some());
+    }
+
+    #[test]
+    fn measured_imu_coverage_must_reach_ninety_percent() {
+        let mut t = base_totals();
+        t.moving_ms = 1_000_000;
+        t.imu_moving_ms = 899_000;
+        assert!(compute_safety_score(&t).is_none());
+        t.imu_moving_ms = 900_000;
+        assert!(compute_safety_score(&t).is_some());
+        t.imu_moving_ms = 1_000_000;
+        assert!(compute_safety_score(&t).is_some());
+    }
+
+    #[test]
+    fn period_score_is_weighted_by_eligible_daily_miles() {
+        assert_eq!(mileage_weighted_score(&[(90.0, 10.0), (70.0, 30.0)]), Some(75.0));
+        assert_eq!(mileage_weighted_score(&[]), None);
     }
 
     #[test]
@@ -723,59 +781,26 @@ mod tests {
     }
 
     #[test]
-    fn fsd_share_relieves_behavior_penalties_only() {
-        let mut t = base_totals();
-        t.brake_any_ms = 3_600_000; // 1 h of braking time
-        t.hard_brake_ms = 72_000; // 2% of it → mid-curve
-        t.speeding_ms = 72_000;
-        let manual = compute_safety_score(&t).unwrap();
-
-        t.assisted_mi = 80.0; // 80% FSD share → 40% relief
-        let assisted = compute_safety_score(&t).unwrap();
-        assert!(assisted.score > manual.score);
-        assert!(assisted.hard_brake_penalty < manual.hard_brake_penalty);
-        assert_eq!(assisted.speeding_penalty, manual.speeding_penalty);
-        assert_eq!(assisted.fsd_relief_pct, 40.0);
-    }
-
-    #[test]
-    fn denominator_floor_tempers_undersampled_ratios() {
-        // One second of hard braking against only 2 s of total braking
-        // would be a 50% ratio; the 60 s floor keeps it at ~1.7% instead
-        // of instantly saturating the 5.2% cap.
-        let mut t = base_totals();
-        t.brake_any_ms = 2_000;
-        t.hard_brake_ms = 1_000;
-        let s = compute_safety_score(&t).unwrap();
-        assert!(
-            s.hard_brake_pct < 2.0,
-            "floored ratio should be ~1.7%, got {}",
-            s.hard_brake_pct
-        );
-        assert!(s.hard_brake_penalty < WEIGHT_HARD_BRAKE, "must not saturate");
-    }
-
-    #[test]
     fn night_weighting_scales_penalty_not_display() {
         let mut early = base_totals();
-        early.night_mi = 30.0;
-        early.night_weighted_mi = 30.0 * night_weight(22); // 10pm — half weight
+        early.night_mi = 5.0;
+        early.night_weighted_mi = 5.0 * night_weight(23);
         let mut late = base_totals();
-        late.night_mi = 30.0;
-        late.night_weighted_mi = 30.0 * night_weight(3); // 3am — 1.5×
+        late.night_mi = 5.0;
+        late.night_weighted_mi = 5.0 * night_weight(3);
         let se = compute_safety_score(&early).unwrap();
         let sl = compute_safety_score(&late).unwrap();
         assert_eq!(se.night_pct, sl.night_pct, "displayed share is unweighted");
-        assert!(sl.night_penalty > se.night_penalty, "3am must cost more than 10pm");
+        assert!(sl.night_penalty > se.night_penalty, "3am must cost more than 11pm");
     }
 
     #[test]
     fn tiny_windows_are_unscored() {
         let mut t = base_totals();
-        t.distance_mi = 0.3;
+        t.distance_mi = 0.09;
         assert!(compute_safety_score(&t).is_none());
         let mut t = base_totals();
-        t.moving_ms = 30_000;
+        t.moving_ms = 0;
         assert!(compute_safety_score(&t).is_none());
     }
 

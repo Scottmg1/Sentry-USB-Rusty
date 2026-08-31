@@ -243,6 +243,7 @@ fn build_safety_analytics(summaries: &[DriveSummary], period: &str) -> SafetyAna
         totals.night_mi += d.safety_night_mi;
         totals.night_weighted_mi += d.safety_night_weighted_mi;
         totals.moving_ms += d.safety_moving_ms;
+        totals.imu_moving_ms += d.safety_moving_ms;
         totals.manual_moving_ms += d.safety_manual_moving_ms;
         totals.hard_brake_ms += d.safety_hard_brake_ms;
         totals.hard_brake_events += d.safety_hard_brake_events;
@@ -282,6 +283,7 @@ fn build_safety_analytics(summaries: &[DriveSummary], period: &str) -> SafetyAna
             acc.totals.night_mi += d.safety_night_mi;
             acc.totals.night_weighted_mi += d.safety_night_weighted_mi;
             acc.totals.moving_ms += d.safety_moving_ms;
+            acc.totals.imu_moving_ms += d.safety_moving_ms;
             acc.totals.manual_moving_ms += d.safety_manual_moving_ms;
             acc.totals.hard_brake_ms += d.safety_hard_brake_ms;
             acc.totals.hard_brake_events += d.safety_hard_brake_events;
@@ -4273,6 +4275,9 @@ fn build_summary_from_aggregates(
         night_mi: safety_night_m / calc::M_PER_MILE,
         night_weighted_mi: safety_night_weighted_m / calc::M_PER_MILE,
         moving_ms: safety_moving_ms.round() as i64,
+        // Replaced with the persisted measured-IMU total in the v22
+        // aggregation checkpoint.
+        imu_moving_ms: safety_moving_ms.round() as i64,
         manual_moving_ms: safety_manual_moving_ms.round() as i64,
         hard_brake_ms: safety_hard_brake_ms.round() as i64,
         hard_brake_events: safety_hard_brake_events,
