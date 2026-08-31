@@ -27,6 +27,7 @@ jobs:
         run: |
           cd web
           npm ci
+          npm test
           npx eslint . --max-warnings 30
       - name: Production build
         # Direct pushes otherwise receive no production bundle check.

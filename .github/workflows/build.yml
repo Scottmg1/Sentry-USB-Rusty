@@ -323,6 +323,7 @@ jobs:
         run: |
           cd web
           npm ci
+          npm test
           npx eslint . --max-warnings 30
       - name: Production build
         # Exercise Vite/Rolldown on PRs; release slices cover tags/manual runs.

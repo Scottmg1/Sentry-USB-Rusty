@@ -7,8 +7,12 @@ import { fetchDrives } from "@/api/drives"
 import type { DriveSummary } from "@/types/drives"
 import { cn } from "@/lib/utils"
 import { formatDistance, formatDuration } from "@/lib/drive-format"
-
-type Period = "day" | "week" | "month" | "all"
+import {
+  browserSafetyPeriodStorage,
+  loadSafetyPeriod,
+  saveSafetyPeriod,
+  type SafetyPeriod,
+} from "@/lib/safetyPeriod"
 
 // Tesla-app blue, used literally — the app theme remaps Tailwind's blue
 // scale to green, and this page deliberately matches the official app.
@@ -104,7 +108,9 @@ export default function SafetyScore() {
   const navigate = useNavigate()
   const [data, setData] = useState<SafetyAnalyticsData | null>(null)
   const [drives, setDrives] = useState<DriveSummary[]>([])
-  const [period, setPeriod] = useState<Period>("month")
+  const [period, setPeriod] = useState<SafetyPeriod>(() =>
+    loadSafetyPeriod(browserSafetyPeriodStorage()),
+  )
   const [loading, setLoading] = useState(true)
   const [metric, setMetric] = useState(false)
   const [expanded, setExpanded] = useState<string | null>(null)
@@ -266,10 +272,13 @@ export default function SafetyScore() {
         </button>
         <h1 className="text-xl font-semibold text-slate-100">Safety Score</h1>
         <div className="absolute right-0 flex items-center gap-1 rounded-full border border-white/10 bg-white/5 p-0.5">
-          {(["day", "week", "month", "all"] as Period[]).map((p) => (
+          {(["day", "week", "month", "all"] as SafetyPeriod[]).map((p) => (
             <button
               key={p}
-              onClick={() => setPeriod(p)}
+              onClick={() => {
+                setPeriod(p)
+                saveSafetyPeriod(browserSafetyPeriodStorage(), p)
+              }}
               className={cn(
                 "rounded-full px-2 py-1 text-[10px] font-medium transition-colors",
                 period === p ? "bg-white/10 text-slate-100" : "text-slate-500 hover:text-slate-300"
