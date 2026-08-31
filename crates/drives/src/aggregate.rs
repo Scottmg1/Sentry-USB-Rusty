@@ -329,6 +329,12 @@ pub fn compute_route_aggregates(r: &Route) -> RouteAggregates {
     agg.safety_manual_moving_ms = Some(cs.manual_moving_ms);
     agg.safety_brake_any_ms = Some(cs.brake_any_ms);
     agg.safety_turn_any_ms = Some(cs.turn_any_ms);
+    agg.ap_at_end = cs.ap_at_end.map(i32::from);
+    agg.safety_imu_moving_ms = Some(cs.imu_moving_ms);
+    agg.safety_night_ms = Some(cs.night_ms);
+    agg.safety_night_weighted_ms = Some(cs.night_weighted_ms);
+    agg.safety_grace_ms_end = Some(cs.grace_ms_end);
+    agg.safety_grace_prefix = Some(cs.grace_prefix);
 
     agg
 }

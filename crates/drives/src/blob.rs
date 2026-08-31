@@ -15,6 +15,7 @@
 use anyhow::{bail, Result};
 
 use crate::types::{ApRun, FlagRun, GearRun, GpsPoint};
+use crate::safety::{SafetyGracePrefix, SafetyPrefixBucket};
 
 // -----------------------------------------------------------------------------
 // Points: [f64; 2] per point (16 bytes)
@@ -188,6 +189,57 @@ pub fn decode_ap_runs(buf: Option<&[u8]>) -> Result<Option<Vec<ApRun>>> {
 }
 
 // -----------------------------------------------------------------------------
+// Tesla v2.2 estimate grace prefix: version + 5 one-second buckets.
+// Each bucket stores five little-endian i64 factor durations.
+// -----------------------------------------------------------------------------
+
+const SAFETY_GRACE_PREFIX_VERSION: u8 = 1;
+const SAFETY_GRACE_BUCKET_FIELDS: usize = 5;
+const SAFETY_GRACE_PREFIX_LEN: usize =
+    1 + 5 * SAFETY_GRACE_BUCKET_FIELDS * std::mem::size_of::<i64>();
+
+pub fn encode_safety_grace_prefix(prefix: &SafetyGracePrefix) -> Vec<u8> {
+    let mut out = Vec::with_capacity(SAFETY_GRACE_PREFIX_LEN);
+    out.push(SAFETY_GRACE_PREFIX_VERSION);
+    for bucket in prefix {
+        for value in [
+            bucket.hard_brake_ms,
+            bucket.brake_any_ms,
+            bucket.aggr_turn_ms,
+            bucket.turn_any_ms,
+            bucket.speeding_ms,
+        ] {
+            out.extend_from_slice(&value.to_le_bytes());
+        }
+    }
+    out
+}
+
+pub fn decode_safety_grace_prefix(buf: Option<&[u8]>) -> SafetyGracePrefix {
+    let Some(buf) = buf else { return SafetyGracePrefix::default() };
+    if buf.len() != SAFETY_GRACE_PREFIX_LEN || buf[0] != SAFETY_GRACE_PREFIX_VERSION {
+        return SafetyGracePrefix::default();
+    }
+    let mut prefix = SafetyGracePrefix::default();
+    let mut offset = 1;
+    for bucket in &mut prefix {
+        let mut next = || {
+            let value = i64::from_le_bytes(buf[offset..offset + 8].try_into().unwrap());
+            offset += 8;
+            value
+        };
+        *bucket = SafetyPrefixBucket {
+            hard_brake_ms: next(),
+            brake_any_ms: next(),
+            aggr_turn_ms: next(),
+            turn_any_ms: next(),
+            speeding_ms: next(),
+        };
+    }
+    prefix
+}
+
+// -----------------------------------------------------------------------------
 // FlagRuns: 1-byte flags + 4-byte i32 frames + 4-byte f32 max_mps per run
 // (gear-run wire shape plus the per-run |SEI speed| max; NaN encodes an
 // absent max_mps so legacy no-speed runs survive the round-trip as None)
@@ -240,6 +292,7 @@ pub fn decode_flag_runs(buf: Option<&[u8]>) -> Result<Option<Vec<FlagRun>>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::safety::{SafetyGracePrefix, SafetyPrefixBucket};
 
     #[test]
     fn roundtrip_points() {
@@ -367,6 +420,36 @@ mod tests {
     fn decode_flag_runs_rejects_misaligned_input() {
         let buf = vec![0u8; 6];
         assert!(decode_flag_runs(Some(&buf)).is_err());
+    }
+
+    #[test]
+    fn safety_grace_prefix_roundtrips_all_five_buckets() {
+        let mut prefix = SafetyGracePrefix::default();
+        prefix[0] = SafetyPrefixBucket {
+            hard_brake_ms: 1,
+            brake_any_ms: 2,
+            aggr_turn_ms: 3,
+            turn_any_ms: 4,
+            speeding_ms: 5,
+        };
+        prefix[4] = SafetyPrefixBucket {
+            hard_brake_ms: 101,
+            brake_any_ms: 102,
+            aggr_turn_ms: 103,
+            turn_any_ms: 104,
+            speeding_ms: 105,
+        };
+
+        let encoded = encode_safety_grace_prefix(&prefix);
+
+        assert_eq!(decode_safety_grace_prefix(Some(&encoded)), prefix);
+    }
+
+    #[test]
+    fn malformed_safety_grace_prefix_fails_closed_to_empty() {
+        assert_eq!(decode_safety_grace_prefix(None), SafetyGracePrefix::default());
+        assert_eq!(decode_safety_grace_prefix(Some(&[])), SafetyGracePrefix::default());
+        assert_eq!(decode_safety_grace_prefix(Some(&[99; 201])), SafetyGracePrefix::default());
     }
 
     #[test]

@@ -758,6 +758,13 @@ pub struct RouteAggregates {
     /// decelerating above 0.1g / turning above 0.2g.
     pub safety_brake_any_ms: Option<i64>,
     pub safety_turn_any_ms: Option<i64>,
+    /// v22 Tesla v2.2 estimate compatibility and clip-boundary evidence.
+    pub ap_at_end: Option<i32>,
+    pub safety_imu_moving_ms: Option<i64>,
+    pub safety_night_ms: Option<i64>,
+    pub safety_night_weighted_ms: Option<i64>,
+    pub safety_grace_ms_end: Option<i64>,
+    pub safety_grace_prefix: Option<crate::safety::SafetyGracePrefix>,
 }
 
 /// Per-clip telemetry rollup populated from `telemetry_samples` rows

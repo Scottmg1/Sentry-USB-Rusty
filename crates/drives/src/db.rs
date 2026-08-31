@@ -3873,6 +3873,7 @@ fn select_route_summaries_where(
                 safety_manual_moving_ms,
                 safety_brake_any_ms,
                 safety_turn_any_ms,
+                ..Default::default()
             },
             source,
             external_signature,
