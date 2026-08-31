@@ -25,6 +25,7 @@
 
 use crate::calc;
 use crate::types::{FlagRun, Route, AUTOPILOT_OFF, FLAG_BRAKE};
+use chrono::Timelike;
 
 // ---------------------------------------------------------------------------
 // Tunables. Every threshold the feature uses lives here.
@@ -77,7 +78,7 @@ pub const BRAKE_GATE_BEFORE_MS: f64 = 2000.0;
 pub const BRAKE_GATE_AFTER_MS: f64 = 500.0;
 
 /// Late-night window (local wall clock), inclusive start / exclusive end.
-pub const NIGHT_START_HOUR: u32 = 22;
+pub const NIGHT_START_HOUR: u32 = 23;
 pub const NIGHT_END_HOUR: u32 = 4;
 
 pub const MODEL_ID: &str = "tesla-v2.2-estimate-1";
@@ -108,11 +109,11 @@ pub const CAP_NIGHT_PCT: f64 = 14.2;
 /// night share stays unweighted. Hours outside 10pm–4am weigh 0.
 pub fn night_weight(hour: u32) -> f64 {
     match hour {
-        22 => 0.5,
-        23 => 0.75,
-        0 => 1.0,
-        1 => 1.25,
-        2 | 3 => 1.5,
+        23 => 0.21,
+        0 => 0.53,
+        1 => 0.71,
+        2 => 0.82,
+        3 => 1.0,
         _ => 0.0,
     }
 }
@@ -132,10 +133,37 @@ pub struct ClipSafety {
     pub speeding_ms: i64,
     pub moving_ms: i64,
     pub manual_moving_ms: i64,
+    pub imu_moving_ms: i64,
+    pub night_ms: i64,
+    pub night_weighted_ms: i64,
+    pub grace_ms_end: i64,
+    pub grace_prefix: SafetyGracePrefix,
+    pub ap_at_end: Option<u8>,
     /// Conditional-ratio denominators: manual time decelerating above
     /// 0.1g / turning above 0.2g (same gating as their numerators).
     pub brake_any_ms: i64,
     pub turn_any_ms: i64,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SafetyPrefixBucket {
+    pub hard_brake_ms: i64,
+    pub brake_any_ms: i64,
+    pub aggr_turn_ms: i64,
+    pub turn_any_ms: i64,
+    pub speeding_ms: i64,
+}
+
+pub type SafetyGracePrefix = [SafetyPrefixBucket; 5];
+
+fn driver_controls_factor(ap: u8, accel_position: f32) -> bool {
+    ap == AUTOPILOT_OFF || (ap == crate::types::AUTOPILOT_TACC && accel_position > 1.0)
+}
+
+fn clip_local_start(file: &str) -> Option<chrono::NaiveDateTime> {
+    let name = file.rsplit(['/', '\\']).next()?;
+    let stamp = name.get(..19)?;
+    chrono::NaiveDateTime::parse_from_str(stamp, "%Y-%m-%d_%H-%M-%S").ok()
 }
 
 /// Frame-domain brake-pedal intervals in clip-ms, built from `flag_runs`
@@ -170,14 +198,14 @@ fn menger_curvature(p0: [f64; 2], p1: [f64; 2], p2: [f64; 2]) -> f64 {
 
     let ax = (p1[1] - p0[1]) * m_per_deg_lon;
     let ay = (p1[0] - p0[0]) * m_per_deg_lat;
-    let bx = (p2[1] - p0[1]) * m_per_deg_lon;
-    let by = (p2[0] - p0[0]) * m_per_deg_lat;
+    let bx = (p2[1] - p1[1]) * m_per_deg_lon;
+    let by = (p2[0] - p1[0]) * m_per_deg_lat;
 
     let a = (ax * ax + ay * ay).sqrt(); // p0→p1
-    let cx = bx - ax;
-    let cy = by - ay;
-    let b = (cx * cx + cy * cy).sqrt(); // p1→p2
-    let c = (bx * bx + by * by).sqrt(); // p0→p2
+    let b = (bx * bx + by * by).sqrt(); // p1→p2
+    let cx = ax + bx;
+    let cy = ay + by;
+    let c = (cx * cx + cy * cy).sqrt(); // p0→p2
     if a < 1e-6 || b < 1e-6 || c < 1e-6 {
         return 0.0;
     }
@@ -226,16 +254,31 @@ pub fn compute_clip_safety(r: &Route) -> ClipSafety {
             .any(|iv| iv.1 > t_ms - BRAKE_GATE_BEFORE_MS && iv.0 < t_ms + BRAKE_GATE_AFTER_MS)
     };
 
-    let manual_at = |i: usize| -> bool { !has_ap || r.autopilot_states[i] == AUTOPILOT_OFF };
     let valid = |i: usize| -> bool { !calc::is_null_island(r.points[i][0], r.points[i][1]) };
     // Measured IMU channel present (v20+ extraction, firmware emits it).
     let has_imu = r.accel_x.len() == n && r.accel_y.len() == n;
+    let has_pedal = r.accel_positions.len() == n;
+    let clip_start = clip_local_start(&r.file);
 
     let mut in_brake_run = false;
     let mut in_turn_run = false;
     let mut turn_streak: u32 = 0;
+    let mut grace_remaining_ms = 0.0_f64;
 
     for i in 1..n {
+        let interval_ms = dt_ms.round() as i64;
+        let ap = if has_ap { r.autopilot_states[i] } else { AUTOPILOT_OFF };
+        let prev_ap = if has_ap { r.autopilot_states[i - 1] } else { AUTOPILOT_OFF };
+        if has_ap && prev_ap != AUTOPILOT_OFF && ap == AUTOPILOT_OFF {
+            grace_remaining_ms = 5_000.0;
+        }
+        let pedal = if has_pedal { r.accel_positions[i] } else { 0.0 };
+        let factor_allowed = driver_controls_factor(ap, pedal) && grace_remaining_ms <= 0.0;
+        if grace_remaining_ms > 0.0 {
+            grace_remaining_ms = (grace_remaining_ms - dt_ms).max(0.0);
+        }
+        let prefix_idx = (((i - 1) as f64 * dt_ms) / 1_000.0).floor() as usize;
+
         if !valid(i) || !valid(i - 1) {
             in_brake_run = false;
             in_turn_run = false;
@@ -250,25 +293,46 @@ pub fn compute_clip_safety(r: &Route) -> ClipSafety {
         let sane = (-1.0..100.0).contains(&vp) && (-1.0..100.0).contains(&vc);
 
         if vc.abs() >= MOVING_MPS && vc.abs() < 100.0 {
-            out.moving_ms += dt_ms as i64;
-            if manual_at(i) {
-                out.manual_moving_ms += dt_ms as i64;
+            out.moving_ms += interval_ms;
+            if has_imu {
+                out.imu_moving_ms += interval_ms;
             }
-            if vc >= SPEEDING_MPS && vc < 100.0 {
-                out.speeding_ms += dt_ms as i64;
+            if factor_allowed {
+                out.manual_moving_ms += interval_ms;
+            }
+            if let Some(start) = clip_start {
+                let midpoint = start
+                    + chrono::Duration::milliseconds((((i as f64) - 0.5) * dt_ms).round() as i64);
+                let weight = night_weight(midpoint.hour());
+                if weight > 0.0 {
+                    out.night_ms += interval_ms;
+                    out.night_weighted_ms += (interval_ms as f64 * weight).round() as i64;
+                }
+            }
+            if factor_allowed && vc >= SPEEDING_MPS && vc < 100.0 {
+                out.speeding_ms += interval_ms;
+                if prefix_idx < out.grace_prefix.len() {
+                    out.grace_prefix[prefix_idx].speeding_ms += interval_ms;
+                }
             }
         }
 
         // ── Measured path: real IMU acceleration per sample ──
         if has_imu {
-            if manual_at(i) && vc.abs() >= MOVING_MPS {
+            if factor_allowed && vc.abs() >= MOVING_MPS {
                 // Sanity: |30 m/s²| ≈ 3g is beyond any road event.
-                let decel = -(r.accel_y[i] as f64);
+                let decel = r.accel_y[i] as f64;
                 let lateral = (r.accel_x[i] as f64).abs();
                 let braking_here = if decel.abs() < 30.0 && decel >= ANY_BRAKE_MPS2 {
-                    out.brake_any_ms += dt_ms as i64;
+                    out.brake_any_ms += interval_ms;
+                    if prefix_idx < out.grace_prefix.len() {
+                        out.grace_prefix[prefix_idx].brake_any_ms += interval_ms;
+                    }
                     if decel >= HARD_BRAKE_MPS2 {
-                        out.hard_brake_ms += dt_ms as i64;
+                        out.hard_brake_ms += interval_ms;
+                        if prefix_idx < out.grace_prefix.len() {
+                            out.grace_prefix[prefix_idx].hard_brake_ms += interval_ms;
+                        }
                         if !in_brake_run {
                             out.hard_brake_events += 1;
                         }
@@ -282,9 +346,15 @@ pub fn compute_clip_safety(r: &Route) -> ClipSafety {
                 in_brake_run = braking_here;
 
                 let turning_here = if lateral < 30.0 && lateral >= ANY_TURN_MPS2 {
-                    out.turn_any_ms += dt_ms as i64;
+                    out.turn_any_ms += interval_ms;
+                    if prefix_idx < out.grace_prefix.len() {
+                        out.grace_prefix[prefix_idx].turn_any_ms += interval_ms;
+                    }
                     if lateral >= AGGR_TURN_MPS2 {
-                        out.aggr_turn_ms += dt_ms as i64;
+                        out.aggr_turn_ms += interval_ms;
+                        if prefix_idx < out.grace_prefix.len() {
+                            out.grace_prefix[prefix_idx].aggr_turn_ms += interval_ms;
+                        }
                         if !in_turn_run {
                             out.aggr_turn_events += 1;
                         }
@@ -307,7 +377,7 @@ pub fn compute_clip_safety(r: &Route) -> ClipSafety {
         // Hard braking: decel between consecutive samples over estimated
         // real pair time, manual-only, pedal-confirmed when possible.
         let mut braking_here = false;
-        if sane && vp >= BRAKE_MIN_MPS && vc >= 0.0 && manual_at(i) {
+        if sane && vp >= BRAKE_MIN_MPS && vc >= 0.0 && factor_allowed {
             let d = calc::geodesic_m(
                 r.points[i - 1][0],
                 r.points[i - 1][1],
@@ -322,11 +392,17 @@ pub fn compute_clip_safety(r: &Route) -> ClipSafety {
                 // pedal gate here — regen alone reaches 0.1g and Tesla's
                 // denominator is plain deceleration time.
                 if decel >= ANY_BRAKE_MPS2 {
-                    out.brake_any_ms += dt_ms as i64;
+                    out.brake_any_ms += interval_ms;
+                    if prefix_idx < out.grace_prefix.len() {
+                        out.grace_prefix[prefix_idx].brake_any_ms += interval_ms;
+                    }
                 }
                 if decel >= HARD_BRAKE_MPS2 && brake_near(i as f64 * dt_ms) {
                     braking_here = true;
-                    out.hard_brake_ms += dt_ms as i64;
+                    out.hard_brake_ms += interval_ms;
+                    if prefix_idx < out.grace_prefix.len() {
+                        out.grace_prefix[prefix_idx].hard_brake_ms += interval_ms;
+                    }
                     if !in_brake_run {
                         out.hard_brake_events += 1;
                     }
@@ -338,7 +414,7 @@ pub fn compute_clip_safety(r: &Route) -> ClipSafety {
         // Aggressive turning: v²·k over the triple centered on i, with a
         // 2-consecutive-sample requirement to reject GPS bearing noise.
         let mut turning_here = false;
-        if i + 1 < n && valid(i + 1) && sane && manual_at(i) {
+        if i + 1 < n && valid(i + 1) && sane && factor_allowed {
             let v = vc.abs();
             if v >= TURN_MIN_MPS {
                 let p0 = [r.points[i - 1][0], r.points[i - 1][1]];
@@ -349,16 +425,25 @@ pub fn compute_clip_safety(r: &Route) -> ClipSafety {
                 if hop_a >= TURN_MIN_HOP_M && hop_b >= TURN_MIN_HOP_M {
                     let lateral = v * v * menger_curvature(p0, p1, p2);
                     if lateral >= ANY_TURN_MPS2 {
-                        out.turn_any_ms += dt_ms as i64;
+                        out.turn_any_ms += interval_ms;
+                        if prefix_idx < out.grace_prefix.len() {
+                            out.grace_prefix[prefix_idx].turn_any_ms += interval_ms;
+                        }
                     }
                     if lateral >= AGGR_TURN_MPS2 {
                         turning_here = true;
                         turn_streak += 1;
                         if turn_streak == 2 {
                             out.aggr_turn_events += 1;
-                            out.aggr_turn_ms += (2.0 * dt_ms) as i64;
+                            out.aggr_turn_ms += 2 * interval_ms;
+                            if prefix_idx < out.grace_prefix.len() {
+                                out.grace_prefix[prefix_idx].aggr_turn_ms += 2 * interval_ms;
+                            }
                         } else if turn_streak > 2 {
-                            out.aggr_turn_ms += dt_ms as i64;
+                            out.aggr_turn_ms += interval_ms;
+                            if prefix_idx < out.grace_prefix.len() {
+                                out.grace_prefix[prefix_idx].aggr_turn_ms += interval_ms;
+                            }
                         }
                     }
                 }
@@ -368,6 +453,8 @@ pub fn compute_clip_safety(r: &Route) -> ClipSafety {
             turn_streak = 0;
         }
     }
+    out.grace_ms_end = grace_remaining_ms.round() as i64;
+    out.ap_at_end = has_ap.then(|| r.autopilot_states[n - 1]);
     out
 }
 
@@ -499,7 +586,10 @@ pub fn is_night_hour(hour: u32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{FlagRun, Route, AUTOPILOT_FSD, FLAG_BRAKE};
+    use crate::types::{
+        FlagRun, Route, AUTOPILOT_AUTOSTEER, AUTOPILOT_FSD, AUTOPILOT_OFF,
+        AUTOPILOT_TACC, FLAG_BRAKE,
+    };
 
     /// Straight-line 61-point route (dt = 1000 ms) heading north at the
     /// given per-sample speeds (m/s). Point spacing follows the speeds so
@@ -657,9 +747,9 @@ mod tests {
         let mut ax = vec![0.0_f32; 61];
         let mut ay = vec![0.0_f32; 61];
         for k in 30..33 {
-            ay[k] = -4.0; // 0.41 g deceleration
+            ay[k] = 4.0; // stored Tesla SEI: positive Y is deceleration
         }
-        ay[40] = -1.5; // 0.15 g — denominator only
+        ay[40] = 1.5; // 0.15 g — denominator only
         for k in 45..47 {
             ax[k] = 5.0; // 0.51 g lateral
         }
@@ -680,6 +770,101 @@ mod tests {
         assert_eq!(cs.hard_brake_events, 0);
         assert_eq!(cs.aggr_turn_events, 0);
         assert_eq!(cs.brake_any_ms, 0);
+    }
+
+    #[test]
+    fn negative_measured_y_is_acceleration_not_braking() {
+        let mut r = route_with_speeds(vec![25.0; 61]);
+        r.accel_x = vec![0.0; 61];
+        r.accel_y = vec![0.0; 61];
+        r.accel_y[30] = -5.0;
+
+        let cs = compute_clip_safety(&r);
+
+        assert_eq!(cs.hard_brake_ms, 0);
+        assert_eq!(cs.brake_any_ms, 0);
+    }
+
+    #[test]
+    fn measured_imu_coverage_counts_only_aligned_moving_samples() {
+        let mut r = route_with_speeds(vec![25.0; 61]);
+        r.accel_x = vec![0.0; 61];
+        r.accel_y = vec![0.0; 61];
+        assert!((59_000..=61_000).contains(&compute_clip_safety(&r).imu_moving_ms));
+
+        r.accel_y.pop();
+        assert_eq!(compute_clip_safety(&r).imu_moving_ms, 0);
+    }
+
+    #[test]
+    fn autosteer_and_unoverridden_tacc_are_ineligible_but_tacc_pedal_override_counts() {
+        let measured_route = |ap: u8, pedal: f32| {
+            let mut r = route_with_speeds(vec![25.0; 61]);
+            r.autopilot_states = vec![ap; 61];
+            r.accel_positions = vec![pedal; 61];
+            r.accel_x = vec![0.0; 61];
+            r.accel_y = vec![4.0; 61];
+            r
+        };
+
+        assert_eq!(compute_clip_safety(&measured_route(AUTOPILOT_AUTOSTEER, 0.0)).hard_brake_ms, 0);
+        assert_eq!(compute_clip_safety(&measured_route(AUTOPILOT_TACC, 0.0)).hard_brake_ms, 0);
+        assert!(compute_clip_safety(&measured_route(AUTOPILOT_TACC, 1.1)).hard_brake_ms > 0);
+    }
+
+    #[test]
+    fn five_seconds_after_assisted_disengagement_are_ineligible() {
+        let mut r = route_with_speeds(vec![25.0; 61]);
+        r.autopilot_states = (0..61)
+            .map(|i| if i < 20 { AUTOPILOT_FSD } else { AUTOPILOT_OFF })
+            .collect();
+        r.accel_positions = vec![0.0; 61];
+        r.accel_x = vec![0.0; 61];
+        r.accel_y = vec![0.0; 61];
+        r.accel_y[22] = 4.0;
+        r.accel_y[30] = 4.0;
+
+        let cs = compute_clip_safety(&r);
+
+        assert!((900..=1_100).contains(&cs.hard_brake_ms), "only the post-grace spike counts: {cs:?}");
+        assert!(cs.grace_ms_end <= 5_000);
+    }
+
+    #[test]
+    fn assisted_and_post_disengagement_speeding_are_excluded() {
+        let mut r = route_with_speeds(vec![39.0; 61]);
+        r.autopilot_states = (0..61)
+            .map(|i| if i < 30 { AUTOPILOT_FSD } else { AUTOPILOT_OFF })
+            .collect();
+        r.accel_positions = vec![0.0; 61];
+
+        let cs = compute_clip_safety(&r);
+
+        assert!((25_000..=27_000).contains(&cs.speeding_ms), "30s assisted + 5s grace must be excluded: {cs:?}");
+    }
+
+    #[test]
+    fn late_night_time_is_classified_per_sample_across_the_hour_boundary() {
+        let mut r = route_with_speeds(vec![25.0; 61]);
+        r.file = "2025-01-01_22-59-58-front.mp4".to_string();
+        r.accel_x = vec![0.0; 61];
+        r.accel_y = vec![0.0; 61];
+
+        let cs = compute_clip_safety(&r);
+
+        assert!((57_000..=59_000).contains(&cs.night_ms), "only time after 11pm counts: {cs:?}");
+        assert!((11_900..=12_400).contains(&cs.night_weighted_ms), "11pm weight is 0.21: {cs:?}");
+    }
+
+    #[test]
+    fn menger_curvature_uses_the_true_endpoint_side() {
+        let m_lat = 111_132.0;
+        let m_lon = 111_320.0;
+        let p0 = [0.0, 0.0];
+        let p1 = [0.0, 1.0 / m_lon];
+        let p2 = [(3.0_f64.sqrt() / 2.0) / m_lat, 1.5 / m_lon];
+
+        assert!((menger_curvature(p0, p1, p2) - 1.0).abs() < 0.01);
     }
 
     #[test]
@@ -806,19 +991,19 @@ mod tests {
 
     #[test]
     fn night_window_hours() {
-        assert!(is_night_hour(22));
+        assert!(!is_night_hour(22));
         assert!(is_night_hour(23));
         assert!(is_night_hour(0));
         assert!(is_night_hour(3));
         assert!(!is_night_hour(4));
         assert!(!is_night_hour(12));
         assert!(!is_night_hour(21));
-        // Risk curve: monotonically rising through the night, zero outside.
-        assert!(night_weight(22) < night_weight(23));
-        assert!(night_weight(23) < night_weight(0));
-        assert!(night_weight(0) < night_weight(1));
-        assert!(night_weight(1) < night_weight(2));
-        assert_eq!(night_weight(2), night_weight(3));
+        assert_eq!(night_weight(23), 0.21);
+        assert_eq!(night_weight(0), 0.53);
+        assert_eq!(night_weight(1), 0.71);
+        assert_eq!(night_weight(2), 0.82);
+        assert_eq!(night_weight(3), 1.0);
+        assert_eq!(night_weight(22), 0.0);
         assert_eq!(night_weight(4), 0.0);
         assert_eq!(night_weight(12), 0.0);
     }

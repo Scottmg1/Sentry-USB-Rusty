@@ -631,7 +631,8 @@ pub struct ExtractedGps {
     pub ap_runs: Vec<ApRun>,
     /// IMU linear acceleration per deduped point, m/s² (SEI proto fields
     /// 14/15): X lateral (positive = rightward force), Y longitudinal
-    /// (negative = deceleration). Peak-|value| per collapsed GPS run.
+    /// (positive = deceleration in stored Tesla SEI samples). Peak-|value|
+    /// per collapsed GPS run.
     /// Empty when the clip's firmware doesn't emit the IMU fields.
     pub accel_x: Vec<f32>,
     pub accel_y: Vec<f32>,
