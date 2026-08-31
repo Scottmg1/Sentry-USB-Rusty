@@ -58,6 +58,8 @@ export interface DriveSummary {
   safetyAggrTurnEvents?: number
   safetySpeedingMs?: number
   safetyNightMi?: number
+  safetyImuMovingMs?: number
+  safetyNightWeightedMs?: number
 }
 
 export interface FsdEvent {

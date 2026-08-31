@@ -23,7 +23,7 @@ const TESLA_BLUE = "#3e6ae1"
 // crates/drives/src/safety.rs. Braking/turning are Tesla's published
 // caps for the same conditional ratios. Used to bucket the severity
 // segments and scale the daily factor charts.
-const FACTOR_CAPS = { hardBrake: 5.2, aggrTurn: 17.1, speeding: 5.0, night: 30.0 }
+const FACTOR_CAPS = { hardBrake: 5.2, aggrTurn: 13.2, speeding: 10.0, night: 14.2 }
 
 // Conditional-ratio denominator floor (ms) — mirrors MIN_RATE_DENOM_MS
 // in safety.rs so the daily charts match the backend's rate math.
@@ -64,23 +64,38 @@ function normalizeSafety(raw: any): SafetyAnalyticsData | null {
         aggrTurnEvents: d?.aggrTurnEvents ?? d?.aggr_turn_events ?? 0,
         speedingMs: d?.speedingMs ?? d?.speeding_ms ?? 0,
         nightMi: d?.nightMi ?? d?.night_mi ?? 0,
+        nightMs: d?.nightMs ?? d?.night_ms ?? 0,
+        nightWeightedMs: d?.nightWeightedMs ?? d?.night_weighted_ms ?? 0,
         movingMs: d?.movingMs ?? d?.moving_ms ?? 0,
         manualMovingMs: d?.manualMovingMs ?? d?.manual_moving_ms ?? 0,
         hardBrakeMs: d?.hardBrakeMs ?? d?.hard_brake_ms ?? 0,
         aggrTurnMs: d?.aggrTurnMs ?? d?.aggr_turn_ms ?? 0,
         brakeAnyMs: d?.brakeAnyMs ?? d?.brake_any_ms ?? 0,
         turnAnyMs: d?.turnAnyMs ?? d?.turn_any_ms ?? 0,
+        imuMovingMs: d?.imuMovingMs ?? d?.imu_moving_ms ?? 0,
+        coveragePct: d?.coveragePct ?? d?.coverage_pct ?? 0,
+        eligible: d?.eligible ?? false,
       }))
     : []
   return {
+    modelId: raw.modelId ?? raw.model_id ?? "tesla-v2.2-estimate-1",
+    modelLabel: raw.modelLabel ?? raw.model_label ?? "Tesla v2.2 Estimate",
     period: raw.period ?? "",
     periodStart: raw.periodStart ?? raw.period_start ?? "",
     totalDrives: raw.totalDrives ?? raw.total_drives ?? 0,
     scoredDrives: raw.scoredDrives ?? raw.scored_drives ?? 0,
+    compatibleDays: raw.compatibleDays ?? raw.compatible_days ?? 0,
+    compatibleDistanceMi: raw.compatibleDistanceMi ?? raw.compatible_distance_mi ?? 0,
+    totalNativeDistanceMi: raw.totalNativeDistanceMi ?? raw.total_native_distance_mi ?? 0,
+    coveragePct: raw.coveragePct ?? raw.coverage_pct ?? 0,
+    unavailableFactors: raw.unavailableFactors ?? raw.unavailable_factors ?? [],
     score: score(raw.score),
     totalDistanceMi: raw.totalDistanceMi ?? raw.total_distance_mi ?? 0,
     totalDistanceKm: raw.totalDistanceKm ?? raw.total_distance_km ?? 0,
     movingMs: raw.movingMs ?? raw.moving_ms ?? 0,
+    imuMovingMs: raw.imuMovingMs ?? raw.imu_moving_ms ?? 0,
+    nightMs: raw.nightMs ?? raw.night_ms ?? 0,
+    nightWeightedMs: raw.nightWeightedMs ?? raw.night_weighted_ms ?? 0,
     manualMovingMs: raw.manualMovingMs ?? raw.manual_moving_ms ?? 0,
     hardBrakeEvents: raw.hardBrakeEvents ?? raw.hard_brake_events ?? 0,
     hardBrakeMs: raw.hardBrakeMs ?? raw.hard_brake_ms ?? 0,
@@ -116,7 +131,6 @@ export default function SafetyScore() {
   const [expanded, setExpanded] = useState<string | null>(null)
   const [showLearnMore, setShowLearnMore] = useState(false)
   const [showDaily, setShowDaily] = useState(false)
-  const [reliefTipFor, setReliefTipFor] = useState<string | null>(null)
 
   useEffect(() => {
     fetch("/api/setup/config")
@@ -189,7 +203,6 @@ export default function SafetyScore() {
     description: string
     avg: number | null
     series: number[] | null
-    relieved: boolean
     forceBucket?: "green" | "yellow" | "red"
   }
 
@@ -203,7 +216,6 @@ export default function SafetyScore() {
           description: "Proportion of braking time (deceleration above 0.1g) spent braking harder than 0.3g — the same conditional measure Tesla uses. Braking while FSD or Autopilot is engaged is not counted.",
           avg: score.hardBrakePct,
           series: daily.map((d) => (d.hardBrakeMs / Math.max(d.brakeAnyMs, MIN_RATE_DENOM_MS)) * 100),
-          relieved: score.fsdReliefPct > 0,
         },
         {
           key: "aggrTurn",
@@ -213,7 +225,6 @@ export default function SafetyScore() {
           description: "Proportion of turning time (lateral force above 0.2g) done with force above 0.4g — the same conditional measure Tesla uses. Turns under FSD or Autopilot are not counted.",
           avg: score.aggrTurnPct,
           series: daily.map((d) => (d.aggrTurnMs / Math.max(d.turnAnyMs, MIN_RATE_DENOM_MS)) * 100),
-          relieved: score.fsdReliefPct > 0,
         },
         {
           key: "speeding",
@@ -223,17 +234,15 @@ export default function SafetyScore() {
           description: `Proportion of moving time driven above 85 mph (${formatDuration(data.speedingMs)} in this period).`,
           avg: score.speedingPct,
           series: daily.map((d) => (d.movingMs > 0 ? (d.speedingMs / d.movingMs) * 100 : 0)),
-          relieved: false,
         },
         {
           key: "night",
           label: "Late Night Driving",
           value: `${score.nightPct}%`,
           frac: Math.min(score.nightPct / FACTOR_CAPS.night, 1),
-          description: `Proportion of miles driven between 10pm and 4am (${nightDist.toFixed(1)} ${distUnit} in this period). Risk-weighted by hour like Tesla's: driving at 3am counts three times as much as 10pm.`,
+          description: `Proportion of moving time between 11pm and 4am (${nightDist.toFixed(1)} ${distUnit} in this period). Risk-weighted by hour using Tesla v2.2's published curve.`,
           avg: score.nightPct,
-          series: daily.map((d) => (d.distanceMi > 0 ? (d.nightMi / d.distanceMi) * 100 : 0)),
-          relieved: false,
+          series: daily.map((d) => (d.movingMs > 0 ? (d.nightMs / d.movingMs) * 100 : 0)),
         },
         {
           key: "fsd",
@@ -241,10 +250,9 @@ export default function SafetyScore() {
           value: `${Math.round(score.fsdSharePct)}%`,
           frac: 0,
           forceBucket: "green",
-          description: `Share of miles driven with FSD, Autosteer or TACC engaged. Events during assisted driving never count against you${score.fsdReliefPct > 0 ? `, and this share trims the braking and turning penalties by ${Math.round(score.fsdReliefPct)}%` : ""}.`,
+          description: "Share of miles driven with FSD, Autosteer or TACC engaged. Hard braking, aggressive turning, and excessive speeding while assistance controls the vehicle are excluded, plus a five-second grace period after disengagement. Tesla v2.2 applies no blanket percentage discount.",
           avg: null,
           series: null,
-          relieved: false,
         },
         {
           key: "disengage",
@@ -255,7 +263,6 @@ export default function SafetyScore() {
           description: "Times FSD (Supervised) or Autosteer was disengaged in this period. The dashcam stream can't distinguish forced disengagements (strikeouts) from normal takeovers, so every disengagement is counted. Informational only — this does not affect the score.",
           avg: null,
           series: null,
-          relieved: false,
         },
       ]
     : []
@@ -270,7 +277,7 @@ export default function SafetyScore() {
         >
           <ArrowBackIcon className="h-5 w-5" />
         </button>
-        <h1 className="text-xl font-semibold text-slate-100">Safety Score</h1>
+        <h1 className="text-xl font-semibold text-slate-100">Tesla v2.2 Estimate</h1>
         <div className="absolute right-0 flex items-center gap-1 rounded-full border border-white/10 bg-white/5 p-0.5">
           {(["day", "week", "month", "all"] as SafetyPeriod[]).map((p) => (
             <button
@@ -298,7 +305,7 @@ export default function SafetyScore() {
               : "Not enough driving to score yet"}
           </p>
           <p className="mt-1 text-xs text-slate-500">
-            The score needs at least half a mile of SEI-recorded driving in the period.
+            The estimate needs at least 0.1 mile and 90% aligned vehicle-IMU coverage on a local day.
           </p>
         </div>
       ) : (<>
@@ -323,14 +330,13 @@ export default function SafetyScore() {
       </button>
       {showLearnMore && (
         <p className="mt-2 rounded-lg bg-white/[0.03] p-3 text-xs leading-relaxed text-slate-400">
-          This score is estimated from your dashcam SEI telemetry. Braking and turning G-forces
-          come from the vehicle's own accelerometer when the footage includes it; older clips
-          fall back to estimates derived from speed and GPS data and are read conservatively.
-          Braking and turning factors are tuned to be similar to Tesla's conditional measures
-          and caps.
+          This estimate uses Tesla's published v2.2 formula for the factors available in SEI:
+          hard braking, aggressive turning, excessive speeding, and weighted late-night driving.
+          A day is included only when aligned vehicle-IMU data covers at least 90% of its moving time.
+          Older or imported drives remain visible but do not receive a clean score by default.
           <br />
           <br />
-          Using FSD (Supervised) reduces some scoring factor impacts.
+          Unavailable factors are omitted: {data.unavailableFactors.join(", ")}.
         </p>
       )}
 
@@ -346,29 +352,6 @@ export default function SafetyScore() {
               >
                 <span className="flex items-center gap-2 pr-3 text-[15px] text-slate-100">
                   {f.label}
-                  {f.relieved && (
-                    <span
-                      className="relative inline-block"
-                      onClick={(e) => {
-                        // Don't let a tap on the pill expand/collapse the row.
-                        e.stopPropagation()
-                        setReliefTipFor(reliefTipFor === f.key ? null : f.key)
-                      }}
-                      onMouseEnter={() => setReliefTipFor(f.key)}
-                      onMouseLeave={() => setReliefTipFor(null)}
-                    >
-                      <span className="rounded-full bg-emerald-500/10 px-1.5 py-px text-[9px] font-medium text-emerald-400">
-                        FSD relief
-                      </span>
-                      {reliefTipFor === f.key && (
-                        <span className="absolute left-1/2 top-full z-50 mt-1.5 w-60 -translate-x-1/2 rounded-md border border-white/10 bg-slate-900/95 px-2.5 py-1.5 text-[11px] font-normal normal-case leading-relaxed text-slate-300 shadow-2xl">
-                          This penalty is reduced by {Math.round(score.fsdReliefPct)}% because{" "}
-                          {Math.round(score.fsdSharePct)}% of your miles are driven on FSD/Autopilot.
-                          Braking and turning while assisted never count at all.
-                        </span>
-                      )}
-                    </span>
-                  )}
                 </span>
                 <span className="flex shrink-0 items-center gap-2">
                   <span className="text-[15px] font-medium text-slate-100 tabular-nums">{f.value}</span>
@@ -458,8 +441,7 @@ export default function SafetyScore() {
       </div>
 
       <p className="mt-6 text-xs leading-relaxed text-slate-600">
-        Estimated from dashcam SEI telemetry data extracted by Sentry USB - not Tesla's official
-        Safety Score.
+        Tesla v2.2 Estimate from Sentry USB SEI telemetry. This is not Tesla's official Safety Score.
       </p>
       </>)}
     </div>

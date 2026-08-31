@@ -126,6 +126,7 @@ export function DriveRow({
           )}
           {typeof drive.safetyScore === "number" && (
             <Chip
+              title="Tesla v2.2 Estimate for this drive"
               className={
                 drive.safetyScore >= 90
                   ? "bg-emerald-400/15 text-emerald-200 ring-emerald-400/20"
@@ -160,15 +161,17 @@ export function DriveRow({
 
 interface ChipProps {
   children: React.ReactNode
+  title?: string
   emphasis?: boolean
   summon?: boolean
   /** Explicit color classes (bg/text/ring); overrides the variant flags. */
   className?: string
 }
 
-function Chip({ children, emphasis, summon, className }: ChipProps) {
+function Chip({ children, title, emphasis, summon, className }: ChipProps) {
   return (
     <span
+      title={title}
       className={cn(
         "inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-xs font-medium tabular-nums ring-1 ring-inset",
         className ??

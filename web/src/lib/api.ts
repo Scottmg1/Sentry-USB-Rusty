@@ -177,23 +177,38 @@ export interface SafetyDayStats {
   aggrTurnEvents: number
   speedingMs: number
   nightMi: number
+  nightMs: number
+  nightWeightedMs: number
   movingMs: number
+  imuMovingMs: number
   manualMovingMs: number
   hardBrakeMs: number
   aggrTurnMs: number
   brakeAnyMs: number
   turnAnyMs: number
+  coveragePct: number
+  eligible: boolean
 }
 
 export interface SafetyAnalytics {
+  modelId: string
+  modelLabel: string
   period: string
   periodStart: string
   totalDrives: number
   scoredDrives: number
+  compatibleDays: number
+  compatibleDistanceMi: number
+  totalNativeDistanceMi: number
+  coveragePct: number
+  unavailableFactors: string[]
   score: SafetyScoreBreakdown | null
   totalDistanceMi: number
   totalDistanceKm: number
   movingMs: number
+  imuMovingMs: number
+  nightMs: number
+  nightWeightedMs: number
   manualMovingMs: number
   hardBrakeEvents: number
   hardBrakeMs: number
