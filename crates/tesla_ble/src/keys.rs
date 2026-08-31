@@ -1,11 +1,13 @@
 //! Load the user's Tesla BLE NIST P-256 private key and derive the
 //! public key for SessionInfoRequest. Also generates fresh keypairs.
 
-use std::path::Path;
+use std::fs::{File, OpenOptions};
+use std::io::Write;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use p256::SecretKey;
-use p256::pkcs8::{DecodePrivateKey, EncodePrivateKey, LineEnding};
+use p256::pkcs8::{DecodePrivateKey, DecodePublicKey, EncodePrivateKey, LineEnding};
 
 /// Loaded ECDH keypair. The private key is for signing/ECDH; the
 /// `pub_uncompressed` bytes are the 65-byte SEC1 format Tesla expects
@@ -41,17 +43,216 @@ impl KeyPair {
     }
 }
 
+/// Load and validate the complete on-disk Tesla BLE keypair. The private key
+/// is authoritative, but a usable installation also requires a parseable SPKI
+/// public key derived from that same private scalar.
+pub fn load_keypair(dir: &Path) -> Result<KeyPair> {
+    load_keypair_paths(&dir.join("key_private.pem"), &dir.join("key_public.pem"))
+}
+
+fn load_keypair_paths(priv_path: &Path, pub_path: &Path) -> Result<KeyPair> {
+    let keypair = load_regular_private_key(priv_path)?;
+    require_regular_file(pub_path, "public key")?;
+    let public_pem = std::fs::read_to_string(pub_path)
+        .with_context(|| format!("reading public key file {}", pub_path.display()))?;
+    let public = p256::PublicKey::from_public_key_pem(&public_pem)
+        .with_context(|| format!("parsing public key file {}", pub_path.display()))?;
+    if public.to_sec1_bytes().as_ref() != keypair.pub_uncompressed.as_slice() {
+        bail!("Tesla BLE public key does not match the private key");
+    }
+    Ok(keypair)
+}
+
+fn require_regular_file(path: &Path, description: &str) -> Result<()> {
+    let metadata = std::fs::symlink_metadata(path)
+        .with_context(|| format!("reading {description} metadata {}", path.display()))?;
+    if !metadata.file_type().is_file() {
+        bail!(
+            "{description} path {} is not a regular file",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+fn load_regular_private_key(path: &Path) -> Result<KeyPair> {
+    require_regular_file(path, "private key")?;
+    KeyPair::load(path).context("loading Tesla BLE private key")
+}
+
+/// Is there a usable private key at `path`?
+///
+/// Prefer this over `Path::exists()` for every "do we need to generate a
+/// key?" decision. A bare existence test caused an unrecoverable deadlock:
+/// an interrupted keygen leaves a 0-byte `key_private.pem`, which "exists"
+/// but cannot be parsed, so pairing failed forever while every guard
+/// happily reported the key was already installed. This actually parses
+/// the key, so empty, truncated and corrupt files all read as unusable.
+pub fn key_is_usable(path: &Path) -> bool {
+    load_regular_private_key(path).is_ok()
+}
+
+struct KeyDirectoryLock {
+    file: File,
+}
+
+impl KeyDirectoryLock {
+    fn acquire(dir: &Path) -> Result<Self> {
+        let path = dir.join(".keygen.lock");
+        let mut options = OpenOptions::new();
+        options.read(true).write(true).create(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let file = options
+            .open(&path)
+            .with_context(|| format!("opening BLE key lock {}", path.display()))?;
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd;
+            let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+            if rc != 0 {
+                return Err(std::io::Error::last_os_error())
+                    .with_context(|| format!("locking BLE key directory {}", dir.display()));
+            }
+        }
+        Ok(Self { file })
+    }
+}
+
+impl Drop for KeyDirectoryLock {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd;
+            let _ = unsafe { libc::flock(self.file.as_raw_fd(), libc::LOCK_UN) };
+        }
+    }
+}
+
+fn stage_key_file(dir: &Path, name: &str, contents: &[u8], mode: u32) -> Result<PathBuf> {
+    use p256::elliptic_curve::rand_core::{OsRng, RngCore};
+
+    for _ in 0..16 {
+        let mut rng = OsRng;
+        let path = dir.join(format!(".{name}.{:016x}.tmp", rng.next_u64()));
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(mode);
+        }
+        match options.open(&path) {
+            Ok(mut file) => {
+                let result = (|| -> Result<()> {
+                    file.write_all(contents)
+                        .with_context(|| format!("writing staged key {}", path.display()))?;
+                    #[cfg(unix)]
+                    std::fs::set_permissions(
+                        &path,
+                        std::os::unix::fs::PermissionsExt::from_mode(mode),
+                    )
+                    .with_context(|| format!("setting permissions on {}", path.display()))?;
+                    file.sync_all()
+                        .with_context(|| format!("syncing staged key {}", path.display()))?;
+                    Ok(())
+                })();
+                if let Err(error) = result {
+                    let _ = std::fs::remove_file(&path);
+                    return Err(error);
+                }
+                return Ok(path);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("creating staged key {}", path.display()));
+            }
+        }
+    }
+    bail!("could not allocate a unique staged BLE key file")
+}
+
+#[cfg(unix)]
+fn sync_key_directory(dir: &Path) -> Result<()> {
+    File::open(dir)
+        .with_context(|| format!("opening key directory {} for sync", dir.display()))?
+        .sync_all()
+        .with_context(|| format!("syncing key directory {}", dir.display()))
+}
+
+#[cfg(not(unix))]
+fn sync_key_directory(_dir: &Path) -> Result<()> {
+    Ok(())
+}
+
+fn publish_public_key(dir: &Path, keypair: &KeyPair) -> Result<()> {
+    use p256::pkcs8::EncodePublicKey;
+
+    let public_pem = keypair
+        .secret
+        .public_key()
+        .to_public_key_pem(LineEnding::LF)
+        .context("encoding SPKI public key")?;
+    let staged = stage_key_file(dir, "key_public.pem", public_pem.as_bytes(), 0o644)?;
+    let destination = dir.join("key_public.pem");
+    if let Err(error) = std::fs::rename(&staged, &destination) {
+        let _ = std::fs::remove_file(&staged);
+        return Err(error).with_context(|| format!("publishing {}", destination.display()));
+    }
+    sync_key_directory(dir)
+}
+
+/// Validate the private key and repair a missing, malformed, or mismatched
+/// public key without rotating the private key that may already be paired.
+pub fn ensure_keypair_files(dir: &Path) -> Result<KeyPair> {
+    std::fs::create_dir_all(dir).with_context(|| format!("creating key dir {}", dir.display()))?;
+    let _lock = KeyDirectoryLock::acquire(dir)?;
+    let priv_path = dir.join("key_private.pem");
+    let keypair = load_regular_private_key(&priv_path)?;
+    if load_keypair(dir).is_ok() {
+        return Ok(keypair);
+    }
+    publish_public_key(dir, &keypair)?;
+    load_keypair(dir).context("validating repaired Tesla BLE keypair")
+}
+
 /// Generate a fresh P-256 BLE keypair, write both halves to disk, and
 /// return the loaded keypair. Writes:
 ///   * `<dir>/key_private.pem` — PKCS#8 PEM, 0600. (`KeyPair::load` also
 ///     accepts the SEC1 PEM that older tesla-keygen installs use.)
 ///   * `<dir>/key_public.pem` — SPKI PEM, 0644 (what the pair flow reads).
-pub fn generate_keypair(dir: &Path) -> Result<KeyPair> {
+fn generate_keypair_locked(dir: &Path, replace_unusable: bool) -> Result<KeyPair> {
     use p256::elliptic_curve::rand_core::OsRng;
     use p256::pkcs8::EncodePublicKey;
 
-    std::fs::create_dir_all(dir)
-        .with_context(|| format!("creating key dir {}", dir.display()))?;
+    let priv_path = dir.join("key_private.pem");
+    let pub_path = dir.join("key_public.pem");
+    match std::fs::symlink_metadata(&priv_path) {
+        Ok(metadata) if !metadata.file_type().is_file() => {
+            bail!(
+                "existing Tesla BLE private key path {} is not a regular file; refusing to overwrite it",
+                priv_path.display()
+            );
+        }
+        Ok(_) if !replace_unusable => {
+            return load_keypair(dir).with_context(|| {
+                format!(
+                    "existing Tesla BLE private key {} is invalid or incomplete; refusing to overwrite it",
+                    priv_path.display()
+                )
+            });
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("reading private key metadata {}", priv_path.display()));
+        }
+    }
 
     let secret = SecretKey::random(&mut OsRng);
     let private_pem = secret
@@ -62,29 +263,96 @@ pub fn generate_keypair(dir: &Path) -> Result<KeyPair> {
         .to_public_key_pem(LineEnding::LF)
         .context("encoding SPKI public key")?;
 
-    let priv_path = dir.join("key_private.pem");
-    let pub_path = dir.join("key_public.pem");
-    std::fs::write(&priv_path, private_pem.as_bytes())
-        .with_context(|| format!("writing {}", priv_path.display()))?;
-    std::fs::write(&pub_path, public_pem.as_bytes())
-        .with_context(|| format!("writing {}", pub_path.display()))?;
-
-    // 0600 / 0644 — only matters on Unix; on other targets the chmod
-    // is a no-op.
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(
-            &priv_path,
-            std::fs::Permissions::from_mode(0o600),
-        );
-        let _ = std::fs::set_permissions(
-            &pub_path,
-            std::fs::Permissions::from_mode(0o644),
-        );
+    let staged_private = stage_key_file(dir, "key_private.pem", private_pem.as_bytes(), 0o600)?;
+    let staged_public = match stage_key_file(dir, "key_public.pem", public_pem.as_bytes(), 0o644) {
+        Ok(path) => path,
+        Err(error) => {
+            let _ = std::fs::remove_file(&staged_private);
+            return Err(error);
+        }
+    };
+    if let Err(error) = load_keypair_paths(&staged_private, &staged_public) {
+        let _ = std::fs::remove_file(&staged_private);
+        let _ = std::fs::remove_file(&staged_public);
+        return Err(error).context("validating staged Tesla BLE keypair");
     }
 
-    KeyPair::load(&priv_path)
+    // The private key is the durable source of truth. Publish it first, then
+    // the derivable public key; if the second rename is interrupted, the next
+    // install safely repairs the public half without rotating the private key.
+    if let Err(error) = std::fs::rename(&staged_private, &priv_path) {
+        let _ = std::fs::remove_file(&staged_private);
+        let _ = std::fs::remove_file(&staged_public);
+        return Err(error).with_context(|| format!("publishing {}", priv_path.display()));
+    }
+    sync_key_directory(dir)?;
+    if let Err(error) = std::fs::rename(&staged_public, &pub_path) {
+        let _ = std::fs::remove_file(&staged_public);
+        return Err(error).with_context(|| format!("publishing {}", pub_path.display()));
+    }
+    sync_key_directory(dir)?;
+
+    load_keypair(dir).context("validating published Tesla BLE keypair")
+}
+
+pub fn generate_keypair(dir: &Path) -> Result<KeyPair> {
+    std::fs::create_dir_all(dir).with_context(|| format!("creating key dir {}", dir.display()))?;
+    let _lock = KeyDirectoryLock::acquire(dir)?;
+    generate_keypair_locked(dir, false)
+}
+
+/// Explicitly make the directory contain one usable keypair. A valid private
+/// key is preserved and its public half is repaired; an unusable regular
+/// private-key file is atomically replaced. Private-key replacement also
+/// clears the stale paired marker and marks pairing as pending. Symlinks and
+/// other non-files are always rejected.
+pub fn regenerate_keypair(dir: &Path) -> Result<KeyPair> {
+    std::fs::create_dir_all(dir).with_context(|| format!("creating key dir {}", dir.display()))?;
+    let _lock = KeyDirectoryLock::acquire(dir)?;
+
+    let priv_path = dir.join("key_private.pem");
+    if let Ok(keypair) = load_regular_private_key(&priv_path) {
+        if load_keypair(dir).is_ok() {
+            return Ok(keypair);
+        }
+        publish_public_key(dir, &keypair)?;
+        return load_keypair(dir).context("validating repaired Tesla BLE keypair");
+    }
+
+    // Validate the replacement target before changing pairing state. A
+    // symlink or directory is rejected without touching an existing marker.
+    match std::fs::symlink_metadata(&priv_path) {
+        Ok(metadata) if !metadata.file_type().is_file() => {
+            bail!(
+                "existing Tesla BLE private key path {} is not a regular file; refusing to overwrite it",
+                priv_path.display()
+            );
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("reading private key metadata {}", priv_path.display()));
+        }
+    }
+
+    // An unusable private key cannot authenticate an existing enrolment. Clear
+    // the durable paired state before publishing its replacement so no failure
+    // path can leave the new key falsely reported as paired.
+    let paired_path = dir.join("paired");
+    if let Err(error) = std::fs::remove_file(&paired_path)
+        && error.kind() != std::io::ErrorKind::NotFound
+    {
+        return Err(error)
+            .with_context(|| format!("clearing stale paired marker {}", paired_path.display()));
+    }
+
+    let keypair = generate_keypair_locked(dir, true)?;
+    let pending_path = dir.join("key_pending_pairing");
+    std::fs::write(&pending_path, "")
+        .with_context(|| format!("writing pairing marker {}", pending_path.display()))?;
+    sync_key_directory(dir)?;
+    Ok(keypair)
 }
 
 /// Hand-parse SEC1 ECPrivateKey DER to extract the 32-byte scalar.
@@ -183,6 +451,176 @@ mod tests {
             "uncompressed SEC1 pubkey is 65 bytes"
         );
         assert_eq!(loaded.pub_uncompressed, kp.pub_uncompressed);
+    }
+
+    #[test]
+    fn empty_key_files_are_not_a_valid_pair() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("key_private.pem"), b"").unwrap();
+        std::fs::write(dir.path().join("key_public.pem"), b"").unwrap();
+
+        let error = match load_keypair(dir.path()) {
+            Ok(_) => panic!("empty PEM files must be rejected"),
+            Err(error) => error,
+        };
+        assert!(
+            error.to_string().contains("private key"),
+            "unexpected validation error: {error:#}"
+        );
+    }
+
+    #[test]
+    fn valid_private_key_repairs_a_missing_public_key_without_rotation() {
+        let dir = tempfile::tempdir().unwrap();
+        generate_keypair(dir.path()).unwrap();
+        let priv_path = dir.path().join("key_private.pem");
+        let pub_path = dir.path().join("key_public.pem");
+        let private_before = std::fs::read(&priv_path).unwrap();
+        std::fs::remove_file(&pub_path).unwrap();
+
+        let repaired = ensure_keypair_files(dir.path()).unwrap();
+
+        assert_eq!(std::fs::read(&priv_path).unwrap(), private_before);
+        assert_eq!(
+            load_keypair(dir.path()).unwrap().pub_uncompressed,
+            repaired.pub_uncompressed
+        );
+    }
+
+    #[test]
+    fn concurrent_generation_converges_on_one_valid_keypair() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = std::sync::Arc::new(dir.path().to_path_buf());
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let mut workers = Vec::new();
+        for _ in 0..2 {
+            let path = path.clone();
+            let barrier = barrier.clone();
+            workers.push(std::thread::spawn(move || {
+                barrier.wait();
+                generate_keypair(&path)
+            }));
+        }
+
+        for worker in workers {
+            worker.join().unwrap().unwrap();
+        }
+        load_keypair(dir.path()).unwrap();
+    }
+
+    #[test]
+    fn invalid_existing_private_key_is_never_overwritten() {
+        let dir = tempfile::tempdir().unwrap();
+        let priv_path = dir.path().join("key_private.pem");
+        std::fs::write(&priv_path, b"broken-private-key").unwrap();
+
+        assert!(ensure_keypair_files(dir.path()).is_err());
+        assert_eq!(std::fs::read(&priv_path).unwrap(), b"broken-private-key");
+        assert!(generate_keypair(dir.path()).is_err());
+        assert_eq!(std::fs::read(&priv_path).unwrap(), b"broken-private-key");
+    }
+
+    #[test]
+    fn explicit_regeneration_replaces_empty_key_files() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("key_private.pem"), b"").unwrap();
+        std::fs::write(dir.path().join("key_public.pem"), b"").unwrap();
+        std::fs::write(dir.path().join("paired"), b"1").unwrap();
+
+        regenerate_keypair(dir.path()).unwrap();
+
+        assert!(key_is_usable(&dir.path().join("key_private.pem")));
+        load_keypair(dir.path()).unwrap();
+        assert!(!dir.path().join("paired").exists());
+        assert!(dir.path().join("key_pending_pairing").exists());
+    }
+
+    #[test]
+    fn explicit_regeneration_repairs_public_key_without_rotation() {
+        let dir = tempfile::tempdir().unwrap();
+        generate_keypair(dir.path()).unwrap();
+        let priv_path = dir.path().join("key_private.pem");
+        let private_before = std::fs::read(&priv_path).unwrap();
+        std::fs::write(dir.path().join("key_public.pem"), b"broken-public-key").unwrap();
+        std::fs::write(dir.path().join("paired"), b"1").unwrap();
+
+        regenerate_keypair(dir.path()).unwrap();
+
+        assert_eq!(std::fs::read(priv_path).unwrap(), private_before);
+        load_keypair(dir.path()).unwrap();
+        assert!(dir.path().join("paired").exists());
+        assert!(!dir.path().join("key_pending_pairing").exists());
+    }
+
+    #[test]
+    fn explicit_regeneration_fails_if_paired_marker_cannot_be_cleared() {
+        let dir = tempfile::tempdir().unwrap();
+        let priv_path = dir.path().join("key_private.pem");
+        std::fs::write(&priv_path, b"").unwrap();
+        std::fs::write(dir.path().join("key_public.pem"), b"").unwrap();
+        std::fs::create_dir(dir.path().join("paired")).unwrap();
+
+        let error = match regenerate_keypair(dir.path()) {
+            Ok(_) => panic!("regeneration should fail when the paired marker cannot be removed"),
+            Err(error) => error,
+        };
+
+        assert!(error.to_string().contains("clearing stale paired marker"));
+        assert_eq!(std::fs::read(priv_path).unwrap(), b"");
+        assert!(!dir.path().join("key_pending_pairing").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn generated_key_files_have_safe_modes_and_no_staging_remnants() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        generate_keypair(dir.path()).unwrap();
+
+        let private_mode = std::fs::metadata(dir.path().join("key_private.pem"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        let public_mode = std::fs::metadata(dir.path().join("key_public.pem"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(private_mode, 0o600);
+        assert_eq!(public_mode, 0o644);
+        let staged: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .flatten()
+            .filter(|entry| entry.file_name().to_string_lossy().ends_with(".tmp"))
+            .collect();
+        assert!(staged.is_empty(), "staging files remain: {staged:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_key_symlinks_are_not_accepted_as_install_state() {
+        let source = tempfile::tempdir().unwrap();
+        generate_keypair(source.path()).unwrap();
+        let install = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(
+            source.path().join("key_private.pem"),
+            install.path().join("key_private.pem"),
+        )
+        .unwrap();
+        std::fs::copy(
+            source.path().join("key_public.pem"),
+            install.path().join("key_public.pem"),
+        )
+        .unwrap();
+
+        assert!(load_keypair(install.path()).is_err());
+        assert!(ensure_keypair_files(install.path()).is_err());
+        std::fs::write(install.path().join("paired"), b"1").unwrap();
+        assert!(regenerate_keypair(install.path()).is_err());
+        assert!(install.path().join("key_private.pem").is_symlink());
+        assert!(install.path().join("paired").exists());
     }
 
     #[test]

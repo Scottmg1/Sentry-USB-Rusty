@@ -22,14 +22,37 @@
 # to the unsuffixed legacy name for very old installs that pre-date
 # this scheme.
 
-set -u
+set -euo pipefail
 
-INSTALL_DIR=/opt/sentryusb
+INSTALL_DIR="${SENTRYUSB_INSTALL_DIR:-/opt/sentryusb}"
+ROOT_BIN="${SENTRYUSB_ROOT_BIN:-/root/bin}"
 CURRENT_LINK="${INSTALL_DIR}/sentryusb-current"
 ACTIVE_FILE="${INSTALL_DIR}/active-variant"
 TAG="sentryusb-pick-binary"
 
-log() { logger -t "$TAG" -- "$1" 2>/dev/null || echo "$TAG: $1" >&2; }
+log() {
+    if [ "${SENTRYUSB_PICK_LOG_STDERR:-0}" = 1 ]; then
+        echo "$TAG: $1" >&2
+    else
+        logger -t "$TAG" -- "$1" 2>/dev/null || echo "$TAG: $1" >&2
+    fi
+}
+
+ensure_symlink() {
+    local target="$1"
+    local link="$2"
+
+    # A read-only production root is the normal boot state. Avoid rewriting an
+    # already-correct link: ln -sfn would fail with EROFS even though no repair
+    # is needed.
+    if [ -L "$link" ] \
+        && [ "$(readlink "$link" 2>/dev/null || true)" = "$target" ] \
+        && [ -x "$link" ]; then
+        return 0
+    fi
+
+    ln -sfn "$target" "$link"
+}
 
 detect_variant() {
     # Userspace arch takes precedence — a 64-bit kernel may host a 32-bit
@@ -125,7 +148,10 @@ fi
 # Atomic symlink swap — ln -sfn keeps the old link reachable until rename
 # completes, so a concurrent systemd ExecStart wouldn't dereference a
 # half-written link.
-ln -sfn "$PICKED_PATH" "$CURRENT_LINK"
+if ! ensure_symlink "$PICKED_PATH" "$CURRENT_LINK"; then
+    log "FATAL: could not link ${CURRENT_LINK} -> ${PICKED_PATH}"
+    exit 1
+fi
 
 # Record what this CPU NEEDS (the detected variant) — NOT what we ended
 # up running. The fallback pick above reflects what happened to be on
@@ -136,8 +162,11 @@ ln -sfn "$PICKED_PATH" "$CURRENT_LINK"
 # it isn't a release suffix and 404s every download built from it.
 # Best-effort write — failure here doesn't block startup, the updater
 # just falls back to re-detection on its own.
-if [ -n "$DETECTED" ]; then
-    printf '%s\n' "$DETECTED" > "$ACTIVE_FILE" 2>/dev/null || true
+if [ -n "$DETECTED" ] \
+    && [ "$(cat "$ACTIVE_FILE" 2>/dev/null || true)" != "$DETECTED" ]; then
+    if ! printf '%s\n' "$DETECTED" > "$ACTIVE_FILE" 2>/dev/null; then
+        log "WARNING: could not update ${ACTIVE_FILE}; keeping existing value"
+    fi
 fi
 
 log "selected variant=${PICKED} (detected=${DETECTED:-unknown}) path=${PICKED_PATH}"
@@ -160,7 +189,9 @@ log "selected variant=${PICKED} (detected=${DETECTED:-unknown}) path=${PICKED_PA
 # Legacy installs: if no per-variant copies exist under /opt/sentryusb
 # (image predates this scheme and the OTA updater hasn't run since), leave
 # /root/bin alone — a regular file there is the only copy we have.
-mkdir -p /root/bin 2>/dev/null || true
+if ! mkdir -p "$ROOT_BIN" 2>/dev/null; then
+    log "WARNING: could not create ${ROOT_BIN}; auxiliary BLE links cannot be repaired"
+fi
 for name in sentryusb-tesla-telemetry sentryusb-ble-action; do
     AUX_PATH="${INSTALL_DIR}/${name}-${PICKED}"
     if [ ! -x "$AUX_PATH" ]; then
@@ -175,8 +206,21 @@ for name in sentryusb-tesla-telemetry sentryusb-ble-action; do
         done
     fi
     if [ -x "$AUX_PATH" ]; then
-        ln -sfn "$AUX_PATH" "/root/bin/${name}"
-        log "${name} -> ${AUX_PATH}"
+        if ensure_symlink "$AUX_PATH" "${ROOT_BIN}/${name}"; then
+            log "${name} -> ${AUX_PATH}"
+        else
+            log "ERROR: could not link ${ROOT_BIN}/${name} -> ${AUX_PATH}"
+        fi
+    elif [ -L "${ROOT_BIN}/${name}" ]; then
+        if [ -x "${ROOT_BIN}/${name}" ]; then
+            if rm -f "${ROOT_BIN}/${name}" 2>/dev/null; then
+                log "ERROR: removed incompatible helper link ${ROOT_BIN}/${name}; no executable fallback is installed"
+            else
+                log "ERROR: ${ROOT_BIN}/${name} points to an incompatible helper and the read-only root prevented removal"
+            fi
+        else
+            log "WARNING: ${ROOT_BIN}/${name} is a dangling symlink and no executable fallback is installed"
+        fi
     fi
 done
 

@@ -7,6 +7,7 @@ shellcheck -V
 
 # Runtime-sourced files are absent in the checkout.
 shellcheck --exclude=SC1091 \
+           ./install-pi.sh \
            ./setup/pi/setup-sentryusb \
            ./pi-gen-sources/00-sentryusb-tweaks/files/rc.local \
            ./pi-gen-sources/00-sentryusb-tweaks/files/sentryusb-pick-binary \
@@ -19,4 +20,6 @@ shellcheck --exclude=SC1091 \
            ./run/remountfs_rw \
            ./run/send-push-message \
            ./run/temperature_monitor \
-           ./run/waitforidle
+           ./run/waitforidle \
+           ./test/install-pi-safety.test.sh \
+           ./test/sentryusb-pick-binary.test.sh

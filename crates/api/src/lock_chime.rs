@@ -823,8 +823,14 @@ async fn query_ble_shift_state() -> Result<String, String> {
         return Err("BLE not paired -- pair your Pi in Settings first".into());
     }
 
-    if !Path::new("/root/.ble/key_private.pem").exists() {
-        return Err("BLE private key missing at /root/.ble/key_private.pem".into());
+    // Usability, not existence: a 0-byte key left by an interrupted keygen
+    // would otherwise pass here and fail later with an opaque PEM error.
+    if !sentryusb_tesla_ble::keys::key_is_usable(Path::new("/root/.ble/key_private.pem")) {
+        return Err(
+            "BLE private key at /root/.ble/key_private.pem is missing or unusable -- \
+             regenerate it in Settings, then pair with the car again"
+                .into(),
+        );
     }
 
     // Read the gear via sentryusb-ble-action, which routes through the

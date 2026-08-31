@@ -299,13 +299,22 @@ function check_and_configure_tesla_ble () {
 
     local pairing_needed=true
     mkdir -p /root/.ble
-    if [ ! -f /root/.ble/key_public.pem ] || [ ! -f /root/.ble/key_private.pem ]
+    # `-s` (exists AND non-empty), not `-f` (merely exists). An interrupted
+    # keygen leaves a 0-byte PEM behind; `-f` accepted it, skipped
+    # regeneration, and every later pair attempt died with an opaque
+    # "parsing PEM envelope: malformedframing". keygen itself now validates
+    # and replaces an unusable key, so re-running it here is safe.
+    if [ ! -s /root/.ble/key_public.pem ] || [ ! -s /root/.ble/key_private.pem ]
     then
       if [ -x "$ble_action" ]; then
         # Generates the keypair + the key_pending_pairing marker with the
         # right perms (0600 / 0644).
-        "$ble_action" keygen
-        log_progress "Generated keys for Tesla BLE interface."
+        if "$ble_action" keygen; then
+          log_progress "Generated keys for Tesla BLE interface."
+        else
+          log_progress "WARNING: keygen failed (exit $?) — BLE pairing will not work. Check that / is writable and re-run: $ble_action keygen"
+          pairing_needed=false
+        fi
       else
         log_progress "WARNING: $ble_action not found — keys will be generated later via the web UI."
         pairing_needed=false

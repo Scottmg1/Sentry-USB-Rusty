@@ -995,7 +995,7 @@ pub async fn ble_install(
     State(s): State<AppState>,
 ) -> (StatusCode, Json<serde_json::Value>) {
     // Native binaries ship with the image; the keypair is the durable install state.
-    let already_installed = std::path::Path::new("/root/.ble/key_private.pem").exists();
+    let already_installed = sentryusb_setup::archive::tesla_ble_keypair_is_valid();
 
     let hub = s.hub.clone();
     tokio::spawn(async move {

@@ -79,6 +79,9 @@ pem = "4"
 # crypto-common, so we now request it directly.
 aes-gcm = { version = "0.10", features = ["std"] }
 
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [build-dependencies]
 prost-build = "0.14"
 # Vendored protoc so users don't need to apt install protobuf-compiler.
