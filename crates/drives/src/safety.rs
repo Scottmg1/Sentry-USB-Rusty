@@ -15,13 +15,10 @@
 //!     rolling period of drives) to the 0–100 score with a per-factor
 //!     penalty breakdown.
 //!
-//! Derived G-force caveat: the car's IMU is not in the SEI stream, so
-//! longitudinal acceleration is differentiated from SEI speed between
-//! GPS-deduplicated samples, and lateral acceleration is `v²·k` with the
-//! curvature `k` taken from the GPS track. Both are ~1 Hz estimates of a
-//! peak signal — they systematically read LOW versus a real
-//! accelerometer, which the thresholds below already account for; do not
-//! "correct" them upward without re-tuning against known clips.
+//! Current native clips carry the car's aligned IMU channels in SEI. Those
+//! measured samples are required for score eligibility. Speed/GPS-derived
+//! fallback metrics remain available for diagnostics and old clips, but
+//! never satisfy the v2.2 compatibility-coverage gate.
 
 use crate::calc;
 use crate::types::{FlagRun, Route, AUTOPILOT_OFF, FLAG_BRAKE};
@@ -105,8 +102,8 @@ pub const CAP_NIGHT_PCT: f64 = 14.2;
 
 /// Late-night risk weight per local wall-clock hour, mirroring Tesla's
 /// v2 change ("impact reduced earlier in the night and increased later").
-/// Applied to night MILES when computing the penalty; the displayed
-/// night share stays unweighted. Hours outside 10pm–4am weigh 0.
+/// Applied to moving time when computing the penalty; the displayed
+/// night share stays unweighted. Hours outside 11pm–4am weigh 0.
 pub fn night_weight(hour: u32) -> f64 {
     match hour {
         23 => 0.21,
@@ -462,18 +459,21 @@ pub fn compute_clip_safety(r: &Route) -> ClipSafety {
 // Score
 // ---------------------------------------------------------------------------
 
-/// Window totals the score is computed from — one drive, or the sum over
-/// a rolling period of drives (summing totals and scoring once IS the
-/// mileage/time-weighted aggregate; never average per-drive scores).
+/// Window totals the score is computed from. Period analytics first score
+/// each eligible local day, then mileage-weight those daily scores.
 #[derive(Debug, Clone, Default)]
 pub struct SafetyTotals {
     pub distance_mi: f64,
     pub assisted_mi: f64,
     pub night_mi: f64,
-    /// Night miles scaled by [`night_weight`] — the penalty input.
+    /// Legacy display compatibility; scoring uses `night_weighted_ms`.
     pub night_weighted_mi: f64,
     pub moving_ms: i64,
     pub imu_moving_ms: i64,
+    /// All moving time inside Tesla's late-night window.
+    pub night_ms: i64,
+    /// Late-night moving time scaled by [`night_weight`].
+    pub night_weighted_ms: i64,
     pub manual_moving_ms: i64,
     pub hard_brake_ms: i64,
     pub hard_brake_events: i32,
@@ -539,8 +539,8 @@ pub fn compute_safety_score(t: &SafetyTotals) -> Option<SafetyScore> {
         0.0
     };
     let sp_pct = 100.0 * t.speeding_ms as f64 / t.moving_ms as f64;
-    let ln_display_pct = 100.0 * (t.night_mi / t.distance_mi).clamp(0.0, 1.0);
-    let ln_pct = 100.0 * (t.night_weighted_mi / t.distance_mi).clamp(0.0, 1.0);
+    let ln_display_pct = 100.0 * (t.night_ms as f64 / t.moving_ms as f64).clamp(0.0, 1.0);
+    let ln_pct = 100.0 * (t.night_weighted_ms as f64 / t.moving_ms as f64).clamp(0.0, 1.0);
     let fsd_share = (t.assisted_mi / t.distance_mi).clamp(0.0, 1.0);
 
     let score = score_from_percentages(hb_pct, at_pct, ln_pct, sp_pct);
@@ -961,6 +961,8 @@ mod tests {
         t.speeding_ms = t.moving_ms;
         t.night_mi = t.distance_mi;
         t.night_weighted_mi = t.distance_mi;
+        t.night_ms = t.moving_ms;
+        t.night_weighted_ms = t.moving_ms;
         let s = compute_safety_score(&t).unwrap();
         assert_eq!(s.score, 0.0);
     }
@@ -970,13 +972,32 @@ mod tests {
         let mut early = base_totals();
         early.night_mi = 5.0;
         early.night_weighted_mi = 5.0 * night_weight(23);
+        early.night_ms = early.moving_ms / 20;
+        early.night_weighted_ms = (early.night_ms as f64 * night_weight(23)).round() as i64;
         let mut late = base_totals();
         late.night_mi = 5.0;
         late.night_weighted_mi = 5.0 * night_weight(3);
+        late.night_ms = late.moving_ms / 20;
+        late.night_weighted_ms = (late.night_ms as f64 * night_weight(3)).round() as i64;
         let se = compute_safety_score(&early).unwrap();
         let sl = compute_safety_score(&late).unwrap();
         assert_eq!(se.night_pct, sl.night_pct, "displayed share is unweighted");
         assert!(sl.night_penalty > se.night_penalty, "3am must cost more than 11pm");
+    }
+
+    #[test]
+    fn late_night_factor_uses_moving_time_not_distance() {
+        let mut slow = base_totals();
+        slow.night_ms = slow.moving_ms / 10;
+        slow.night_weighted_ms = slow.night_ms;
+        slow.night_mi = 1.0;
+        slow.night_weighted_mi = 1.0;
+
+        let mut fast = slow.clone();
+        fast.night_mi = 50.0;
+        fast.night_weighted_mi = 50.0;
+
+        assert_eq!(compute_safety_score(&slow), compute_safety_score(&fast));
     }
 
     #[test]

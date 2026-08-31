@@ -181,10 +181,9 @@ pub fn safety_analytics_from_summaries_for_period(
     build_safety_analytics(&drives, period)
 }
 
-/// Safety Score analytics over an already-grouped drive list. The window
-/// score comes from SUMMED totals scored once (mileage/time-weighted by
-/// construction), matching `safety.rs` semantics — averaging per-drive
-/// scores would over-weight short drives.
+/// Safety estimate analytics over an already-grouped drive list. Each
+/// compatible local day is scored independently, then daily scores and
+/// factor displays are weighted by native mileage.
 fn build_safety_analytics(summaries: &[DriveSummary], period: &str) -> SafetyAnalytics {
     let now = chrono::Local::now().naive_local();
     let today = now.date();
@@ -243,7 +242,9 @@ fn build_safety_analytics(summaries: &[DriveSummary], period: &str) -> SafetyAna
         totals.night_mi += d.safety_night_mi;
         totals.night_weighted_mi += d.safety_night_weighted_mi;
         totals.moving_ms += d.safety_moving_ms;
-        totals.imu_moving_ms += d.safety_moving_ms;
+        totals.imu_moving_ms += d.safety_imu_moving_ms;
+        totals.night_ms += d.safety_night_ms;
+        totals.night_weighted_ms += d.safety_night_weighted_ms;
         totals.manual_moving_ms += d.safety_manual_moving_ms;
         totals.hard_brake_ms += d.safety_hard_brake_ms;
         totals.hard_brake_events += d.safety_hard_brake_events;
@@ -256,7 +257,7 @@ fn build_safety_analytics(summaries: &[DriveSummary], period: &str) -> SafetyAna
         assisted_dist_km +=
             d.fsd_distance_km + d.autosteer_distance_km + d.tacc_distance_km;
         night_km += d.safety_night_mi * calc::M_PER_MILE / 1000.0;
-        if d.safety_moving_ms > 0 {
+        if d.safety_score.is_some() {
             scored_drives += 1;
         }
         fsd_disengagements += d.fsd_disengagements;
@@ -283,7 +284,9 @@ fn build_safety_analytics(summaries: &[DriveSummary], period: &str) -> SafetyAna
             acc.totals.night_mi += d.safety_night_mi;
             acc.totals.night_weighted_mi += d.safety_night_weighted_mi;
             acc.totals.moving_ms += d.safety_moving_ms;
-            acc.totals.imu_moving_ms += d.safety_moving_ms;
+            acc.totals.imu_moving_ms += d.safety_imu_moving_ms;
+            acc.totals.night_ms += d.safety_night_ms;
+            acc.totals.night_weighted_ms += d.safety_night_weighted_ms;
             acc.totals.manual_moving_ms += d.safety_manual_moving_ms;
             acc.totals.hard_brake_ms += d.safety_hard_brake_ms;
             acc.totals.hard_brake_events += d.safety_hard_brake_events;
@@ -297,10 +300,20 @@ fn build_safety_analytics(summaries: &[DriveSummary], period: &str) -> SafetyAna
         }
     }
 
+    let mut eligible_daily_scores: Vec<(crate::safety::SafetyScore, f64)> = Vec::new();
     let mut daily: Vec<SafetyDayStats> = daily_map
         .into_iter()
         .map(|(date, acc)| {
-            let score = crate::safety::compute_safety_score(&acc.totals).map(|s| s.score);
+            let score_breakdown = crate::safety::compute_safety_score(&acc.totals);
+            if let Some(score) = score_breakdown.as_ref() {
+                eligible_daily_scores.push((score.clone(), acc.totals.distance_mi));
+            }
+            let score = score_breakdown.map(|s| s.score);
+            let coverage_pct = if acc.totals.moving_ms > 0 {
+                round1(100.0 * acc.totals.imu_moving_ms as f64 / acc.totals.moving_ms as f64)
+            } else {
+                0.0
+            };
             SafetyDayStats {
                 date,
                 day_name: acc.day_name,
@@ -312,12 +325,17 @@ fn build_safety_analytics(summaries: &[DriveSummary], period: &str) -> SafetyAna
                 aggr_turn_events: acc.totals.aggr_turn_events,
                 speeding_ms: acc.totals.speeding_ms,
                 night_mi: round2(acc.totals.night_mi),
+                night_ms: acc.totals.night_ms,
+                night_weighted_ms: acc.totals.night_weighted_ms,
                 moving_ms: acc.totals.moving_ms,
                 manual_moving_ms: acc.totals.manual_moving_ms,
                 hard_brake_ms: acc.totals.hard_brake_ms,
                 aggr_turn_ms: acc.totals.aggr_turn_ms,
                 brake_any_ms: acc.totals.brake_any_ms,
                 turn_any_ms: acc.totals.turn_any_ms,
+                imu_moving_ms: acc.totals.imu_moving_ms,
+                coverage_pct,
+                eligible: score.is_some(),
             }
         })
         .collect();
@@ -339,16 +357,40 @@ fn build_safety_analytics(summaries: &[DriveSummary], period: &str) -> SafetyAna
     } else {
         0.0
     };
+    let compatible_distance_mi: f64 = eligible_daily_scores.iter().map(|(_, mi)| *mi).sum();
+    let compatible_days = eligible_daily_scores.len() as i32;
+    let coverage_pct = if totals.moving_ms > 0 {
+        round1(100.0 * totals.imu_moving_ms as f64 / totals.moving_ms as f64)
+    } else {
+        0.0
+    };
+    let period_score = mileage_weighted_safety_breakdown(&eligible_daily_scores);
 
     SafetyAnalytics {
+        model_id: crate::safety::MODEL_ID.to_string(),
+        model_label: crate::safety::MODEL_LABEL.to_string(),
         period: period.to_string(),
         period_start: period_start_str,
         total_drives: period_drives.len() as i32,
         scored_drives,
-        score: crate::safety::compute_safety_score(&totals),
+        compatible_days,
+        compatible_distance_mi: round2(compatible_distance_mi),
+        total_native_distance_mi: round2(totals.distance_mi),
+        coverage_pct,
+        unavailable_factors: vec![
+            "Unsafe following".to_string(),
+            "Forced Autopilot disengagements".to_string(),
+            "Unbuckled driving".to_string(),
+            "Lead-relative speeding".to_string(),
+            "Yellow-light braking exemption".to_string(),
+        ],
+        score: period_score,
         total_distance_mi: round2(totals.distance_mi),
         total_distance_km: round2(total_dist_km),
         moving_ms: totals.moving_ms,
+        imu_moving_ms: totals.imu_moving_ms,
+        night_ms: totals.night_ms,
+        night_weighted_ms: totals.night_weighted_ms,
         manual_moving_ms: totals.manual_moving_ms,
         hard_brake_events: totals.hard_brake_events,
         hard_brake_ms: totals.hard_brake_ms,
@@ -365,6 +407,34 @@ fn build_safety_analytics(summaries: &[DriveSummary], period: &str) -> SafetyAna
         best_day,
         best_day_score,
     }
+}
+
+fn mileage_weighted_safety_breakdown(
+    days: &[(crate::safety::SafetyScore, f64)],
+) -> Option<crate::safety::SafetyScore> {
+    let total_miles: f64 = days.iter().map(|(_, miles)| miles.max(0.0)).sum();
+    if total_miles <= 0.0 {
+        return None;
+    }
+    let weighted = |pick: fn(&crate::safety::SafetyScore) -> f64| {
+        days.iter()
+            .map(|(score, miles)| pick(score) * miles.max(0.0))
+            .sum::<f64>()
+            / total_miles
+    };
+    Some(crate::safety::SafetyScore {
+        score: round1(weighted(|s| s.score)),
+        hard_brake_pct: round1(weighted(|s| s.hard_brake_pct)),
+        aggr_turn_pct: round1(weighted(|s| s.aggr_turn_pct)),
+        speeding_pct: round1(weighted(|s| s.speeding_pct)),
+        night_pct: round1(weighted(|s| s.night_pct)),
+        hard_brake_penalty: round1(weighted(|s| s.hard_brake_penalty)),
+        aggr_turn_penalty: round1(weighted(|s| s.aggr_turn_penalty)),
+        speeding_penalty: round1(weighted(|s| s.speeding_penalty)),
+        night_penalty: round1(weighted(|s| s.night_penalty)),
+        fsd_share_pct: round1(weighted(|s| s.fsd_share_pct)),
+        fsd_relief_pct: 0.0,
+    })
 }
 
 /// Resolve a drive id (numeric index or start-time string) to the
@@ -3952,6 +4022,27 @@ fn distance_from_summary_clips(clips: &[SubClipSummary]) -> SummaryDistances {
 /// once per parent file (attributed to the first sub-clip of that
 /// file in this drive) to avoid double-counting in the rare case a
 /// parent contributes multiple sub-clips here.
+fn safety_prefix_for_grace(
+    prefix: &crate::safety::SafetyGracePrefix,
+    grace_ms: i64,
+) -> crate::safety::SafetyPrefixBucket {
+    let mut out = crate::safety::SafetyPrefixBucket::default();
+    let mut remaining = grace_ms.clamp(0, 5_000);
+    for bucket in prefix {
+        if remaining <= 0 {
+            break;
+        }
+        let fraction = (remaining.min(1_000) as f64 / 1_000.0).clamp(0.0, 1.0);
+        out.hard_brake_ms += (bucket.hard_brake_ms as f64 * fraction).round() as i64;
+        out.brake_any_ms += (bucket.brake_any_ms as f64 * fraction).round() as i64;
+        out.aggr_turn_ms += (bucket.aggr_turn_ms as f64 * fraction).round() as i64;
+        out.turn_any_ms += (bucket.turn_any_ms as f64 * fraction).round() as i64;
+        out.speeding_ms += (bucket.speeding_ms as f64 * fraction).round() as i64;
+        remaining -= 1_000;
+    }
+    out
+}
+
 fn build_summary_from_aggregates(
     clips: &[SubClipSummary],
     idx: usize,
@@ -4005,10 +4096,12 @@ fn build_summary_from_aggregates(
     let mut safety_aggr_turn_events: i32 = 0;
     let mut safety_speeding_ms: f64 = 0.0;
     let mut safety_moving_ms: f64 = 0.0;
+    let mut safety_imu_moving_ms: f64 = 0.0;
     let mut safety_manual_moving_ms: f64 = 0.0;
     let mut safety_brake_any_ms: f64 = 0.0;
     let mut safety_turn_any_ms: f64 = 0.0;
     let mut safety_night_ms: f64 = 0.0;
+    let mut safety_night_weighted_ms: f64 = 0.0;
     let mut safety_night_m: f64 = 0.0;
     let mut safety_night_weighted_m: f64 = 0.0;
 
@@ -4038,6 +4131,8 @@ fn build_summary_from_aggregates(
     // attributes that dt to the next point's autopilot state; we do the
     // same via the incoming clip's `ap_at_start`.
     let mut prev_end_ts: Option<chrono::NaiveDateTime> = None;
+    let mut safety_grace_remaining_ms: i64 = 0;
+    let mut prev_ap_at_end: Option<i32> = None;
 
     for clip in clips {
         let a = &clip.summary.aggregates;
@@ -4055,16 +4150,47 @@ fn build_summary_from_aggregates(
         tacc_dist_m += a.tacc_distance_m * f;
         assisted_dist_m += a.assisted_distance_m * f;
 
+        // If assistance disengaged at a clip seam, exclude factor time
+        // from the next five seconds exactly as we do for an in-clip
+        // transition. Prefix buckets let this stay BLOB-free.
+        let mut prefix_excluded = crate::safety::SafetyPrefixBucket::default();
+        if clip.start_frame == 0 {
+            let seam_is_contiguous = prev_end_ts.is_none_or(|end| {
+                (clip.timestamp - end).num_milliseconds().unsigned_abs() <= 5_000
+            });
+            if !seam_is_contiguous {
+                safety_grace_remaining_ms = 0;
+                prev_ap_at_end = None;
+            }
+            if prev_ap_at_end.is_some_and(|ap| ap != AUTOPILOT_OFF as i32)
+                && a.ap_at_start == Some(AUTOPILOT_OFF as i32)
+            {
+                safety_grace_remaining_ms = 5_000;
+            }
+            if safety_grace_remaining_ms > 0 {
+                if let Some(prefix) = a.safety_grace_prefix.as_ref() {
+                    prefix_excluded = safety_prefix_for_grace(prefix, safety_grace_remaining_ms);
+                }
+            }
+        }
+
         // Safety time totals (NULL columns = pre-v18 row = contribute 0).
-        safety_hard_brake_ms += a.safety_hard_brake_ms.unwrap_or(0) as f64 * f;
-        safety_aggr_turn_ms += a.safety_aggr_turn_ms.unwrap_or(0) as f64 * f;
-        safety_speeding_ms += a.safety_speeding_ms.unwrap_or(0) as f64 * f;
+        safety_hard_brake_ms +=
+            (a.safety_hard_brake_ms.unwrap_or(0) - prefix_excluded.hard_brake_ms).max(0) as f64 * f;
+        safety_aggr_turn_ms +=
+            (a.safety_aggr_turn_ms.unwrap_or(0) - prefix_excluded.aggr_turn_ms).max(0) as f64 * f;
+        safety_speeding_ms +=
+            (a.safety_speeding_ms.unwrap_or(0) - prefix_excluded.speeding_ms).max(0) as f64 * f;
         safety_moving_ms += a.safety_moving_ms.unwrap_or(0) as f64 * f;
+        safety_imu_moving_ms += a.safety_imu_moving_ms.unwrap_or(0) as f64 * f;
         safety_manual_moving_ms += a.safety_manual_moving_ms.unwrap_or(0) as f64 * f;
-        safety_brake_any_ms += a.safety_brake_any_ms.unwrap_or(0) as f64 * f;
-        safety_turn_any_ms += a.safety_turn_any_ms.unwrap_or(0) as f64 * f;
+        safety_brake_any_ms +=
+            (a.safety_brake_any_ms.unwrap_or(0) - prefix_excluded.brake_any_ms).max(0) as f64 * f;
+        safety_turn_any_ms +=
+            (a.safety_turn_any_ms.unwrap_or(0) - prefix_excluded.turn_any_ms).max(0) as f64 * f;
+        safety_night_ms += a.safety_night_ms.unwrap_or(0) as f64 * f;
+        safety_night_weighted_ms += a.safety_night_weighted_ms.unwrap_or(0) as f64 * f;
         if crate::safety::is_night_hour(clip.timestamp.hour()) {
-            safety_night_ms += 60_000.0 * f;
             safety_night_m += a.distance_m * f;
             safety_night_weighted_m +=
                 a.distance_m * f * crate::safety::night_weight(clip.timestamp.hour());
@@ -4122,6 +4248,13 @@ fn build_summary_from_aggregates(
         } else {
             None
         };
+        if whole_clip_end {
+            safety_grace_remaining_ms = a.safety_grace_ms_end.unwrap_or(0).clamp(0, 5_000);
+            prev_ap_at_end = a.ap_at_end;
+        } else {
+            safety_grace_remaining_ms = 0;
+            prev_ap_at_end = None;
+        }
 
         if start_point.is_none() {
             if let (Some(lat), Some(lng)) = (a.start_lat, a.start_lng) {
@@ -4275,9 +4408,9 @@ fn build_summary_from_aggregates(
         night_mi: safety_night_m / calc::M_PER_MILE,
         night_weighted_mi: safety_night_weighted_m / calc::M_PER_MILE,
         moving_ms: safety_moving_ms.round() as i64,
-        // Replaced with the persisted measured-IMU total in the v22
-        // aggregation checkpoint.
-        imu_moving_ms: safety_moving_ms.round() as i64,
+        imu_moving_ms: safety_imu_moving_ms.round() as i64,
+        night_ms: safety_night_ms.round() as i64,
+        night_weighted_ms: safety_night_weighted_ms.round() as i64,
         manual_moving_ms: safety_manual_moving_ms.round() as i64,
         hard_brake_ms: safety_hard_brake_ms.round() as i64,
         hard_brake_events: safety_hard_brake_events,
@@ -4364,8 +4497,10 @@ fn build_summary_from_aggregates(
         safety_aggr_turn_events,
         safety_speeding_ms: safety_totals.speeding_ms,
         safety_moving_ms: safety_totals.moving_ms,
+        safety_imu_moving_ms: safety_totals.imu_moving_ms,
         safety_manual_moving_ms: safety_totals.manual_moving_ms,
         safety_night_ms: safety_night_ms.round() as i64,
+        safety_night_weighted_ms: safety_night_weighted_ms.round() as i64,
         safety_night_mi: round2(safety_night_m / calc::M_PER_MILE),
         safety_night_weighted_mi: round2(safety_night_weighted_m / calc::M_PER_MILE),
         safety_brake_any_ms: safety_totals.brake_any_ms,
@@ -4528,6 +4663,46 @@ fn roll_up_telemetry(clips: &[SubClipSummary]) -> DriveTelemetryRollup {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cross_clip_grace_removes_only_the_covered_prefix() {
+        let mut prefix = crate::safety::SafetyGracePrefix::default();
+        for bucket in &mut prefix {
+            bucket.hard_brake_ms = 1_000;
+            bucket.brake_any_ms = 1_000;
+            bucket.speeding_ms = 500;
+        }
+
+        let removed = safety_prefix_for_grace(&prefix, 2_500);
+
+        assert_eq!(removed.hard_brake_ms, 2_500);
+        assert_eq!(removed.brake_any_ms, 2_500);
+        assert_eq!(removed.speeding_ms, 1_250);
+    }
+
+    #[test]
+    fn period_breakdown_is_weighted_by_eligible_daily_miles() {
+        let score = |value| crate::safety::SafetyScore {
+            score: value,
+            hard_brake_pct: value,
+            aggr_turn_pct: value,
+            speeding_pct: value,
+            night_pct: value,
+            hard_brake_penalty: value,
+            aggr_turn_penalty: value,
+            speeding_penalty: value,
+            night_penalty: value,
+            fsd_share_pct: value,
+            fsd_relief_pct: 0.0,
+        };
+
+        let weighted = mileage_weighted_safety_breakdown(&[(score(90.0), 10.0), (score(70.0), 30.0)])
+            .unwrap();
+
+        assert_eq!(weighted.score, 75.0);
+        assert_eq!(weighted.hard_brake_pct, 75.0);
+        assert_eq!(weighted.fsd_relief_pct, 0.0);
+    }
 
     /// Differential release gate for the streaming planner: over a
     /// fixture exercising every grouping rule, planning from metadata

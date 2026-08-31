@@ -454,10 +454,16 @@ pub struct DriveSummary {
     pub safety_speeding_ms: i64,
     #[serde(default)]
     pub safety_moving_ms: i64,
+    /// Moving time backed by aligned vehicle IMU samples. A drive is
+    /// compatible with the v2.2 estimate only when this covers >=90%.
+    #[serde(default)]
+    pub safety_imu_moving_ms: i64,
     #[serde(default)]
     pub safety_manual_moving_ms: i64,
     #[serde(default)]
     pub safety_night_ms: i64,
+    #[serde(default)]
+    pub safety_night_weighted_ms: i64,
     #[serde(default)]
     pub safety_night_mi: f64,
     /// Night miles scaled by the per-hour risk curve (`night_weight`).
@@ -544,29 +550,40 @@ pub struct SafetyDayStats {
     pub aggr_turn_events: i32,
     pub speeding_ms: i64,
     pub night_mi: f64,
+    pub night_ms: i64,
+    pub night_weighted_ms: i64,
     /// Day-level time denominators/numerators so the UI can chart each
     /// factor as a daily PROPORTION (mirroring the Tesla app's per-factor
     /// daily graphs) instead of raw counts.
     pub moving_ms: i64,
+    pub imu_moving_ms: i64,
     pub manual_moving_ms: i64,
     pub hard_brake_ms: i64,
     pub aggr_turn_ms: i64,
     /// v19 conditional denominators (braking >0.1g / turning >0.2g time).
     pub brake_any_ms: i64,
     pub turn_any_ms: i64,
+    pub coverage_pct: f64,
+    pub eligible: bool,
 }
 
-/// Safety Score analytics over a period. Totals are summed across the
-/// period's SEI drives and scored ONCE (mileage/time-weighted by
-/// construction) — never an average of per-drive scores.
+/// Safety estimate analytics over a period. Compatible local days are
+/// scored independently and then weighted by each day's native mileage.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SafetyAnalytics {
+    pub model_id: String,
+    pub model_label: String,
     pub period: String,
     pub period_start: String,
     pub total_drives: i32,
     /// Drives that carried safety data (SEI, non-summon, non-imported).
     pub scored_drives: i32,
+    pub compatible_days: i32,
+    pub compatible_distance_mi: f64,
+    pub total_native_distance_mi: f64,
+    pub coverage_pct: f64,
+    pub unavailable_factors: Vec<String>,
     /// The window score + factor breakdown, `None` when the window has
     /// too little scored driving.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -574,6 +591,9 @@ pub struct SafetyAnalytics {
     pub total_distance_mi: f64,
     pub total_distance_km: f64,
     pub moving_ms: i64,
+    pub imu_moving_ms: i64,
+    pub night_ms: i64,
+    pub night_weighted_ms: i64,
     pub manual_moving_ms: i64,
     pub hard_brake_events: i32,
     pub hard_brake_ms: i64,
