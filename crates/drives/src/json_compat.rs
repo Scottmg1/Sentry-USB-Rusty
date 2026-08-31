@@ -509,6 +509,10 @@ fn insert_imported_route(
     } else {
         crate::blob::encode_f32s(Some(&r.accel_y))
     };
+    let safety_grace_prefix_blob = a
+        .safety_grace_prefix
+        .as_ref()
+        .map(crate::blob::encode_safety_grace_prefix);
 
     let first_lat: Option<f64> = r.points.first().map(|p| p[0]);
     let first_lon: Option<f64> = r.points.first().map(|p| p[1]);
@@ -550,7 +554,10 @@ fn insert_imported_route(
             safety_aggr_turn_ms, safety_aggr_turn_events,
             safety_speeding_ms, safety_moving_ms, safety_manual_moving_ms,
             safety_brake_any_ms, safety_turn_any_ms,
-            accel_x_blob, accel_y_blob, ap_runs_blob)
+            accel_x_blob, accel_y_blob, ap_runs_blob,
+            ap_at_end, safety_imu_moving_ms, safety_night_ms,
+            safety_night_weighted_ms, safety_grace_ms_end,
+            safety_grace_prefix_blob)
          VALUES(
             ?1, ?2, ?3, ?4, ?5,
             NULL, NULL, ?6, ?7, ?8,
@@ -567,7 +574,8 @@ fn insert_imported_route(
             ?50, ?51, ?52, ?53, ?54,
             ?55, ?56,
             ?57, ?58, ?59, ?60, ?61, ?62, ?63, ?64, ?65,
-            ?66, ?67, ?68)
+            ?66, ?67, ?68,
+            ?69, ?70, ?71, ?72, ?73, ?74)
          ON CONFLICT(file) DO UPDATE SET
             date_dir            = excluded.date_dir,
             point_count         = excluded.point_count,
@@ -635,7 +643,13 @@ fn insert_imported_route(
             safety_turn_any_ms       = excluded.safety_turn_any_ms,
             accel_x_blob        = COALESCE(excluded.accel_x_blob, accel_x_blob),
             accel_y_blob        = COALESCE(excluded.accel_y_blob, accel_y_blob),
-            ap_runs_blob        = COALESCE(excluded.ap_runs_blob, ap_runs_blob)",
+            ap_runs_blob        = COALESCE(excluded.ap_runs_blob, ap_runs_blob),
+            ap_at_end                = excluded.ap_at_end,
+            safety_imu_moving_ms     = excluded.safety_imu_moving_ms,
+            safety_night_ms          = excluded.safety_night_ms,
+            safety_night_weighted_ms = excluded.safety_night_weighted_ms,
+            safety_grace_ms_end      = excluded.safety_grace_ms_end,
+            safety_grace_prefix_blob = excluded.safety_grace_prefix_blob",
         params![
             norm, r.date, r.points.len() as i64, r.raw_park_count as i64, r.raw_frame_count as i64,
             a.distance_m, first_lat, first_lon,
@@ -660,6 +674,9 @@ fn insert_imported_route(
             a.safety_speeding_ms, a.safety_moving_ms, a.safety_manual_moving_ms,
             a.safety_brake_any_ms, a.safety_turn_any_ms,
             axb, ayb, apb,
+            a.ap_at_end, a.safety_imu_moving_ms, a.safety_night_ms,
+            a.safety_night_weighted_ms, a.safety_grace_ms_end,
+            safety_grace_prefix_blob,
         ],
     )?;
     Ok(())

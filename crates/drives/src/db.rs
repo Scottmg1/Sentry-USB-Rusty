@@ -129,7 +129,7 @@ const ARCHIVE_SYNC_EXPORT_DATE_KEY: &str = "archive_sync_export_date";
 // braking/turning ratios (v19 denominator columns), rebalanced weights,
 // hour-weighted late-night miles. Stale v10 caches hold v1-formula
 // scores computed from absolute rates.
-const DRIVE_LIST_CACHE_ALGO_VERSION: &str = "11";
+const DRIVE_LIST_CACHE_ALGO_VERSION: &str = "12";
 
 /// Version tag for the per-clip aggregate FORMULA (compute_route_aggregates).
 /// Distinct from the cache algo version above: this gates a one-shot
@@ -148,7 +148,7 @@ const DRIVE_LIST_CACHE_ALGO_VERSION: &str = "11";
 /// archives get safety data without re-extraction. "safety-cond-6" adds
 /// the v19 conditional-ratio denominators (brake >0.1g / turn >0.2g
 /// time) and recomputes all safety columns under the same walk.
-const AGGREGATE_FORMULA_VERSION: &str = "safety-cond-6";
+const AGGREGATE_FORMULA_VERSION: &str = "tesla-v2.2-estimate-1";
 
 /// Version tag for the route `file` KEY format. Gates a one-shot rewrite of
 /// `routes.file` / `processed_files.file` to the canonical form (see
@@ -570,7 +570,10 @@ impl DriveStore {
                      safety_aggr_turn_ms = NULL, safety_aggr_turn_events = NULL, \
                      safety_speeding_ms = NULL, safety_moving_ms = NULL, \
                      safety_manual_moving_ms = NULL, \
-                     safety_brake_any_ms = NULL, safety_turn_any_ms = NULL",
+                     safety_brake_any_ms = NULL, safety_turn_any_ms = NULL, \
+                     ap_at_end = NULL, safety_imu_moving_ms = NULL, \
+                     safety_night_ms = NULL, safety_night_weighted_ms = NULL, \
+                     safety_grace_ms_end = NULL, safety_grace_prefix_blob = NULL",
                     [],
                 )?;
                 info!(
@@ -3164,6 +3167,10 @@ fn insert_or_update_route(
     // firmware and old extractions must read as "no channel".
     let axb = if r.accel_x.is_empty() { None } else { encode_f32s(Some(&r.accel_x)) };
     let ayb = if r.accel_y.is_empty() { None } else { encode_f32s(Some(&r.accel_y)) };
+    let safety_grace_prefix_blob = a
+        .safety_grace_prefix
+        .as_ref()
+        .map(crate::blob::encode_safety_grace_prefix);
 
     let first_lat: Option<f64> = r.points.first().map(|p| p[0]);
     let first_lon: Option<f64> = r.points.first().map(|p| p[1]);
@@ -3205,7 +3212,10 @@ fn insert_or_update_route(
             safety_aggr_turn_ms, safety_aggr_turn_events,
             safety_speeding_ms, safety_moving_ms, safety_manual_moving_ms,
             safety_brake_any_ms, safety_turn_any_ms,
-            accel_x_blob, accel_y_blob, ap_runs_blob)
+            accel_x_blob, accel_y_blob, ap_runs_blob,
+            ap_at_end, safety_imu_moving_ms, safety_night_ms,
+            safety_night_weighted_ms, safety_grace_ms_end,
+            safety_grace_prefix_blob)
          VALUES(
             ?1, ?2, ?3, ?4, ?5,
             NULL, NULL, ?6, ?7, ?8,
@@ -3223,7 +3233,8 @@ fn insert_or_update_route(
             ?55, ?56,
             ?57, ?58, ?59, ?60, ?61, ?62, ?63,
             ?64, ?65,
-            ?66, ?67, ?68)
+            ?66, ?67, ?68,
+            ?69, ?70, ?71, ?72, ?73, ?74)
          ON CONFLICT(file) DO UPDATE SET
             date_dir            = excluded.date_dir,
             point_count         = excluded.point_count,
@@ -3291,7 +3302,13 @@ fn insert_or_update_route(
             safety_turn_any_ms       = excluded.safety_turn_any_ms,
             accel_x_blob             = excluded.accel_x_blob,
             accel_y_blob             = excluded.accel_y_blob,
-            ap_runs_blob             = excluded.ap_runs_blob",
+            ap_runs_blob             = excluded.ap_runs_blob,
+            ap_at_end                = excluded.ap_at_end,
+            safety_imu_moving_ms     = excluded.safety_imu_moving_ms,
+            safety_night_ms          = excluded.safety_night_ms,
+            safety_night_weighted_ms = excluded.safety_night_weighted_ms,
+            safety_grace_ms_end      = excluded.safety_grace_ms_end,
+            safety_grace_prefix_blob = excluded.safety_grace_prefix_blob",
         params![
             norm_file,
             &r.date,
@@ -3361,6 +3378,12 @@ fn insert_or_update_route(
             axb,
             ayb,
             apb,
+            a.ap_at_end,
+            a.safety_imu_moving_ms,
+            a.safety_night_ms,
+            a.safety_night_weighted_ms,
+            a.safety_grace_ms_end,
+            safety_grace_prefix_blob,
         ],
     )?;
     Ok(())
@@ -3679,7 +3702,10 @@ fn select_route_summaries_where(
                 safety_aggr_turn_ms, safety_aggr_turn_events,
                 safety_speeding_ms, safety_moving_ms, safety_manual_moving_ms,
                 safety_brake_any_ms, safety_turn_any_ms,
-                ap_runs_blob
+                ap_runs_blob,
+                ap_at_end, safety_imu_moving_ms, safety_night_ms,
+                safety_night_weighted_ms, safety_grace_ms_end,
+                safety_grace_prefix_blob
          FROM routes
          {where_sql}
          ORDER BY file",
@@ -3765,6 +3791,15 @@ fn select_route_summaries_where(
             ),
             // v21 autopilot runs (summon Self Driving signature)
             row.get::<_, Option<Vec<u8>>>(55)?,
+            // v22 Tesla safety-estimate inputs and clip-boundary state
+            (
+                row.get::<_, Option<i64>>(56)?,
+                row.get::<_, Option<i64>>(57)?,
+                row.get::<_, Option<i64>>(58)?,
+                row.get::<_, Option<i64>>(59)?,
+                row.get::<_, Option<i64>>(60)?,
+                row.get::<_, Option<Vec<u8>>>(61)?,
+            ),
         ))
     })?;
 
@@ -3819,6 +3854,14 @@ fn select_route_summaries_where(
                 safety_turn_any_ms,
             ),
             apb,
+            (
+                ap_at_end,
+                safety_imu_moving_ms,
+                safety_night_ms,
+                safety_night_weighted_ms,
+                safety_grace_ms_end,
+                safety_grace_prefix_blob,
+            ),
         ) = r?;
 
         let gear_runs = decode_gear_runs(rb.as_deref())
@@ -3830,6 +3873,9 @@ fn select_route_summaries_where(
         let ap_runs = decode_ap_runs(apb.as_deref())
             .with_context(|| format!("decode ap_runs {}", file))?
             .unwrap_or_default();
+        let safety_grace_prefix = safety_grace_prefix_blob
+            .as_deref()
+            .map(|blob| crate::blob::decode_safety_grace_prefix(Some(blob)));
 
         out.push(RouteSummary {
             file,
@@ -3873,7 +3919,12 @@ fn select_route_summaries_where(
                 safety_manual_moving_ms,
                 safety_brake_any_ms,
                 safety_turn_any_ms,
-                ..Default::default()
+                ap_at_end: ap_at_end.map(|v| v as i32),
+                safety_imu_moving_ms,
+                safety_night_ms,
+                safety_night_weighted_ms,
+                safety_grace_ms_end,
+                safety_grace_prefix,
             },
             source,
             external_signature,
@@ -4314,6 +4365,47 @@ mod tests {
                 assert_eq!(summaries.len(), 1);
                 assert_eq!(summaries[0].flag_runs, routes[0].flag_runs);
                 assert_eq!(summaries[0].aggregates.sei_speed_abs_max, Some(26.0));
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn v22_safety_aggregates_survive_insert_and_summary_read() {
+        let store = DriveStore::open_memory().unwrap();
+        let n = 61;
+        let gps = crate::types::ExtractedGps {
+            points: (0..n)
+                .map(|i| [37.7749 + i as f64 * 0.0001, -122.4194])
+                .collect(),
+            gear_states: vec![4; n],
+            autopilot_states: vec![crate::types::AUTOPILOT_OFF; n],
+            speeds: vec![25.0; n],
+            accel_positions: vec![0.0; n],
+            raw_park_count: 0,
+            raw_frame_count: n as u32,
+            gear_runs: vec![],
+            flag_runs: vec![],
+            ap_runs: vec![],
+            accel_x: vec![0.0; n],
+            accel_y: vec![4.0; n],
+        };
+        store
+            .add_route_extracted(
+                "2026-08-31/2026-08-31_23-30-00-front.mp4",
+                "2026-08-31",
+                &gps,
+            )
+            .unwrap();
+
+        store
+            .with_route_summaries(|summaries| {
+                let agg = &summaries[0].aggregates;
+                assert_eq!(agg.ap_at_end, Some(crate::types::AUTOPILOT_OFF as i32));
+                assert!((59_000..=61_000).contains(&agg.safety_imu_moving_ms.unwrap()));
+                assert!((59_000..=61_000).contains(&agg.safety_night_ms.unwrap()));
+                assert!((12_000..=13_000).contains(&agg.safety_night_weighted_ms.unwrap()));
+                assert_eq!(agg.safety_grace_ms_end, Some(0));
+                assert!(agg.safety_grace_prefix.unwrap()[0].hard_brake_ms > 0);
             })
             .unwrap();
     }
@@ -4868,7 +4960,8 @@ mod tests {
             // Simulate a stale haversine distance + a non-NULL gate column,
             // so the migration path (not a fresh insert) is exercised.
             conn.execute(
-                "UPDATE routes SET distance_m = 999.0, max_speed_mps = 12.3",
+                "UPDATE routes SET distance_m = 999.0, max_speed_mps = 12.3,
+                    safety_imu_moving_ms = 1234, safety_grace_ms_end = 4321",
                 [],
             )
             .unwrap();
@@ -4885,6 +4978,8 @@ mod tests {
             "stale distance should have been recomputed, got {}",
             out[0].aggregates.distance_m
         );
+        assert_eq!(out[0].aggregates.safety_imu_moving_ms, Some(0));
+        assert_eq!(out[0].aggregates.safety_grace_ms_end, Some(0));
 
         let conn = store.conn.lock().unwrap();
         let ver = meta_get(&conn, "aggregate_formula_version").unwrap();

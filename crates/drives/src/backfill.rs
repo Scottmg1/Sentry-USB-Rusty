@@ -307,10 +307,20 @@ fn backfill_one_batch(conn: &mut Connection) -> Result<i64> {
                 safety_moving_ms         = ?30,
                 safety_manual_moving_ms  = ?31,
                 safety_brake_any_ms      = ?32,
-                safety_turn_any_ms       = ?33
-             WHERE file = ?34",
+                safety_turn_any_ms       = ?33,
+                ap_at_end                = ?34,
+                safety_imu_moving_ms     = ?35,
+                safety_night_ms          = ?36,
+                safety_night_weighted_ms = ?37,
+                safety_grace_ms_end      = ?38,
+                safety_grace_prefix_blob = ?39
+             WHERE file = ?40",
         )?;
         for (file, a) in &decoded {
+            let safety_grace_prefix_blob = a
+                .safety_grace_prefix
+                .as_ref()
+                .map(crate::blob::encode_safety_grace_prefix);
             stmt.execute(params![
                 a.distance_m,
                 a.max_speed_mps,
@@ -345,6 +355,12 @@ fn backfill_one_batch(conn: &mut Connection) -> Result<i64> {
                 a.safety_manual_moving_ms,
                 a.safety_brake_any_ms,
                 a.safety_turn_any_ms,
+                a.ap_at_end,
+                a.safety_imu_moving_ms,
+                a.safety_night_ms,
+                a.safety_night_weighted_ms,
+                a.safety_grace_ms_end,
+                safety_grace_prefix_blob,
                 file,
             ])
             .with_context(|| format!("update {}", file))?;
